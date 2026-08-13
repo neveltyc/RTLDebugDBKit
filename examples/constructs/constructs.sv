@@ -31,11 +31,17 @@ endmodule
 
 module gates(input logic a, input logic b, input logic en, output logic y);
     wire yi, yn, o1, o2, zt, pu;
+    wire [2:0] sr;
     and    g_and (yi, a, b);                // n-input gate
     nand   g_nand(yn, a, b);
     buf    g_buf (o1, o2, a);               // n-output gate: outputs first
     bufif1 g_bufz(zt, yi, en);              // enable terminal
     pullup g_pu  (pu);                      // no input terminal at all
+    // One net on both terminals, different bits: real dataflow, and the case
+    // that a same-symbol self-pairing guard threw away -- and then reported as
+    // a gate driving sr[1] from nothing.
+    buf    g_sr0 (sr[1], sr[0]);
+    buf    g_sr1 (sr[2], sr[1]);
     assign y = zt;
 endmodule
 

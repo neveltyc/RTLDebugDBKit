@@ -69,6 +69,21 @@ if mode == "constructs":
     check("the pullup's null-source row", """
         SELECT count(*) FROM edge
         WHERE construct = 'gate:pullup' AND src IS NULL""")
+    # One net on both terminals of a gate, different bits. Guarding on the
+    # symbol dropped the edge and then called the target undriven, which
+    # severed every stage of a gate-level chain and mislabelled it.
+    check("a gate driving one bit of a net from another", """
+        SELECT count(*) FROM edge e
+        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
+        WHERE e.construct = 'gate:buf' AND d.text = 'sr' AND s.text = 'sr'
+          AND e.dst_lo = e.src_lo + 1""", 2)
+    nulls = con.execute("""
+        SELECT count(*) FROM edge JOIN name d ON d.id = edge.dst
+        WHERE edge.construct = 'gate:buf' AND d.text = 'sr'
+          AND edge.src IS NULL""").fetchone()[0]
+    if nulls:
+        sys.exit(f"{nulls} gate row(s) on `sr` claim no source; the chain is severed")
+    print("ok: no gate on `sr` claims to drive from nothing")
     check("the part-select port connection (.idx(stim[3:0]))", """
         SELECT count(*) FROM port
         WHERE outer_lo = 0 AND outer_hi = 3 AND outer_exact = 1""")

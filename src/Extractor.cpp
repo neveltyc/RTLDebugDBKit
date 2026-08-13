@@ -1333,6 +1333,11 @@ private:
             EdgeRow row;
             if (!relativePath(*dst.sym, prefix, row.dst)) {
                 addHierRef(true, dst, kind, construct, at);
+                // The operand too, gating conditions included -- those reach
+                // here and nowhere else, so returning on the target alone lost
+                // the only record of what an outward write depends on.
+                if (src.sym)
+                    addHierRef(false, src, kind, construct, at);
                 return;
             }
             if (!dst.whole)
@@ -1393,8 +1398,18 @@ private:
             if (!relativePath(*dst.sym, prefix, arow.dst)) {
                 // The statement itself cannot be a row -- its target has no
                 // module-relative name -- but the write is recorded where
-                // every outward reference is.
+                // every outward reference is, and so is everything it read.
+                //
+                // Returning before the operand loop threw the read side away
+                // entirely, uncounted: `always_ff @(posedge clk) b.rdy <=
+                // b.vld & b.ack;` -- a modport driver, which is what interface
+                // RTL mostly is -- exported one write-only row, and the two
+                // reads appeared in no table and in no total.
                 addHierRef(true, dst, kind, construct, at);
+                for (auto& r : operands) {
+                    if (r.sym)
+                        addHierRef(false, r, kind, construct, at);
+                }
                 return;
             }
             if (!dst.whole)
@@ -1518,34 +1533,55 @@ private:
                 }
             };
 
-            std::vector<Ref> reads, writes;
+            // Each reference remembers which terminal it came from. A
+            // bidirectional terminal is both read and driven, and it must not
+            // pair with *itself* -- but comparing symbols to detect that was
+            // wrong twice over: `buf (sr[1], sr[0])` has one symbol on both
+            // terminals and is ordinary dataflow, and the guard discarded it
+            // and then, finding no input, claimed the gate drives `sr[1]` from
+            // nothing. Every stage of a gate-level shift register came out
+            // severed and mislabelled as a constant driver. The terminal index
+            // is what "the same terminal" actually means.
+            struct Term {
+                Ref ref;
+                size_t terminal;
+            };
+            std::vector<Term> reads, writes;
+            auto take = [&](size_t i, std::vector<Term>& into, bool skipSelectors) {
+                std::vector<Ref> refs;
+                collectRefs(*conns[i], evalCtx, refs, skipSelectors);
+                for (auto& r : refs)
+                    into.push_back(Term{r, i});
+            };
             for (size_t i = 0; i < n; i++) {
                 if (!conns[i])
                     continue;
                 switch (dirOf(i)) {
                     case PrimitivePortDirection::In:
-                        collectRefs(*conns[i], evalCtx, reads);
+                        take(i, reads, /*skipSelectors=*/false);
                         break;
-                    case PrimitivePortDirection::InOut: {
+                    case PrimitivePortDirection::InOut:
                         // A tran terminal conducts both ways: it is read and
                         // driven at once, so it lands in both sets and the
                         // pairing below emits both directions.
-                        std::vector<Ref> refs;
-                        collectRefs(*conns[i], evalCtx, refs, /*skipSelectors=*/true);
-                        reads.insert(reads.end(), refs.begin(), refs.end());
-                        writes.insert(writes.end(), refs.begin(), refs.end());
+                        take(i, reads, /*skipSelectors=*/true);
+                        take(i, writes, /*skipSelectors=*/true);
                         break;
-                    }
                     default:    // Out, OutReg
-                        collectRefs(*conns[i], evalCtx, writes, /*skipSelectors=*/true);
+                        take(i, writes, /*skipSelectors=*/true);
                         break;
                 }
             }
 
-            for (auto& dst : writes) {
+            for (auto& dstTerm : writes) {
+                const Ref& dst = dstTerm.ref;
                 std::string dstRel;
                 if (!relativePath(*dst.sym, prefix, dstRel)) {
                     addHierRef(true, dst, "primitive", construct, at);
+                    for (auto& srcTerm : reads) {
+                        if (srcTerm.terminal != dstTerm.terminal)
+                            addHierRef(false, srcTerm.ref, "primitive", construct, at);
+                    }
                     continue;
                 }
                 // The dst half of the row is the same for every source this
@@ -1565,19 +1601,26 @@ private:
                 base.line = at.line;
 
                 const auto dk = keyRange(dst);
+                // Whether this terminal has any input at all, which decides
+                // the null-source row below. Set only where a row is actually
+                // written: counting inputs that then turn out to live outside
+                // the module left a gate driven entirely by hierarchical
+                // references with no driver row of any kind.
                 bool anyInput = false;
-                for (auto& src : reads) {
-                    // A bidirectional terminal appears in both sets; pairing
-                    // it with itself would fabricate self-feedback out of one
-                    // terminal, which is wiring, not dataflow.
-                    if (src.sym == dst.sym)
+                for (auto& srcTerm : reads) {
+                    // One terminal does not feed itself. A tran's two ends are
+                    // both read and driven, and pairing an end with itself
+                    // would fabricate dataflow out of a single wire.
+                    if (srcTerm.terminal == dstTerm.terminal)
                         continue;
-                    anyInput = true;
+                    const Ref& src = srcTerm.ref;
                     const auto sk = keyRange(src);
                     if (!seen.emplace(dst.sym, src.sym, at.line, dk.first, dk.second,
                                       sk.first, sk.second)
-                             .second)
+                             .second) {
+                        anyInput = true;   // already recorded, still an input
                         continue;
+                    }
                     EdgeRow row = base;
                     if (!relativePath(*src.sym, prefix, row.src)) {
                         addHierRef(false, src, "primitive", construct, at);
@@ -1587,10 +1630,14 @@ private:
                     if (!src.whole)
                         row.srcBits = std::make_pair(src.lo, src.hi);
                     row.srcExact = src.exact;
+                    anyInput = true;
                     out.push_back(std::move(row));
                 }
-                // pullup(y) has no input terminal; the null-source row names
-                // the gate as the driver, exactly as `q <= 8'h0` is named.
+                // pullup(y) has no input terminal, and a gate whose inputs all
+                // live outside the module has none this row can name. Either
+                // way the null-source row names the gate as the driver,
+                // exactly as `q <= 8'h0` is named; without it the net reads as
+                // undriven.
                 if (!anyInput &&
                     seen.emplace(dst.sym, nullptr, at.line, dk.first, dk.second,
                                  uint64_t(0), uint64_t(0))
