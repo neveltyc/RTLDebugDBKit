@@ -88,6 +88,21 @@ if mode == "constructs":
     check("the included wait, attributed to seq.svh", """
         SELECT count(*) FROM proc_event pe JOIN file f ON f.id = pe.file
         WHERE f.path LIKE '%seq.svh'""")
+    # An initial block is not sensitive to anything. Its event controls are
+    # waits, and a reader filtering wait=0 must get nothing for it -- without
+    # the column those rows read as a trigger set and the block looks clocked.
+    check("the initial block's events are all waits", """
+        SELECT count(*) FROM proc_event WHERE wait = 1""", 2)
+    sensitive = con.execute("""
+        SELECT count(*) FROM proc_event pe JOIN module m ON m.id = pe.module
+        WHERE m.name = 'constructs' AND pe.wait = 0""").fetchone()[0]
+    if sensitive:
+        sys.exit(f"the initial block reports {sensitive} sensitivity row(s); "
+                 "an initial block triggers on nothing")
+    print("ok: the initial block reports no sensitivity")
+    check("the always_ff's real sensitivity list", """
+        SELECT count(*) FROM proc_event pe JOIN module m ON m.id = pe.module
+        WHERE m.name = 'counter' AND pe.wait = 0""", 2)
     # A downward XMR resolves inside the module that writes it, so it is an
     # ordinary assignment under a dotted name rather than a hier_ref -- the
     # point here is only that the row names the file the statement is in.
@@ -110,5 +125,12 @@ if mode == "interfaces":
     check("interface member reads in hier_ref", """
         SELECT count(*) FROM hier_ref h JOIN name n ON n.id = h.path
         WHERE h.write = 0 AND n.text LIKE 'bus.%'""")
+    # `assign seen = bus.vld && bus.data[0]` reads nothing this module can
+    # name, but it plainly drives `seen`. Without a null-source row a driver
+    # query answers "nothing drives it" -- and under v2 every module computing
+    # from interface members is this case.
+    check("a driver row for a target fed only from outside the module", """
+        SELECT count(*) FROM edge e JOIN name d ON d.id = e.dst
+        WHERE d.text = 'seen' AND e.src IS NULL""")
 
 print("OK")

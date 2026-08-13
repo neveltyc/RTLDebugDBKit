@@ -1238,7 +1238,8 @@ private:
     /// event signal (`@(posedge tb.clk)`) also lands in hier_ref.
     ProcEventRow eventRow(const Expression* expr, const std::string& edge,
                           const std::string& prefix, const std::string& kind,
-                          const std::string& construct, const Where& at) {
+                          const std::string& construct, const Where& at,
+                          bool isWait) {
         std::string signal;
         if (expr && (expr->kind == ExpressionKind::NamedValue ||
                      expr->kind == ExpressionKind::HierarchicalValue)) {
@@ -1250,7 +1251,7 @@ private:
                 addHierRef(false, r, kind, construct, at);
             }
         }
-        return ProcEventRow{std::move(signal), edge, at.file, at.line};
+        return ProcEventRow{std::move(signal), edge, isWait, at.file, at.line};
     }
 
     /// One procedure's edges, paired statement by statement.
@@ -1279,7 +1280,7 @@ private:
             collectEdgeEvents(sens.timingControl, raw);
             for (auto& [expr, edge] : raw)
                 events.push_back(eventRow(expr, edge, prefix, kind, construct,
-                                          procAt));
+                                          procAt, /*isWait=*/false));
         }
 
         // Input-port drivers belong to the parent, not to this module: the port
@@ -1340,12 +1341,31 @@ private:
             if (src.sym) {
                 if (!relativePath(*src.sym, prefix, row.src)) {
                     addHierRef(false, src, kind, construct, at);
-                    return;
+                    // The operand has no name this row can carry, but the
+                    // statement still drives the target. Returning here left
+                    // an output assigned only from outside the module -- every
+                    // `assign seen = bus.vld` in an interface-using design --
+                    // with no edge row at all, so a driver query answered
+                    // "nothing drives it" about a signal that is plainly
+                    // driven. Recorded as a null source, exactly as `q <= 8'h0`
+                    // is; what the source actually was is in `hier_ref` at this
+                    // module, file and line.
+                    //
+                    // Re-keyed, because the dedup above ran on the operand's
+                    // symbol: two external operands in one statement reach here
+                    // separately and would otherwise write the same row twice.
+                    if (!seen.emplace(dst.sym, nullptr, stmtLine, dk.first,
+                                      dk.second, uint64_t(0), uint64_t(0))
+                             .second)
+                        return;
+                    row.src.clear();
                 }
-                row.srcType = typeOf(*src.sym);
-                if (!src.whole)
-                    row.srcBits = std::make_pair(src.lo, src.hi);
-                row.srcExact = src.exact;
+                else {
+                    row.srcType = typeOf(*src.sym);
+                    if (!src.whole)
+                        row.srcBits = std::make_pair(src.lo, src.hi);
+                    row.srcExact = src.exact;
+                }
             }
             row.dstType = typeOf(*dst.sym);
             row.kind = kind;
@@ -1416,7 +1436,8 @@ private:
         // `include` puts in a different file from the procedure header.
         [&](const Expression* e, const std::string& edge, SourceRange where) {
             events.push_back(eventRow(e, edge, prefix, kind, construct,
-                                      locate(where.start(), procAt)));
+                                      locate(where.start(), procAt),
+                                      /*isWait=*/true));
         },
         evalCtx);
         walker.sensitivityTiming = sens.timingControl;

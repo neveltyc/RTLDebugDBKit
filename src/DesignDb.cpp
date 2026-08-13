@@ -256,13 +256,24 @@ CREATE TABLE assignment(
 -- Statement-level event controls are rows too: `@(posedge clk);` inside an
 -- initial block or a task is a wait rather than sensitivity, but the signal
 -- is sampled either way, and without a row the read had no trace at all.
--- `file`/`line` tell the two apart -- a sensitivity row carries the
--- procedure's own location, a wait carries the statement's.
+--
+-- `wait` is what tells the two apart, and it has to be a column. An earlier
+-- version said file/line would do it -- a sensitivity row carrying the
+-- procedure's location, a wait its statement's -- which is not something a
+-- consumer can evaluate: no table stores a procedure's own location, so there
+-- is nothing to compare against, and a wait written on the same line as the
+-- header produces two rows that are byte-identical. Without the column an
+-- `initial` block containing `@(posedge clk);` reads as a procedure triggered
+-- by `clk`, which is a wrong trigger set rather than a missing one.
 CREATE TABLE proc_event(
     module INTEGER NOT NULL REFERENCES module(id),
     proc   INTEGER NOT NULL,
     signal INTEGER REFERENCES name(id),   -- NULL when not a plain reference
     edge_kind TEXT,                       -- posedge | negedge | both
+    -- 0 = the procedure's sensitivity list, so it triggers the block.
+    -- 1 = a wait reached during execution; it suspends the block instead, and
+    -- says nothing about what triggers it. An `initial` block has only these.
+    wait   INTEGER NOT NULL,
     file   INTEGER REFERENCES file(id),
     line   INTEGER);
 
@@ -386,7 +397,7 @@ Writer::Writer(const std::string& path) {
     prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
-        prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?)", &insProcEvent);
+        prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?)", &insProcEvent);
         prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?)", &insAssignOp);
         prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?)", &insHierRef);
         begin();
@@ -766,8 +777,9 @@ void Writer::addProcEvents(int64_t moduleId, int64_t proc,
         sqlite3_bind_int64(insProcEvent, 2, proc);
         bindOptId(insProcEvent, 3, internName(e.signal));
         bindOptText(insProcEvent, 4, e.edge);
-        bindOptId(insProcEvent, 5, internFile(e.file));
-        sqlite3_bind_int64(insProcEvent, 6, e.line);
+        sqlite3_bind_int(insProcEvent, 5, e.wait ? 1 : 0);
+        bindOptId(insProcEvent, 6, internFile(e.file));
+        sqlite3_bind_int64(insProcEvent, 7, e.line);
         step(insProcEvent);
         pending++;
     }

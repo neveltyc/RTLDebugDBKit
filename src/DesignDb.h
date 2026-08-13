@@ -86,6 +86,11 @@ struct OperandRow {
 struct ProcEventRow {
     std::string signal;   // empty when the event expression is not a plain name
     std::string edge;     // posedge | negedge | both
+    /// False for the procedure's sensitivity list, true for an event control
+    /// reached during execution. The distinction is the difference between
+    /// "this triggers the block" and "the block stops here until it happens",
+    /// and an `initial` block has none of the first kind.
+    bool wait = false;
     std::string file;
     uint32_t line = 0;    // the sensitivity's procedure, or the wait's statement
 };

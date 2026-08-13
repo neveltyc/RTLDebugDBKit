@@ -17,7 +17,10 @@ Version 2 added: the [`hier_ref`](#leaving-the-hierarchy) table; bit ranges,
 interface bindings and expression operands on [`port`](#crossing-a-module-boundary)
 — `conn_kind` gained values 3 and 4, which a v1 reader would misread as plain
 nets, and that misreading is why the version moved rather than staying a pure
-addition; statement-level waits and `file`/`line` in `proc_event`; primitive
+addition; statement-level waits, with `wait`, `file` and `line`, in
+`proc_event` — a v1 reader treating those rows as sensitivity reads an
+`initial` block as clocked, which is the second reason the version moved;
+primitive
 edges (`kind='primitive'`); `symbol.kind='interface_port'`; `file.source_file`;
 self-feedback edges; and `meta.top` written from the elaborated tops whether or
 not `--top` was passed.
@@ -151,7 +154,7 @@ WHERE s.direction = 1
 
 | table | column | meaning |
 |---|---|---|
-| `edge` | `module`, `src`, `dst` | One dependency inside a module. `src` is NULL when the right-hand side reads nothing at all (`q <= 8'h0`) — the row still names the statement. Self-feedback is a real row: `cnt <= cnt + 1` records `cnt → cnt`, which is what makes "who reads cnt" answerable. A downward hierarchical reference that stays inside the module's subtree is an ordinary row whose name is dotted (`u_child.sig`). |
+| `edge` | `module`, `src`, `dst` | One dependency inside a module. `src` is NULL when no operand has a name in this module's namespace — the right-hand side read nothing at all (`q <= 8'h0`), or everything it read lives outside the module (`assign seen = bus.vld`, where the operands are in `hier_ref` at the same `module`/`file`/`line`). Either way the row names the statement, so a driver query answers. Self-feedback is a real row: `cnt <= cnt + 1` records `cnt → cnt`, which is what makes "who reads cnt" answerable. A downward hierarchical reference that stays inside the module's subtree is an ordinary row whose name is dotted (`u_child.sig`). |
 | | `src_type`, `dst_type` | Type text. |
 | | `kind`, `construct` | `continuous_assign`/`procedural`/`primitive`, and the construct: `assign`, `always_ff`, `gate:and`, `udp:my_latch`, … A gate, switch or UDP instance is one edge per (input, output) pairing — `and (y, a, b)` is `a → y` and `b → y`. |
 | | `control` | 1 when the operand reached the target through a branch condition rather than the right-hand side. |
@@ -166,7 +169,7 @@ WHERE s.direction = 1
 | | `blocking` | 1 for `=`, 0 for `<=`, NULL for a continuous assign. Not decoration — two assignments to one target in one block resolve by different rules, and it separates a block-local temporary written with `=` inside an `always_ff` from a real register. |
 | | `dropped_operands` | Operands not recorded: compile-time constants, and references outside this module. A row with one operand and three dropped is not a row that reads one signal. |
 | `assign_operand` | `assignment`, `name`, `src_lo`/`src_hi`/`src_exact` | What the right-hand side reads. |
-| `proc_event` | `module`, `proc`, `signal`, `edge_kind`, `file`, `line` | Every edge event a procedure triggers on **or waits on**. `signal` is NULL when the event expression is not a plain reference. A sensitivity row carries the procedure's own location; a statement-level wait (`@(posedge clk);` inside an initial block or a task) carries its statement's, which is also what tells the two apart. |
+| `proc_event` | `module`, `proc`, `signal`, `edge_kind`, `wait`, `file`, `line` | Every edge event a procedure triggers on **or waits on**. `signal` is NULL when the event expression is not a plain reference. `wait` is the discriminator: `0` is the procedure's sensitivity list, so the event triggers the block; `1` is an event control reached during execution (`@(posedge clk);` inside an initial block or a task), which suspends it and says nothing about what triggers it. **Filter on `wait = 0` to ask what a procedure is sensitive to** — an `initial` block has only `wait = 1` rows, and reading those as a trigger set makes it look clocked. |
 
 `edge` flattens a procedure into "these signals drive that one". `assignment`
 keeps the statements apart, so a target written in four places reads as four
