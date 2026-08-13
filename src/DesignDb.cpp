@@ -157,12 +157,23 @@ CREATE TABLE port(
     -- expression the same way outer_width does).
     outer_lo     INTEGER, outer_hi INTEGER, outer_exact INTEGER,
     -- 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an
-    -- expression. 3 is not a net: `.en(state == RUN)` samples `state` but does
-    -- not alias it to `en`, and recording it as 0 made every reader of `en`
-    -- count as a reader of `state`. An unconnected port is recorded rather
-    -- than omitted: absence would otherwise mean both "nobody connected it"
-    -- and "the exporter did not get that far".
+    -- expression, 4=an interface binding. 3 is not a net: `.en(state == RUN)`
+    -- samples `state` but does not alias it to `en`, and recording it as 0
+    -- made every reader of `en` count as a reader of `state`. An unconnected
+    -- port is recorded rather than omitted: absence would otherwise mean both
+    -- "nobody connected it" and "the exporter did not get that far".
+    --
+    -- For 4, `port` is the child's interface port, `outer` the interface
+    -- instance (or the parent's own interface port, passed through) in the
+    -- parent's namespace, `outer_type` the interface definition, and
+    -- `direction` is NULL -- an interface port has none. This row is the alias
+    -- that makes `child.bus.*` resolvable: the signals live in the interface
+    -- instance named by `outer`, and without the row they can be reached from
+    -- neither side.
     conn_kind    INTEGER,
+    -- The modport restricting an interface binding, when one does. NULL
+    -- otherwise, and for every non-interface row.
+    modport      INTEGER REFERENCES name(id),
     file         INTEGER REFERENCES file(id),
     line         INTEGER);
 
@@ -322,7 +333,7 @@ Writer::Writer(const std::string& path) {
     prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
     prepare("INSERT INTO child VALUES(?,?,?,?)", &insChild);
     prepare("INSERT INTO instance VALUES(?,?,?,?)", &insInstance);
-    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
+    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?)", &insProcEvent);
@@ -561,7 +572,12 @@ void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
         sqlite3_bind_int64(insPort, 2, internName(r.child));
         bindOptId(insPort, 3, defModuleId);
         sqlite3_bind_int64(insPort, 4, internName(r.port));
-        sqlite3_bind_int(insPort, 5, directionCode(r.direction));
+        // An interface port has no direction at all; NULL says so, where a
+        // made-up code would read as a direction this tool failed to model.
+        if (r.direction.empty())
+            sqlite3_bind_null(insPort, 5);
+        else
+            sqlite3_bind_int(insPort, 5, directionCode(r.direction));
         bindOptId(insPort, 6, internName(r.outer));
         bindOptId(insPort, 7, internType(r.outerType));
         if (r.outerWidth >= 0)
@@ -580,8 +596,9 @@ void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
             sqlite3_bind_int(insPort, 11, r.outerExact ? 1 : 0);
         }
         sqlite3_bind_int(insPort, 12, static_cast<int>(r.conn));
-        bindOptId(insPort, 13, internFile(r.file));
-        sqlite3_bind_int64(insPort, 14, r.line);
+        bindOptId(insPort, 13, internName(r.modport));
+        bindOptId(insPort, 14, internFile(r.file));
+        sqlite3_bind_int64(insPort, 15, r.line);
         step(insPort);
         if (++pending >= kBatch) {
             commit();

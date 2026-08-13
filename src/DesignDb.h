@@ -100,7 +100,10 @@ struct SymbolRow {
 /// How a child instance's port is attached. `Expression` is an operand of an
 /// expression tied to the port, not a wired net: `.en(state == RUN)` samples
 /// `state` but does not alias it to `en`, and a consumer must be able to tell.
-enum class PortConn { Net = 0, Constant = 1, Unconnected = 2, Expression = 3 };
+/// `Interface` binds a child's interface port to an interface instance in the
+/// parent: the row is the alias that lets `child.bus.*` resolve at all.
+enum class PortConn { Net = 0, Constant = 1, Unconnected = 2, Expression = 3,
+                      Interface = 4 };
 
 /// One port connection on a child instance, as written in the parent.
 ///
@@ -121,6 +124,8 @@ struct PortRow {
     std::optional<std::pair<uint64_t, uint64_t>> outerBits;
     bool outerExact = true;
     PortConn conn = PortConn::Net;
+    // For an interface binding: the modport restricting it, when one does.
+    std::string modport;
     std::string file;
     uint32_t line = 0;
 };

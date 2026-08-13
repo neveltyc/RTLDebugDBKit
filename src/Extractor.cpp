@@ -818,6 +818,13 @@ void forEachDeclaration(const Scope& scope, F&& fn, const std::string& gen = "")
                     fn(member, gen, std::optional<ArgumentDirection>{port.direction});
                 break;
             }
+            case SymbolKind::InterfacePort:
+                // No net or variable stands behind an interface port, so it
+                // gets a row of its own -- it is the name a reference like
+                // `bus.vld` resolves its first segment against, and without
+                // the row that segment matches nothing in the module.
+                fn(member, gen, std::optional<ArgumentDirection>{});
+                break;
             case SymbolKind::GenerateBlock: {
                 auto& block = member.as<GenerateBlockSymbol>();
                 if (block.isUninstantiated)
@@ -848,11 +855,12 @@ void forEachDeclaration(const Scope& scope, F&& fn, const std::string& gen = "")
 /// The word for a symbol kind, in the vocabulary the consumer already uses.
 std::string symbolKindName(SymbolKind kind) {
     switch (kind) {
-        case SymbolKind::Variable:  return "variable";
-        case SymbolKind::Net:       return "net";
-        case SymbolKind::Parameter: return "parameter";
-        case SymbolKind::Port:      return "port";
-        default:                    return "other";
+        case SymbolKind::Variable:      return "variable";
+        case SymbolKind::Net:           return "net";
+        case SymbolKind::Parameter:     return "parameter";
+        case SymbolKind::Port:          return "port";
+        case SymbolKind::InterfacePort: return "interface_port";
+        default:                        return "other";
     }
 }
 
@@ -972,6 +980,16 @@ private:
                 row.type = vs.getType().toString();
                 if (vs.getType().isIntegral())
                     row.width = static_cast<int64_t>(vs.getType().getBitWidth());
+            }
+            else if (sym.kind == SymbolKind::InterfacePort) {
+                // Not a value symbol, so the type is spelled by hand: the
+                // interface definition, with the declared modport when the
+                // port restricts itself to one.
+                auto& ip = sym.as<InterfacePortSymbol>();
+                if (ip.interfaceDef)
+                    row.type = std::string(ip.interfaceDef->name);
+                if (!ip.modport.empty())
+                    row.type += "." + std::string(ip.modport);
             }
             locationOf(sym, sourceManager, row.file, row.line);
             if (sym.location)
@@ -1241,12 +1259,49 @@ private:
         // For evaluating the constant selects inside connection expressions.
         EvalContext evalCtx(child);
         for (auto* conn : child.getPortConnections()) {
-            if (!conn || conn->port.kind != SymbolKind::Port)
-                continue;                     // interface ports carry no net
-            auto& port = conn->port.as<PortSymbol>();
+            if (!conn)
+                continue;
             std::string file;
             uint32_t line = 0;
             locationOf(child, sourceManager, file, line);
+
+            // An interface port carries no net, but the *binding* is the alias
+            // that makes `child.bus.*` resolvable at all: the signals live in
+            // the interface instance on the parent side, and without this row
+            // they can be reached from neither direction. `.dbg` needs its
+            // simulated net table to derive the same fact; here it is one row.
+            if (conn->port.kind == SymbolKind::InterfacePort) {
+                auto& ip = conn->port.as<InterfacePortSymbol>();
+                auto [ifaceSym, modport] = conn->getIfaceConn();
+                PortRow row;
+                row.child = childName;
+                row.port = std::string(ip.name);
+                row.conn = PortConn::Interface;
+                if (ip.interfaceDef)
+                    row.outerType = std::string(ip.interfaceDef->name);
+                // The modport in force: the one the connection names, else the
+                // one the port declares.
+                if (modport)
+                    row.modport = std::string(modport->name);
+                else if (!ip.modport.empty())
+                    row.modport = std::string(ip.modport);
+                if (ifaceSym) {
+                    // The instance (or the parent's own interface port, passed
+                    // straight through) in the parent's namespace.
+                    std::string outerRel;
+                    if (relativePath(*ifaceSym, prefix, outerRel))
+                        row.outer = std::move(outerRel);
+                    else
+                        stats.external++;
+                }
+                row.file = file;
+                row.line = line;
+                out.push_back(std::move(row));
+                continue;
+            }
+            if (conn->port.kind != SymbolKind::Port)
+                continue;
+            auto& port = conn->port.as<PortSymbol>();
 
             const Expression* expr = conn->getExpression();
 
