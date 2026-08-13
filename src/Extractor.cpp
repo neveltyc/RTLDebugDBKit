@@ -877,31 +877,45 @@ std::string generateSegment(const GenerateBlockSymbol& block) {
 /// so a scan of the body's own members finds nothing. A design that puts its
 /// replication in a generate loop — which is most of them — would come out with
 /// its leaves missing and no error to say so.
-template<typename F>
-void forEachInstance(const Scope& scope, F&& fn) {
+/// Calls `fn` for every member of `scope` of kind `K`, descending through
+/// generate blocks and instance arrays but never into an instance's own body.
+///
+/// Generate blocks matter and are easy to miss: an instance written inside
+/// `for (…) begin : g_lane` is a member of the *block*, not of the module body,
+/// so a scan of the body's own members finds nothing. A design that puts its
+/// replication in a generate loop — which is most of them — would come out with
+/// its leaves missing and no error to say so.
+///
+/// One traversal for every leaf kind rather than one copy each. The descent
+/// rules are subtle and shared: an uninstantiated generate branch is in the
+/// AST but not in the design, a `GenerateBlockArray` holds its iterations as
+/// entries, and `foo u [3:0] (...)` is an `InstanceArray` wrapping the
+/// elements. Copies of this drifted apart -- one leaf kind would have gone
+/// missing from whichever containers only the other copy had learned about,
+/// with no error to say so.
+template<SymbolKind K, typename SymT, typename F>
+void forEachOfKind(const Scope& scope, F&& fn) {
     for (auto& member : scope.members()) {
+        if (member.kind == K) {
+            fn(member.as<SymT>());
+            continue;
+        }
         switch (member.kind) {
-            case SymbolKind::Instance:
-                fn(member.as<InstanceSymbol>());
-                break;
             case SymbolKind::GenerateBlock: {
                 auto& block = member.as<GenerateBlockSymbol>();
                 // A branch this parameterisation did not take: its contents are
                 // present in the AST but are not part of the elaborated design.
                 if (block.isUninstantiated)
                     break;
-                forEachInstance(block, fn);
+                forEachOfKind<K, SymT>(block, fn);
                 break;
             }
             case SymbolKind::GenerateBlockArray:
                 for (auto& entry : member.as<GenerateBlockArraySymbol>().entries)
-                    forEachInstance(*entry, fn);
+                    forEachOfKind<K, SymT>(*entry, fn);
                 break;
             case SymbolKind::InstanceArray:
-                // `foo u [3:0] (...)` is an InstanceArraySymbol wrapping the
-                // elements. Missing this case makes the array and its whole
-                // subtree invisible, with no error to say so.
-                forEachInstance(member.as<InstanceArraySymbol>(), fn);
+                forEachOfKind<K, SymT>(member.as<InstanceArraySymbol>(), fn);
                 break;
             default:
                 break;
@@ -909,35 +923,18 @@ void forEachInstance(const Scope& scope, F&& fn) {
     }
 }
 
-/// Calls `fn` for every primitive instance directly inside `scope` -- a gate,
-/// a switch, a UDP -- descending generate blocks and instance arrays exactly
-/// as `forEachInstance` does, and for the same reason: `and g [3:0] (...)`
-/// inside a generate loop is the ordinary spelling of replicated logic.
+/// Every instance directly inside `scope`.
+template<typename F>
+void forEachInstance(const Scope& scope, F&& fn) {
+    forEachOfKind<SymbolKind::Instance, InstanceSymbol>(scope, fn);
+}
+
+/// Every primitive instance -- a gate, a switch, a UDP -- inside `scope`.
+/// `and g [3:0] (...)` inside a generate loop is the ordinary spelling of
+/// replicated gate-level logic, so it needs the same descent.
 template<typename F>
 void forEachPrimitive(const Scope& scope, F&& fn) {
-    for (auto& member : scope.members()) {
-        switch (member.kind) {
-            case SymbolKind::PrimitiveInstance:
-                fn(member.as<PrimitiveInstanceSymbol>());
-                break;
-            case SymbolKind::GenerateBlock: {
-                auto& block = member.as<GenerateBlockSymbol>();
-                if (block.isUninstantiated)
-                    break;
-                forEachPrimitive(block, fn);
-                break;
-            }
-            case SymbolKind::GenerateBlockArray:
-                for (auto& entry : member.as<GenerateBlockArraySymbol>().entries)
-                    forEachPrimitive(*entry, fn);
-                break;
-            case SymbolKind::InstanceArray:
-                forEachPrimitive(member.as<InstanceArraySymbol>(), fn);
-                break;
-            default:
-                break;
-        }
-    }
+    forEachOfKind<SymbolKind::PrimitiveInstance, PrimitiveInstanceSymbol>(scope, fn);
 }
 
 /// (target, source, line) triples already emitted for one module.
@@ -2002,7 +1999,7 @@ private:
     /// expression samples, so those come back flagged, selector reads included,
     /// for the consumer to treat as operands rather than wires.
     static void collectConnRefs(const Expression& expr, EvalContext& ctx,
-                                std::vector<ConnRef>& out, bool inExpression = false) {
+                                std::vector<ConnRef>& out) {
         switch (expr.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue:
@@ -2014,17 +2011,19 @@ private:
                 // `.idx(stim[3:0])` means -- bits 0..3 of stim, not stim.
                 std::vector<Ref> refs;
                 collectRefs(expr, ctx, refs, /*skipSelectors=*/true);
+                // Reached only by descending structural nodes, so never an
+                // expression operand: the branch that produces those does not
+                // recurse.
                 for (auto& r : refs)
-                    out.push_back({r, inExpression});
+                    out.push_back({r, /*expression=*/false});
                 return;
             }
             case ExpressionKind::Concatenation:
                 for (auto* op : expr.as<ConcatenationExpression>().operands())
-                    collectConnRefs(*op, ctx, out, inExpression);
+                    collectConnRefs(*op, ctx, out);
                 return;
             case ExpressionKind::Conversion:
-                collectConnRefs(expr.as<ConversionExpression>().operand(), ctx, out,
-                                inExpression);
+                collectConnRefs(expr.as<ConversionExpression>().operand(), ctx, out);
                 return;
             case ExpressionKind::Assignment:
                 // An output or inout connection arrives wrapped in the
@@ -2033,8 +2032,7 @@ private:
                 // Without this case `.y(gy)` fell through to the expression
                 // branch and the plainest wire in the design read as an
                 // operand.
-                collectConnRefs(expr.as<AssignmentExpression>().left(), ctx, out,
-                                inExpression);
+                collectConnRefs(expr.as<AssignmentExpression>().left(), ctx, out);
                 return;
             default: {
                 std::vector<Ref> refs;

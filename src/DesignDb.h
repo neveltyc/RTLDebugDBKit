@@ -272,7 +272,6 @@ private:
     std::unordered_map<std::string, int64_t> typeIds;
     std::unordered_map<std::string, int64_t> fileIds;
     std::unordered_map<std::string, int64_t> nameIds;
-    std::unordered_map<std::string, int64_t> sourceFileIds;
     bool inTransaction = false;
     int64_t pending = 0;
 };

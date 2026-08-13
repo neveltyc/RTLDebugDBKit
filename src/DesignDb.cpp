@@ -502,31 +502,22 @@ void Writer::addSourceFile(const std::string& path, const std::string& digest) {
         throw std::runtime_error(std::string("sqlite: recording source file ") + path + ": " +
                                  sqlite3_errmsg(db));
     }
-    // The row id, whether this insert created the row or an earlier one did
-    // (OR IGNORE makes last_insert_rowid() unreliable here) -- kept so
-    // linkSourceFiles can join file rows to it later.
-    prepare("SELECT id FROM source_file WHERE path=?", &s);
-    sqlite3_bind_text(s, 1, path.c_str(), -1, SQLITE_TRANSIENT);
-    rc = sqlite3_step(s);
-    if (rc == SQLITE_ROW)
-        sourceFileIds.emplace(path, sqlite3_column_int64(s, 0));
-    sqlite3_finalize(s);
-    if (rc != SQLITE_ROW) {
-        throw std::runtime_error(std::string("sqlite: looking up source file ") + path +
-                                 ": " + sqlite3_errmsg(db));
-    }
 }
 
 void Writer::linkSourceFiles(
     const std::unordered_map<std::string, std::string>& origins) {
+    // The id comes from the subquery, not from a map this class maintains
+    // alongside the table. The map had to be kept consistent with insert order
+    // by hand, and any source_file row inserted without going through
+    // addSourceFile would have broken the join silently. A row with no match
+    // -- a synthesized buffer, which is not a file and was never hashed --
+    // yields NULL, which is what "no origin" already means in this column.
     sqlite3_stmt* s = nullptr;
-    prepare("UPDATE file SET source_file=? WHERE path=?", &s);
+    prepare("UPDATE file SET source_file="
+            "(SELECT id FROM source_file WHERE path = ?1) WHERE path = ?2", &s);
     for (auto& [asWritten, full] : origins) {
-        auto it = sourceFileIds.find(full);
-        if (it == sourceFileIds.end())
-            continue;       // a synthesized buffer; there is no file to hash
         sqlite3_reset(s);
-        sqlite3_bind_int64(s, 1, it->second);
+        sqlite3_bind_text(s, 1, full.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(s, 2, asWritten.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(s) != SQLITE_DONE) {
             std::string msg = sqlite3_errmsg(db);
@@ -691,8 +682,7 @@ void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
         // A row with no outer net has no bits to describe; all three stay NULL
         // so a tie-off does not read as "the whole of nothing, exactly".
         if (r.outer.empty()) {
-            sqlite3_bind_null(insPort, 9);
-            sqlite3_bind_null(insPort, 10);
+            bindOptRange(insPort, 9, 10, std::nullopt);
             sqlite3_bind_null(insPort, 11);
         }
         else {
