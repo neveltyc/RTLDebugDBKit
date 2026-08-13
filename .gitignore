@@ -1,0 +1,11 @@
+build/
+cmake-build-*/
+compile_commands.json
+.cache/
+
+# Exported databases and local RTL drops
+*.db
+/rtl/
+/scratch/
+
+.DS_Store
