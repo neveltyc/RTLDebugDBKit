@@ -106,14 +106,26 @@ std::string typeOf(const ValueSymbol& sym) {
     return sym.getType().toString();
 }
 
-/// `file` and `line` for a symbol, resolved through the source manager.
-void locationOf(const Symbol& sym, const SourceManager& sm, std::string& file,
-                uint32_t& line) {
-    auto loc = sym.location;
+/// A file and a line that came from one source location.
+///
+/// The two travel together deliberately. Taking the line from a statement and
+/// the file from its enclosing procedure names a line in a file that does not
+/// contain it: a task body pulled in by `include` reported the module's file
+/// with the included file's line number, and on a module shorter than that
+/// number the pair points past the end of the file.
+struct Where {
+    std::string file;
+    uint32_t line = 0;
+};
+
+/// `file` and `line` for a source location. Both are read from the same
+/// location, and slang resolves a macro expansion identically for each, so the
+/// pair always names a line in the file it says.
+Where whereOf(SourceLocation loc, const SourceManager& sm) {
     if (!loc)
-        return;
-    file = std::string(sm.getFileName(loc));
-    line = sm.getLineNumber(loc);
+        return {};
+    return Where{std::string(sm.getFileName(loc)),
+                 static_cast<uint32_t>(sm.getLineNumber(loc))};
 }
 
 /// The source text of an expression, exactly as written. Empty when it cannot
@@ -293,6 +305,20 @@ Ref refOf(const ValuePath& path) {
     // a consumer can use.
     r.whole = width == 0 || (r.lo == 0 && r.hi + 1 >= width);
     return r;
+}
+
+/// A reference's bit range as the dedup key needs it: as it will be *stored*,
+/// not as computed. A root whose width is unknown always serialises as whole,
+/// but its raw bounds differ per element, so keying on those stops the key
+/// collapsing rows that come out byte-identical -- four identical rows for
+/// `mem[g] <= a` across a four-iteration generate loop.
+///
+/// One function rather than one lambda per emitter: the procedure walk and the
+/// primitive walk feed the *same* per-module set, so a change to how a range
+/// keys has to reach both or they stop deduplicating against each other.
+std::pair<uint64_t, uint64_t> keyRange(const Ref& r) {
+    return r.whole ? std::make_pair<uint64_t, uint64_t>(0, 0)
+                   : std::make_pair(r.lo, r.hi);
 }
 
 /// Collects every value path in an expression, each with its bit range.
@@ -1043,8 +1069,35 @@ private:
             return;
         if (fileOrigins.count(asWritten))
             return;
-        fileOrigins.emplace(asWritten,
-                            sourceManager.getFullPath(loc.buffer()).string());
+        // Through the expansion, not the raw buffer. A location inside a macro
+        // body belongs to the macro's own buffer, which is not a file, so
+        // `getFullPath` answers with nothing -- and because that nothing was
+        // cached like any other answer, a single macro-expanded row anywhere
+        // in a file left the whole file with a NULL `source_file` and no
+        // digest to check it against. `getFileName` resolves the expansion, so
+        // this has to resolve it the same way to name the same file.
+        auto path = sourceManager.getFullPath(
+            sourceManager.getFullyExpandedLoc(loc).buffer());
+        if (path.empty())
+            return;   // no origin to record; caching the miss would suppress
+                      // the next sighting, which may well have one
+        fileOrigins.emplace(asWritten, path.string());
+    }
+
+    /// Where a location is, with its file's origin recorded on the way past.
+    ///
+    /// One call rather than a `whereOf` and a `noteFile`: the two were spelled
+    /// out separately at four sites, nothing enforced the pairing, and a site
+    /// that resolved a location without noting it left that file unjoinable to
+    /// its digest -- invisible until a consumer's join came back empty.
+    /// `fallback` is what an unknown location resolves to, which is how a
+    /// statement with no location of its own inherits its procedure's.
+    Where locate(SourceLocation loc, const Where& fallback = {}) {
+        if (!loc)
+            return fallback;
+        Where w = whereOf(loc, sourceManager);
+        noteFile(loc, w.file);
+        return w;
     }
 
     /// Records one reference that leaves the module, as written. Every such
@@ -1053,10 +1106,13 @@ private:
     /// recoverable and actually is a path -- a bare name that leaves the
     /// module (a subroutine's package-level free variable) resolves against
     /// imports this table cannot see, so it stays a count.
-    void addHierRef(const Expression* origin, bool isWrite, const Ref& r,
-                    const std::string& kind, const std::string& construct,
-                    const std::string& file, uint32_t line) {
-        std::string text = sourceTextOf(origin, sourceManager);
+    /// The expression comes from `r.origin` rather than as its own argument:
+    /// the two were passed side by side at every call site, nothing tied them
+    /// together, and a transposed pair would have recorded one reference's
+    /// text against another's bit range -- a wrong row, not an error.
+    void addHierRef(bool isWrite, const Ref& r, const std::string& kind,
+                    const std::string& construct, const Where& at) {
+        std::string text = sourceTextOf(r.origin, sourceManager);
         if (text.empty() || (text.find('.') == std::string::npos &&
                              text.find("::") == std::string::npos)) {
             stats.external++;
@@ -1064,7 +1120,7 @@ private:
         }
         // One statement surfaces the same reference through several collection
         // passes (the edge, the assignment's operand list); counted once.
-        if (!hierSeen.emplace(text, isWrite, line).second)
+        if (!hierSeen.emplace(text, isWrite, at.line).second)
             return;
         stats.external++;
         HierRefRow row;
@@ -1072,8 +1128,8 @@ private:
         row.write = isWrite;
         row.kind = kind;
         row.construct = construct;
-        row.file = file;
-        row.line = line;
+        row.file = at.file;
+        row.line = at.line;
         if (r.sym && !r.whole)
             row.bits = std::make_pair(r.lo, r.hi);
         row.exact = r.sym ? r.exact : true;
@@ -1128,8 +1184,9 @@ private:
                 if (!ip.modport.empty())
                     row.type += "." + std::string(ip.modport);
             }
-            locationOf(sym, sourceManager, row.file, row.line);
-            noteFile(sym.location, row.file);
+            const Where at = locate(sym.location);
+            row.file = at.file;
+            row.line = at.line;
             if (sym.location)
                 row.col = static_cast<uint32_t>(sourceManager.getColumnNumber(sym.location));
             symbols.push_back(std::move(row));
@@ -1181,18 +1238,19 @@ private:
     /// event signal (`@(posedge tb.clk)`) also lands in hier_ref.
     ProcEventRow eventRow(const Expression* expr, const std::string& edge,
                           const std::string& prefix, const std::string& kind,
-                          const std::string& construct, const std::string& file,
-                          uint32_t line) {
+                          const std::string& construct, const Where& at) {
         std::string signal;
         if (expr && (expr->kind == ExpressionKind::NamedValue ||
                      expr->kind == ExpressionKind::HierarchicalValue)) {
             if (!relativePath(expr->as<ValueExpressionBase>().symbol, prefix,
                               signal)) {
                 signal.clear();
-                addHierRef(expr, false, Ref{}, kind, construct, file, line);
+                Ref r;
+                r.origin = expr;   // no bits: an event names a whole signal
+                addHierRef(false, r, kind, construct, at);
             }
         }
-        return ProcEventRow{std::move(signal), edge, file, line};
+        return ProcEventRow{std::move(signal), edge, at.file, at.line};
     }
 
     /// One procedure's edges, paired statement by statement.
@@ -1204,11 +1262,11 @@ private:
     void emitProcedure(const AnalyzedProcedure& proc, const std::string& prefix,
                        std::vector<EdgeRow>& out, SeenSet& seen, int64_t moduleId,
                        int64_t procIndex) {
-        std::string kind, construct, file;
-        uint32_t line = 0;
+        std::string kind, construct;
         classify(*proc.analyzedSymbol, kind, construct);
-        locationOf(*proc.analyzedSymbol, sourceManager, file, line);
-        noteFile(proc.analyzedSymbol->location, file);
+        // The procedure's own location, and the fallback for any statement
+        // inside it that has none of its own.
+        const Where procAt = locate(proc.analyzedSymbol->location);
 
         auto& sens = proc.getSensitivityList();
 
@@ -1221,7 +1279,7 @@ private:
             collectEdgeEvents(sens.timingControl, raw);
             for (auto& [expr, edge] : raw)
                 events.push_back(eventRow(expr, edge, prefix, kind, construct,
-                                          file, line));
+                                          procAt));
         }
 
         // Input-port drivers belong to the parent, not to this module: the port
@@ -1252,24 +1310,19 @@ private:
             // about a signal the simulator's own database reports as read.
             if (inputPorts.count(dst.sym))
                 return;
-            // The assignment's own line, not the procedure header's. Using the
-            // header made every edge in a 200-line always block report the
+            // The assignment's own location, not the procedure header's. Using
+            // the header made every edge in a 200-line always block report the
             // `always` keyword, and -- because the dedup key includes the line
             // -- made two different statements driving the same pair look like
             // one, so the second was dropped. A control edge emitted early in a
             // block silently suppressed the real data edge later in it.
-            const uint32_t stmtLine = where.start()
-                                          ? sourceManager.getLineNumber(where.start())
-                                          : line;
-            // Keyed on the range as it will be *stored*, not as computed. A
-            // root whose width is unknown always serialises as whole, but its
-            // raw bounds differ per element, so keying on those stops the key
-            // collapsing rows that come out byte-identical -- four identical
-            // rows for `mem[g] <= a` across a four-iteration generate loop.
-            auto keyRange = [](const Ref& r) {
-                return r.whole ? std::make_pair<uint64_t, uint64_t>(0, 0)
-                               : std::make_pair(r.lo, r.hi);
-            };
+            //
+            // The file travels with the line. Taking only the line and keeping
+            // the procedure's file broke every statement that lives in another
+            // file -- a task body reached by `include` -- into a pair naming a
+            // line the file does not have.
+            const Where at = locate(where.start(), procAt);
+            const uint32_t stmtLine = at.line;
             const auto dk = keyRange(dst);
             const auto sk = src.sym ? keyRange(src) : std::make_pair<uint64_t, uint64_t>(0, 0);
             if (!seen.emplace(dst.sym, src.sym, stmtLine, dk.first, dk.second,
@@ -1278,7 +1331,7 @@ private:
                 return;
             EdgeRow row;
             if (!relativePath(*dst.sym, prefix, row.dst)) {
-                addHierRef(dst.origin, true, dst, kind, construct, file, stmtLine);
+                addHierRef(true, dst, kind, construct, at);
                 return;
             }
             if (!dst.whole)
@@ -1286,8 +1339,7 @@ private:
             row.dstExact = dst.exact;
             if (src.sym) {
                 if (!relativePath(*src.sym, prefix, row.src)) {
-                    addHierRef(src.origin, false, src, kind, construct, file,
-                               stmtLine);
+                    addHierRef(false, src, kind, construct, at);
                     return;
                 }
                 row.srcType = typeOf(*src.sym);
@@ -1303,8 +1355,8 @@ private:
             // `construct` made a consumer string-match a suffix to recover one of
             // two orthogonal facts.
             row.control = gatingEdge;
-            row.file = file;
-            row.line = stmtLine;
+            row.file = at.file;
+            row.line = at.line;
             out.push_back(std::move(row));
         },
         // One row per assignment statement, so a target written in several
@@ -1316,12 +1368,13 @@ private:
             if (!dst.sym || inputPorts.count(dst.sym))
                 return;
             AssignRow arow;
-            arow.line = where.start() ? sourceManager.getLineNumber(where.start()) : line;
+            const Where at = locate(where.start(), procAt);
+            arow.line = at.line;
             if (!relativePath(*dst.sym, prefix, arow.dst)) {
                 // The statement itself cannot be a row -- its target has no
                 // module-relative name -- but the write is recorded where
                 // every outward reference is.
-                addHierRef(dst.origin, true, dst, kind, construct, file, arow.line);
+                addHierRef(true, dst, kind, construct, at);
                 return;
             }
             if (!dst.whole)
@@ -1329,7 +1382,7 @@ private:
             arow.dstExact = dst.exact;
             arow.kind = kind;
             arow.construct = construct;
-            arow.file = file;
+            arow.file = at.file;
             arow.proc = procIndex;
             arow.seq = stmtSeq;
             arow.blocking = (proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
@@ -1343,8 +1396,7 @@ private:
                 std::string rel;
                 if (!relativePath(*r.sym, prefix, rel)) {
                     arow.dropped++;      // outside the module; cannot be shared
-                    addHierRef(r.origin, false, r, kind, construct, file,
-                               arow.line);
+                    addHierRef(false, r, kind, construct, at);
                     continue;
                 }
                 OperandRow o;
@@ -1360,13 +1412,11 @@ private:
             writer.addAssignment(moduleId, arow, ops);
             stats.assignments++;
         },
-        // A wait's event, at its statement's line.
+        // A wait's event, at its own statement -- which a task body reached by
+        // `include` puts in a different file from the procedure header.
         [&](const Expression* e, const std::string& edge, SourceRange where) {
-            const uint32_t stmtLine = where.start()
-                                          ? sourceManager.getLineNumber(where.start())
-                                          : line;
-            events.push_back(eventRow(e, edge, prefix, kind, construct, file,
-                                      stmtLine));
+            events.push_back(eventRow(e, edge, prefix, kind, construct,
+                                      locate(where.start(), procAt)));
         },
         evalCtx);
         walker.sensitivityTiming = sens.timingControl;
@@ -1424,10 +1474,7 @@ private:
                                 ? "udp:"
                                 : "gate:") +
                 std::string(def.name);
-            std::string file;
-            uint32_t line = 0;
-            locationOf(prim, sourceManager, file, line);
-            noteFile(prim.location, file);
+            const Where at = locate(prim.location);
 
             // A terminal's direction. The built-in gates are variadic -- the
             // definition's port list does not stretch to the instance's
@@ -1474,17 +1521,29 @@ private:
                 }
             }
 
-            auto keyRange = [](const Ref& r) {
-                return r.whole ? std::make_pair<uint64_t, uint64_t>(0, 0)
-                               : std::make_pair(r.lo, r.hi);
-            };
             for (auto& dst : writes) {
                 std::string dstRel;
                 if (!relativePath(*dst.sym, prefix, dstRel)) {
-                    addHierRef(dst.origin, true, dst, "primitive", construct,
-                               file, line);
+                    addHierRef(true, dst, "primitive", construct, at);
                     continue;
                 }
+                // The dst half of the row is the same for every source this
+                // terminal pairs with, and the type text is a fresh heap
+                // string out of slang's type printer -- on a netlist-style
+                // module that is one allocation per (output, input) pair
+                // where one per output does.
+                EdgeRow base;
+                base.dst = dstRel;
+                base.dstType = typeOf(*dst.sym);
+                if (!dst.whole)
+                    base.dstBits = std::make_pair(dst.lo, dst.hi);
+                base.dstExact = dst.exact;
+                base.kind = "primitive";
+                base.construct = construct;
+                base.file = at.file;
+                base.line = at.line;
+
+                const auto dk = keyRange(dst);
                 bool anyInput = false;
                 for (auto& src : reads) {
                     // A bidirectional terminal appears in both sets; pairing
@@ -1493,52 +1552,29 @@ private:
                     if (src.sym == dst.sym)
                         continue;
                     anyInput = true;
-                    const auto dk = keyRange(dst);
                     const auto sk = keyRange(src);
-                    if (!seen.emplace(dst.sym, src.sym, line, dk.first, dk.second,
+                    if (!seen.emplace(dst.sym, src.sym, at.line, dk.first, dk.second,
                                       sk.first, sk.second)
                              .second)
                         continue;
-                    EdgeRow row;
-                    row.dst = dstRel;
-                    row.dstType = typeOf(*dst.sym);
-                    if (!dst.whole)
-                        row.dstBits = std::make_pair(dst.lo, dst.hi);
-                    row.dstExact = dst.exact;
+                    EdgeRow row = base;
                     if (!relativePath(*src.sym, prefix, row.src)) {
-                        addHierRef(src.origin, false, src, "primitive",
-                                   construct, file, line);
+                        addHierRef(false, src, "primitive", construct, at);
                         continue;
                     }
                     row.srcType = typeOf(*src.sym);
                     if (!src.whole)
                         row.srcBits = std::make_pair(src.lo, src.hi);
                     row.srcExact = src.exact;
-                    row.kind = "primitive";
-                    row.construct = construct;
-                    row.file = file;
-                    row.line = line;
                     out.push_back(std::move(row));
                 }
                 // pullup(y) has no input terminal; the null-source row names
                 // the gate as the driver, exactly as `q <= 8'h0` is named.
-                if (!anyInput) {
-                    const auto dk = keyRange(dst);
-                    if (!seen.emplace(dst.sym, nullptr, line, dk.first, dk.second,
-                                      uint64_t(0), uint64_t(0))
-                             .second)
-                        continue;
-                    EdgeRow row;
-                    row.dst = dstRel;
-                    row.dstType = typeOf(*dst.sym);
-                    if (!dst.whole)
-                        row.dstBits = std::make_pair(dst.lo, dst.hi);
-                    row.dstExact = dst.exact;
-                    row.kind = "primitive";
-                    row.construct = construct;
-                    row.file = file;
-                    row.line = line;
-                    out.push_back(std::move(row));
+                if (!anyInput &&
+                    seen.emplace(dst.sym, nullptr, at.line, dk.first, dk.second,
+                                 uint64_t(0), uint64_t(0))
+                        .second) {
+                    out.push_back(std::move(base));
                 }
             }
         });
@@ -1564,13 +1600,15 @@ private:
             inArray = ps->asSymbol().kind == SymbolKind::InstanceArray;
         // For evaluating the constant selects inside connection expressions.
         EvalContext evalCtx(child);
+        // The instance's own location: every connection on it is written at the
+        // same place, so resolving it per connection re-derived one answer once
+        // per port -- 200 times over on a wide instance.
+        const Where at = locate(child.location);
+        const std::string& file = at.file;
+        const uint32_t line = at.line;
         for (auto* conn : child.getPortConnections()) {
             if (!conn)
                 continue;
-            std::string file;
-            uint32_t line = 0;
-            locationOf(child, sourceManager, file, line);
-            noteFile(child.location, file);
 
             // An interface port carries no net, but the *binding* is the alias
             // that makes `child.bus.*` resolvable at all: the signals live in
@@ -1696,7 +1734,7 @@ private:
                     // being the direction a trace cannot rediscover.
                     const bool drives = port.direction == ArgumentDirection::Out ||
                                         port.direction == ArgumentDirection::InOut;
-                    addHierRef(r.origin, drives, r, "port", dir, file, line);
+                    addHierRef(drives, r, "port", dir, at);
                     continue;
                 }
                 row.outer = std::move(outerRel);

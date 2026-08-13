@@ -49,6 +49,16 @@ if mode:
         sys.exit(f"meta.top is {top and top[0]!r}, expected {mode!r} without --top")
     check("file rows joined to source_file",
           "SELECT count(*) FROM file WHERE source_file IS NOT NULL")
+    # Every file row, not merely one. The origin of a file is learned from the
+    # first row that mentions it, and a row whose location sits inside a macro
+    # body names no file at all -- which left that file, and only that file,
+    # with no digest to check it against while the count above still passed.
+    unlinked = con.execute(
+        "SELECT count(*) FROM file WHERE source_file IS NULL").fetchone()[0]
+    if unlinked:
+        sys.exit(f"{unlinked} file row(s) have no source_file; a macro-expanded "
+                 "or otherwise fileless location poisoned the origin lookup")
+    print("ok: every file row joined to source_file")
 
 if mode == "constructs":
     check("the self-feedback edge (cnt -> cnt)", """
@@ -72,6 +82,19 @@ if mode == "constructs":
     check("the downward XMR as a dotted edge name", """
         SELECT count(*) FROM edge e JOIN name s ON s.id = e.src
         WHERE s.text = 'u_cnt.cnt'""")
+    # The statements in seq.svh belong to a procedure whose header is in
+    # constructs.sv. Their rows must say seq.svh: the file has to travel with
+    # the line it is paired with, or the pair names a line in the wrong file.
+    check("the included wait, attributed to seq.svh", """
+        SELECT count(*) FROM proc_event pe JOIN file f ON f.id = pe.file
+        WHERE f.path LIKE '%seq.svh'""")
+    # A downward XMR resolves inside the module that writes it, so it is an
+    # ordinary assignment under a dotted name rather than a hier_ref -- the
+    # point here is only that the row names the file the statement is in.
+    check("the included XMR, attributed to seq.svh", """
+        SELECT count(*) FROM assignment a
+        JOIN file f ON f.id = a.file JOIN name d ON d.id = a.dst
+        WHERE f.path LIKE '%seq.svh' AND d.text = 'u_cnt.dbg'""")
 
 if mode == "interfaces":
     check("the interface binding (conn_kind=4)",

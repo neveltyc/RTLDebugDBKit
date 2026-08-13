@@ -28,11 +28,17 @@ set -u
 file="${1:?usage: check-rtl.sh <file.sv> [top]}"
 top="${2:-}"
 
+# The file's own directory is on the include path, which is where a quoted
+# `include names first for every tool that implements one. Without it a fixture
+# split across a header cannot be checked at all, and splitting one is how a
+# cross-file bug gets a test.
+incdir="$(dirname "$file")"
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 vrc=0
 if have verilator; then
-    vout=$(verilator --lint-only -Wno-fatal --timing -sv "$file" \
+    vout=$(verilator --lint-only -Wno-fatal --timing -sv -I"$incdir" "$file" \
                      ${top:+--top-module "$top"} 2>&1) || vrc=$?
 else
     vout="(verilator not installed)"; vrc=127
@@ -40,7 +46,7 @@ fi
 
 irc=0
 if have iverilog; then
-    iout=$(iverilog -g2012 -t null "$file" 2>&1) || irc=$?
+    iout=$(iverilog -g2012 -t null -I"$incdir" "$file" 2>&1) || irc=$?
 else
     iout="(iverilog not installed)"; irc=127
 fi
