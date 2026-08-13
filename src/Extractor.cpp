@@ -730,6 +730,37 @@ void forEachInstance(const Scope& scope, F&& fn) {
     }
 }
 
+/// Calls `fn` for every primitive instance directly inside `scope` -- a gate,
+/// a switch, a UDP -- descending generate blocks and instance arrays exactly
+/// as `forEachInstance` does, and for the same reason: `and g [3:0] (...)`
+/// inside a generate loop is the ordinary spelling of replicated logic.
+template<typename F>
+void forEachPrimitive(const Scope& scope, F&& fn) {
+    for (auto& member : scope.members()) {
+        switch (member.kind) {
+            case SymbolKind::PrimitiveInstance:
+                fn(member.as<PrimitiveInstanceSymbol>());
+                break;
+            case SymbolKind::GenerateBlock: {
+                auto& block = member.as<GenerateBlockSymbol>();
+                if (block.isUninstantiated)
+                    break;
+                forEachPrimitive(block, fn);
+                break;
+            }
+            case SymbolKind::GenerateBlockArray:
+                for (auto& entry : member.as<GenerateBlockArraySymbol>().entries)
+                    forEachPrimitive(*entry, fn);
+                break;
+            case SymbolKind::InstanceArray:
+                forEachPrimitive(member.as<InstanceArraySymbol>(), fn);
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 /// (target, source, line) triples already emitted for one module.
 /// (target, source, line, target bits, source bits) already emitted for one
 /// module. The bit range belongs in the key: two part-selects of one signal
@@ -956,12 +987,16 @@ private:
         const std::string prefix = body.getHierarchicalPath();
 
         std::vector<EdgeRow> edges;
+        // One dedup set for the whole module: procedures and primitives can
+        // legitimately drive the same pair from the same line only in the
+        // replicated-generate case the set exists to fold.
+        SeenSet seen;
         if (auto* scope = analysis.getAnalyzedScope(body)) {
-            SeenSet seen;
             int64_t procIndex = 0;
             for (auto& proc : scope->procedures)
                 emitProcedure(proc, prefix, edges, seen, moduleId, procIndex++);
         }
+        emitPrimitives(body, prefix, edges, seen);
         stats.edges += static_cast<int64_t>(edges.size());
         writer.addEdges(moduleId, edges);
 
@@ -1236,6 +1271,142 @@ private:
         if (!reached && !proc.getDrivers().empty()) {
             stats.emptyProcedures++;
         }
+    }
+
+    /// Gate, switch and UDP instances, as edges. `and (y, a, b)` is dataflow
+    /// at its most literal, and it was entirely absent: the walk knew module
+    /// instances only, so a netlist-style module exported empty and every
+    /// gate-driven net answered "no driver". No new table -- a primitive is
+    /// one edge per (input, output) pairing, with the construct naming the
+    /// gate: `gate:and`, `gate:nmos`, `udp:my_latch`.
+    void emitPrimitives(const InstanceBodySymbol& body, const std::string& prefix,
+                        std::vector<EdgeRow>& out, SeenSet& seen) {
+        EvalContext evalCtx(body);
+        forEachPrimitive(body, [&](const PrimitiveInstanceSymbol& prim) {
+            auto conns = prim.getPortConnections();
+            if (conns.empty())
+                return;
+            auto& def = prim.primitiveType;
+            const std::string construct =
+                std::string(def.primitiveKind == PrimitiveSymbol::UserDefined
+                                ? "udp:"
+                                : "gate:") +
+                std::string(def.name);
+            std::string file;
+            uint32_t line = 0;
+            locationOf(prim, sourceManager, file, line);
+
+            // A terminal's direction. The built-in gates are variadic -- the
+            // definition's port list does not stretch to the instance's
+            // terminal count -- and the LRM fixes their shape instead: an
+            // n-input gate drives its first terminal, an n-output gate reads
+            // its last, and everything else (switches, UDPs) declares one
+            // direction per port.
+            const size_t n = conns.size();
+            auto dirOf = [&](size_t i) {
+                switch (def.primitiveKind) {
+                    case PrimitiveSymbol::NInput:
+                        return i == 0 ? PrimitivePortDirection::Out
+                                      : PrimitivePortDirection::In;
+                    case PrimitiveSymbol::NOutput:
+                        return i + 1 == n ? PrimitivePortDirection::In
+                                          : PrimitivePortDirection::Out;
+                    default:
+                        return i < def.ports.size() ? def.ports[i]->direction
+                                                    : PrimitivePortDirection::In;
+                }
+            };
+
+            std::vector<Ref> reads, writes;
+            for (size_t i = 0; i < n; i++) {
+                if (!conns[i])
+                    continue;
+                switch (dirOf(i)) {
+                    case PrimitivePortDirection::In:
+                        collectRefs(*conns[i], evalCtx, reads);
+                        break;
+                    case PrimitivePortDirection::InOut: {
+                        // A tran terminal conducts both ways: it is read and
+                        // driven at once, so it lands in both sets and the
+                        // pairing below emits both directions.
+                        std::vector<Ref> refs;
+                        collectRefs(*conns[i], evalCtx, refs, /*skipSelectors=*/true);
+                        reads.insert(reads.end(), refs.begin(), refs.end());
+                        writes.insert(writes.end(), refs.begin(), refs.end());
+                        break;
+                    }
+                    default:    // Out, OutReg
+                        collectRefs(*conns[i], evalCtx, writes, /*skipSelectors=*/true);
+                        break;
+                }
+            }
+
+            auto keyRange = [](const Ref& r) {
+                return r.whole ? std::make_pair<uint64_t, uint64_t>(0, 0)
+                               : std::make_pair(r.lo, r.hi);
+            };
+            for (auto& dst : writes) {
+                std::string dstRel;
+                if (!relativePath(*dst.sym, prefix, dstRel)) {
+                    stats.external++;
+                    continue;
+                }
+                bool anyInput = false;
+                for (auto& src : reads) {
+                    // A bidirectional terminal appears in both sets; pairing
+                    // it with itself would fabricate self-feedback out of one
+                    // terminal, which is wiring, not dataflow.
+                    if (src.sym == dst.sym)
+                        continue;
+                    anyInput = true;
+                    const auto dk = keyRange(dst);
+                    const auto sk = keyRange(src);
+                    if (!seen.emplace(dst.sym, src.sym, line, dk.first, dk.second,
+                                      sk.first, sk.second)
+                             .second)
+                        continue;
+                    EdgeRow row;
+                    row.dst = dstRel;
+                    row.dstType = typeOf(*dst.sym);
+                    if (!dst.whole)
+                        row.dstBits = std::make_pair(dst.lo, dst.hi);
+                    row.dstExact = dst.exact;
+                    if (!relativePath(*src.sym, prefix, row.src)) {
+                        stats.external++;
+                        continue;
+                    }
+                    row.srcType = typeOf(*src.sym);
+                    if (!src.whole)
+                        row.srcBits = std::make_pair(src.lo, src.hi);
+                    row.srcExact = src.exact;
+                    row.kind = "primitive";
+                    row.construct = construct;
+                    row.file = file;
+                    row.line = line;
+                    out.push_back(std::move(row));
+                }
+                // pullup(y) has no input terminal; the null-source row names
+                // the gate as the driver, exactly as `q <= 8'h0` is named.
+                if (!anyInput) {
+                    const auto dk = keyRange(dst);
+                    if (!seen.emplace(dst.sym, nullptr, line, dk.first, dk.second,
+                                      uint64_t(0), uint64_t(0))
+                             .second)
+                        continue;
+                    EdgeRow row;
+                    row.dst = dstRel;
+                    row.dstType = typeOf(*dst.sym);
+                    if (!dst.whole)
+                        row.dstBits = std::make_pair(dst.lo, dst.hi);
+                    row.dstExact = dst.exact;
+                    row.kind = "primitive";
+                    row.construct = construct;
+                    row.file = file;
+                    row.line = line;
+                    out.push_back(std::move(row));
+                }
+            }
+        });
     }
 
     /// One child instance's port connections, in the parent's namespace.
