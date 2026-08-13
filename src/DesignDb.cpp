@@ -80,6 +80,9 @@ CREATE TABLE edge(
     dst      INTEGER NOT NULL REFERENCES name(id),
     src_type INTEGER REFERENCES type(id),
     dst_type INTEGER REFERENCES type(id),
+    -- continuous_assign | procedural | primitive | procedure. `primitive` is
+    -- a gate, switch or UDP instance, whose `construct` names it (`gate:and`,
+    -- `udp:my_latch`); it has no procedure and so no `proc_event` row.
     kind      TEXT,
     construct TEXT,
     file      INTEGER REFERENCES file(id),
@@ -129,7 +132,10 @@ CREATE TABLE child(
 CREATE TABLE symbol(
     module    INTEGER NOT NULL REFERENCES module(id),
     name      INTEGER NOT NULL REFERENCES name(id),
-    kind      TEXT,                       -- variable | net | port | parameter
+    -- variable | net | port | parameter | interface_port. An interface port
+    -- has no net behind it, so it gets a row of its own; `type` holds the
+    -- interface name, with `.modport` appended when the port declares one.
+    kind      TEXT,
     type      INTEGER REFERENCES type(id),
     width     INTEGER,                    -- bits, NULL when not integral
     direction INTEGER,                    -- 0=in 1=out 2=inout 3=ref, NULL if not a port
@@ -208,6 +214,8 @@ CREATE TABLE assignment(
     module   INTEGER NOT NULL REFERENCES module(id),
     dst       INTEGER NOT NULL REFERENCES name(id),
     dst_lo    INTEGER, dst_hi INTEGER, dst_exact INTEGER,
+    -- continuous_assign | procedural. Never `primitive`: a gate is not a
+    -- statement, so it contributes edges and no assignment row.
     kind      TEXT,
     construct TEXT,
     file     INTEGER REFERENCES file(id),

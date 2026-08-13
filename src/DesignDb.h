@@ -34,8 +34,9 @@ struct EdgeRow {
     std::string dst;
     std::string srcType;
     std::string dstType;
-    std::string kind;         // continuous_assign | procedural | procedure
-    std::string construct;        // always_ff / assign / ...
+    // continuous_assign | procedural | primitive | procedure
+    std::string kind;
+    std::string construct;    // always_ff / assign / gate:and / udp:foo / ...
     std::string file;
     uint32_t line = 0;
     // Bit ranges, absent for a whole-signal edge. LSB-relative offsets into
@@ -58,7 +59,9 @@ struct EdgeRow {
 struct AssignRow {
     std::string dst;
     std::optional<std::pair<uint64_t, uint64_t>> dstBits;
-    std::string kind;         // continuous_assign | procedural
+    // continuous_assign | procedural. Never `primitive`: a gate is not a
+    // statement, so it yields edges and no assignment row.
+    std::string kind;
     std::string construct;    // assign | always_ff | ...
     std::string file;
     uint32_t line = 0;
@@ -96,7 +99,8 @@ struct ProcEventRow {
 /// and those are exactly the ones worth asking about.
 struct SymbolRow {
     std::string name;         // module-relative, generate-block prefix included
-    std::string kind;         // variable | net | port | parameter
+    // variable | net | port | parameter | interface_port
+    std::string kind;
     std::string type;
     int64_t width = -1;       // bits; -1 when the type is not integral
     std::string direction;    // "" unless this signal is a port
@@ -154,7 +158,9 @@ struct ChildRow {
 struct HierRefRow {
     std::string path;         // as written
     bool write = false;       // the module writes it, rather than reads it
-    std::string kind;         // as edge.kind, plus "port"
+    // edge.kind's vocabulary (continuous_assign | procedural | primitive |
+    // procedure), plus "port" for a reference made by a port connection.
+    std::string kind;
     std::string construct;    // as edge.construct; the direction for a port
     std::string file;
     uint32_t line = 0;

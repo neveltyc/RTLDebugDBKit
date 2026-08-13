@@ -17,7 +17,7 @@ build/rtl-designdb -f rtl.f --top my_core -o design.db
 ```
 
 ```
-design.db: 25 modules, 32 instances, 1703 symbols, 5723 edges, 31 children, 652 ports
+design.db: 34 modules, 49 instances, 912 symbols, 4839 edges, 1458 assignments, 44 children, 478 ports
 ```
 
 Try it against the RTL in this repo:
@@ -73,10 +73,15 @@ Release build, macOS arm64, against public designs:
 
 | design | modules | instances | symbols | edges | ports | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 269 | 4,378 | 0 | 0.03 s | 0.53 MB |
-| tinyriscv | 29 | 43 | 877 | 4,755 | 470 | 0.02 s | 0.69 MB |
-| Ibex (`ibex_core`) | 25 | 32 | 1,703 | 5,723 | 652 | 0.04 s | 0.99 MB |
-| VeeRwolf (`veerwolf_core`) | 220 | 3,950 | 10,342 | 24,589 | 15,780 | 0.19 s | 5.35 MB |
+| picorv32 | 1 | 1 | 269 | 4,425 | 0 | 0.02 s | 0.54 MB |
+| tinyriscv | 34 | 49 | 912 | 4,839 | 478 | 0.02 s | 0.71 MB |
+| Ibex (`ibex_core`) † | 25 | 32 | 1,703 | 5,723 | 652 | 0.04 s | 0.99 MB |
+| VeeRwolf (`veerwolf_core`) † | 220 | 3,950 | 10,342 | 24,589 | 15,780 | 0.19 s | 5.35 MB |
+
+† measured on schema v1 and not re-run since. Expect more edges under v2 on
+the same source: a self-feedback assignment (`cnt <= cnt + 1`) now contributes
+a row, and gate, switch and UDP instances contribute one per (input, output)
+pairing where v1 recorded none. The other columns are unaffected.
 
 Elaboration cost is slang's: memory scales with the number of elaborated
 instances, so a very large flat design wants `--top` on a subtree.
@@ -147,6 +152,17 @@ Icarus correctly rejects, Icarus rejects an unpacked array slice that Verilator
 correctly accepts — so disagreement is a prompt to read the LRM, not a verdict.
 Several "defects" during development turned out to be invalid RTL written by
 hand.
+
+A front end that has not implemented a construct at all says nothing about the
+RTL, so a file may declare that one of them cannot accept it:
+
+```
+// check-rtl: expect-fail icarus -- interface ports are not in its grammar
+```
+
+The declared failure then counts as a pass, and the tool *accepting* the file
+counts as a failure — so the marker cannot outlive the limitation it records.
+`examples/constructs/interfaces.sv` is the only file that carries one.
 
 ## Licence
 

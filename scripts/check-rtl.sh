@@ -22,7 +22,15 @@
 #
 #   usage: check-rtl.sh <file.sv> [top-module]
 #
-# Exit status is 0 only when both accept it.
+# Exit status is 0 only when both accept it -- unless the file declares that
+# one of them cannot, with a marker among its first 15 lines:
+#
+#   // check-rtl: expect-fail icarus -- no interface support
+#
+# That is for a front end that has not implemented the construct at all, which
+# is not evidence the RTL is wrong. It is deliberately not a blanket waiver: a
+# declared failure that starts passing fails this script too, so the marker
+# cannot outlive the limitation it documents.
 
 set -u
 file="${1:?usage: check-rtl.sh <file.sv> [top]}"
@@ -51,15 +59,35 @@ else
     iout="(iverilog not installed)"; irc=127
 fi
 
-status() { [ "$1" -eq 0 ] && echo OK || { [ "$1" -eq 127 ] && echo SKIP || echo FAIL; }; }
+# A declared expected failure, per tool.
+expected() { head -15 "$file" | grep -qiE "^[[:space:]]*//[[:space:]]*check-rtl:.*expect-fail[[:space:]]+$1"; }
 
-printf '%-30s verilator:%-5s icarus:%-5s\n' "$(basename "$file")${top:+ [$top]}" \
-       "$(status $vrc)" "$(status $irc)"
+status() {
+    rc=$1; tool=$2
+    if expected "$tool"; then
+        # Passing while declared failing is a failure of its own: the marker
+        # is stale and the file should simply be checked like any other.
+        [ "$rc" -eq 0 ] && echo STALE && return
+        [ "$rc" -eq 127 ] && echo SKIP || echo XFAIL
+        return
+    fi
+    [ "$rc" -eq 0 ] && echo OK || { [ "$rc" -eq 127 ] && echo SKIP || echo FAIL; }
+}
 
-[ $vrc -ne 0 ] && [ $vrc -ne 127 ] && \
+vst=$(status $vrc verilator)
+ist=$(status $irc icarus)
+printf '%-30s verilator:%-5s icarus:%-5s\n' "$(basename "$file")${top:+ [$top]}" "$vst" "$ist"
+
+[ "$vst" = FAIL ] && \
     printf '%s\n' "$vout" | grep -E '^%(Error|Warning)' | head -4 | sed 's/^/    verilator: /'
-[ $irc -ne 0 ] && [ $irc -ne 127 ] && \
+[ "$ist" = FAIL ] && \
     printf '%s\n' "$iout" | grep -Ei 'error|sorry' | head -4 | sed 's/^/    icarus:    /'
+for t in "verilator:$vst" "icarus:$ist"; do
+    [ "${t#*:}" = STALE ] && printf '    %s now accepts this file; drop its expect-fail marker\n' "${t%%:*}"
+done
 
-# A front end that is absent cannot vouch for anything, so SKIP is not success.
-[ $vrc -eq 0 ] && [ $irc -eq 0 ]
+# Success is every front end either accepting the file or failing exactly as
+# the file said it would. SKIP is not success: a front end that is absent has
+# vouched for nothing. Nor is STALE: the marker has outlived its reason.
+ok() { [ "$1" = OK ] || [ "$1" = XFAIL ]; }
+ok "$vst" && ok "$ist"

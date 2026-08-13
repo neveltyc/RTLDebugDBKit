@@ -1,6 +1,11 @@
-// Interface constructs, split out of constructs.sv: Icarus does not
-// implement interfaces ("sorry"), so scripts/check-rtl.sh cannot vouch for
-// this file with both front ends. slang and Verilator both accept it.
+// Interface constructs, split out of constructs.sv.
+//
+// check-rtl: expect-fail icarus -- interface ports are not in its grammar
+//
+// Icarus has no interface support at all, so it reports the port list as a
+// syntax error rather than declining a construct it knows; that is a gap in
+// the front end, not evidence about this file. slang and Verilator accept it,
+// and check-rtl.sh will fail if Icarus ever starts to.
 //
 // What it exercises: an interface port binding (port.conn_kind=4, with the
 // declared modport), interface_port symbol rows, and interface member
