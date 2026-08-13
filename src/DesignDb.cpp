@@ -61,7 +61,15 @@ CREATE TABLE type(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
 -- Identifiers: signals, ports, instance names. Short, and repeated far more
 -- than they are distinct.
 CREATE TABLE name(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
-CREATE TABLE file(id INTEGER PRIMARY KEY, path TEXT UNIQUE);
+-- `path` is the spelling the rows carry -- as written in the filelist or on
+-- the command line -- while `source_file.path` is absolute. The two genuinely
+-- differ, so `source_file` joins them: without it a consumer checking digests
+-- had to match spellings by basename, which breaks on the first design with
+-- two files of one name.
+CREATE TABLE file(
+    id          INTEGER PRIMARY KEY,
+    path        TEXT UNIQUE,
+    source_file INTEGER REFERENCES source_file(id));
 
 -- Intra-module dataflow, in the module's own namespace.
 CREATE TABLE edge(
@@ -468,6 +476,39 @@ void Writer::addSourceFile(const std::string& path, const std::string& digest) {
         throw std::runtime_error(std::string("sqlite: recording source file ") + path + ": " +
                                  sqlite3_errmsg(db));
     }
+    // The row id, whether this insert created the row or an earlier one did
+    // (OR IGNORE makes last_insert_rowid() unreliable here) -- kept so
+    // linkSourceFiles can join file rows to it later.
+    prepare("SELECT id FROM source_file WHERE path=?", &s);
+    sqlite3_bind_text(s, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(s);
+    if (rc == SQLITE_ROW)
+        sourceFileIds.emplace(path, sqlite3_column_int64(s, 0));
+    sqlite3_finalize(s);
+    if (rc != SQLITE_ROW) {
+        throw std::runtime_error(std::string("sqlite: looking up source file ") + path +
+                                 ": " + sqlite3_errmsg(db));
+    }
+}
+
+void Writer::linkSourceFiles(
+    const std::unordered_map<std::string, std::string>& origins) {
+    sqlite3_stmt* s = nullptr;
+    prepare("UPDATE file SET source_file=? WHERE path=?", &s);
+    for (auto& [asWritten, full] : origins) {
+        auto it = sourceFileIds.find(full);
+        if (it == sourceFileIds.end())
+            continue;       // a synthesized buffer; there is no file to hash
+        sqlite3_reset(s);
+        sqlite3_bind_int64(s, 1, it->second);
+        sqlite3_bind_text(s, 2, asWritten.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) != SQLITE_DONE) {
+            std::string msg = sqlite3_errmsg(db);
+            sqlite3_finalize(s);
+            throw std::runtime_error("sqlite: linking file rows: " + msg);
+        }
+    }
+    sqlite3_finalize(s);
 }
 
 int64_t Writer::internModule(const std::string& name, const std::string& params) {

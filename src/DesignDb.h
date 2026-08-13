@@ -180,6 +180,12 @@ public:
     /// database and the RTL have diverged instead of answering from stale data.
     void addSourceFile(const std::string& path, const std::string& digest);
 
+    /// Joins `file` rows to `source_file` rows: `origins` maps each as-written
+    /// spelling to the absolute path the buffer really came from. Called once,
+    /// after rows are written (file paths intern lazily) and before finish().
+    void linkSourceFiles(
+        const std::unordered_map<std::string, std::string>& origins);
+
     /// Interns a module (name + its elaborated parameter text) and returns its
     /// row id. Parameters are part of the identity because they change the
     /// module's contents, not just its numbers.
@@ -251,6 +257,7 @@ private:
     std::unordered_map<std::string, int64_t> typeIds;
     std::unordered_map<std::string, int64_t> fileIds;
     std::unordered_map<std::string, int64_t> nameIds;
+    std::unordered_map<std::string, int64_t> sourceFileIds;
     bool inTransaction = false;
     int64_t pending = 0;
 };

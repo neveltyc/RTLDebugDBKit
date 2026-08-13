@@ -988,6 +988,9 @@ public:
         // Pass 2: the instance tree, now that every module has a row.
         for (auto inst : compilation.getRoot().topInstances)
             visitInstance(*inst, 0, "");
+
+        // Last: file rows exist only once something interned them.
+        writer.linkSourceFiles(fileOrigins);
         return stats;
     }
 
@@ -1028,6 +1031,20 @@ private:
     int64_t moduleIdFor(const InstanceSymbol& inst) {
         auto it = instanceGroup.find(&inst);
         return it == instanceGroup.end() ? 0 : groups[it->second].id;
+    }
+
+    /// Remembers which absolute path an as-written file spelling came from, so
+    /// the writer can join `file` rows to `source_file` rows at the end. The
+    /// two spellings genuinely differ -- rows carry the filelist's relative
+    /// path, source_file the hashed absolute one -- and matching them by
+    /// basename breaks on the first design with two files of one name.
+    void noteFile(SourceLocation loc, const std::string& asWritten) {
+        if (!loc || asWritten.empty())
+            return;
+        if (fileOrigins.count(asWritten))
+            return;
+        fileOrigins.emplace(asWritten,
+                            sourceManager.getFullPath(loc.buffer()).string());
     }
 
     /// Records one reference that leaves the module, as written. Every such
@@ -1112,6 +1129,7 @@ private:
                     row.type += "." + std::string(ip.modport);
             }
             locationOf(sym, sourceManager, row.file, row.line);
+            noteFile(sym.location, row.file);
             if (sym.location)
                 row.col = static_cast<uint32_t>(sourceManager.getColumnNumber(sym.location));
             symbols.push_back(std::move(row));
@@ -1190,6 +1208,7 @@ private:
         uint32_t line = 0;
         classify(*proc.analyzedSymbol, kind, construct);
         locationOf(*proc.analyzedSymbol, sourceManager, file, line);
+        noteFile(proc.analyzedSymbol->location, file);
 
         auto& sens = proc.getSensitivityList();
 
@@ -1408,6 +1427,7 @@ private:
             std::string file;
             uint32_t line = 0;
             locationOf(prim, sourceManager, file, line);
+            noteFile(prim.location, file);
 
             // A terminal's direction. The built-in gates are variadic -- the
             // definition's port list does not stretch to the instance's
@@ -1550,6 +1570,7 @@ private:
             std::string file;
             uint32_t line = 0;
             locationOf(child, sourceManager, file, line);
+            noteFile(child.location, file);
 
             // An interface port carries no net, but the *binding* is the alias
             // that makes `child.bus.*` resolvable at all: the signals live in
@@ -1816,6 +1837,8 @@ private:
     // passes, so the seen-set folds them to one row per (text, rw, line).
     std::vector<HierRefRow> hierRefs;
     std::set<std::tuple<std::string, bool, uint32_t>> hierSeen;
+    // As-written file spelling -> the absolute path its buffer came from.
+    std::unordered_map<std::string, std::string> fileOrigins;
     int64_t instanceRow = 0;
     Stats stats;
 };
