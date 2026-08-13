@@ -55,8 +55,8 @@ can read it.
 |---|---|
 | Hierarchy | `module` (a definition plus the parameter values it elaborated with), `instance` (the tree), `child` (what a module instantiates) |
 | Declarations | `symbol` — every declaration with kind, type, width, direction, and `file:line:col` |
-| Dataflow | `edge` (what drives what, with bit ranges), `assignment` + `assign_operand` (per statement), `proc_event` (procedure sensitivity) |
-| Boundaries | `port` — port connections, the rows that let a trace leave the module it started in |
+| Dataflow | `edge` (what drives what, gates and UDPs included, with bit ranges), `assignment` + `assign_operand` (per statement), `proc_event` (sensitivity and waits) |
+| Boundaries | `port` — port connections with their bit ranges, interface bindings included; `hier_ref` — references that leave the module (XMRs, interface members), as written |
 | Provenance | `source_file` (every file slang read, with its SHA-256), `meta` (schema version, tool, top) |
 
 The model is **folded**: rows hang off a *module*, not an instance, so thirty-two

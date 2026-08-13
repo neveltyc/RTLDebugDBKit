@@ -9,9 +9,18 @@ include directories, and optionally a top module.
 **Out:** one SQLite file. No runtime, no library, no simulator — anything that
 speaks SQL can read it.
 
-**Schema version 1.** `meta.schema_version` carries it. A reader that does not
+**Schema version 2.** `meta.schema_version` carries it. A reader that does not
 know the version should refuse the file rather than read it as though the layout
 had held.
+
+Version 2 added: the [`hier_ref`](#leaving-the-hierarchy) table; bit ranges,
+interface bindings and expression operands on [`port`](#crossing-a-module-boundary)
+— `conn_kind` gained values 3 and 4, which a v1 reader would misread as plain
+nets, and that misreading is why the version moved rather than staying a pure
+addition; statement-level waits and `file`/`line` in `proc_event`; primitive
+edges (`kind='primitive'`); `symbol.kind='interface_port'`; `file.source_file`;
+self-feedback edges; and `meta.top` written from the elaborated tops whether or
+not `--top` was passed.
 
 ## Contents
 
@@ -22,6 +31,7 @@ had held.
 - [Declarations](#declarations) — `symbol`
 - [Dataflow](#dataflow) — `edge`, `assignment`, `assign_operand`, `proc_event`
 - [Crossing a module boundary](#crossing-a-module-boundary) — `port`
+- [Leaving the hierarchy](#leaving-the-hierarchy) — `hier_ref`
 - [Bit ranges](#bit-ranges)
 - [Provenance](#provenance) — `source_file`, `meta`
 - [Naming rules](#naming-rules)
@@ -41,10 +51,11 @@ half: the elaborated structure of the design, addressable by name, with a
 | What reads it? | `edge` where `src` is the signal |
 | Which *statement* wrote it, when several do? | `assignment` (one row per statement, with `proc`/`seq`/`blocking`) + `assign_operand` |
 | Which *bits* came from where? | `src_lo`/`src_hi`/`dst_lo`/`dst_hi` on `edge`, read with `*_exact` |
-| Where does this path leave the module? | `port` — the only table spanning two modules |
+| Where does this path leave the module? | `port` — the only table spanning two modules, interface bindings included |
+| What does this module touch outside itself? | `hier_ref` — every reference that leaves it, exactly as written |
 | What is this instance, and what is it inside? | `instance` (leaf name + parent chain) and `module` |
 | How wide is it, which direction, where is it declared? | `symbol` |
-| What is this procedure sensitive to? | `proc_event` |
+| What is this procedure sensitive to, or waiting on? | `proc_event` |
 | Is my database still valid for this source tree? | `source_file` — every file read, with its SHA-256 |
 
 Two properties make it usable as a *back end* rather than a report: the names
@@ -99,8 +110,9 @@ referencing one of those is a row id**, so reading a name means joining
 | [`edge`](#dataflow) | dependency (one signal drives another) | unique RTL |
 | [`assignment`](#dataflow) | statement that writes a target | unique RTL |
 | [`assign_operand`](#dataflow) | signal read by an assignment's RHS | unique RTL |
-| [`proc_event`](#dataflow) | edge event a procedure triggers on | unique RTL |
+| [`proc_event`](#dataflow) | edge event a procedure triggers on or waits on | unique RTL |
 | [`port`](#crossing-a-module-boundary) | port connection on a child instance | unique RTL |
+| [`hier_ref`](#leaving-the-hierarchy) | reference that leaves the module, as written | unique RTL |
 | [`source_file`](#provenance) | file slang actually read | source tree |
 | [`meta`](#provenance) | key/value (schema version, tool, top) | fixed |
 
@@ -116,7 +128,7 @@ referencing one of those is a row id**, so reading a name means joining
 
 | table | column | meaning |
 |---|---|---|
-| `symbol` | `module`, `name`, `kind`, `type`, `width`, `direction`, `file`, `line`, `col` | Every declaration. `kind` is `variable`/`net`/`parameter`/`port`. `direction` is `0`=in, `1`=out, `2`=inout, `3`=ref, and non-NULL exactly when the signal is a port. `width` is in bits, NULL when the type is not integral. |
+| `symbol` | `module`, `name`, `kind`, `type`, `width`, `direction`, `file`, `line`, `col` | Every declaration. `kind` is `variable`/`net`/`parameter`/`port`/`interface_port`. `direction` is `0`=in, `1`=out, `2`=inout, `3`=ref, and non-NULL exactly when the signal is an ordinary port — an `interface_port` has no direction. For an `interface_port`, `type` is the interface definition, with the declared modport when the port restricts itself to one (`simple_bus.master`); it is the name a reference like `bus.vld` resolves its first segment against. |
 
 One row per real signal. slang carries a `Port` symbol *and* the net or variable
 behind it; the port contributes its direction to the signal's row rather than a
@@ -139,9 +151,9 @@ WHERE s.direction = 1
 
 | table | column | meaning |
 |---|---|---|
-| `edge` | `module`, `src`, `dst` | One dependency inside a module. `src` is NULL when the right-hand side reads nothing at all (`q <= 8'h0`) — the row still names the statement. Self-feedback is a real row: `cnt <= cnt + 1` records `cnt → cnt`, which is what makes "who reads cnt" answerable. |
+| `edge` | `module`, `src`, `dst` | One dependency inside a module. `src` is NULL when the right-hand side reads nothing at all (`q <= 8'h0`) — the row still names the statement. Self-feedback is a real row: `cnt <= cnt + 1` records `cnt → cnt`, which is what makes "who reads cnt" answerable. A downward hierarchical reference that stays inside the module's subtree is an ordinary row whose name is dotted (`u_child.sig`). |
 | | `src_type`, `dst_type` | Type text. |
-| | `kind`, `construct` | `continuous_assign`/`procedural`, and the construct: `assign`, `always_ff`, `always_comb`, … |
+| | `kind`, `construct` | `continuous_assign`/`procedural`/`primitive`, and the construct: `assign`, `always_ff`, `gate:and`, `udp:my_latch`, … A gate, switch or UDP instance is one edge per (input, output) pairing — `and (y, a, b)` is `a → y` and `b → y`. |
 | | `control` | 1 when the operand reached the target through a branch condition rather than the right-hand side. |
 | | `file`, `line` | The statement's own line, not the enclosing procedure's. |
 | | `src_lo`/`src_hi`/`src_exact`, `dst_lo`/`dst_hi`/`dst_exact` | Bit ranges — see [below](#bit-ranges). |
@@ -154,7 +166,7 @@ WHERE s.direction = 1
 | | `blocking` | 1 for `=`, 0 for `<=`, NULL for a continuous assign. Not decoration — two assignments to one target in one block resolve by different rules, and it separates a block-local temporary written with `=` inside an `always_ff` from a real register. |
 | | `dropped_operands` | Operands not recorded: compile-time constants, and references outside this module. A row with one operand and three dropped is not a row that reads one signal. |
 | `assign_operand` | `assignment`, `name`, `src_lo`/`src_hi`/`src_exact` | What the right-hand side reads. |
-| `proc_event` | `module`, `proc`, `signal`, `edge_kind` | Every edge event a procedure triggers on. `signal` is NULL when the event expression is not a plain reference. |
+| `proc_event` | `module`, `proc`, `signal`, `edge_kind`, `file`, `line` | Every edge event a procedure triggers on **or waits on**. `signal` is NULL when the event expression is not a plain reference. A sensitivity row carries the procedure's own location; a statement-level wait (`@(posedge clk);` inside an initial block or a task) carries its statement's, which is also what tells the two apart. |
 
 `edge` flattens a procedure into "these signals drive that one". `assignment`
 keeps the statements apart, so a target written in four places reads as four
@@ -165,10 +177,12 @@ statements rather than one merged set.
 | table | column | meaning |
 |---|---|---|
 | `port` | `module`, `child`, `def_module`, `port` | A port connection, recorded against the parent module that writes it. `module` is the parent, `def_module` the child's module, `port` the formal inside it. |
-| | `direction` | 0=in, 1=out, 2=inout, 3=ref, 4=unknown. |
+| | `direction` | 0=in, 1=out, 2=inout, 3=ref, 4=unknown. NULL for an interface binding — an interface port has no direction. |
 | | `outer`, `outer_type` | The net in the *parent's* namespace. |
 | | `outer_width` | The width of the connection **as written**, looking through the implicit conversion slang inserts to fit the formal. Comparing it against the formal's `symbol.width` is how a width-mismatched connection is found. NULL for an element of an instance array, where every element shares the array's connection expression and the comparison has no meaning. |
-| | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected. |
+| | `outer_lo`/`outer_hi`/`outer_exact` | The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches bits 0..3 of `stim`, not all of it. Same encoding as `edge` — see [Bit ranges](#bit-ranges). NULL with exact=0 for an element of an instance array, as with `outer_width`. |
+| | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an expression, 4=an interface binding. |
+| | `modport` | The modport restricting an interface binding, when one does. NULL otherwise. |
 | | `file`, `line` | Where the connection is written, in the parent. |
 
 Both directions are indexed, because the two queries need opposite ones: a
@@ -178,10 +192,50 @@ module it started in — which matters more than it sounds: on real designs a
 large share of modules are pure structural wrappers with no procedural logic at
 all, and without port rows every path through a register leaves the graph.
 
+**`conn_kind` 3 is not a wire.** `.en(state == RUN)` samples `state`, but it
+does not alias it to `en`: treating the operand as a connection attributes
+every reader of `en` to `state`. The operands are still recorded — they are
+what the expression reads, selector indices included — flagged so a consumer
+can tell wire from computation.
+
+**`conn_kind` 4 is the alias that makes `child.bus.*` resolvable.** For an
+interface binding, `port` is the child's interface port, `outer` the interface
+instance — or the parent's own interface port, passed through — in the parent's
+namespace, and `outer_type` the interface definition. The signals live in the
+interface instance; this row is how a reference on either side finds them.
+
+## Leaving the hierarchy
+
+| table | column | meaning |
+|---|---|---|
+| `hier_ref` | `module`, `path` | One reference that leaves the module, **exactly as written**: `bus.vld` through an interface port, `tb.u_dut.state` as an XMR, `pkg::cfg` from a package. |
+| | `write` | 1 when the module writes the path, 0 when it reads it. An inout port connection tied to an external signal is recorded as the write. |
+| | `kind`, `construct` | The enclosing construct, in `edge`'s vocabulary — plus `kind='port'` with the direction in `construct` for a port connection tied to an external signal. |
+| | `file`, `line` | Where the reference is written. |
+| | `path_lo`/`path_hi`/`path_exact` | The bits the reference touches, as everywhere else. |
+
+The target of such a reference cannot go into `edge` or `port` rows: those name
+signals in the module's own namespace, shared by every instance of it, and an
+absolute path would bake one instance's hierarchy into all of them. The
+as-written *text* has no such problem — every instance of the module carries
+the same spelling — so the text is what is stored. Resolving it against the
+hierarchy belongs to the consumer, who has the `instance` tree and the
+interface bindings (`port.conn_kind=4`) this table's rows resolve through.
+
+Two deliberate exclusions. A **bare name** that leaves the module — typically a
+package-level variable read by a called subroutine — is counted in the
+exporter's external-reference note but not stored: with no path in the text, it
+resolves against imports a reader cannot see, and a bare `mask` row would be
+noise pretending to be an answer (`pkg::mask`, written with its package, is
+stored). And a **downward reference that stays inside the module's subtree**
+(`u_child.sig`) was never external at all: it lands in ordinary `edge` and
+`assignment` rows as a dotted module-relative name.
+
 ## Bit ranges
 
-`src_lo`/`src_hi` and `dst_lo`/`dst_hi` are **LSB-relative offsets into the
-flattened object**, not declared indices. `logic [15:8] off` has bit 15 at
+`src_lo`/`src_hi` and `dst_lo`/`dst_hi` — and the same pairs on
+`assign_operand`, `port.outer_*` and `hier_ref.path_*` — are **LSB-relative
+offsets into the flattened object**, not declared indices. `logic [15:8] off` has bit 15 at
 offset 7; `logic [0:7] up` has bit 0 at offset 7. A consumer mapping them onto
 declared indices mislabels every signal not declared `[N-1:0]`; the declared
 range is recoverable from `src_type`/`dst_type`.
@@ -200,7 +254,7 @@ Storing both NULL cases the same way made uncertainty read as fact.
 
 | table | meaning |
 |---|---|
-| `source_file` | Every file slang actually read, with its SHA-256 — including headers reached by `` `include ``, which are exactly the files that change without the filelist changing. |
+| `source_file` | Every file slang actually read, with its SHA-256 — including headers reached by `` `include ``, which are exactly the files that change without the filelist changing. `file.source_file` joins every interned as-written path to its hashed row, so checking freshness never means matching spellings. |
 | `meta` | Schema version, tool name, top module. `top` holds the *elaborated* top(s), space-separated when the design has several — written whether or not `--top` was passed. A reader that does not know the version should refuse the file rather than read it as though the layout had held. |
 
 ## Naming rules
@@ -257,6 +311,15 @@ go stale against a digest that can only say *that* it changed.
 
 ## Known limits
 
+- SystemVerilog only: the front end is slang. VHDL, and mixed-language designs'
+  VHDL halves, are out of scope.
+- `force` is recorded as an ordinary blocking assignment in its enclosing
+  construct; `release` leaves no row. The force's overriding semantics are not
+  modelled — a consumer replaying drive order sees it as one more write.
+- A statement whose target lives outside the module (`assign bus.vld = x;`)
+  records the outward write in `hier_ref`, but its *operands* are not recorded:
+  the assignment row they would hang from cannot exist without a
+  module-relative target.
 - Function and task locals appear as edge and assignment endpoints but have no
   `symbol` row — they are not declared in the module.
 - `assign_operand` is not deduplicated: an expression reading one signal twice
