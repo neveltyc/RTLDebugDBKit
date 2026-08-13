@@ -1,0 +1,117 @@
+name: Binaries
+
+# The release platform set, built the same way on every push and every tag:
+# ci.yml and release.yml both call this workflow, so the binary a release
+# ships is produced by exactly the pipeline CI has been running all along.
+#
+# The set matches rwave's platform selection — linux-amd64, linux-arm64,
+# windows-amd64, macos-arm64 — because the database is read next to a
+# waveform: the exporter ships everywhere the viewer does.
+on:
+  workflow_call:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
+    # Both Linux targets build in an Alpine container: musl plus -static is
+    # what lets one binary run on any distro, any glibc (see build-release.sh).
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runs-on: ubuntu-latest
+            container: alpine:3.21
+            bin: dist/rtl-designdb-linux-amd64
+            python: python3
+          - target: linux-arm64
+            runs-on: ubuntu-24.04-arm
+            container: alpine:3.21
+            bin: dist/rtl-designdb-linux-arm64
+            python: python3
+          - target: windows-amd64
+            runs-on: windows-latest
+            bin: dist/rtl-designdb-windows-amd64.exe
+            python: python
+          - target: macos-arm64
+            runs-on: macos-latest
+            bin: dist/rtl-designdb-macos-arm64
+            python: python3
+    steps:
+      # Before checkout, and with `sh`: the container starts with neither bash
+      # nor git, and checkout falls back to a tarball download without git.
+      # tar+zstd are for actions/cache, file is for the build script's report.
+      - name: Install Alpine build tools
+        if: matrix.container != ''
+        shell: sh
+        run: apk add --no-cache bash build-base cmake ninja python3 git ca-certificates linux-headers file tar zstd
+
+      - uses: actions/checkout@v4
+
+      # slang is a large dependency and the pin is exact, so the key is the
+      # CMakeLists that carries it: the cache is reused until the pin moves.
+      # Windows skips it: $HOME under Git Bash is a POSIX path that the native
+      # CMake would misread, and the clone is noise next to the MSVC build.
+      - name: Cache CPM sources
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/CPM
+          key: cpm-${{ matrix.target }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ matrix.target }}-
+
+      - name: Build release binary
+        run: |
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            export CPM_SOURCE_CACHE="$HOME/.cache/CPM"
+          fi
+          bash scripts/build-release.sh --target ${{ matrix.target }}
+
+      # Every platform runs the binary it just built: export the example
+      # design and read the database back.
+      - name: Export and read back
+        run: |
+          ${{ matrix.bin }} examples/basic/top.sv --top top -o design.db
+          ${{ matrix.python }} scripts/verify-designdb.py design.db
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtl-designdb-${{ matrix.target }}
+          path: dist/rtl-designdb-*
+          if-no-files-found: error
+
+  # The build jobs run the Linux binaries inside the Alpine container that
+  # made them, which proves nothing about portability. Run them again on the
+  # bare glibc runner with nothing installed: if the binary is truly static,
+  # this passes on any distro; if a dynamic dependency crept in, it fails
+  # here instead of on someone's farm.
+  run-on-glibc:
+    name: ${{ matrix.target }} runs on glibc
+    needs: build
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runs-on: ubuntu-latest
+          - target: linux-arm64
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rtl-designdb-${{ matrix.target }}
+          path: dist
+      - name: Export and read back on the bare runner
+        run: |
+          chmod +x dist/rtl-designdb-${{ matrix.target }}
+          dist/rtl-designdb-${{ matrix.target }} examples/basic/top.sv --top top -o design.db
+          python3 scripts/verify-designdb.py design.db

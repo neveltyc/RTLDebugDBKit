@@ -88,6 +88,31 @@ SQLite is the official amalgamation, fetched and compiled in, so the binary
 carries its own copy and the database does not depend on the host's libsqlite3.
 `-DDESIGNDB_SYSTEM_SQLITE=ON` links the system library instead.
 
+### Release binaries
+
+CI builds four platform binaries on every push, and a `v*` tag publishes them
+as a GitHub release alongside a `sha256sums.txt`:
+
+| target | binary | linking |
+|---|---|---|
+| linux-amd64 | `rtl-designdb-linux-amd64` | musl, fully static — any distro, any glibc |
+| linux-arm64 | `rtl-designdb-linux-arm64` | musl, fully static |
+| windows-amd64 | `rtl-designdb-windows-amd64.exe` | MSVC, static CRT — no DLLs required |
+| macos-arm64 | `rtl-designdb-macos-arm64` | native, macOS 11+ (Apple Silicon) |
+
+The set is [rwave](https://github.com/neveltyc/RWaveAnalyzer)'s platform
+selection, deliberately: the database is read next to a waveform, so the
+exporter ships everywhere the viewer does. rwave keeps its linux-amd64
+glibc-dynamic because its vendor waveform backends arrive by `dlopen`; this
+exporter has no `dlopen` at all — SQLite is compiled in with loadable
+extensions omitted — so both Linux targets are fully static and run unchanged
+on the CentOS 7-era farms EDA tools live on.
+
+[scripts/build-release.sh](scripts/build-release.sh) builds the same binaries
+locally: macOS builds its own target natively, the Linux pair build through a
+Docker Alpine container, and windows-amd64 needs a Windows host, which CI
+provides.
+
 ## Repository layout
 
 ```
@@ -95,12 +120,20 @@ CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
 src/                    main.cpp (CLI + filelist parsing), Extractor, DesignDb
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
-scripts/check-rtl.sh    validate a test case against Verilator and Icarus
+scripts/                build-release.sh (the four release platforms),
+                        verify-designdb.py (read an export back, fail if hollow),
+                        check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 
 [CI](.github/workflows/ci.yml) builds both SQLite configurations on every push,
 exports `examples/basic/top.sv`, and reads the database back — a build that
 links proves the slang pin resolves, not that the exporter still writes rows.
+The same push builds all four release binaries
+([binaries.yml](.github/workflows/binaries.yml)) and repeats the export on
+each platform; the Linux pair is then re-run on a bare glibc runner, so a
+dynamic dependency that crept into the "static" binary fails in CI rather
+than on a farm. [release.yml](.github/workflows/release.yml) ships exactly
+that pipeline's output when a `v*` tag is pushed.
 
 ## Testing RTL
 

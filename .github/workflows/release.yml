@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Allow the publish job to create a release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  # The exact pipeline ci.yml runs on every push — a release is not a special
+  # build, it is the ordinary one with a tag on it.
+  binaries:
+    uses: ./.github/workflows/binaries.yml
+
+  publish:
+    name: Publish release
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rtl-designdb-*
+          merge-multiple: true
+          path: dist
+
+      # One sha256sums.txt instead of a .sha256 beside every binary, and
+      # computed here rather than per build job so the hashes cover exactly
+      # the bytes being uploaded — after the artifact round-trip, not before.
+      - name: Compute sha256sums.txt
+        run: |
+          cd dist
+          sha256sum rtl-designdb-* > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/rtl-designdb-linux-amd64
+            dist/rtl-designdb-linux-arm64
+            dist/rtl-designdb-windows-amd64.exe
+            dist/rtl-designdb-macos-arm64
+            dist/sha256sums.txt

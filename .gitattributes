@@ -1,0 +1,4 @@
+# The windows-amd64 CI job runs the build script under Git Bash; a CRLF
+# checkout there turns every line into "command not found\r".
+*.sh text eol=lf
+*.py text eol=lf
