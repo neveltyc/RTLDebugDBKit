@@ -18,21 +18,16 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runs-on }}
-    # Both Linux targets build in an Alpine container: musl plus -static is
-    # what lets one binary run on any distro, any glibc (see build-release.sh).
-    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: linux-amd64
             runs-on: ubuntu-latest
-            container: alpine:3.21
             bin: dist/rtl-designdb-linux-amd64
             python: python3
           - target: linux-arm64
             runs-on: ubuntu-24.04-arm
-            container: alpine:3.21
             bin: dist/rtl-designdb-linux-arm64
             python: python3
           - target: windows-amd64
@@ -44,37 +39,39 @@ jobs:
             bin: dist/rtl-designdb-macos-arm64
             python: python3
     steps:
-      # Before checkout, and with `sh`: the container starts with neither bash
-      # nor git, and checkout falls back to a tarball download without git.
-      # tar+zstd are for actions/cache, file is for the build script's report.
-      - name: Install Alpine build tools
-        if: matrix.container != ''
-        shell: sh
-        run: apk add --no-cache bash build-base cmake ninja python3 git ca-certificates linux-headers file tar zstd
-
       - uses: actions/checkout@v4
 
       # slang is a large dependency and the pin is exact, so the key is the
       # CMakeLists that carries it: the cache is reused until the pin moves.
-      # Windows skips it: $HOME under Git Bash is a POSIX path that the native
-      # CMake would misread, and the clone is noise next to the MSVC build.
+      # macOS only. The Linux builds run inside the script's Alpine container,
+      # where slang lands on a docker volume this cache cannot see, and on
+      # Windows $HOME under Git Bash is a POSIX path native CMake would
+      # misread. Both lose only the clone, not the compile.
       - name: Cache CPM sources
-        if: runner.os != 'Windows'
+        if: runner.os == 'macOS'
         uses: actions/cache@v4
         with:
           path: ~/.cache/CPM
           key: cpm-${{ matrix.target }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ matrix.target }}-
 
+      # The Linux targets go through the script's docker path — the runner
+      # itself stays glibc, because JavaScript actions cannot run in an
+      # Alpine container on arm64 runners, and the build must not care what
+      # the runner is made of anyway. That split is also the proof the smoke
+      # test below relies on: built against musl in the container, executed
+      # against glibc on the runner.
       - name: Build release binary
         run: |
-          if [ "$RUNNER_OS" != "Windows" ]; then
+          if [ "$RUNNER_OS" == "macOS" ]; then
             export CPM_SOURCE_CACHE="$HOME/.cache/CPM"
           fi
           bash scripts/build-release.sh --target ${{ matrix.target }}
 
       # Every platform runs the binary it just built: export the example
-      # design and read the database back.
+      # design and read the database back. For the Linux pair this runs on
+      # the bare glibc runner, so a dynamic dependency that crept into the
+      # "static" binary fails here instead of on someone's farm.
       - name: Export and read back
         run: |
           ${{ matrix.bin }} examples/basic/top.sv --top top -o design.db
@@ -86,32 +83,3 @@ jobs:
           name: rtl-designdb-${{ matrix.target }}
           path: dist/rtl-designdb-*
           if-no-files-found: error
-
-  # The build jobs run the Linux binaries inside the Alpine container that
-  # made them, which proves nothing about portability. Run them again on the
-  # bare glibc runner with nothing installed: if the binary is truly static,
-  # this passes on any distro; if a dynamic dependency crept in, it fails
-  # here instead of on someone's farm.
-  run-on-glibc:
-    name: ${{ matrix.target }} runs on glibc
-    needs: build
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: linux-amd64
-            runs-on: ubuntu-latest
-          - target: linux-arm64
-            runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: rtl-designdb-${{ matrix.target }}
-          path: dist
-      - name: Export and read back on the bare runner
-        run: |
-          chmod +x dist/rtl-designdb-${{ matrix.target }}
-          dist/rtl-designdb-${{ matrix.target }} examples/basic/top.sv --top top -o design.db
-          python3 scripts/verify-designdb.py design.db

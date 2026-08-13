@@ -130,10 +130,11 @@ exports `examples/basic/top.sv`, and reads the database back — a build that
 links proves the slang pin resolves, not that the exporter still writes rows.
 The same push builds all four release binaries
 ([binaries.yml](.github/workflows/binaries.yml)) and repeats the export on
-each platform; the Linux pair is then re-run on a bare glibc runner, so a
-dynamic dependency that crept into the "static" binary fails in CI rather
-than on a farm. [release.yml](.github/workflows/release.yml) ships exactly
-that pipeline's output when a `v*` tag is pushed.
+each platform — the Linux pair builds inside an Alpine container and then
+runs on the bare glibc runner, so a dynamic dependency that crept into the
+"static" binary fails in CI rather than on a farm.
+[release.yml](.github/workflows/release.yml) ships exactly that pipeline's
+output when a `v*` tag is pushed.
 
 ## Testing RTL
 
