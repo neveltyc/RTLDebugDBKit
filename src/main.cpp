@@ -467,8 +467,20 @@ int main(int argc, char** argv) {
         designdb::Writer writer(opt.output);
         writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
         writer.setMeta("tool", "rtl-designdb");
-        if (!opt.top.empty())
-            writer.setMeta("top", opt.top);
+        // The *elaborated* tops, not the --top argument: slang picks tops even
+        // when none is asked for, and a consumer mounting the database against
+        // a waveform needs the name either way. Space-separated when the design
+        // elaborates several -- the case that previously wrote nothing at all.
+        {
+            std::string tops;
+            for (auto inst : compilation.getRoot().topInstances) {
+                if (!tops.empty())
+                    tops += ' ';
+                tops += inst->name;
+            }
+            if (!tops.empty())
+                writer.setMeta("top", tops);
+        }
         // Every buffer the source manager actually opened, not the list that
         // was asked for. That covers globs after expansion and, more to the
         // point, headers pulled in by `include -- a `define changed in one of
