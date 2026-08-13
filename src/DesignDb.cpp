@@ -147,9 +147,21 @@ CREATE TABLE port(
     -- from `outer`. Comparing it against the formal's width in `symbol` is how
     -- a width-mismatched connection is found.
     outer_width  INTEGER,
-    -- 0=a net, 1=tied to a constant, 2=left unconnected. An unconnected port is
-    -- recorded rather than omitted: absence would otherwise mean both "nobody
-    -- connected it" and "the exporter did not get that far".
+    -- The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches
+    -- bits 0..3 of stim, and without these columns it attached all of stim --
+    -- a trace crossing the boundary then fanned out to everything else the
+    -- bus feeds. Encoded exactly as `edge` encodes its ranges: LSB-relative
+    -- offsets into the flattened object; NULL with exact=1 is the whole net,
+    -- NULL with exact=0 is somewhere inside it (a dynamic select, or an
+    -- element of an instance array, which shares the whole array's connection
+    -- expression the same way outer_width does).
+    outer_lo     INTEGER, outer_hi INTEGER, outer_exact INTEGER,
+    -- 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an
+    -- expression. 3 is not a net: `.en(state == RUN)` samples `state` but does
+    -- not alias it to `en`, and recording it as 0 made every reader of `en`
+    -- count as a reader of `state`. An unconnected port is recorded rather
+    -- than omitted: absence would otherwise mean both "nobody connected it"
+    -- and "the exporter did not get that far".
     conn_kind    INTEGER,
     file         INTEGER REFERENCES file(id),
     line         INTEGER);
@@ -310,7 +322,7 @@ Writer::Writer(const std::string& path) {
     prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
     prepare("INSERT INTO child VALUES(?,?,?,?)", &insChild);
     prepare("INSERT INTO instance VALUES(?,?,?,?)", &insInstance);
-    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?)", &insPort);
+    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?)", &insProcEvent);
@@ -556,9 +568,20 @@ void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
             sqlite3_bind_int64(insPort, 8, r.outerWidth);
         else
             sqlite3_bind_null(insPort, 8);
-        sqlite3_bind_int(insPort, 9, static_cast<int>(r.conn));
-        bindOptId(insPort, 10, internFile(r.file));
-        sqlite3_bind_int64(insPort, 11, r.line);
+        // A row with no outer net has no bits to describe; all three stay NULL
+        // so a tie-off does not read as "the whole of nothing, exactly".
+        if (r.outer.empty()) {
+            sqlite3_bind_null(insPort, 9);
+            sqlite3_bind_null(insPort, 10);
+            sqlite3_bind_null(insPort, 11);
+        }
+        else {
+            bindOptRange(insPort, 9, 10, r.outerBits);
+            sqlite3_bind_int(insPort, 11, r.outerExact ? 1 : 0);
+        }
+        sqlite3_bind_int(insPort, 12, static_cast<int>(r.conn));
+        bindOptId(insPort, 13, internFile(r.file));
+        sqlite3_bind_int64(insPort, 14, r.line);
         step(insPort);
         if (++pending >= kBatch) {
             commit();

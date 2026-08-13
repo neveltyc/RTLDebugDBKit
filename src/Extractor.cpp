@@ -1238,6 +1238,8 @@ private:
         bool inArray = false;
         if (auto* ps = child.getParentScope())
             inArray = ps->asSymbol().kind == SymbolKind::InstanceArray;
+        // For evaluating the constant selects inside connection expressions.
+        EvalContext evalCtx(child);
         for (auto* conn : child.getPortConnections()) {
             if (!conn || conn->port.kind != SymbolKind::Port)
                 continue;                     // interface ports carry no net
@@ -1291,8 +1293,8 @@ private:
             // `sel` is read to choose an element rather than wired to the port.
             // The assignment path already separates the two; this one did not,
             // and reported the index signal as connected.
-            std::vector<const ValueSymbol*> nets;
-            collectConnectedNets(*expr, nets);
+            std::vector<ConnRef> nets;
+            collectConnRefs(*expr, evalCtx, nets);
             if (nets.empty()) {
                 // Tied off: the connection is a literal, a parameter, or an
                 // enum member, so there is no net on the outside. The
@@ -1310,23 +1312,43 @@ private:
                 out.push_back(std::move(row));
                 continue;
             }
-            std::set<const ValueSymbol*> unique;
-            for (auto* net : nets) {
-                if (!unique.insert(net).second)
+            // Deduplicated on what will be stored: the same net attached twice
+            // with different bits (`.z({x[7:4], x[3:0]})`) is two attachments,
+            // not one.
+            std::set<std::tuple<const ValueSymbol*, uint64_t, uint64_t, bool, bool>>
+                unique;
+            for (auto& cn : nets) {
+                const Ref& r = cn.ref;
+                const uint64_t klo = r.whole ? 0 : r.lo;
+                const uint64_t khi = r.whole ? 0 : r.hi;
+                if (!unique.emplace(r.sym, klo, khi, r.whole, cn.expression).second)
                     continue;
                 PortRow row;
                 row.child = childName;
                 row.port = std::string(port.name);
                 row.direction = dir;
                 std::string outerRel;
-                if (!relativePath(*net, prefix, outerRel)) {
+                if (!relativePath(*r.sym, prefix, outerRel)) {
                     stats.external++;
                     continue;
                 }
                 row.outer = std::move(outerRel);
-                row.outerType = typeOf(*net);
+                row.outerType = typeOf(*r.sym);
                 row.outerWidth = exprWidth;
-                row.conn = PortConn::Net;
+                // An element of an instance array shares the whole array's
+                // connection expression, so its bits describe the array's tie
+                // rather than this element's slice of it. NULL with exact=0 --
+                // somewhere in the object -- is the honest reading, exactly as
+                // with outer_width above.
+                if (inArray) {
+                    row.outerExact = false;
+                }
+                else {
+                    if (!r.whole)
+                        row.outerBits = std::make_pair(r.lo, r.hi);
+                    row.outerExact = r.exact;
+                }
+                row.conn = cn.expression ? PortConn::Expression : PortConn::Net;
                 row.file = file;
                 row.line = line;
                 out.push_back(std::move(row));
@@ -1334,39 +1356,81 @@ private:
         }
     }
 
-    /// The value symbols a connection expression actually attaches to,
-    /// skipping anything that appears only inside a selector.
-    static void collectConnectedNets(const Expression& expr,
-                                     std::vector<const ValueSymbol*>& out) {
+    /// One net a connection expression attaches: the base symbol, the bits the
+    /// selector chain picks, and whether it was reached structurally or only
+    /// read inside a wider expression.
+    struct ConnRef {
+        Ref ref;
+        bool expression = false;
+    };
+
+    /// The value symbols a connection expression attaches to, each with its
+    /// bit range.
+    ///
+    /// A structural connection -- a name, a select, a concatenation of those --
+    /// attaches its nets directly, and the selector *reads* (`readies[sel]`
+    /// reading `sel`) are not connections and are skipped. Anything else is an
+    /// expression: there is no net behind `.en(state == RUN)`, only signals the
+    /// expression samples, so those come back flagged, selector reads included,
+    /// for the consumer to treat as operands rather than wires.
+    static void collectConnRefs(const Expression& expr, EvalContext& ctx,
+                                std::vector<ConnRef>& out, bool inExpression = false) {
         switch (expr.kind) {
             case ExpressionKind::NamedValue:
-            case ExpressionKind::HierarchicalValue: {
-                auto& sym = expr.as<ValueExpressionBase>().symbol;
-                if (!isConstantSymbol(sym))
-                    out.push_back(&sym);
+            case ExpressionKind::HierarchicalValue:
+            case ExpressionKind::ElementSelect:
+            case ExpressionKind::RangeSelect:
+            case ExpressionKind::MemberAccess: {
+                // One structural leaf: slang's path analysis resolves the base
+                // symbol and the bits its static selects pick, which is what
+                // `.idx(stim[3:0])` means -- bits 0..3 of stim, not stim.
+                std::vector<Ref> refs;
+                collectRefs(expr, ctx, refs, /*skipSelectors=*/true);
+                for (auto& r : refs)
+                    out.push_back({r, inExpression});
                 return;
             }
-            case ExpressionKind::ElementSelect:
-                collectConnectedNets(expr.as<ElementSelectExpression>().value(), out);
-                return;
-            case ExpressionKind::RangeSelect:
-                collectConnectedNets(expr.as<RangeSelectExpression>().value(), out);
-                return;
-            case ExpressionKind::MemberAccess:
-                collectConnectedNets(expr.as<MemberAccessExpression>().value(), out);
-                return;
             case ExpressionKind::Concatenation:
                 for (auto* op : expr.as<ConcatenationExpression>().operands())
-                    collectConnectedNets(*op, out);
+                    collectConnRefs(*op, ctx, out, inExpression);
                 return;
             case ExpressionKind::Conversion:
-                collectConnectedNets(expr.as<ConversionExpression>().operand(), out);
+                collectConnRefs(expr.as<ConversionExpression>().operand(), ctx, out,
+                                inExpression);
                 return;
-            default:
-                // Anything else -- an arithmetic expression tied to an input --
-                // has no single net behind it; every symbol it reads counts.
-                collectReads(expr, out);
+            case ExpressionKind::Assignment:
+                // An output or inout connection arrives wrapped in the
+                // assignment `bindLValue` builds around it, with an empty
+                // placeholder on the right; the lvalue is the connection.
+                // Without this case `.y(gy)` fell through to the expression
+                // branch and the plainest wire in the design read as an
+                // operand.
+                collectConnRefs(expr.as<AssignmentExpression>().left(), ctx, out,
+                                inExpression);
                 return;
+            default: {
+                std::vector<Ref> refs;
+                collectRefs(expr, ctx, refs);
+                // visitPaths stops at a call's arguments; the subroutine's own
+                // free reads still reach the port, so they are appended the way
+                // the assignment path appends them -- whole-object, since their
+                // bounds belong to expressions inside the callee.
+                std::set<const ValueSymbol*> have;
+                for (auto& r : refs)
+                    have.insert(r.sym);
+                std::vector<const ValueSymbol*> all;
+                collectReads(expr, all);
+                for (auto* s : all) {
+                    if (have.insert(s).second) {
+                        Ref r;
+                        r.sym = s;
+                        refs.push_back(r);
+                    }
+                }
+                for (auto& r : refs)
+                    out.push_back({r, true});
+                return;
+            }
         }
     }
 

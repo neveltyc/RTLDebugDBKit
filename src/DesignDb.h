@@ -18,9 +18,11 @@ struct sqlite3_stmt;
 
 namespace designdb {
 
-/// Bumped whenever a column's meaning changes. A reader that does not know the
-/// version must refuse the file rather than read it as though the layout held.
-inline constexpr int SchemaVersion = 1;
+/// Bumped whenever a column's meaning changes -- or its value domain grows, as
+/// in v2, where `port.conn_kind` gained kinds a v1 reader would have misread
+/// as plain nets. A reader that does not know the version must refuse the file
+/// rather than read it as though the layout held.
+inline constexpr int SchemaVersion = 2;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
@@ -95,8 +97,10 @@ struct SymbolRow {
     uint32_t col = 0;
 };
 
-/// How a child instance's port is attached.
-enum class PortConn { Net = 0, Constant = 1, Unconnected = 2 };
+/// How a child instance's port is attached. `Expression` is an operand of an
+/// expression tied to the port, not a wired net: `.en(state == RUN)` samples
+/// `state` but does not alias it to `en`, and a consumer must be able to tell.
+enum class PortConn { Net = 0, Constant = 1, Unconnected = 2, Expression = 3 };
 
 /// One port connection on a child instance, as written in the parent.
 ///
@@ -112,6 +116,10 @@ struct PortRow {
     std::string outer;        // the connected net, in the PARENT's namespace
     std::string outerType;
     int64_t outerWidth = -1;  // width of the connection expression, not of the net
+    // The bits of `outer` the connection selects, absent when it attaches the
+    // whole net. Same encoding as EdgeRow: read with outerExact.
+    std::optional<std::pair<uint64_t, uint64_t>> outerBits;
+    bool outerExact = true;
     PortConn conn = PortConn::Net;
     std::string file;
     uint32_t line = 0;
