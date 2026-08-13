@@ -132,6 +132,20 @@ if mode == "interfaces":
     check("the binding's declared modport", """
         SELECT count(*) FROM port p JOIN name n ON n.id = p.modport
         WHERE p.conn_kind = 4 AND n.text = 'src'""")
+    # `relay` owns no interface instance: it forwards its own port, so the row
+    # must name that port. A NULL outer here breaks the chain in the middle,
+    # and it resolves from neither end.
+    check("the pass-through binding names the forwarding port", """
+        SELECT count(*) FROM port p
+        JOIN module m ON m.id = p.module JOIN name o ON o.id = p.outer
+        WHERE m.name = 'relay' AND p.conn_kind = 4 AND o.text = 'bus'""")
+    unbound = con.execute("""
+        SELECT count(*) FROM port WHERE conn_kind = 4 AND outer IS NULL"""
+    ).fetchone()[0]
+    if unbound:
+        sys.exit(f"{unbound} interface binding(s) have no outer; "
+                 "the alias they exist to record is missing")
+    print("ok: every interface binding names its outer side")
     check("interface_port symbol rows",
           "SELECT count(*) FROM symbol WHERE kind = 'interface_port'", 2)
     check("interface member writes in hier_ref", """

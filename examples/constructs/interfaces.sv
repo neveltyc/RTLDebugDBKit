@@ -23,6 +23,14 @@ module producer(simple_bus.src bus);
     assign bus.data = 8'hA5;
 endmodule
 
+// A level that owns no interface instance and only forwards its own port. The
+// elaborated interface lives two levels up, so it has no name here; the row
+// has to say `bus`, the port, or the chain from `producer` to the instance is
+// broken in the middle and resolves from neither end.
+module relay(simple_bus.src bus);
+    producer u_prod(.bus(bus));
+endmodule
+
 module consumer(simple_bus bus, output logic seen, output logic [3:0] nib);
     assign seen = bus.vld && bus.data[0];
     // Spelled three ways on purpose: one reference interns as one name only if
@@ -38,6 +46,6 @@ module interfaces;
     simple_bus bus(clk);
     logic seen;
     logic [3:0] nib;
-    producer u_prod(.bus(bus));
+    relay    u_relay(.bus(bus));
     consumer u_cons(.bus(bus), .seen(seen), .nib(nib));
 endmodule

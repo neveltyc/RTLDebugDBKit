@@ -1316,7 +1316,7 @@ private:
                                         std::string(child.getDefinition().name),
                                         defModule});
             std::vector<PortRow> ports;
-            emitPorts(child, childName, prefix, ports);
+            emitPorts(child, childName, prefix, ports, body);
             stats.ports += static_cast<int64_t>(ports.size());
             writer.addPorts(moduleId, defModule, ports);
         });
@@ -1766,8 +1766,26 @@ private:
     /// slice ties several parent nets to one formal. One row per (formal, net)
     /// pair keeps that honest rather than picking whichever net happens to be
     /// first, which would silently drop the rest of a bus.
+    /// The module's own interface port that `iface` arrived through, if it is
+    /// one. That is what a pass-through connection names, and the only spelling
+    /// of it that is true for every instance of the module.
+    static const InterfacePortSymbol* passedThrough(const InstanceBodySymbol& body,
+                                                    const Symbol* iface) {
+        if (!iface)
+            return nullptr;
+        for (auto& member : body.members()) {
+            if (member.kind != SymbolKind::InterfacePort)
+                continue;
+            auto& ip = member.as<InterfacePortSymbol>();
+            if (ip.getConnection().first == iface)
+                return &ip;
+        }
+        return nullptr;
+    }
+
     void emitPorts(const InstanceSymbol& child, const std::string& childName,
-                   const std::string& prefix, std::vector<PortRow>& out) {
+                   const std::string& prefix, std::vector<PortRow>& out,
+                   const InstanceBodySymbol& parentBody) {
         // An element of an instance array shares the array's connection
         // expression: `foo u [63:0] (.z(bus64))` gives every element the whole
         // 64-bit bus, while each element's formal is one bit. Recording that as
@@ -1811,13 +1829,27 @@ private:
                 else if (!ip.modport.empty())
                     row.modport = std::string(ip.modport);
                 if (ifaceSym) {
-                    // The instance (or the parent's own interface port, passed
-                    // straight through) in the parent's namespace.
+                    // The instance in the parent's namespace -- or, when the
+                    // parent is passing its *own* interface port down, that
+                    // port's name.
+                    //
+                    // The second case needs looking for. `getIfaceConn` answers
+                    // with the elaborated interface instance, which for a
+                    // pass-through lives above the parent and so has no
+                    // module-relative path; the row came out with a NULL outer
+                    // and the alias it exists to record was missing from both
+                    // sides. The parent's own port is what was written, and it
+                    // is the one spelling every instance of the parent shares.
                     std::string outerRel;
-                    if (relativePath(*ifaceSym, prefix, outerRel))
+                    if (relativePath(*ifaceSym, prefix, outerRel)) {
                         row.outer = std::move(outerRel);
-                    else
+                    }
+                    else if (auto* through = passedThrough(parentBody, ifaceSym)) {
+                        row.outer = std::string(through->name);
+                    }
+                    else {
                         stats.external++;
+                    }
                 }
                 row.file = file;
                 row.line = line;
