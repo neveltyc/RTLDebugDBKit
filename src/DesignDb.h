@@ -79,6 +79,14 @@ struct OperandRow {
     bool exact = true;
 };
 
+/// One edge event a procedure triggers on or waits on.
+struct ProcEventRow {
+    std::string signal;   // empty when the event expression is not a plain name
+    std::string edge;     // posedge | negedge | both
+    std::string file;
+    uint32_t line = 0;    // the sensitivity's procedure, or the wait's statement
+};
+
 /// One declaration inside a module: a signal, a port, or a parameter.
 ///
 /// The rest of the database is derived from *edges*, so a signal exists in it
@@ -182,11 +190,10 @@ public:
     void addPorts(int64_t moduleId, int64_t defModuleId, const std::vector<PortRow>& rows);
     void addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows);
 
-    /// Writes one assignment with its operands, and returns its row id.
-    /// Every edge event a procedure triggers on. An event list has no order, so
-    /// all of them are recorded and none is singled out.
+    /// Every edge event a procedure triggers on or waits on. An event list has
+    /// no order, so all of them are recorded and none is singled out.
     void addProcEvents(int64_t moduleId, int64_t proc,
-                       const std::vector<std::pair<std::string, std::string>>& events);
+                       const std::vector<ProcEventRow>& events);
 
     int64_t addAssignment(int64_t moduleId, const AssignRow& row,
                           const std::vector<OperandRow>& operands);

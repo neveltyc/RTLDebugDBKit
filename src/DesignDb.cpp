@@ -236,11 +236,19 @@ CREATE TABLE assignment(
 -- block shares its sensitivity list. Level-sensitive lists are not recorded --
 -- for `always @(*)` or `always @(a or b)` the sensitivity is the read set,
 -- which `assign_operand` already carries.
+--
+-- Statement-level event controls are rows too: `@(posedge clk);` inside an
+-- initial block or a task is a wait rather than sensitivity, but the signal
+-- is sampled either way, and without a row the read had no trace at all.
+-- `file`/`line` tell the two apart -- a sensitivity row carries the
+-- procedure's own location, a wait carries the statement's.
 CREATE TABLE proc_event(
     module INTEGER NOT NULL REFERENCES module(id),
     proc   INTEGER NOT NULL,
     signal INTEGER REFERENCES name(id),   -- NULL when not a plain reference
-    edge_kind TEXT);                      -- posedge | negedge | both
+    edge_kind TEXT,                       -- posedge | negedge | both
+    file   INTEGER REFERENCES file(id),
+    line   INTEGER);
 
 CREATE TABLE assign_operand(
     assignment INTEGER NOT NULL REFERENCES assignment(id),
@@ -336,7 +344,7 @@ Writer::Writer(const std::string& path) {
     prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
-        prepare("INSERT INTO proc_event VALUES(?,?,?,?)", &insProcEvent);
+        prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?)", &insProcEvent);
         prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?)", &insAssignOp);
         begin();
     }
@@ -673,13 +681,15 @@ int64_t Writer::addAssignment(int64_t moduleId, const AssignRow& row,
 }
 
 void Writer::addProcEvents(int64_t moduleId, int64_t proc,
-                           const std::vector<std::pair<std::string, std::string>>& events) {
+                           const std::vector<ProcEventRow>& events) {
     for (auto& e : events) {
         sqlite3_reset(insProcEvent);
         sqlite3_bind_int64(insProcEvent, 1, moduleId);
         sqlite3_bind_int64(insProcEvent, 2, proc);
-        bindOptId(insProcEvent, 3, internName(e.first));
-        bindOptText(insProcEvent, 4, e.second);
+        bindOptId(insProcEvent, 3, internName(e.signal));
+        bindOptText(insProcEvent, 4, e.edge);
+        bindOptId(insProcEvent, 5, internFile(e.file));
+        sqlite3_bind_int64(insProcEvent, 6, e.line);
         step(insProcEvent);
         pending++;
     }

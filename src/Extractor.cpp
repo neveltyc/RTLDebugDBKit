@@ -27,6 +27,7 @@
 #include "slang/ast/expressions/SelectExpressions.h"
 #include "slang/ast/statements/ConditionalStatements.h"
 #include "slang/ast/statements/LoopStatements.h"
+#include "slang/ast/statements/MiscStatements.h"
 #include "slang/ast/symbols/BlockSymbols.h"
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
@@ -410,10 +411,18 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     using EmitAssign = std::function<void(const Ref& dst, const std::vector<Ref>& operands,
                                           SourceRange where, int64_t seq, bool blocking,
                                           int64_t droppedConstants)>;
+    using EmitEvent = std::function<void(const Expression* expr, const std::string& edge,
+                                         SourceRange where)>;
 
     Emit emit;
     EmitAssign emitAssign;
+    EmitEvent emitEvent;
     EvalContext& eval;
+    /// The timing control the procedure's sensitivity list was derived from.
+    /// `always_ff @(posedge clk)` keeps its event as the body's leading timed
+    /// statement, so without this the same event came out twice: once as
+    /// sensitivity and once as a wait.
+    const TimingControl* sensitivityTiming = nullptr;
     std::vector<Ref> gating;
     int64_t seq = 0;
     std::set<const SubroutineSymbol*> activeSubs;
@@ -421,8 +430,23 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     std::set<const ValueSymbol*> loopVars;
 
 
-    StatementWalker(Emit emit, EmitAssign emitAssign, EvalContext& eval) :
-        emit(std::move(emit)), emitAssign(std::move(emitAssign)), eval(eval) {}
+    StatementWalker(Emit emit, EmitAssign emitAssign, EmitEvent emitEvent,
+                    EvalContext& eval) :
+        emit(std::move(emit)), emitAssign(std::move(emitAssign)),
+        emitEvent(std::move(emitEvent)), eval(eval) {}
+
+    /// A statement-level event control: `@(posedge clk); …` in an initial
+    /// block or a task. It is a wait rather than sensitivity, but the signal
+    /// is sampled either way, and the export had no trace of the read at all.
+    void handle(const TimedStatement& stmt) {
+        if (&stmt.timing != sensitivityTiming) {
+            std::vector<std::pair<const Expression*, std::string>> raw;
+            collectEdgeEvents(&stmt.timing, raw);
+            for (auto& [expr, edge] : raw)
+                emitEvent(expr, edge, stmt.sourceRange);
+        }
+        visitDefault(stmt);
+    }
 
     void handle(const ConditionalStatement& stmt) {
         const size_t mark = gating.size();
@@ -1108,8 +1132,12 @@ private:
 
         auto& sens = proc.getSensitivityList();
 
-        writer.addProcEvents(moduleId, procIndex,
-                             edgeEvents(sens.timingControl, prefix));
+        // Sensitivity rows carry the procedure's own location; the waits the
+        // walker reports below carry their statement's. Written together once
+        // the walk is done.
+        std::vector<ProcEventRow> events;
+        for (auto& [signal, edge] : edgeEvents(sens.timingControl, prefix))
+            events.push_back(ProcEventRow{signal, edge, file, line});
 
         // Input-port drivers belong to the parent, not to this module: the port
         // is receiving a value from outside, and reporting it here would name
@@ -1239,12 +1267,30 @@ private:
             writer.addAssignment(moduleId, arow, ops);
             stats.assignments++;
         },
+        // A wait's event: named module-relative where it can be, recorded
+        // with an empty signal where it cannot -- the same rule sensitivity
+        // rows follow.
+        [&](const Expression* e, const std::string& edge, SourceRange where) {
+            std::string signal;
+            if (e && (e->kind == ExpressionKind::NamedValue ||
+                      e->kind == ExpressionKind::HierarchicalValue)) {
+                if (!relativePath(e->as<ValueExpressionBase>().symbol, prefix, signal))
+                    signal.clear();
+            }
+            const uint32_t stmtLine = where.start()
+                                          ? sourceManager.getLineNumber(where.start())
+                                          : line;
+            events.push_back(ProcEventRow{std::move(signal), edge, file, stmtLine});
+        },
         evalCtx);
+        walker.sensitivityTiming = sens.timingControl;
 
         if (proc.analyzedSymbol->kind == SymbolKind::ProceduralBlock)
             proc.analyzedSymbol->as<ProceduralBlockSymbol>().getBody().visit(walker);
         else if (proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
             proc.analyzedSymbol->as<ContinuousAssignSymbol>().getAssignment().visit(walker);
+
+        writer.addProcEvents(moduleId, procIndex, events);
 
         // A procedure the analysis says drives something, but in which the walk
         // found nothing, means the traversal did not see what the analysis did.
