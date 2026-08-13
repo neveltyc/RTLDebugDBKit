@@ -69,13 +69,17 @@ jobs:
           bash scripts/build-release.sh --target ${{ matrix.target }}
 
       # Every platform runs the binary it just built: export the example
-      # design and read the database back. For the Linux pair this runs on
+      # designs and read the databases back. For the Linux pair this runs on
       # the bare glibc runner, so a dynamic dependency that crept into the
       # "static" binary fails here instead of on someone's farm.
       - name: Export and read back
         run: |
           ${{ matrix.bin }} examples/basic/top.sv --top top -o design.db
           ${{ matrix.python }} scripts/verify-designdb.py design.db
+          ${{ matrix.bin }} examples/constructs/constructs.sv -o constructs.db
+          ${{ matrix.python }} scripts/verify-designdb.py constructs.db constructs
+          ${{ matrix.bin }} examples/constructs/interfaces.sv -o interfaces.db
+          ${{ matrix.python }} scripts/verify-designdb.py interfaces.db interfaces
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

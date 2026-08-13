@@ -44,11 +44,19 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
       # A build that links proves the pin resolves; it does not prove the
-      # exporter still writes a database. Export one and read it back.
+      # exporter still writes a database. Export and read back: the basic
+      # example for the hollow check, and the constructs pair for the facts
+      # v2 added -- self-feedback, primitives, port bit ranges, waits,
+      # interface bindings, hier_ref. No --top on the constructs pair, so
+      # meta.top's slang-elected spelling is what gets asserted.
       - name: Export and read back
         run: |
           ./build/rtl-designdb examples/basic/top.sv --top top -o design.db
           python3 scripts/verify-designdb.py design.db
+          ./build/rtl-designdb examples/constructs/constructs.sv -o constructs.db
+          python3 scripts/verify-designdb.py constructs.db constructs
+          ./build/rtl-designdb examples/constructs/interfaces.sv -o interfaces.db
+          python3 scripts/verify-designdb.py interfaces.db interfaces
 
   # The four release platforms, as workflow artifacts on every push. The same
   # workflow builds a tagged release, so a red push here is a release that

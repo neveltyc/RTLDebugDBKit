@@ -120,6 +120,8 @@ CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
 src/                    main.cpp (CLI + filelist parsing), Extractor, DesignDb
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
+examples/constructs/    self-feedback, primitives, waits, XMRs, interfaces --
+                        what v2 records; exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
