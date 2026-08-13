@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    # Both SQLite configurations, because they compile different code: the
+    # bundled amalgamation builds a sqlite3.c of our own and the system one
+    # builds no C at all, so a C-language defect in the project() call is
+    # invisible to whichever half is not run.
+    name: build (${{ matrix.sqlite }} sqlite)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sqlite: bundled
+            cmake_flags: ""
+          - sqlite: system
+            cmake_flags: "-DDESIGNDB_SYSTEM_SQLITE=ON"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsqlite3-dev
+      # slang is a large dependency and the pin is exact, so the key is the
+      # CMakeLists that carries it: the cache is reused until the pin moves.
+      - name: Cache CPM sources
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/CPM
+          key: cpm-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCPM_SOURCE_CACHE=~/.cache/CPM
+          ${{ matrix.cmake_flags }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      # A build that links proves the pin resolves; it does not prove the
+      # exporter still writes a database. Export one and read it back.
+      - name: Export and read back
+        run: |
+          ./build/rtl-designdb examples/basic/top.sv --top top -o design.db
+          python3 - <<'PY'
+          import sqlite3, sys
+          con = sqlite3.connect("design.db")
+          counts = {
+              t: con.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
+              for t in ("module", "instance", "symbol", "edge", "port")
+          }
+          print("row counts:", counts)
+          empty = [t for t, n in counts.items() if n == 0]
+          if empty:
+              sys.exit(f"exported database has no rows in: {', '.join(empty)}")
+          digest = con.execute("SELECT digest FROM source_file").fetchone()
+          if not digest or len(digest[0]) != 64:
+              sys.exit("source_file.digest is missing or not a SHA-256")
+          PY
