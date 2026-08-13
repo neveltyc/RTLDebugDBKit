@@ -1947,6 +1947,17 @@ private:
                     const bool drives = port.direction == ArgumentDirection::Out ||
                                         port.direction == ArgumentDirection::InOut;
                     addHierRef(drives, r, "port", dir, at, evalCtx);
+                    // And a row saying the port *is* attached, with no `outer`
+                    // because the net has no name here. Skipping it entirely
+                    // made `.a(tb.glob)` indistinguishable from a port nobody
+                    // connected -- the same ambiguity the unconnected row above
+                    // exists to remove, reintroduced one branch later. What it
+                    // is tied to is in `hier_ref` at this file and line.
+                    row.conn = PortConn::External;
+                    row.outerWidth = exprWidth;
+                    row.file = file;
+                    row.line = line;
+                    out.push_back(std::move(row));
                     continue;
                 }
                 row.outer = std::move(outerRel);

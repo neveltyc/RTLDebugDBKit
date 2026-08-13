@@ -31,6 +31,16 @@ module relay(simple_bus.src bus);
     producer u_prod(.bus(bus));
 endmodule
 
+module sink(input logic s);
+endmodule
+
+// A child port tied to a signal this module cannot name. The row must still
+// exist, with a NULL outer: without it, "attached to something outside" and
+// "nobody connected it" are the same absence.
+module watcher;
+    sink u_sink(.s(interfaces.seen));
+endmodule
+
 module consumer(simple_bus bus, output logic seen, output logic [3:0] nib);
     assign seen = bus.vld && bus.data[0];
     // Spelled three ways on purpose: one reference interns as one name only if
@@ -48,4 +58,5 @@ module interfaces;
     logic [3:0] nib;
     relay    u_relay(.bus(bus));
     consumer u_cons(.bus(bus), .seen(seen), .nib(nib));
+    watcher  u_watch();
 endmodule

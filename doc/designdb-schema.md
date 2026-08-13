@@ -15,7 +15,7 @@ had held.
 
 Version 2 added: the [`hier_ref`](#leaving-the-hierarchy) table; bit ranges,
 interface bindings and expression operands on [`port`](#crossing-a-module-boundary)
-— `conn_kind` gained values 3 and 4, which a v1 reader would misread as plain
+— `conn_kind` gained values 3, 4 and 5, which a v1 reader would misread as plain
 nets, and that misreading is why the version moved rather than staying a pure
 addition; statement-level waits, with `wait`, `file` and `line`, in
 `proc_event` — a v1 reader treating those rows as sensitivity reads an
@@ -184,7 +184,7 @@ statements rather than one merged set.
 | | `outer`, `outer_type` | The net in the *parent's* namespace. |
 | | `outer_width` | The width of the connection **as written**, looking through the implicit conversion slang inserts to fit the formal. Comparing it against the formal's `symbol.width` is how a width-mismatched connection is found. NULL for an element of an instance array, where every element shares the array's connection expression and the comparison has no meaning. |
 | | `outer_lo`/`outer_hi`/`outer_exact` | The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches bits 0..3 of `stim`, not all of it. Same encoding as `edge` — see [Bit ranges](#bit-ranges). NULL with exact=0 for an element of an instance array, as with `outer_width`. |
-| | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an expression, 4=an interface binding. |
+| | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an expression, 4=an interface binding, 5=attached to a signal with no name in this module. |
 | | `modport` | The modport restricting an interface binding, when one does. NULL otherwise. |
 | | `file`, `line` | Where the connection is written, in the parent. |
 
@@ -200,6 +200,13 @@ does not alias it to `en`: treating the operand as a connection attributes
 every reader of `en` to `state`. The operands are still recorded — they are
 what the expression reads, selector indices included — flagged so a consumer
 can tell wire from computation.
+
+**`conn_kind` 5 has a NULL `outer` and is still a connection.** `.a(tb.glob)`
+attaches the port to a signal this module cannot name, so there is nothing to
+put in `outer`; what it is tied to is in `hier_ref` at the same `file`/`line`.
+The row is written anyway, because dropping it made a port tied to a
+testbench signal read exactly like a port nobody connected — the distinction
+`conn_kind` 2 exists to draw.
 
 **`conn_kind` 4 is the alias that makes `child.bus.*` resolvable.** For an
 interface binding, `port` is the child's interface port, `outer` the interface

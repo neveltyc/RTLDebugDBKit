@@ -184,6 +184,13 @@ CREATE TABLE port(
     -- that makes `child.bus.*` resolvable: the signals live in the interface
     -- instance named by `outer`, and without the row they can be reached from
     -- neither side.
+    --
+    -- 5 = attached to a signal with no name in this module -- `.a(tb.glob)`.
+    -- `outer` is NULL because there is nothing here to name; what it is tied
+    -- to is in `hier_ref` at the same file and line. The row is written all
+    -- the same, so "connected to something I cannot name here" stays distinct
+    -- from "nobody connected it", which is the whole point of recording an
+    -- unconnected port in the first place.
     conn_kind    INTEGER,
     -- The modport restricting an interface binding, when one does. NULL
     -- otherwise, and for every non-interface row.

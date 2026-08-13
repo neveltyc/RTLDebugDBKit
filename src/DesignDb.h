@@ -119,8 +119,12 @@ struct SymbolRow {
 /// `state` but does not alias it to `en`, and a consumer must be able to tell.
 /// `Interface` binds a child's interface port to an interface instance in the
 /// parent: the row is the alias that lets `child.bus.*` resolve at all.
+/// `External` is attached to something with no name in this module
+/// (`.a(tb.glob)`): `outer` is NULL and `hier_ref` holds what it is tied to,
+/// but the row exists so that "connected to something I cannot name" stays
+/// distinct from "nobody connected it".
 enum class PortConn { Net = 0, Constant = 1, Unconnected = 2, Expression = 3,
-                      Interface = 4 };
+                      Interface = 4, External = 5 };
 
 /// One port connection on a child instance, as written in the parent.
 ///

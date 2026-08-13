@@ -166,6 +166,11 @@ if mode == "interfaces":
     # them intern as one name, with the bits in the range columns.
     check("the differently-spelled references intern as one name", """
         SELECT count(*) FROM name WHERE text = 'bus.data'""")
+    # A port tied to a signal with no name here still gets a row. Dropping it
+    # made an external tie read exactly like a port nobody connected.
+    check("a port tied outside the module keeps its row", """
+        SELECT count(*) FROM port p JOIN module m ON m.id = p.module
+        WHERE m.name = 'watcher' AND p.conn_kind = 5 AND p.outer IS NULL""")
     for bad, what in ((" ", "a space"), ("/*", "a comment"), ("[", "a select")):
         n = con.execute("SELECT count(*) FROM name WHERE instr(text, ?) > 0",
                         (bad,)).fetchone()[0]
