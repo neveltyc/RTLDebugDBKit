@@ -526,8 +526,8 @@ int main(int argc, char** argv) {
             if (stats.external) {
                 std::fprintf(stderr,
                              "note: %lld reference(s) to symbols outside their own "
-                             "module were skipped (upward hierarchical references, "
-                             "interface or package items)\n",
+                             "module (hierarchical, interface or package items); "
+                             "those written as a path are recorded in hier_ref\n",
                              (long long)stats.external);
             }
             if (stats.duplicatePaths) {

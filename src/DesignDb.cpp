@@ -255,6 +255,31 @@ CREATE TABLE assign_operand(
     name       INTEGER NOT NULL REFERENCES name(id),
     src_lo     INTEGER, src_hi INTEGER, src_exact INTEGER);
 
+-- References that leave the module, exactly as written: `bus.vld` through an
+-- interface port, `tb.u_dut.state` as an XMR, `pkg::cfg` from a package.
+--
+-- Their target cannot go into edge or port rows: those name signals in the
+-- module's own namespace, shared by every instance of it, and an absolute
+-- path would bake one instance's hierarchy into all of them. The *text* has
+-- no such problem -- every instance carries the same spelling -- so the text
+-- is what is stored, and resolving it against the hierarchy belongs to the
+-- consumer. Bare names that leave the module (a subroutine's package-level
+-- free variable) are counted but not recorded: a name with no path in it
+-- resolves against imports this table cannot see.
+--
+-- `write`=1 when the module writes the path. `kind`/`construct` are edge's
+-- vocabulary, plus kind='port' with the direction in `construct` for a port
+-- connection tied to an external signal. Bits as everywhere else.
+CREATE TABLE hier_ref(
+    module INTEGER NOT NULL REFERENCES module(id),
+    path   INTEGER NOT NULL REFERENCES name(id),
+    write  INTEGER,
+    kind      TEXT,
+    construct TEXT,
+    file   INTEGER REFERENCES file(id),
+    line   INTEGER,
+    path_lo INTEGER, path_hi INTEGER, path_exact INTEGER);
+
 -- The instance tree. This is the one table that scales with the design rather
 -- than with the source, which is why it carries nothing but identity.
 CREATE TABLE instance(
@@ -272,6 +297,7 @@ CREATE INDEX symbol_by_module ON symbol(module);
 CREATE INDEX assign_by_dst    ON assignment(module, dst);
 CREATE INDEX pevent_by_proc   ON proc_event(module, proc);
 CREATE INDEX aop_by_assign    ON assign_operand(assignment);
+CREATE INDEX href_by_module   ON hier_ref(module);
 CREATE INDEX symbol_by_name   ON symbol(name);
 -- Both directions: outward from a net in the parent, and inward from a formal
 -- in the child. A driver query needs the first, a load query the second.
@@ -346,6 +372,7 @@ Writer::Writer(const std::string& path) {
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?)", &insProcEvent);
         prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?)", &insAssignOp);
+        prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?)", &insHierRef);
         begin();
     }
     catch (...) {
@@ -357,6 +384,7 @@ Writer::Writer(const std::string& path) {
         sqlite3_finalize(insAssign);
         sqlite3_finalize(insProcEvent);
         sqlite3_finalize(insAssignOp);
+        sqlite3_finalize(insHierRef);
         sqlite3_close(db);
         db = nullptr;
         throw;
@@ -373,6 +401,7 @@ Writer::~Writer() {
         sqlite3_finalize(insAssign);
         sqlite3_finalize(insProcEvent);
         sqlite3_finalize(insAssignOp);
+        sqlite3_finalize(insHierRef);
         sqlite3_close(db);
     }
 }
@@ -696,6 +725,26 @@ void Writer::addProcEvents(int64_t moduleId, int64_t proc,
     if (pending >= kBatch) {
         commit();
         begin();
+    }
+}
+
+void Writer::addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows) {
+    for (auto& r : rows) {
+        sqlite3_reset(insHierRef);
+        sqlite3_bind_int64(insHierRef, 1, moduleId);
+        sqlite3_bind_int64(insHierRef, 2, internName(r.path));
+        sqlite3_bind_int(insHierRef, 3, r.write ? 1 : 0);
+        bindOptText(insHierRef, 4, r.kind);
+        bindOptText(insHierRef, 5, r.construct);
+        bindOptId(insHierRef, 6, internFile(r.file));
+        sqlite3_bind_int64(insHierRef, 7, r.line);
+        bindOptRange(insHierRef, 8, 9, r.bits);
+        sqlite3_bind_int(insHierRef, 10, r.exact ? 1 : 0);
+        step(insHierRef);
+        if (++pending >= kBatch) {
+            commit();
+            begin();
+        }
     }
 }
 

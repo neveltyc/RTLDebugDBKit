@@ -116,6 +116,25 @@ void locationOf(const Symbol& sym, const SourceManager& sm, std::string& file,
     line = sm.getLineNumber(loc);
 }
 
+/// The source text of an expression, exactly as written. Empty when it cannot
+/// be recovered whole -- a range that spans buffers, or one outside its
+/// buffer's bounds -- in which case the caller records nothing rather than a
+/// fragment.
+std::string sourceTextOf(const Expression* e, const SourceManager& sm) {
+    if (!e)
+        return {};
+    auto range = e->sourceRange;
+    if (!range.start() || !range.end() ||
+        range.start().buffer() != range.end().buffer())
+        return {};
+    auto text = sm.getSourceText(range.start().buffer());
+    const size_t a = range.start().offset();
+    const size_t b = range.end().offset();
+    if (a >= b || b > text.size())
+        return {};
+    return std::string(text.substr(a, b - a));
+}
+
 /// What kind of construct a procedure is.
 ///
 /// The words are spelled out rather than taken from slang's own enum printer,
@@ -229,6 +248,11 @@ struct Ref {
     /// Without this, "the whole signal" and "somewhere in the signal" are both
     /// stored as NULL and a consumer reads the second as the first.
     bool exact = true;
+    /// The expression the reference was written as. Only consulted when the
+    /// symbol turns out to live outside the module: its source text is the
+    /// one instance-independent name the reference has (`bus.vld` reads the
+    /// same in every instance), and hier_ref stores exactly that.
+    const Expression* origin = nullptr;
 };
 
 /// How many bits a symbol's type can be selected out of.
@@ -250,6 +274,7 @@ Ref refOf(const ValuePath& path) {
     r.sym = path.rootSymbol();
     if (!r.sym)
         return r;
+    r.origin = path.fullExpr;
     r.exact = path.isFullyStatic();
     if (!path.lsp) {
         r.exact = false;
@@ -314,6 +339,7 @@ struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::All
     void addRef(const ValueExpressionBase& e) {
         Ref r;
         r.sym = &e.symbol;
+        r.origin = &e;
         out.push_back(r);
     }
 };
@@ -1004,11 +1030,46 @@ private:
         return it == instanceGroup.end() ? 0 : groups[it->second].id;
     }
 
+    /// Records one reference that leaves the module, as written. Every such
+    /// reference also bumps the external counter, which is where all of them
+    /// lived before hier_ref existed; the row is added only when the text is
+    /// recoverable and actually is a path -- a bare name that leaves the
+    /// module (a subroutine's package-level free variable) resolves against
+    /// imports this table cannot see, so it stays a count.
+    void addHierRef(const Expression* origin, bool isWrite, const Ref& r,
+                    const std::string& kind, const std::string& construct,
+                    const std::string& file, uint32_t line) {
+        std::string text = sourceTextOf(origin, sourceManager);
+        if (text.empty() || (text.find('.') == std::string::npos &&
+                             text.find("::") == std::string::npos)) {
+            stats.external++;
+            return;
+        }
+        // One statement surfaces the same reference through several collection
+        // passes (the edge, the assignment's operand list); counted once.
+        if (!hierSeen.emplace(text, isWrite, line).second)
+            return;
+        stats.external++;
+        HierRefRow row;
+        row.path = std::move(text);
+        row.write = isWrite;
+        row.kind = kind;
+        row.construct = construct;
+        row.file = file;
+        row.line = line;
+        if (r.sym && !r.whole)
+            row.bits = std::make_pair(r.lo, r.hi);
+        row.exact = r.sym ? r.exact : true;
+        hierRefs.push_back(std::move(row));
+    }
+
     /// Everything that belongs to the module rather than to an instance: its
     /// intra-module dataflow and the list of what it instantiates. Emitted once
     /// per canonical body, however many instances share it.
     void emitModule(const InstanceBodySymbol& body, int64_t moduleId) {
         const std::string prefix = body.getHierarchicalPath();
+        hierRefs.clear();
+        hierSeen.clear();
 
         std::vector<EdgeRow> edges;
         // One dedup set for the whole module: procedures and primitives can
@@ -1092,28 +1153,28 @@ private:
         });
         stats.children += static_cast<int64_t>(children.size());
         writer.addChildren(moduleId, children);
+
+        writer.addHierRefs(moduleId, hierRefs);
     }
 
-    /// The procedure's edge events as (module-relative signal, edge) pairs. A
-    /// signal is empty when the event expression is not a plain reference -- a
-    /// clock mux, an expression -- and the edge is still recorded, because that
-    /// the block is edge-triggered is a fact even where the source is not
-    /// nameable.
-    std::vector<std::pair<std::string, std::string>> edgeEvents(
-        const TimingControl* t, const std::string& prefix) const {
-        std::vector<std::pair<const Expression*, std::string>> raw;
-        collectEdgeEvents(t, raw);
-        std::vector<std::pair<std::string, std::string>> out;
-        for (auto& [expr, edge] : raw) {
-            std::string signal;
-            if (expr->kind == ExpressionKind::NamedValue ||
-                expr->kind == ExpressionKind::HierarchicalValue) {
-                if (!relativePath(expr->as<ValueExpressionBase>().symbol, prefix, signal))
-                    signal.clear();
+    /// One event as a proc_event row: named module-relative where it can be,
+    /// recorded with an empty signal where it cannot -- the event being an
+    /// edge is a fact even where its source is not nameable. An external
+    /// event signal (`@(posedge tb.clk)`) also lands in hier_ref.
+    ProcEventRow eventRow(const Expression* expr, const std::string& edge,
+                          const std::string& prefix, const std::string& kind,
+                          const std::string& construct, const std::string& file,
+                          uint32_t line) {
+        std::string signal;
+        if (expr && (expr->kind == ExpressionKind::NamedValue ||
+                     expr->kind == ExpressionKind::HierarchicalValue)) {
+            if (!relativePath(expr->as<ValueExpressionBase>().symbol, prefix,
+                              signal)) {
+                signal.clear();
+                addHierRef(expr, false, Ref{}, kind, construct, file, line);
             }
-            out.emplace_back(std::move(signal), edge);
         }
-        return out;
+        return ProcEventRow{std::move(signal), edge, file, line};
     }
 
     /// One procedure's edges, paired statement by statement.
@@ -1136,8 +1197,13 @@ private:
         // walker reports below carry their statement's. Written together once
         // the walk is done.
         std::vector<ProcEventRow> events;
-        for (auto& [signal, edge] : edgeEvents(sens.timingControl, prefix))
-            events.push_back(ProcEventRow{signal, edge, file, line});
+        {
+            std::vector<std::pair<const Expression*, std::string>> raw;
+            collectEdgeEvents(sens.timingControl, raw);
+            for (auto& [expr, edge] : raw)
+                events.push_back(eventRow(expr, edge, prefix, kind, construct,
+                                          file, line));
+        }
 
         // Input-port drivers belong to the parent, not to this module: the port
         // is receiving a value from outside, and reporting it here would name
@@ -1193,7 +1259,7 @@ private:
                 return;
             EdgeRow row;
             if (!relativePath(*dst.sym, prefix, row.dst)) {
-                stats.external++;
+                addHierRef(dst.origin, true, dst, kind, construct, file, stmtLine);
                 return;
             }
             if (!dst.whole)
@@ -1201,7 +1267,8 @@ private:
             row.dstExact = dst.exact;
             if (src.sym) {
                 if (!relativePath(*src.sym, prefix, row.src)) {
-                    stats.external++;
+                    addHierRef(src.origin, false, src, kind, construct, file,
+                               stmtLine);
                     return;
                 }
                 row.srcType = typeOf(*src.sym);
@@ -1230,15 +1297,20 @@ private:
             if (!dst.sym || inputPorts.count(dst.sym))
                 return;
             AssignRow arow;
-            if (!relativePath(*dst.sym, prefix, arow.dst))
+            arow.line = where.start() ? sourceManager.getLineNumber(where.start()) : line;
+            if (!relativePath(*dst.sym, prefix, arow.dst)) {
+                // The statement itself cannot be a row -- its target has no
+                // module-relative name -- but the write is recorded where
+                // every outward reference is.
+                addHierRef(dst.origin, true, dst, kind, construct, file, arow.line);
                 return;
+            }
             if (!dst.whole)
                 arow.dstBits = std::make_pair(dst.lo, dst.hi);
             arow.dstExact = dst.exact;
             arow.kind = kind;
             arow.construct = construct;
             arow.file = file;
-            arow.line = where.start() ? sourceManager.getLineNumber(where.start()) : line;
             arow.proc = procIndex;
             arow.seq = stmtSeq;
             arow.blocking = (proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
@@ -1252,6 +1324,8 @@ private:
                 std::string rel;
                 if (!relativePath(*r.sym, prefix, rel)) {
                     arow.dropped++;      // outside the module; cannot be shared
+                    addHierRef(r.origin, false, r, kind, construct, file,
+                               arow.line);
                     continue;
                 }
                 OperandRow o;
@@ -1267,20 +1341,13 @@ private:
             writer.addAssignment(moduleId, arow, ops);
             stats.assignments++;
         },
-        // A wait's event: named module-relative where it can be, recorded
-        // with an empty signal where it cannot -- the same rule sensitivity
-        // rows follow.
+        // A wait's event, at its statement's line.
         [&](const Expression* e, const std::string& edge, SourceRange where) {
-            std::string signal;
-            if (e && (e->kind == ExpressionKind::NamedValue ||
-                      e->kind == ExpressionKind::HierarchicalValue)) {
-                if (!relativePath(e->as<ValueExpressionBase>().symbol, prefix, signal))
-                    signal.clear();
-            }
             const uint32_t stmtLine = where.start()
                                           ? sourceManager.getLineNumber(where.start())
                                           : line;
-            events.push_back(ProcEventRow{std::move(signal), edge, file, stmtLine});
+            events.push_back(eventRow(e, edge, prefix, kind, construct, file,
+                                      stmtLine));
         },
         evalCtx);
         walker.sensitivityTiming = sens.timingControl;
@@ -1394,7 +1461,8 @@ private:
             for (auto& dst : writes) {
                 std::string dstRel;
                 if (!relativePath(*dst.sym, prefix, dstRel)) {
-                    stats.external++;
+                    addHierRef(dst.origin, true, dst, "primitive", construct,
+                               file, line);
                     continue;
                 }
                 bool anyInput = false;
@@ -1418,7 +1486,8 @@ private:
                         row.dstBits = std::make_pair(dst.lo, dst.hi);
                     row.dstExact = dst.exact;
                     if (!relativePath(*src.sym, prefix, row.src)) {
-                        stats.external++;
+                        addHierRef(src.origin, false, src, "primitive",
+                                   construct, file, line);
                         continue;
                     }
                     row.srcType = typeOf(*src.sym);
@@ -1601,7 +1670,12 @@ private:
                 row.direction = dir;
                 std::string outerRel;
                 if (!relativePath(*r.sym, prefix, outerRel)) {
-                    stats.external++;
+                    // Tied to a signal outside this module. An output drives
+                    // it, an input samples it; inout is recorded as the write,
+                    // being the direction a trace cannot rediscover.
+                    const bool drives = port.direction == ArgumentDirection::Out ||
+                                        port.direction == ArgumentDirection::InOut;
+                    addHierRef(r.origin, drives, r, "port", dir, file, line);
                     continue;
                 }
                 row.outer = std::move(outerRel);
@@ -1737,6 +1811,11 @@ private:
     std::map<std::string, Group> groups;
     std::unordered_map<const InstanceSymbol*, std::string> instanceGroup;
     std::set<std::pair<int64_t, std::string>> seenSiblings;
+    // The module being emitted accumulates its outward references here; one
+    // statement can surface the same reference through several collection
+    // passes, so the seen-set folds them to one row per (text, rw, line).
+    std::vector<HierRefRow> hierRefs;
+    std::set<std::tuple<std::string, bool, uint32_t>> hierSeen;
     int64_t instanceRow = 0;
     Stats stats;
 };

@@ -145,6 +145,23 @@ struct ChildRow {
     int64_t defModule = 0;  // module row id, resolved by the caller
 };
 
+/// One reference that leaves the module, exactly as written in the source:
+/// `bus.vld` through an interface port, `tb.u_dut.state` as an XMR,
+/// `pkg::cfg` from a package. The text is module-relative by construction --
+/// every instance of the module carries the same spelling -- which is what
+/// lets the row live in the folded model at all. Resolution belongs to the
+/// consumer, who has the hierarchy this row deliberately does not bake in.
+struct HierRefRow {
+    std::string path;         // as written
+    bool write = false;       // the module writes it, rather than reads it
+    std::string kind;         // as edge.kind, plus "port"
+    std::string construct;    // as edge.construct; the direction for a port
+    std::string file;
+    uint32_t line = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> bits;
+    bool exact = true;
+};
+
 /// Writes the database. One writer, deliberately: SQLite serialises writers, so
 /// a second one contends on the same lock rather than adding throughput. At
 /// ~1.2 M rows/s it is far ahead of the producer either way.
@@ -189,6 +206,7 @@ public:
     void addChildren(int64_t moduleId, const std::vector<ChildRow>& rows);
     void addPorts(int64_t moduleId, int64_t defModuleId, const std::vector<PortRow>& rows);
     void addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows);
+    void addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows);
 
     /// Every edge event a procedure triggers on or waits on. An event list has
     /// no order, so all of them are recorded and none is singled out.
@@ -229,6 +247,7 @@ private:
     sqlite3_stmt* insAssign = nullptr;
     sqlite3_stmt* insProcEvent = nullptr;
     sqlite3_stmt* insAssignOp = nullptr;
+    sqlite3_stmt* insHierRef = nullptr;
     std::unordered_map<std::string, int64_t> typeIds;
     std::unordered_map<std::string, int64_t> fileIds;
     std::unordered_map<std::string, int64_t> nameIds;
