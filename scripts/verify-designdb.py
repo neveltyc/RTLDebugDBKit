@@ -147,5 +147,17 @@ if mode == "interfaces":
     check("a driver row for a target fed only from outside the module", """
         SELECT count(*) FROM edge e JOIN name d ON d.id = e.dst
         WHERE d.text = 'seen' AND e.src IS NULL""")
+    # `bus.data` is written three ways in `consumer` -- spaced, commented, and
+    # with two different part-selects. All of them are one signal, so all of
+    # them intern as one name, with the bits in the range columns.
+    check("the differently-spelled references intern as one name", """
+        SELECT count(*) FROM name WHERE text = 'bus.data'""")
+    for bad, what in ((" ", "a space"), ("/*", "a comment"), ("[", "a select")):
+        n = con.execute("SELECT count(*) FROM name WHERE instr(text, ?) > 0",
+                        (bad,)).fetchone()[0]
+        if n:
+            sys.exit(f"{n} interned name(s) contain {what}; "
+                     "hier_ref paths are not being normalised")
+    print("ok: no interned name carries a space, a comment or a select")
 
 print("OK")

@@ -23,8 +23,12 @@ module producer(simple_bus.src bus);
     assign bus.data = 8'hA5;
 endmodule
 
-module consumer(simple_bus bus, output logic seen);
+module consumer(simple_bus bus, output logic seen, output logic [3:0] nib);
     assign seen = bus.vld && bus.data[0];
+    // Spelled three ways on purpose: one reference interns as one name only if
+    // whitespace and comments come out, and a trailing select belongs in
+    // path_lo/path_hi rather than in the text.
+    assign nib  = bus . data[3:0] & bus/*same signal*/.data[7:4];
 endmodule
 
 module interfaces;
@@ -33,6 +37,7 @@ module interfaces;
 
     simple_bus bus(clk);
     logic seen;
+    logic [3:0] nib;
     producer u_prod(.bus(bus));
-    consumer u_cons(.bus(bus), .seen(seen));
+    consumer u_cons(.bus(bus), .seen(seen), .nib(nib));
 endmodule

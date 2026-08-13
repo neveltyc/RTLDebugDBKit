@@ -211,7 +211,7 @@ interface instance; this row is how a reference on either side finds them.
 
 | table | column | meaning |
 |---|---|---|
-| `hier_ref` | `module`, `path` | One reference that leaves the module, **exactly as written**: `bus.vld` through an interface port, `tb.u_dut.state` as an XMR, `pkg::cfg` from a package. |
+| `hier_ref` | `module`, `path` | One reference that leaves the module, **as written and normalised**: `bus.vld` through an interface port, `tb.u_dut.state` as an XMR. Whitespace and comments are removed, and constant selects are resolved where the reference is a member access (`b[2].sig`, not `b[g].sig`), so one reference interns as one name however it was spelled. A trailing select is *not* part of the path — the bits it selects are in `path_lo`/`path_hi`, as in `edge`. |
 | | `write` | 1 when the module writes the path, 0 when it reads it. An inout port connection tied to an external signal is recorded as the write. |
 | | `kind`, `construct` | The enclosing construct, in `edge`'s vocabulary — plus `kind='port'` with the direction in `construct` for a port connection tied to an external signal. |
 | | `file`, `line` | Where the reference is written. |
@@ -320,9 +320,20 @@ go stale against a digest that can only say *that* it changed.
   construct; `release` leaves no row. The force's overriding semantics are not
   modelled — a consumer replaying drive order sees it as one more write.
 - A statement whose target lives outside the module (`assign bus.vld = x;`)
-  records the outward write in `hier_ref`, but its *operands* are not recorded:
-  the assignment row they would hang from cannot exist without a
-  module-relative target.
+  has no `assignment` row, since that row cannot exist without a
+  module-relative target. Both sides still reach `hier_ref` — the outward
+  write, and every operand that is itself outward — but an operand *inside*
+  the module has nowhere to be recorded for such a statement.
+- A reference assembled through a macro (`` `DEFINED_XMR ``, or ``tb.`SIG``)
+  is counted in the external-reference note but has no `hier_ref` row: its
+  text spans two buffers and cannot be recovered as one span, and the
+  elaborated symbol's own path names one instance's hierarchy — which is the
+  one thing a row shared by every instance must not carry.
+- A reference that slang resolves to a single hierarchical symbol keeps its
+  spelling verbatim, so a genvar inside one (`b[g].sig` in a generate loop)
+  stays unresolved. Each elaborated reference is its own row and its own
+  count — the loop above yields four — but the four share a spelling and only
+  `file`/`line` and their order distinguish them.
 - Function and task locals appear as edge and assignment endpoints but have no
   `symbol` row — they are not declared in the module.
 - `assign_operand` is not deduplicated: an expression reading one signal twice

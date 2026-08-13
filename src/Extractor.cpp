@@ -128,23 +128,126 @@ Where whereOf(SourceLocation loc, const SourceManager& sm) {
                  static_cast<uint32_t>(sm.getLineNumber(loc))};
 }
 
-/// The source text of an expression, exactly as written. Empty when it cannot
-/// be recovered whole -- a range that spans buffers, or one outside its
-/// buffer's bounds -- in which case the caller records nothing rather than a
-/// fragment.
-std::string sourceTextOf(const Expression* e, const SourceManager& sm) {
+/// The canonical text of a reference that leaves its module: the path as
+/// written, with every select resolved to the constant it elaborated to.
+///
+/// Not the raw source text, which is what this was at first and which fails
+/// four different ways. A generate loop writes one `b[g].sig` and elaborates
+/// four references from it, so the text was identical for all four and the
+/// dedup key folded them into a single unresolvable row naming a genvar. Two
+/// spellings of one reference (`tbm . ea` and `tbm.ea`) interned as two names,
+/// as did one carrying a comment or a line break. And a reference assembled
+/// through a macro spans two buffers, so it could not be recovered at all and
+/// was silently dropped.
+///
+/// Trailing selects are left off: `path` names a signal and the bits it
+/// touches are in `path_lo`/`path_hi`, which is how `edge` already spells the
+/// same idea. Selects further in are structural -- `b[2].sig` is a member of
+/// one interface instance out of an array -- and stay.
+///
+/// Empty when the reference is not expressible as a path, in which case the
+/// caller counts it rather than storing a guess.
+std::string canonicalPath(const Expression* e, EvalContext& eval) {
+    // Strip the outermost selects: those are the bits, not the path.
+    for (;;) {
+        if (e && e->kind == ExpressionKind::ElementSelect)
+            e = &e->as<ElementSelectExpression>().value();
+        else if (e && e->kind == ExpressionKind::RangeSelect)
+            e = &e->as<RangeSelectExpression>().value();
+        else
+            break;
+    }
+    std::string out;
+    auto build = [&](auto&& self, const Expression* x) -> bool {
+        if (!x)
+            return false;
+        switch (x->kind) {
+            case ExpressionKind::NamedValue: {
+                auto name = x->as<ValueExpressionBase>().symbol.name;
+                if (name.empty())
+                    return false;
+                out += name;
+                return true;
+            }
+            case ExpressionKind::MemberAccess: {
+                auto& ma = x->as<MemberAccessExpression>();
+                if (!self(self, &ma.value()))
+                    return false;
+                if (ma.member.name.empty())
+                    return false;
+                out += '.';
+                out += ma.member.name;
+                return true;
+            }
+            case ExpressionKind::ElementSelect: {
+                auto& sel = x->as<ElementSelectExpression>();
+                if (!self(self, &sel.value()))
+                    return false;
+                auto cv = sel.selector().eval(eval);
+                if (!cv)
+                    return false;   // a runtime index names no one element
+                out += '[';
+                out += cv.toString();
+                out += ']';
+                return true;
+            }
+            case ExpressionKind::Conversion:
+                return self(self, &x->as<ConversionExpression>().operand());
+            default:
+                return false;
+        }
+    };
+    if (!build(build, e))
+        return {};
+    return out;
+}
+
+/// The reference as written, with whitespace and comments taken out.
+///
+/// The fallback for a reference `canonicalPath` cannot walk -- an XMR, which
+/// slang resolves to a single node rather than to a chain of member accesses.
+/// Its text has to stay as written, because that is the only spelling that
+/// means the same thing from every instance of the module: the symbol's own
+/// elaborated path names one instance's hierarchy, and baking that into a row
+/// every instance shares is exactly the mistake the folded model exists to
+/// avoid.
+///
+/// Normalising matters because the text is interned as a name: `tbc . glob`,
+/// `tbc.glob` and `tbc/*why*/.glob` are one reference and were three rows.
+std::string normalizedText(const Expression* e, const SourceManager& sm) {
     if (!e)
         return {};
     auto range = e->sourceRange;
     if (!range.start() || !range.end() ||
         range.start().buffer() != range.end().buffer())
-        return {};
+        return {};   // assembled through a macro: not recoverable as one span
     auto text = sm.getSourceText(range.start().buffer());
     const size_t a = range.start().offset();
     const size_t b = range.end().offset();
     if (a >= b || b > text.size())
         return {};
-    return std::string(text.substr(a, b - a));
+    std::string out;
+    auto raw = text.substr(a, b - a);
+    for (size_t i = 0; i < raw.size(); i++) {
+        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '*') {
+            auto end = raw.find("*/", i + 2);
+            if (end == std::string_view::npos)
+                return {};
+            i = end + 1;
+            continue;
+        }
+        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/')
+            return {};      // a line comment inside a reference: give up
+        if (!std::isspace(static_cast<unsigned char>(raw[i])))
+            out += raw[i];
+    }
+    // A trailing select is the bit range, which has columns of its own.
+    if (!out.empty() && out.back() == ']') {
+        auto open = out.rfind('[');
+        if (open != std::string::npos && open > 0)
+            out.resize(open);
+    }
+    return out;
 }
 
 /// What kind of construct a procedure is.
@@ -1111,17 +1214,23 @@ private:
     /// together, and a transposed pair would have recorded one reference's
     /// text against another's bit range -- a wrong row, not an error.
     void addHierRef(bool isWrite, const Ref& r, const std::string& kind,
-                    const std::string& construct, const Where& at) {
-        std::string text = sourceTextOf(r.origin, sourceManager);
-        if (text.empty() || (text.find('.') == std::string::npos &&
-                             text.find("::") == std::string::npos)) {
+                    const std::string& construct, const Where& at,
+                    EvalContext& eval) {
+        // One reference, one row, however many passes surface it: the edge, the
+        // assignment's operand list and the gating scan all hand over the same
+        // expression node, so the node itself is the identity. Keying on the
+        // text instead lost data -- a generate loop elaborates `b[g].sig` into
+        // four distinct references that share one spelling, and three of them
+        // were dropped without being counted.
+        if (!hierSeen.emplace(r.origin, isWrite).second)
+            return;
+        std::string text = canonicalPath(r.origin, eval);
+        if (text.empty())
+            text = normalizedText(r.origin, sourceManager);
+        if (text.empty() || text.find('.') == std::string::npos) {
             stats.external++;
             return;
         }
-        // One statement surfaces the same reference through several collection
-        // passes (the edge, the assignment's operand list); counted once.
-        if (!hierSeen.emplace(text, isWrite, at.line).second)
-            return;
         stats.external++;
         HierRefRow row;
         row.path = std::move(text);
@@ -1239,7 +1348,7 @@ private:
     ProcEventRow eventRow(const Expression* expr, const std::string& edge,
                           const std::string& prefix, const std::string& kind,
                           const std::string& construct, const Where& at,
-                          bool isWait) {
+                          bool isWait, EvalContext& evalCtx) {
         std::string signal;
         if (expr && (expr->kind == ExpressionKind::NamedValue ||
                      expr->kind == ExpressionKind::HierarchicalValue)) {
@@ -1248,7 +1357,7 @@ private:
                 signal.clear();
                 Ref r;
                 r.origin = expr;   // no bits: an event names a whole signal
-                addHierRef(false, r, kind, construct, at);
+                addHierRef(false, r, kind, construct, at, evalCtx);
             }
         }
         return ProcEventRow{std::move(signal), edge, isWait, at.file, at.line};
@@ -1269,6 +1378,10 @@ private:
         // inside it that has none of its own.
         const Where procAt = locate(proc.analyzedSymbol->location);
 
+        // Declared before the sensitivity pass, which needs it to resolve the
+        // selects in an event expression that leaves the module.
+        EvalContext evalCtx(*proc.analyzedSymbol);
+
         auto& sens = proc.getSensitivityList();
 
         // Sensitivity rows carry the procedure's own location; the waits the
@@ -1280,7 +1393,7 @@ private:
             collectEdgeEvents(sens.timingControl, raw);
             for (auto& [expr, edge] : raw)
                 events.push_back(eventRow(expr, edge, prefix, kind, construct,
-                                          procAt, /*isWait=*/false));
+                                          procAt, /*isWait=*/false, evalCtx));
         }
 
         // Input-port drivers belong to the parent, not to this module: the port
@@ -1299,7 +1412,6 @@ private:
         // as a procedure that yielded nothing.
         bool reached = false;
 
-        EvalContext evalCtx(*proc.analyzedSymbol);
         StatementWalker walker([&](const Ref& dst, const Ref& src, bool gatingEdge,
                                    SourceRange where) {
             reached = true;
@@ -1332,12 +1444,12 @@ private:
                 return;
             EdgeRow row;
             if (!relativePath(*dst.sym, prefix, row.dst)) {
-                addHierRef(true, dst, kind, construct, at);
+                addHierRef(true, dst, kind, construct, at, evalCtx);
                 // The operand too, gating conditions included -- those reach
                 // here and nowhere else, so returning on the target alone lost
                 // the only record of what an outward write depends on.
                 if (src.sym)
-                    addHierRef(false, src, kind, construct, at);
+                    addHierRef(false, src, kind, construct, at, evalCtx);
                 return;
             }
             if (!dst.whole)
@@ -1345,7 +1457,7 @@ private:
             row.dstExact = dst.exact;
             if (src.sym) {
                 if (!relativePath(*src.sym, prefix, row.src)) {
-                    addHierRef(false, src, kind, construct, at);
+                    addHierRef(false, src, kind, construct, at, evalCtx);
                     // The operand has no name this row can carry, but the
                     // statement still drives the target. Returning here left
                     // an output assigned only from outside the module -- every
@@ -1405,10 +1517,10 @@ private:
                 // b.vld & b.ack;` -- a modport driver, which is what interface
                 // RTL mostly is -- exported one write-only row, and the two
                 // reads appeared in no table and in no total.
-                addHierRef(true, dst, kind, construct, at);
+                addHierRef(true, dst, kind, construct, at, evalCtx);
                 for (auto& r : operands) {
                     if (r.sym)
-                        addHierRef(false, r, kind, construct, at);
+                        addHierRef(false, r, kind, construct, at, evalCtx);
                 }
                 return;
             }
@@ -1431,7 +1543,7 @@ private:
                 std::string rel;
                 if (!relativePath(*r.sym, prefix, rel)) {
                     arow.dropped++;      // outside the module; cannot be shared
-                    addHierRef(false, r, kind, construct, at);
+                    addHierRef(false, r, kind, construct, at, evalCtx);
                     continue;
                 }
                 OperandRow o;
@@ -1452,7 +1564,7 @@ private:
         [&](const Expression* e, const std::string& edge, SourceRange where) {
             events.push_back(eventRow(e, edge, prefix, kind, construct,
                                       locate(where.start(), procAt),
-                                      /*isWait=*/true));
+                                      /*isWait=*/true, evalCtx));
         },
         evalCtx);
         walker.sensitivityTiming = sens.timingControl;
@@ -1577,10 +1689,10 @@ private:
                 const Ref& dst = dstTerm.ref;
                 std::string dstRel;
                 if (!relativePath(*dst.sym, prefix, dstRel)) {
-                    addHierRef(true, dst, "primitive", construct, at);
+                    addHierRef(true, dst, "primitive", construct, at, evalCtx);
                     for (auto& srcTerm : reads) {
                         if (srcTerm.terminal != dstTerm.terminal)
-                            addHierRef(false, srcTerm.ref, "primitive", construct, at);
+                            addHierRef(false, srcTerm.ref, "primitive", construct, at, evalCtx);
                     }
                     continue;
                 }
@@ -1623,7 +1735,7 @@ private:
                     }
                     EdgeRow row = base;
                     if (!relativePath(*src.sym, prefix, row.src)) {
-                        addHierRef(false, src, "primitive", construct, at);
+                        addHierRef(false, src, "primitive", construct, at, evalCtx);
                         continue;
                     }
                     row.srcType = typeOf(*src.sym);
@@ -1802,7 +1914,7 @@ private:
                     // being the direction a trace cannot rediscover.
                     const bool drives = port.direction == ArgumentDirection::Out ||
                                         port.direction == ArgumentDirection::InOut;
-                    addHierRef(drives, r, "port", dir, at);
+                    addHierRef(drives, r, "port", dir, at, evalCtx);
                     continue;
                 }
                 row.outer = std::move(outerRel);
@@ -1942,7 +2054,10 @@ private:
     // statement can surface the same reference through several collection
     // passes, so the seen-set folds them to one row per (text, rw, line).
     std::vector<HierRefRow> hierRefs;
-    std::set<std::tuple<std::string, bool, uint32_t>> hierSeen;
+    /// The reference expressions already recorded for this module, by node.
+    /// Not by text: two references can share a spelling and be different
+    /// references, which is what a generate loop does to `b[g].sig`.
+    std::set<std::pair<const Expression*, bool>> hierSeen;
     // As-written file spelling -> the absolute path its buffer came from.
     std::unordered_map<std::string, std::string> fileOrigins;
     int64_t instanceRow = 0;
