@@ -139,7 +139,7 @@ WHERE s.direction = 1
 
 | table | column | meaning |
 |---|---|---|
-| `edge` | `module`, `src`, `dst` | One dependency inside a module. `src` is NULL when the driver has no external operand (`q <= 8'h0`) — the row still names the statement. |
+| `edge` | `module`, `src`, `dst` | One dependency inside a module. `src` is NULL when the right-hand side reads nothing at all (`q <= 8'h0`) — the row still names the statement. Self-feedback is a real row: `cnt <= cnt + 1` records `cnt → cnt`, which is what makes "who reads cnt" answerable. |
 | | `src_type`, `dst_type` | Type text. |
 | | `kind`, `construct` | `continuous_assign`/`procedural`, and the construct: `assign`, `always_ff`, `always_comb`, … |
 | | `control` | 1 when the operand reached the target through a branch condition rather than the right-hand side. |
@@ -201,7 +201,7 @@ Storing both NULL cases the same way made uncertainty read as fact.
 | table | meaning |
 |---|---|
 | `source_file` | Every file slang actually read, with its SHA-256 — including headers reached by `` `include ``, which are exactly the files that change without the filelist changing. |
-| `meta` | Schema version, tool name, top module. A reader that does not know the version should refuse the file rather than read it as though the layout had held. |
+| `meta` | Schema version, tool name, top module. `top` holds the *elaborated* top(s), space-separated when the design has several — written whether or not `--top` was passed. A reader that does not know the version should refuse the file rather than read it as though the layout had held. |
 
 ## Naming rules
 

@@ -66,7 +66,7 @@ CREATE TABLE file(id INTEGER PRIMARY KEY, path TEXT UNIQUE);
 -- Intra-module dataflow, in the module's own namespace.
 CREATE TABLE edge(
     module   INTEGER NOT NULL REFERENCES module(id),
-    -- Null when the driver has no external operand: `q <= 8'h0`, `cnt++`.
+    -- Null when the right-hand side reads nothing at all: `q <= 8'h0`.
     -- The row still names the statement, which is what a driver query reports.
     src      INTEGER REFERENCES name(id),
     dst      INTEGER NOT NULL REFERENCES name(id),

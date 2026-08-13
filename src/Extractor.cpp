@@ -498,13 +498,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 continue;               // a loop counter, not a design signal
             // `cnt++` writes cnt just as `cnt <= cnt + 1` does; without this the
             // target keeps its edges but loses its statement line, seq, and
-            // blocking kind.
-            emitAssign(dst, {}, expr.sourceRange, seq++, true, 0);
+            // blocking kind. It *reads* cnt the same way, so the operand and the
+            // self-edge are recorded exactly as if it were spelled out.
+            emitAssign(dst, {dst}, expr.sourceRange, seq++, true, 0);
             for (auto& src : gating)
                 emit(dst, src, true, expr.sourceRange);
-            // `cnt++` depends on nothing but itself, so it has no data source;
-            // the statement is still its driver.
-            emit(dst, Ref{}, false, expr.sourceRange);
+            emit(dst, dst, false, expr.sourceRange);
         }
         visitDefault(expr);
     }
@@ -628,20 +627,17 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             if (loopVars.count(dst.sym))
                 continue;
             emitAssign(dst, reads, expr.sourceRange, seq++, expr.isBlocking(), droppedConstants);
-            bool anyData = false;
-            for (auto& src : reads) {
-                if (src.sym != dst.sym)
-                    anyData = true;
+            for (auto& src : reads)
                 emit(dst, src, false, expr.sourceRange);
-            }
             for (auto& src : gating)
                 emit(dst, src, true, expr.sourceRange);
-            // A right-hand side with no external operand -- `q <= 8'h0`,
-            // `cnt <= cnt + 1` -- still has a driver, and a query for what
-            // drives the target has to be able to name the statement. One row
-            // with a null source records it; the schema stores edges, so
-            // without this the driver simply is not there.
-            if (!anyData)
+            // A right-hand side that reads nothing at all -- `q <= 8'h0` --
+            // still has a driver, and a query for what drives the target has
+            // to be able to name the statement. One row with a null source
+            // records it; the schema stores edges, so without this the driver
+            // simply is not there. A self-read (`cnt <= cnt + 1`) does not land
+            // here: its edge is real and already names the statement.
+            if (reads.empty())
                 emit(dst, Ref{}, false, expr.sourceRange);
         }
 
@@ -1082,18 +1078,12 @@ private:
         StatementWalker walker([&](const Ref& dst, const Ref& src, bool gatingEdge,
                                    SourceRange where) {
             reached = true;
-            // Self-feedback carries nothing only when it is the *same bits*.
-            // With bit ranges available, `q <= {q[6:0], din}` and
-            // `q[7:4] <= q[3:0]` are real dataflow -- a shift register's whole
-            // behaviour is that self-edge -- so only an exact overlap of the
-            // same range is dropped.
-            if (src.sym == dst.sym) {
-                const bool sameBits = (src.whole && dst.whole) ||
-                                      (!src.whole && !dst.whole &&
-                                       src.lo == dst.lo && src.hi == dst.hi);
-                if (sameBits)
-                    return;
-            }
+            // Self-feedback is kept, same bits included. Following a *driver*
+            // backwards, `cnt <= cnt + 1` adds nothing new -- which is why an
+            // earlier version dropped it -- but the same row read the other way
+            // answers "who reads cnt", and dropping it made the only reader of
+            // a free-running counter disappear: a load query answered "nobody"
+            // about a signal the simulator's own database reports as read.
             if (inputPorts.count(dst.sym))
                 return;
             // The assignment's own line, not the procedure header's. Using the
