@@ -80,6 +80,8 @@ jobs:
           ${{ matrix.python }} scripts/verify-designdb.py constructs.db constructs
           ${{ matrix.bin }} examples/constructs/interfaces.sv -o interfaces.db
           ${{ matrix.python }} scripts/verify-designdb.py interfaces.db interfaces
+          ${{ matrix.bin }} examples/constructs/assertions.sv -o assertions.db
+          ${{ matrix.python }} scripts/verify-designdb.py assertions.db assertions
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

@@ -10,11 +10,12 @@
 #   verify-designdb.py <design.db>              the hollow check
 #   verify-designdb.py <design.db> constructs   + what examples/constructs/constructs.sv must yield
 #   verify-designdb.py <design.db> interfaces   + what examples/constructs/interfaces.sv must yield
+#   verify-designdb.py <design.db> assertions   + what examples/constructs/assertions.sv must yield
 import sqlite3
 import sys
 
 if len(sys.argv) not in (2, 3):
-    sys.exit(f"usage: {sys.argv[0]} <design.db> [constructs|interfaces]")
+    sys.exit(f"usage: {sys.argv[0]} <design.db> [constructs|interfaces|assertions]")
 
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
@@ -97,6 +98,33 @@ if mode == "constructs":
     check("the downward XMR as a dotted edge name", """
         SELECT count(*) FROM edge e JOIN name s ON s.id = e.src
         WHERE s.text = 'u_cnt.cnt'""")
+    # A net declared with an initialiser drives it, exactly as `assign` does.
+    check("the net initialiser's drivers", """
+        SELECT count(*) FROM edge e
+        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
+        WHERE d.text = 'w' AND s.text IN ('a', 'b')""", 2)
+    undriven = con.execute("""
+        SELECT count(*) FROM symbol sy JOIN module m ON m.id = sy.module
+        JOIN name n ON n.id = sy.name
+        WHERE m.name = 'netinit' AND n.text IN ('w', 's')
+          AND NOT EXISTS (SELECT 1 FROM edge e
+                          WHERE e.module = sy.module AND e.dst = sy.name)""").fetchone()[0]
+    if undriven:
+        sys.exit(f"{undriven} net(s) declared with an initialiser have no driver")
+    print("ok: no net initialiser leaves its net undriven")
+    # A call binds its actuals, so the chain through the task body is whole.
+    check("the call's actual bound to the formal", """
+        SELECT count(*) FROM edge e
+        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
+        WHERE s.text = 'd' AND d.text = 'bump.v'""")
+    check("the task body's write, the other half of that chain", """
+        SELECT count(*) FROM edge e
+        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
+        WHERE s.text = 'bump.v' AND d.text = 'q'""")
+    # An immediate assertion writes nothing, so its reads live in stmt_read.
+    check("the immediate assertion's reads", """
+        SELECT count(*) FROM stmt_read r JOIN module m ON m.id = r.module
+        WHERE m.name = 'checks' AND r.construct = 'assert'""", 2)
     # The statements in seq.svh belong to a procedure whose header is in
     # constructs.sv. Their rows must say seq.svh: the file has to travel with
     # the line it is paired with, or the pair names a line in the wrong file.
@@ -178,5 +206,22 @@ if mode == "interfaces":
             sys.exit(f"{n} interned name(s) contain {what}; "
                      "hier_ref paths are not being normalised")
     print("ok: no interned name carries a space, a comment or a select")
+
+if mode == "assertions":
+    check("the concurrent assertion's reads", """
+        SELECT count(*) FROM stmt_read WHERE construct = 'assert'""", 3)
+    check("assume keeps its own word", """
+        SELECT count(*) FROM stmt_read WHERE construct = 'assume'""", 3)
+    check("cover keeps its own word", """
+        SELECT count(*) FROM stmt_read WHERE construct = 'cover'""", 2)
+    # The bits a property reads are not resolved, so the row must say so
+    # rather than claim the whole signal as fact.
+    claimed = con.execute("""
+        SELECT count(*) FROM stmt_read
+        WHERE src_lo IS NULL AND src_exact = 1""").fetchone()[0]
+    if claimed:
+        sys.exit(f"{claimed} assertion read(s) claim the whole signal exactly; "
+                 "an unresolved range must be inexact")
+    print("ok: unresolved assertion reads are marked inexact")
 
 print("OK")

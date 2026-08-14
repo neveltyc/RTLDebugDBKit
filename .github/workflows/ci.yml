@@ -57,6 +57,8 @@ jobs:
           python3 scripts/verify-designdb.py constructs.db constructs
           ./build/rtl-designdb examples/constructs/interfaces.sv -o interfaces.db
           python3 scripts/verify-designdb.py interfaces.db interfaces
+          ./build/rtl-designdb examples/constructs/assertions.sv -o assertions.db
+          python3 scripts/verify-designdb.py assertions.db assertions
 
   # The four release platforms, as workflow artifacts on every push. The same
   # workflow builds a tagged release, so a red push here is a release that

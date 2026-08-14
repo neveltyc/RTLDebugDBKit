@@ -510,6 +510,13 @@ int main(int argc, char** argv) {
                         (long long)stats.instances, (long long)stats.symbols, (long long)stats.edges,
                         (long long)stats.assignments, (long long)stats.children,
                         (long long)stats.ports);
+            if (stats.stmtReads) {
+                std::fprintf(stderr,
+                             "note: %lld read(s) belong to a statement that writes "
+                             "nothing this module can name (an assertion, or a "
+                             "write to a signal outside it); see stmt_read\n",
+                             (long long)stats.stmtReads);
+            }
             if (stats.emptyProcedures) {
                 std::fprintf(stderr,
                              "warning: %lld procedure(s) drive a signal but yielded no "

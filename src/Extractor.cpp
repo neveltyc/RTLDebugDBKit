@@ -214,7 +214,12 @@ std::string canonicalPath(const Expression* e, EvalContext& eval) {
 ///
 /// Normalising matters because the text is interned as a name: `tbc . glob`,
 /// `tbc.glob` and `tbc/*why*/.glob` are one reference and were three rows.
-std::string normalizedText(const Expression* e, const SourceManager& sm) {
+/// `stripTrailingSelect` decides whether a final `[...]` is part of the name.
+/// For a reference it is not -- the bits live in their own columns. For an
+/// interface connection it is: `b[0]` names one element of an array, which is
+/// structure, not a bit range.
+std::string normalizedText(const Expression* e, const SourceManager& sm,
+                           bool stripTrailingSelect = true) {
     if (!e)
         return {};
     auto range = e->sourceRange;
@@ -242,12 +247,39 @@ std::string normalizedText(const Expression* e, const SourceManager& sm) {
             out += raw[i];
     }
     // A trailing select is the bit range, which has columns of its own.
-    if (!out.empty() && out.back() == ']') {
+    if (stripTrailingSelect && !out.empty() && out.back() == ']') {
         auto open = out.rfind('[');
         if (open != std::string::npos && open > 0)
             out.resize(open);
     }
     return out;
+}
+
+/// The `[...]` of the last segment of a hierarchical path -- how slang spells
+/// an array element's index, already translated into the source's own
+/// numbering rather than the zero-based element order.
+std::string arrayIndexSuffix(const std::string& hierPath) {
+    const size_t lastDot = hierPath.rfind('.');
+    const std::string seg =
+        lastDot == std::string::npos ? hierPath : hierPath.substr(lastDot + 1);
+    const size_t open = seg.find('[');
+    if (open == std::string::npos || seg.empty() || seg.back() != ']')
+        return {};
+    return seg.substr(open);
+}
+
+/// The word an assertion publishes as its `construct`. Spelled out rather than
+/// taken from slang's enum printer, for the same reason `classify` is: these
+/// are a wire format consumers match on.
+std::string assertionWord(AssertionKind kind) {
+    switch (kind) {
+        case AssertionKind::Assume:        return "assume";
+        case AssertionKind::CoverProperty:
+        case AssertionKind::CoverSequence: return "cover";
+        case AssertionKind::Restrict:      return "restrict";
+        case AssertionKind::Expect:        return "expect";
+        default:                           return "assert";
+    }
 }
 
 /// What kind of construct a procedure is.
@@ -469,13 +501,22 @@ struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::All
         Ref r;
         r.sym = &e.symbol;
         r.origin = &e;
+        // No bounds were computed here, so the whole object is an upper bound
+        // rather than the bits actually touched. Left exact, a property
+        // checking `tag[1:0]` claimed to read the whole of `tag` --
+        // uncertainty stored as fact, which is the one thing the range
+        // encoding exists to keep apart.
+        r.exact = false;
         out.push_back(r);
     }
 };
 
-void collectStatementRefs(const Statement& stmt, std::vector<Ref>& out) {
+/// Templated over the node kind: a subroutine body is a `Statement`, while an
+/// assertion's body is an `AssertionExpr`, and both are walked the same way.
+template<typename NodeT>
+void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
     StatementRefCollector c(out);
-    stmt.visit(c);
+    node.visit(c);
     // Bit ranges are not resolved here: a subroutine's reads are attributed to
     // its call site, where the caller's own bounds are what matter.
     out.erase(std::remove_if(out.begin(), out.end(),
@@ -566,11 +607,15 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     using EmitAssign = std::function<void(const Ref& dst, const std::vector<Ref>& operands,
                                           SourceRange where, int64_t seq, bool blocking,
                                           int64_t droppedConstants)>;
+    /// A statement that reads without writing anything nameable.
+    using EmitRead = std::function<void(const std::vector<Ref>& operands,
+                                        const std::string& construct, SourceRange where)>;
     using EmitEvent = std::function<void(const Expression* expr, const std::string& edge,
                                          SourceRange where)>;
 
     Emit emit;
     EmitAssign emitAssign;
+    EmitRead emitRead;
     EmitEvent emitEvent;
     EvalContext& eval;
     /// The timing control the procedure's sensitivity list was derived from.
@@ -586,9 +631,33 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
 
 
     StatementWalker(Emit emit, EmitAssign emitAssign, EmitEvent emitEvent,
-                    EvalContext& eval) :
+                    EmitRead emitRead, EvalContext& eval) :
         emit(std::move(emit)), emitAssign(std::move(emitAssign)),
-        emitEvent(std::move(emitEvent)), eval(eval) {}
+        emitEvent(std::move(emitEvent)), emitRead(std::move(emitRead)),
+        eval(eval) {}
+
+    /// `assert (req !== 1'bx);` and its siblings.
+    ///
+    /// An assertion writes nothing, so the walk had nothing to pair its reads
+    /// with and the whole statement vanished: the signals it checks read as
+    /// though no part of the design looked at them. They are reads like any
+    /// other, recorded against the statement rather than against a target.
+    void handle(const ImmediateAssertionStatement& stmt) {
+        std::vector<Ref> reads;
+        collectRefs(stmt.cond, eval, reads);
+        emitRead(reads, assertionWord(stmt.assertionKind), stmt.sourceRange);
+        visitDefault(stmt);
+    }
+
+    /// The concurrent form: `assert property (@(posedge clk) a |-> b);`.
+    /// Its body is an assertion expression rather than an ordinary one, so the
+    /// reads are gathered by walking it for value references.
+    void handle(const ConcurrentAssertionStatement& stmt) {
+        std::vector<Ref> reads;
+        collectStatementRefs(stmt.propertySpec, reads);
+        emitRead(reads, assertionWord(stmt.assertionKind), stmt.sourceRange);
+        visitDefault(stmt);
+    }
 
     /// A statement-level event control: `@(posedge clk); …` in an initial
     /// block or a task. It is a wait rather than sensitivity, but the signal
@@ -695,6 +764,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         auto sub = std::get_if<const SubroutineSymbol*>(&expr.subroutine);
         if (!sub || !*sub)
             return;
+        // Every call, before the once-per-subroutine guard below: the body is
+        // the same wherever it is called from, but the actuals are not.
+        bindArguments(expr, **sub);
         if (!activeSubs.insert(*sub).second)
             return;                             // recursion guard
         // Once per subroutine, not once per call. A function called from four
@@ -706,6 +778,50 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         if (walkedSubs.insert(*sub).second)
             (*sub)->getBody().visit(*this);
         activeSubs.erase(*sub);
+    }
+
+    /// The actuals at a call site, tied to the formals they bind to.
+    ///
+    /// The body is walked once and yields `bump.v -> q`; without this the
+    /// other half of the chain -- `d -> bump.v` -- was never recorded, so
+    /// `always_ff @(posedge clk) bump(d);` left `d` reading as though nothing
+    /// used it and `q` as though it came from a local of a task nothing fed.
+    /// The formal has no `symbol` row, being a subroutine local, which is the
+    /// same footing every other reference to one already stands on.
+    ///
+    /// Direction decides which way the edge points: an `input` formal is fed
+    /// by the actual, an `output` feeds it, and `inout`/`ref` do both.
+    void bindArguments(const CallExpression& expr, const SubroutineSymbol& sub) {
+        auto args = expr.arguments();
+        auto formals = sub.getArguments();
+        const size_t n = std::min(args.size(), formals.size());
+        for (size_t i = 0; i < n; i++) {
+            if (!args[i] || !formals[i])
+                continue;
+            const auto dir = formals[i]->direction;
+            const bool writes = dir == ArgumentDirection::Out ||
+                                dir == ArgumentDirection::InOut ||
+                                dir == ArgumentDirection::Ref;
+            const bool reads = dir == ArgumentDirection::In ||
+                               dir == ArgumentDirection::InOut ||
+                               dir == ArgumentDirection::Ref;
+            Ref formal;
+            formal.sym = formals[i];
+            formal.origin = args[i];
+            std::vector<Ref> actuals;
+            // A written actual is a target, so its selectors are reads of the
+            // index rather than part of what is written -- the same split the
+            // assignment path already makes on an lvalue.
+            collectRefs(*args[i], eval, actuals, /*skipSelectors=*/writes);
+            for (auto& a : actuals) {
+                if (!a.sym)
+                    continue;
+                if (reads)
+                    emit(formal, a, false, expr.sourceRange);
+                if (writes)
+                    emit(a, formal, false, expr.sourceRange);
+            }
+        }
     }
 
     /// A call reads whatever the subroutine reads.
@@ -999,6 +1115,12 @@ void forEachUnresolved(const Scope& scope, F&& fn, const std::string& gen = "") 
 template<typename F>
 void forEachDeclaration(const Scope& scope, F&& fn, const std::string& gen = "") {
     // First pass: which signal does each port stand for, and in which direction.
+    //
+    // A port that stands for a concatenation of internal signals
+    // (`.ext_pair({hi, lo})`) is not reachable this way -- neither the scope's
+    // members nor the body's port list offers it, and `getInternalExpr` is
+    // empty for it -- so `hi` and `lo` keep a NULL direction. Recorded as a
+    // known limit rather than guessed at; the binding itself is in `port`.
     std::unordered_map<const Symbol*, ArgumentDirection> portDir;
     for (auto& member : scope.members()) {
         if (member.kind != SymbolKind::Port)
@@ -1200,6 +1322,38 @@ private:
         return w;
     }
 
+    /// The reads of a statement that writes nothing this module can name.
+    ///
+    /// An assertion writes nothing at all; an assignment whose target is
+    /// outward writes something with no module-relative name. Either way the
+    /// operands fit in no other table -- `edge` needs a target, and an
+    /// `assignment` row cannot exist without one -- and the signals read as
+    /// though the design never looked at them. An operand that is itself
+    /// outward goes to `hier_ref`, as everywhere else.
+    void addStmtReads(const std::vector<Ref>& operands, const std::string& prefix,
+                      const std::string& kind, const std::string& construct,
+                      const Where& at, EvalContext& eval) {
+        for (auto& r : operands) {
+            if (!r.sym)
+                continue;
+            std::string rel;
+            if (!relativePath(*r.sym, prefix, rel)) {
+                addHierRef(false, r, kind, construct, at, eval);
+                continue;
+            }
+            StmtReadRow row;
+            row.name = std::move(rel);
+            row.kind = kind;
+            row.construct = construct;
+            row.file = at.file;
+            row.line = at.line;
+            if (!r.whole)
+                row.bits = std::make_pair(r.lo, r.hi);
+            row.exact = r.exact;
+            stmtReads.push_back(std::move(row));
+        }
+    }
+
     /// Records one reference that leaves the module, as written. Every such
     /// reference also bumps the external counter, which is where all of them
     /// lived before hier_ref existed; the row is added only when the text is
@@ -1248,6 +1402,7 @@ private:
     void emitModule(const InstanceBodySymbol& body, int64_t moduleId) {
         const std::string prefix = body.getHierarchicalPath();
         hierRefs.clear();
+        stmtReads.clear();
         hierSeen.clear();
 
         std::vector<EdgeRow> edges;
@@ -1261,6 +1416,7 @@ private:
                 emitProcedure(proc, prefix, edges, seen, moduleId, procIndex++);
         }
         emitPrimitives(body, prefix, edges, seen);
+        emitNetInitialisers(body, prefix, edges, seen, moduleId);
         stats.edges += static_cast<int64_t>(edges.size());
         writer.addEdges(moduleId, edges);
 
@@ -1336,6 +1492,8 @@ private:
         writer.addChildren(moduleId, children);
 
         writer.addHierRefs(moduleId, hierRefs);
+        writer.addStmtReads(moduleId, stmtReads);
+        stats.stmtReads += static_cast<int64_t>(stmtReads.size());
     }
 
     /// One event as a proc_event row: named module-relative where it can be,
@@ -1515,10 +1673,12 @@ private:
                 // RTL mostly is -- exported one write-only row, and the two
                 // reads appeared in no table and in no total.
                 addHierRef(true, dst, kind, construct, at, evalCtx);
-                for (auto& r : operands) {
-                    if (r.sym)
-                        addHierRef(false, r, kind, construct, at, evalCtx);
-                }
+                // The read side of the same statement. An operand outside the
+                // module joins the write in hier_ref; one inside it has no
+                // assignment row to hang from -- the target has no name -- so
+                // it goes to stmt_read, without which `payload` in
+                // `assign bus.vld = |payload;` read as though nothing used it.
+                addStmtReads(operands, prefix, kind, construct, at, evalCtx);
                 return;
             }
             if (!dst.whole)
@@ -1563,6 +1723,13 @@ private:
                                       locate(where.start(), procAt),
                                       /*isWait=*/true, evalCtx));
         },
+        // A statement that reads without writing anything nameable: an
+        // assertion. Its reads belong to the statement, not to a target.
+        [&](const std::vector<Ref>& operands, const std::string& what,
+            SourceRange where) {
+            const Where at = locate(where.start(), procAt);
+            addStmtReads(operands, prefix, kind, what, at, evalCtx);
+        },
         evalCtx);
         walker.sensitivityTiming = sens.timingControl;
 
@@ -1598,6 +1765,114 @@ private:
         if (!reached && !proc.getDrivers().empty()) {
             stats.emptyProcedures++;
         }
+    }
+
+    /// `wire w = a & b;` -- a net declared with an initialiser.
+    ///
+    /// The LRM makes that a continuous assignment, but slang models it as a
+    /// net carrying an initialiser rather than as a `ContinuousAssign` symbol,
+    /// so it never reached the procedure walk and the net came out with no
+    /// driver at all. Nothing said so: `w` still appeared as a *source* in
+    /// whatever read it, so the export looked complete while the question
+    /// "what drives w" answered nothing.
+    ///
+    /// Recorded exactly as the equivalent `assign` is, because that is what it
+    /// is -- `continuous_assign`/`assign`, with a NULL-source row when the
+    /// initialiser reads nothing this module can name.
+    ///
+    /// Variable initialisers are deliberately not included: `logic [7:0] c = 0`
+    /// writes once at time zero and is not a driver in the same sense, and
+    /// recording it as one would put a continuous assignment on every counter
+    /// that happens to declare its reset value.
+    void emitNetInitialisers(const InstanceBodySymbol& body, const std::string& prefix,
+                             std::vector<EdgeRow>& out, SeenSet& seen, int64_t moduleId) {
+        EvalContext evalCtx(body);
+        int64_t seq = 0;
+        forEachDeclaration(body, [&](const Symbol& sym, const std::string& gen,
+                                     std::optional<ArgumentDirection>) {
+            if (sym.kind != SymbolKind::Net)
+                return;
+            auto& net = sym.as<NetSymbol>();
+            const Expression* init = net.getInitializer();
+            if (!init)
+                return;
+            const Where at = locate(net.location);
+
+            std::vector<Ref> reads;
+            filteredConstants = 0;
+            collectRefs(*init, evalCtx, reads);
+            const int64_t droppedConstants = filteredConstants;
+            evalCtx.reset();
+
+            const std::string dstName = gen + std::string(sym.name);
+
+            AssignRow arow;
+            arow.dst = dstName;
+            arow.kind = "continuous_assign";
+            arow.construct = "assign";
+            arow.file = at.file;
+            arow.line = at.line;
+            arow.proc = -1;    // no procedure: the declaration is the statement
+            arow.seq = seq++;
+            arow.blocking = -1;
+            std::vector<OperandRow> ops;
+            for (auto& r : reads) {
+                if (!r.sym)
+                    continue;
+                std::string rel;
+                if (!relativePath(*r.sym, prefix, rel)) {
+                    arow.dropped++;
+                    addHierRef(false, r, "continuous_assign", "assign", at, evalCtx);
+                    continue;
+                }
+                OperandRow o;
+                o.name = std::move(rel);
+                if (!r.whole)
+                    o.bits = std::make_pair(r.lo, r.hi);
+                o.exact = r.exact;
+                ops.push_back(std::move(o));
+            }
+            arow.dropped += droppedConstants;
+            writer.addAssignment(moduleId, arow, ops);
+            stats.assignments++;
+
+            EdgeRow base;
+            base.dst = dstName;
+            base.dstType = typeOf(net);
+            base.kind = "continuous_assign";
+            base.construct = "assign";
+            base.file = at.file;
+            base.line = at.line;
+
+            bool anySource = false;
+            for (auto& r : reads) {
+                if (!r.sym)
+                    continue;
+                const auto sk = keyRange(r);
+                if (!seen.emplace(&net, r.sym, at.line, uint64_t(0), uint64_t(0),
+                                  sk.first, sk.second)
+                         .second) {
+                    anySource = true;
+                    continue;
+                }
+                EdgeRow row = base;
+                if (!relativePath(*r.sym, prefix, row.src))
+                    continue;   // outward: already in hier_ref, above
+                row.srcType = typeOf(*r.sym);
+                if (!r.whole)
+                    row.srcBits = std::make_pair(r.lo, r.hi);
+                row.srcExact = r.exact;
+                anySource = true;
+                out.push_back(std::move(row));
+            }
+            // `wire w = 1'b0;` drives w as surely as `assign w = 1'b0;` does.
+            if (!anySource &&
+                seen.emplace(&net, nullptr, at.line, uint64_t(0), uint64_t(0),
+                             uint64_t(0), uint64_t(0))
+                    .second) {
+                out.push_back(std::move(base));
+            }
+        });
     }
 
     /// Gate, switch and UDP instances, as edges. `and (y, a, b)` is dataflow
@@ -1763,6 +2038,27 @@ private:
     /// slice ties several parent nets to one formal. One row per (formal, net)
     /// pair keeps that honest rather than picking whichever net happens to be
     /// first, which would silently drop the rest of a bus.
+    /// The single internal signal a formal stands for, when the connection
+    /// names it something else -- `.ext_one(inner)`. Empty when the formal and
+    /// the internal signal share a name, which is the ordinary case, and empty
+    /// when the formal covers several signals (`.ext_pair({hi, lo})`), where
+    /// slang gives each member its own port and there is no one answer.
+    static std::string internalName(const PortSymbol& port) {
+        const Symbol* sym = port.internalSymbol;
+        if (!sym) {
+            auto* inner = port.getInternalExpr();
+            if (!inner)
+                return {};
+            if (inner->kind != ExpressionKind::NamedValue &&
+                inner->kind != ExpressionKind::HierarchicalValue)
+                return {};
+            sym = &inner->as<ValueExpressionBase>().symbol;
+        }
+        if (sym->name.empty() || sym->name == port.name)
+            return {};
+        return std::string(sym->name);
+    }
+
     /// The module's own interface port that `iface` arrived through, if it is
     /// one. That is what a pass-through connection names, and the only spelling
     /// of it that is true for every instance of the module.
@@ -1845,7 +2141,29 @@ private:
                         row.outer = std::string(through->name);
                     }
                     else {
-                        stats.external++;
+                        // An array, either whole (`.b(arr)`) or indexed
+                        // (`.b(b[0])` out of the parent's own array port).
+                        // slang answers both with a synthesized
+                        // `InstanceArraySymbol` that is not a member of any
+                        // scope, so it has no path to be made relative to and
+                        // the row came out with no outer side at all -- which
+                        // is every element of every interface array.
+                        //
+                        // What was written is the answer, and it is already
+                        // module-relative: `arr`, `b[0]`. The index is part of
+                        // the name here, not a bit range, so it stays.
+                        row.outer = normalizedText(conn->getExpression(), sourceManager,
+                                                   /*stripTrailingSelect=*/false);
+                        // slang's connection expression stops at the port name
+                        // -- the element the connection selects is resolved
+                        // into the symbol instead -- so `.b(b[0])` and
+                        // `.b(b[1])` both read as `b`, and the two elements
+                        // became one place. The index comes back from the
+                        // symbol's own path, which is where slang renders it
+                        // in source numbering already.
+                        row.outer += arrayIndexSuffix(ifaceSym->getHierarchicalPath());
+                        if (row.outer.empty())
+                            stats.external++;
                     }
                 }
                 row.file = file;
@@ -1867,6 +2185,13 @@ private:
                 default:                       dir = "ref";   break;
             }
 
+            // The signal inside the child, when the connection names the
+            // formal something else. `module m(.ext_one(inner))` is `ext_one`
+            // out here and `inner` in every row the child's own module owns,
+            // so without this a consumer holding the internal name had no way
+            // back to the binding.
+            const std::string innerName = internalName(port);
+
             if (!expr) {
                 // Left unconnected. Recorded rather than skipped: a floating
                 // output is a bug worth finding, and omitting the row would make
@@ -1875,6 +2200,7 @@ private:
                 PortRow row;
                 row.child = childName;
                 row.port = std::string(port.name);
+                row.inner = innerName;
                 row.direction = dir;
                 row.conn = PortConn::Unconnected;
                 row.file = file;
@@ -1913,6 +2239,7 @@ private:
                 PortRow row;
                 row.child = childName;
                 row.port = std::string(port.name);
+                row.inner = innerName;
                 row.direction = dir;
                 row.conn = PortConn::Constant;
                 row.outerWidth = exprWidth;
@@ -1935,6 +2262,7 @@ private:
                 PortRow row;
                 row.child = childName;
                 row.port = std::string(port.name);
+                row.inner = innerName;
                 row.direction = dir;
                 std::string outerRel;
                 if (!relativePath(*r.sym, prefix, outerRel)) {
@@ -2095,6 +2423,7 @@ private:
     // statement can surface the same reference through several collection
     // passes, so the seen-set folds them to one row per (text, rw, line).
     std::vector<HierRefRow> hierRefs;
+    std::vector<StmtReadRow> stmtReads;
     /// The reference expressions already recorded for this module, by node.
     /// Not by text: two references can share a spelling and be different
     /// references, which is what a generate loop does to `b[g].sig`.

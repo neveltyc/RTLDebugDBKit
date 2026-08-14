@@ -152,6 +152,16 @@ CREATE TABLE port(
     child        INTEGER NOT NULL REFERENCES name(id),
     def_module   INTEGER REFERENCES module(id),
     port         INTEGER NOT NULL REFERENCES name(id),
+    -- The signal inside the child that `port` stands for, when the connection
+    -- names the formal something else: `module m(.ext_one(inner))` is
+    -- `ext_one` here and `inner` in every row the child's own module owns, so
+    -- without this a consumer holding the internal name had no way back to the
+    -- binding. NULL in the ordinary case where the two are one name.
+    --
+    -- Paired with `outer` deliberately: `outer` is the net on the parent's
+    -- side of the boundary, `inner` the signal on the child's, and `port` the
+    -- name the connection is written with.
+    inner        INTEGER REFERENCES name(id),
     -- 0=in 1=out 2=inout 3=ref. Three values do not deserve 1.1 MB of text.
     direction    INTEGER,
     outer        INTEGER REFERENCES name(id),
@@ -314,6 +324,32 @@ CREATE TABLE hier_ref(
     line   INTEGER,
     path_lo INTEGER, path_hi INTEGER, path_exact INTEGER);
 
+-- A statement that reads signals without writing anything this module can
+-- name. Two shapes reach it: an assertion, which writes nothing at all, and an
+-- assignment whose target lies outside the module (`assign bus.vld = |payload;`).
+--
+-- Their reads had nowhere else to go. `edge` requires a `dst`, and
+-- `assign_operand` hangs off an `assignment` row that cannot exist without a
+-- module-relative target -- so `payload` and every signal an assertion checks
+-- read as though nothing in the design used them, which for assertion-heavy
+-- RTL is most of what the file says.
+--
+-- The write side of the second shape is in `hier_ref` at the same file and
+-- line; this is the read side of the same statement.
+CREATE TABLE stmt_read(
+    module    INTEGER NOT NULL REFERENCES module(id),
+    name      INTEGER NOT NULL REFERENCES name(id),
+    -- As edge.kind, plus 'assertion' for one that is not inside a procedure.
+    kind      TEXT,
+    -- The construct that reads: `assign`, `always_ff`, or the assertion's own
+    -- word -- `assert`, `assume`, `cover`, `expect`.
+    construct TEXT,
+    file      INTEGER REFERENCES file(id),
+    line      INTEGER,
+    -- Bits of the thing read, spelled `src_*` as everywhere else that records
+    -- a read.
+    src_lo    INTEGER, src_hi INTEGER, src_exact INTEGER);
+
 -- The instance tree. This is the one table that scales with the design rather
 -- than with the source, which is why it carries nothing but identity.
 CREATE TABLE instance(
@@ -331,6 +367,7 @@ CREATE INDEX symbol_by_module ON symbol(module);
 CREATE INDEX assign_by_dst    ON assignment(module, dst);
 CREATE INDEX pevent_by_proc   ON proc_event(module, proc);
 CREATE INDEX aop_by_assign    ON assign_operand(assignment);
+CREATE INDEX sread_by_name    ON stmt_read(module, name);
 CREATE INDEX href_by_module   ON hier_ref(module);
 CREATE INDEX symbol_by_name   ON symbol(name);
 -- Both directions: outward from a net in the parent, and inward from a formal
@@ -401,11 +438,12 @@ Writer::Writer(const std::string& path) {
     prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
     prepare("INSERT INTO child VALUES(?,?,?,?)", &insChild);
     prepare("INSERT INTO instance VALUES(?,?,?,?)", &insInstance);
-    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
+    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?)", &insProcEvent);
         prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?)", &insAssignOp);
+        prepare("INSERT INTO stmt_read VALUES(?,?,?,?,?,?,?,?,?)", &insStmtRead);
         prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?)", &insHierRef);
         begin();
     }
@@ -418,6 +456,7 @@ Writer::Writer(const std::string& path) {
         sqlite3_finalize(insAssign);
         sqlite3_finalize(insProcEvent);
         sqlite3_finalize(insAssignOp);
+        sqlite3_finalize(insStmtRead);
         sqlite3_finalize(insHierRef);
         sqlite3_close(db);
         db = nullptr;
@@ -435,6 +474,7 @@ Writer::~Writer() {
         sqlite3_finalize(insAssign);
         sqlite3_finalize(insProcEvent);
         sqlite3_finalize(insAssignOp);
+        sqlite3_finalize(insStmtRead);
         sqlite3_finalize(insHierRef);
         sqlite3_close(db);
     }
@@ -670,29 +710,30 @@ void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
         // An interface port has no direction at all; NULL says so, where a
         // made-up code would read as a direction this tool failed to model.
         if (r.direction.empty())
-            sqlite3_bind_null(insPort, 5);
+            sqlite3_bind_null(insPort, 6);
         else
-            sqlite3_bind_int(insPort, 5, directionCode(r.direction));
-        bindOptId(insPort, 6, internName(r.outer));
-        bindOptId(insPort, 7, internType(r.outerType));
+            sqlite3_bind_int(insPort, 6, directionCode(r.direction));
+        bindOptId(insPort, 5, internName(r.inner));
+        bindOptId(insPort, 7, internName(r.outer));
+        bindOptId(insPort, 8, internType(r.outerType));
         if (r.outerWidth >= 0)
-            sqlite3_bind_int64(insPort, 8, r.outerWidth);
+            sqlite3_bind_int64(insPort, 9, r.outerWidth);
         else
-            sqlite3_bind_null(insPort, 8);
+            sqlite3_bind_null(insPort, 9);
         // A row with no outer net has no bits to describe; all three stay NULL
         // so a tie-off does not read as "the whole of nothing, exactly".
         if (r.outer.empty()) {
-            bindOptRange(insPort, 9, 10, std::nullopt);
-            sqlite3_bind_null(insPort, 11);
+            bindOptRange(insPort, 10, 11, std::nullopt);
+            sqlite3_bind_null(insPort, 12);
         }
         else {
-            bindOptRange(insPort, 9, 10, r.outerBits);
-            sqlite3_bind_int(insPort, 11, r.outerExact ? 1 : 0);
+            bindOptRange(insPort, 10, 11, r.outerBits);
+            sqlite3_bind_int(insPort, 12, r.outerExact ? 1 : 0);
         }
-        sqlite3_bind_int(insPort, 12, static_cast<int>(r.conn));
-        bindOptId(insPort, 13, internName(r.modport));
-        bindOptId(insPort, 14, internFile(r.file));
-        sqlite3_bind_int64(insPort, 15, r.line);
+        sqlite3_bind_int(insPort, 13, static_cast<int>(r.conn));
+        bindOptId(insPort, 14, internName(r.modport));
+        bindOptId(insPort, 15, internFile(r.file));
+        sqlite3_bind_int64(insPort, 16, r.line);
         step(insPort);
         if (++pending >= kBatch) {
             commit();
@@ -720,6 +761,25 @@ void Writer::addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows) {
         sqlite3_bind_int64(insSymbol, 8, r.line);
         sqlite3_bind_int64(insSymbol, 9, r.col);
         step(insSymbol);
+        if (++pending >= kBatch) {
+            commit();
+            begin();
+        }
+    }
+}
+
+void Writer::addStmtReads(int64_t moduleId, const std::vector<StmtReadRow>& rows) {
+    for (auto& r : rows) {
+        sqlite3_reset(insStmtRead);
+        sqlite3_bind_int64(insStmtRead, 1, moduleId);
+        sqlite3_bind_int64(insStmtRead, 2, internName(r.name));
+        bindOptText(insStmtRead, 3, r.kind);
+        bindOptText(insStmtRead, 4, r.construct);
+        bindOptId(insStmtRead, 5, internFile(r.file));
+        sqlite3_bind_int64(insStmtRead, 6, r.line);
+        bindOptRange(insStmtRead, 7, 8, r.bits);
+        sqlite3_bind_int(insStmtRead, 9, r.exact ? 1 : 0);
+        step(insStmtRead);
         if (++pending >= kBatch) {
             commit();
             begin();

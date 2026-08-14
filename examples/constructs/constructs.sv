@@ -29,6 +29,30 @@ module decode(input logic [3:0] idx, output logic [15:0] onehot);
     assign onehot = 16'b1 << idx;
 endmodule
 
+// A net declared with an initialiser is a continuous assignment by the LRM,
+// but slang models it as a net carrying an expression rather than as an
+// `assign`, so it reached no procedure and `w`/`s` had no driver at all.
+module netinit(input logic a, input logic b, output logic y);
+    wire w = a & b;
+    wire (strong1, weak0) s = a;
+    assign y = w | s;
+endmodule
+
+// A call binds actuals to formals. The body's write is recorded once; without
+// the binding the other half of the chain is missing and `d` reads as unused.
+module viacall(input logic clk, input logic [7:0] d, output logic [7:0] q);
+    task automatic bump(input logic [7:0] v);
+        q <= v + 8'd1;
+    endtask
+    always_ff @(posedge clk) bump(d);
+endmodule
+
+// An assertion writes nothing, so its reads fit no table keyed on a target.
+// The concurrent form lives in assertions.sv, which Icarus cannot parse.
+module checks(input logic clk, input logic req, input logic ack);
+    always_comb assert (req !== 1'bx || ack !== 1'bx);
+endmodule
+
 module gates(input logic a, input logic b, input logic en, output logic y);
     wire yi, yn, o1, o2, zt, pu;
     wire [2:0] sr;
@@ -64,6 +88,15 @@ module constructs;
 
     logic [7:0] cnt_o;
     counter u_cnt(.clk(clk), .rst_n(rst_n), .cnt(cnt_o));
+
+    logic ni_y;
+    netinit u_netinit(.a(clk), .b(rst_n), .y(ni_y));
+
+    logic [7:0] vq;
+    viacall u_viacall(.clk(clk), .d(cnt_o), .q(vq));
+
+    logic ack = 1'b0;
+    checks u_checks(.clk(clk), .req(rst_n), .ack(ack));
 
     logic [7:0] observed;
     always_comb observed = u_cnt.cnt;       // downward XMR read

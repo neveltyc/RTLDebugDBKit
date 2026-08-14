@@ -135,7 +135,12 @@ enum class PortConn { Net = 0, Constant = 1, Unconnected = 2, Expression = 3,
 /// has no dataflow rows at all and is reachable only through these.
 struct PortRow {
     std::string child;        // child instance name, generate prefix included
-    std::string port;         // formal port name inside the child
+    std::string port;         // the formal, as the connection names it
+    /// The signal inside the child that `port` stands for, when the two differ
+    /// -- `.ext_one(inner)` is `ext_one` on the connection and `inner` within.
+    /// Empty in the ordinary case where they are one name. Paired with `outer`:
+    /// the child's side of the boundary, where `outer` is the parent's.
+    std::string inner;
     std::string direction;    // in | out | inout | ref
     std::string outer;        // the connected net, in the PARENT's namespace
     std::string outerType;
@@ -149,6 +154,20 @@ struct PortRow {
     std::string modport;
     std::string file;
     uint32_t line = 0;
+};
+
+/// One signal read by a statement that writes nothing this module can name:
+/// an assertion, or an assignment whose target lies outside the module. Such
+/// reads fit in no other table -- `edge` needs a target and `assign_operand`
+/// needs an assignment row -- so without this the signal reads as unused.
+struct StmtReadRow {
+    std::string name;
+    std::string kind;         // as EdgeRow::kind, plus "assertion"
+    std::string construct;    // assign | always_ff | assert | assume | cover
+    std::string file;
+    uint32_t line = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> bits;
+    bool exact = true;
 };
 
 /// One instantiation inside a module body.
@@ -227,6 +246,7 @@ public:
     void addChildren(int64_t moduleId, const std::vector<ChildRow>& rows);
     void addPorts(int64_t moduleId, int64_t defModuleId, const std::vector<PortRow>& rows);
     void addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows);
+    void addStmtReads(int64_t moduleId, const std::vector<StmtReadRow>& rows);
     void addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows);
 
     /// Every edge event a procedure triggers on or waits on. An event list has
@@ -268,6 +288,7 @@ private:
     sqlite3_stmt* insAssign = nullptr;
     sqlite3_stmt* insProcEvent = nullptr;
     sqlite3_stmt* insAssignOp = nullptr;
+    sqlite3_stmt* insStmtRead = nullptr;
     sqlite3_stmt* insHierRef = nullptr;
     std::unordered_map<std::string, int64_t> typeIds;
     std::unordered_map<std::string, int64_t> fileIds;

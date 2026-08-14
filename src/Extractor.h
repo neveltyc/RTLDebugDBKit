@@ -37,6 +37,9 @@ struct Stats {
     int64_t ports = 0;
     int64_t symbols = 0;
     int64_t assignments = 0;
+    /// Signals read by a statement that writes nothing this module can name --
+    /// an assertion, or an assignment whose target lies outside the module.
+    int64_t stmtReads = 0;
     /// References to symbols outside the module being extracted. They cannot be
     /// stored in a row shared by every instance of it, so they are counted.
     int64_t external = 0;

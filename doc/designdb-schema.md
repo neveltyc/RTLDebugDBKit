@@ -22,8 +22,12 @@ addition; statement-level waits, with `wait`, `file` and `line`, in
 `initial` block as clocked, which is the second reason the version moved;
 primitive
 edges (`kind='primitive'`); `symbol.kind='interface_port'`; `file.source_file`;
-self-feedback edges; and `meta.top` written from the elaborated tops whether or
-not `--top` was passed.
+self-feedback edges; drivers for nets declared with an initialiser
+(`wire w = a & b`); a call's actuals tied to the formals they bind to; the
+[`stmt_read`](#reads-with-no-target) table, so an assertion's reads and the
+read side of an outward write have somewhere to live; `port.inner` for a
+formal the connection names something else; and `meta.top` written from the
+elaborated tops whether or not `--top` was passed.
 
 ## Contents
 
@@ -35,6 +39,7 @@ not `--top` was passed.
 - [Dataflow](#dataflow) — `edge`, `assignment`, `assign_operand`, `proc_event`
 - [Crossing a module boundary](#crossing-a-module-boundary) — `port`
 - [Leaving the hierarchy](#leaving-the-hierarchy) — `hier_ref`
+- [Reads with no target](#reads-with-no-target) — `stmt_read`
 - [Bit ranges](#bit-ranges)
 - [Provenance](#provenance) — `source_file`, `meta`
 - [Naming rules](#naming-rules)
@@ -51,11 +56,11 @@ half: the elaborated structure of the design, addressable by name, with a
 | Question | Where the answer is |
 |---|---|
 | What drives this signal? | `edge` where `dst` is the signal — with the construct and the statement's own line |
-| What reads it? | `edge` where `src` is the signal |
 | Which *statement* wrote it, when several do? | `assignment` (one row per statement, with `proc`/`seq`/`blocking`) + `assign_operand` |
 | Which *bits* came from where? | `src_lo`/`src_hi`/`dst_lo`/`dst_hi` on `edge`, read with `*_exact` |
 | Where does this path leave the module? | `port` — the only table spanning two modules, interface bindings included |
 | What does this module touch outside itself? | `hier_ref` — every reference that leaves it, exactly as written |
+| What reads it? | the union of `edge` where `src` is it, `assign_operand`, `proc_event`, `hier_ref` with `write = 0`, and `stmt_read` — each records a different kind of read |
 | What is this instance, and what is it inside? | `instance` (leaf name + parent chain) and `module` |
 | How wide is it, which direction, where is it declared? | `symbol` |
 | What is this procedure sensitive to, or waiting on? | `proc_event` |
@@ -116,6 +121,7 @@ referencing one of those is a row id**, so reading a name means joining
 | [`proc_event`](#dataflow) | edge event a procedure triggers on or waits on | unique RTL |
 | [`port`](#crossing-a-module-boundary) | port connection on a child instance | unique RTL |
 | [`hier_ref`](#leaving-the-hierarchy) | reference that leaves the module, as written | unique RTL |
+| [`stmt_read`](#reads-with-no-target) | signal read by a statement that writes nothing nameable | unique RTL |
 | [`source_file`](#provenance) | file slang actually read | source tree |
 | [`meta`](#provenance) | key/value (schema version, tool, top) | fixed |
 
@@ -181,6 +187,7 @@ statements rather than one merged set.
 |---|---|---|
 | `port` | `module`, `child`, `def_module`, `port` | A port connection, recorded against the parent module that writes it. `module` is the parent, `def_module` the child's module, `port` the formal inside it. |
 | | `direction` | 0=in, 1=out, 2=inout, 3=ref, 4=unknown. NULL for an interface binding — an interface port has no direction. |
+| | `inner` | The signal inside the child that `port` stands for, when the connection names the formal something else (`module m(.ext_one(inner))`). NULL when the two are one name, which is the ordinary case. Without it a consumer holding the internal name has no way back to the binding. |
 | | `outer`, `outer_type` | The net in the *parent's* namespace. |
 | | `outer_width` | The width of the connection **as written**, looking through the implicit conversion slang inserts to fit the formal. Comparing it against the formal's `symbol.width` is how a width-mismatched connection is found. NULL for an element of an instance array, where every element shares the array's connection expression and the comparison has no meaning. |
 | | `outer_lo`/`outer_hi`/`outer_exact` | The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches bits 0..3 of `stim`, not all of it. Same encoding as `edge` — see [Bit ranges](#bit-ranges). NULL with exact=0 for an element of an instance array, as with `outer_width`. |
@@ -240,6 +247,33 @@ noise pretending to be an answer (`pkg::mask`, written with its package, is
 stored). And a **downward reference that stays inside the module's subtree**
 (`u_child.sig`) was never external at all: it lands in ordinary `edge` and
 `assignment` rows as a dotted module-relative name.
+
+## Reads with no target
+
+| table | column | meaning |
+|---|---|---|
+| `stmt_read` | `module`, `name` | One signal read by a statement that writes nothing this module can name. |
+| | `kind`, `construct` | As `edge`, plus the assertion's own word as the construct: `assert`, `assume`, `cover`, `restrict`, `expect`. |
+| | `file`, `line` | The statement's own location. |
+| | `src_lo`/`src_hi`/`src_exact` | Bits of the thing read, spelled as everywhere else. An assertion's operands are walked for value references rather than through path analysis, so their ranges come back NULL with `src_exact = 0` — somewhere inside, and we cannot say where. |
+
+Two shapes land here, and they have the same problem: `edge` requires a `dst`,
+and an `assign_operand` row hangs off an `assignment` that cannot exist without
+a module-relative target.
+
+- **An assertion** writes nothing at all. `assert (req !== 1'bx)` and
+  `assert property (@(posedge clk) req |-> ##1 ack)` read `req`, `ack` and
+  `clk`, and without this table those signals read as though no part of the
+  design looked at them.
+- **An assignment whose target lies outside the module** —
+  `assign bus.vld = |payload;` through an interface port. The write is in
+  `hier_ref`; this is the read side of the same statement, at the same
+  `file`/`line`. An operand that is *itself* outward goes to `hier_ref` too.
+
+**Answering "what reads this signal" means a union**: `edge.src`,
+`assign_operand.name`, `proc_event.signal`, `hier_ref` where `write = 0`, and
+`stmt_read.name`. Each records a different kind of read, and none subsumes
+another.
 
 ## Bit ranges
 
@@ -328,9 +362,18 @@ go stale against a digest that can only say *that* it changed.
   modelled — a consumer replaying drive order sees it as one more write.
 - A statement whose target lives outside the module (`assign bus.vld = x;`)
   has no `assignment` row, since that row cannot exist without a
-  module-relative target. Both sides still reach `hier_ref` — the outward
-  write, and every operand that is itself outward — but an operand *inside*
-  the module has nowhere to be recorded for such a statement.
+  module-relative target. The write is in `hier_ref`, an outward operand joins
+  it there, and an operand inside the module is in
+  [`stmt_read`](#reads-with-no-target) — but the three are related only by
+  sharing a `module`, `file` and `line`.
+- A port that stands for a *concatenation* of internal signals
+  (`module m(.ext_pair({hi, lo}))`) records the binding, but `hi` and `lo`
+  keep a NULL `symbol.direction`: slang offers the concatenation through
+  neither the scope's members nor the body's port list, so there is nothing to
+  attribute the direction from.
+- A variable initialiser (`logic [7:0] c = 0`) is not a driver and has no row.
+  It writes once at time zero; treating it as a continuous assignment would
+  put one on every register that declares a reset value.
 - A reference assembled through a macro (`` `DEFINED_XMR ``, or ``tb.`SIG``)
   is counted in the external-reference note but has no `hier_ref` row: its
   text spans two buffers and cannot be recovered as one span, and the
