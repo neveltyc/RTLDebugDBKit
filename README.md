@@ -73,15 +73,17 @@ Release build, macOS arm64, against public designs:
 
 | design | modules | instances | symbols | edges | ports | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 269 | 4,425 | 0 | 0.02 s | 0.54 MB |
-| tinyriscv | 34 | 49 | 912 | 4,839 | 478 | 0.02 s | 0.71 MB |
+| picorv32 | 1 | 1 | 269 | 4,455 | 0 | 0.02 s | 0.56 MB |
+| tinyriscv | 34 | 49 | 912 | 4,869 | 478 | 0.02 s | 0.73 MB |
 | Ibex (`ibex_core`) † | 25 | 32 | 1,703 | 5,723 | 652 | 0.04 s | 0.99 MB |
 | VeeRwolf (`veerwolf_core`) † | 220 | 3,950 | 10,342 | 24,589 | 15,780 | 0.19 s | 5.35 MB |
 
-† measured on schema v1 and not re-run since. Expect more edges under v2 on
-the same source: a self-feedback assignment (`cnt <= cnt + 1`) now contributes
-a row, and gate, switch and UDP instances contribute one per (input, output)
-pairing where v1 recorded none. The other columns are unaffected.
+† measured on schema v1 and not re-run since. Expect more edges under v3 on
+the same source: a self-feedback assignment (`cnt <= cnt + 1`) contributes a
+row, gate, switch and UDP instances contribute one per (input, output) pairing,
+a net declared with an initialiser (`wire w = a & b`) gets the driver it never
+had, and a call binds its actuals to the formals. The other columns are
+unaffected.
 
 Elaboration cost is slang's: memory scales with the number of elaborated
 instances, so a very large flat design wants `--top` on a subtree.
@@ -125,8 +127,8 @@ CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
 src/                    main.cpp (CLI + filelist parsing), Extractor, DesignDb
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
-examples/constructs/    self-feedback, primitives, waits, XMRs, interfaces --
-                        what v2 records; exported and asserted by CI
+examples/constructs/    self-feedback, primitives, waits, XMRs, interfaces,
+                        assertions -- exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
                         check-rtl.sh (validate RTL against Verilator and Icarus)

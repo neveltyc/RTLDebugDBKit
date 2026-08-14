@@ -22,7 +22,14 @@ namespace designdb {
 /// in v2, where `port.conn_kind` gained kinds a v1 reader would have misread
 /// as plain nets. A reader that does not know the version must refuse the file
 /// rather than read it as though the layout held.
-inline constexpr int SchemaVersion = 2;
+///
+/// v3 moved for the same reason rather than for the new `stmt_read` table or
+/// the new `port.inner` column, both of which a v2 reader would merely not
+/// query: `assignment.proc` gained NULL, for a statement that is in no
+/// procedure. A reader that joins it against `proc_event.proc`, or indexes
+/// procedures by it, reads that as a fact about procedure 0 unless it is told
+/// the layout changed.
+inline constexpr int SchemaVersion = 3;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
@@ -65,7 +72,7 @@ struct AssignRow {
     std::string construct;    // assign | always_ff | ...
     std::string file;
     uint32_t line = 0;
-    int64_t proc = 0;         // which procedure in the module
+    int64_t proc = 0;         // which procedure; negative = none, stored NULL
     int64_t seq = 0;          // order within that procedure
     int blocking = -1;        // 1 for `=`, 0 for `<=`, -1 for a continuous assign
     bool dstExact = true;

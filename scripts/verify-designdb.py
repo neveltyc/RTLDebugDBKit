@@ -41,10 +41,10 @@ def check(what, sql, expect_at_least=1):
 
 
 if mode:
-    # The v2 facts every reader relies on, whichever example is loaded.
+    # The facts every reader relies on, whichever example is loaded.
     version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if not version or version[0] != "2":
-        sys.exit(f"schema_version is {version and version[0]}, expected 2")
+    if not version or version[0] != "3":
+        sys.exit(f"schema_version is {version and version[0]}, expected 3")
     top = con.execute("SELECT value FROM meta WHERE key='top'").fetchone()
     if not top or top[0] != mode:
         sys.exit(f"meta.top is {top and top[0]!r}, expected {mode!r} without --top")
@@ -73,6 +73,18 @@ if mode == "constructs":
     # One net on both terminals of a gate, different bits. Guarding on the
     # symbol dropped the edge and then called the target undriven, which
     # severed every stage of a gate-level chain and mislabelled it.
+    # The reason the schema version moved to 3: a statement in no procedure.
+    # Spelled NULL, as `blocking` in the same table already spells "does not
+    # apply" -- a -1 would have to be known about and excluded before joining.
+    check("the net initialiser's assignment has no procedure", """
+        SELECT count(*) FROM assignment a JOIN name d ON d.id = a.dst
+        WHERE a.proc IS NULL AND d.text IN ('w', 's')""", 2)
+    orphan = con.execute("""
+        SELECT count(*) FROM assignment WHERE proc = -1""").fetchone()[0]
+    if orphan:
+        sys.exit(f"{orphan} assignment(s) carry proc=-1; a statement in no "
+                 "procedure is spelled NULL, like blocking beside it")
+    print("ok: no assignment uses a -1 sentinel for proc")
     check("a gate driving one bit of a net from another", """
         SELECT count(*) FROM edge e
         JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src

@@ -241,6 +241,11 @@ CREATE TABLE assignment(
     -- `seq` restarts per procedure, so two assignments to one target from
     -- different `always` blocks can carry the same seq and would otherwise read
     -- as one ordered sequence.
+    --
+    -- `proc` is NULL when the statement is in no procedure: a net declared with
+    -- an initialiser (`wire w = a & b;`) is a continuous assignment written at
+    -- the declaration, so it has a `seq` among its peers and no procedure to
+    -- belong to.
     proc     INTEGER,
     seq      INTEGER,
     -- 1 for `=`, 0 for `<=`, NULL for a continuous assign. Not decoration: two
@@ -799,7 +804,14 @@ int64_t Writer::addAssignment(int64_t moduleId, const AssignRow& row,
     bindOptText(insAssign, 8, row.construct);
     bindOptId(insAssign, 9, internFile(row.file));
     sqlite3_bind_int64(insAssign, 10, row.line);
-    sqlite3_bind_int64(insAssign, 11, row.proc);
+    // NULL when the statement is not inside a procedure at all -- a net
+    // declared with an initialiser. Spelled the way `blocking` two columns
+    // along already spells "does not apply", rather than as a -1 a consumer
+    // would have to know to exclude before joining on it.
+    if (row.proc < 0)
+        sqlite3_bind_null(insAssign, 11);
+    else
+        sqlite3_bind_int64(insAssign, 11, row.proc);
     sqlite3_bind_int64(insAssign, 12, row.seq);
     if (row.blocking < 0)
         sqlite3_bind_null(insAssign, 13);
