@@ -32,6 +32,50 @@ digest = con.execute("SELECT digest FROM source_file").fetchone()
 if not digest or len(digest[0]) != 64:
     sys.exit("source_file.digest is missing or not a SHA-256")
 
+# Structural integrity — catches corruption and generator bugs.
+ic = con.execute("PRAGMA integrity_check").fetchone()[0]
+if ic != "ok":
+    sys.exit(f"integrity_check failed: {ic}")
+con.execute("PRAGMA foreign_keys = ON")
+fk_errs = con.execute("PRAGMA foreign_key_check").fetchall()
+if fk_errs:
+    sys.exit(f"foreign_key_check failed: {len(fk_errs)} violation(s), "
+             f"first: table={fk_errs[0][0]} rowid={fk_errs[0][1]}")
+print("ok: integrity_check and foreign_key_check pass")
+
+# Value domain: boolean-ish columns must be 0, 1, or NULL.
+for tbl, cols in (
+    ("edge", ("control", "src_exact", "dst_exact")),
+    ("port", ("outer_exact",)),
+    ("proc_event", ("wait",)),
+    ("assign_operand", ("src_exact",)),
+    ("stmt_read", ("src_exact",)),
+    ("hier_ref", ("path_exact",)),
+):
+    for col in cols:
+        bad = con.execute(
+            f'SELECT count(*) FROM "{tbl}" WHERE "{col}" NOT IN (0, 1) '
+            f'AND "{col}" IS NOT NULL').fetchone()[0]
+        if bad:
+            sys.exit(f"{bad} row(s) in {tbl}.{col} outside {{0, 1, NULL}}")
+print("ok: boolean columns are 0/1/NULL")
+
+# Range consistency: lo <= hi when both are non-NULL.
+for tbl, lo, hi in (
+    ("edge", "src_lo", "src_hi"), ("edge", "dst_lo", "dst_hi"),
+    ("port", "outer_lo", "outer_hi"),
+    ("assignment", "dst_lo", "dst_hi"),
+    ("assign_operand", "src_lo", "src_hi"),
+    ("stmt_read", "src_lo", "src_hi"),
+    ("hier_ref", "path_lo", "path_hi"),
+):
+    bad = con.execute(
+        f'SELECT count(*) FROM "{tbl}" WHERE "{lo}" IS NOT NULL '
+        f'AND "{hi}" IS NOT NULL AND "{lo}" > "{hi}"').fetchone()[0]
+    if bad:
+        sys.exit(f"{bad} row(s) in {tbl} have {lo} > {hi}")
+print("ok: range lo <= hi")
+
 
 def check(what, sql, expect_at_least=1):
     n = con.execute(sql).fetchone()[0]

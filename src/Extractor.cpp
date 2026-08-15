@@ -505,6 +505,7 @@ std::pair<uint64_t, uint64_t> keyRange(const Ref& r) {
 uint8_t kindTag(std::string_view k) {
     if (k == "procedural") return 1;
     if (k == "primitive") return 2;
+    if (k == "procedure") return 3;
     return 0;
 }
 

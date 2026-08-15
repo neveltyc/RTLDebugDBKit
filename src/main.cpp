@@ -529,6 +529,7 @@ int main(int argc, char** argv) {
                 cfg += inst->name;
                 cfg += '\n';
             }
+            cfg += "1ns/1ps\n";
             cfg += RTLDESIGNDB_VERSION "\n";
             cfg += RTLDESIGNDB_SLANG_TAG "\n";
             writer.setMeta("config_digest", designdb::digest(cfg));
