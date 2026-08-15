@@ -363,7 +363,8 @@ void classify(const Symbol& sym, std::string& kind, std::string& construct) {
 /// out "the first" would record how the author arranged the list, and would
 /// name the reset in half of all async-reset flops.
 void collectEdgeEvents(const TimingControl* t,
-                       std::vector<std::pair<const Expression*, std::string>>& out) {
+                       std::vector<std::pair<const Expression*, std::string>>& out,
+                       std::vector<const Expression*>* iffs = nullptr) {
     if (!t)
         return;
     switch (t->kind) {
@@ -374,11 +375,16 @@ void collectEdgeEvents(const TimingControl* t,
             out.emplace_back(&se.expr, se.edge == EdgeKind::PosEdge   ? "posedge"
                                        : se.edge == EdgeKind::NegEdge ? "negedge"
                                                                       : "both");
+            // `@(posedge clk iff en)` samples `en` too. It qualifies the
+            // event rather than being one, so it gets no `proc_event` row --
+            // but it is a read, and it was reaching no table at all.
+            if (iffs && se.iffCondition)
+                iffs->push_back(se.iffCondition);
             return;
         }
         case TimingControlKind::EventList:
             for (auto* c : t->as<EventListControl>().events)
-                collectEdgeEvents(c, out);
+                collectEdgeEvents(c, out, iffs);
             return;
         default:
             return;
@@ -646,7 +652,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                     SourceRange where)>;
     using EmitAssign = std::function<void(const Ref& dst, const std::vector<Ref>& operands,
                                           SourceRange where, int64_t seq, bool blocking,
-                                          int64_t droppedConstants)>;
+                                          int64_t droppedConstants, bool inSubroutine)>;
     /// A statement that reads without writing anything nameable.
     using EmitRead = std::function<void(const std::vector<Ref>& operands,
                                         const std::string& construct, SourceRange where)>;
@@ -668,6 +674,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     std::set<const SubroutineSymbol*> activeSubs;
     std::set<const SubroutineSymbol*> walkedSubs;
     std::set<const ValueSymbol*> loopVars;
+    int subDepth = 0;
 
 
     StatementWalker(Emit emit, EmitAssign emitAssign, EmitEvent emitEvent,
@@ -896,7 +903,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // target keeps its edges but loses its statement line, seq, and
             // blocking kind. It *reads* cnt the same way, so the operand and the
             // self-edge are recorded exactly as if it were spelled out.
-            emitAssign(dst, {dst}, expr.sourceRange, seq++, true, 0);
+            emitAssign(dst, {dst}, expr.sourceRange, seq++, true, 0, subDepth > 0);
             // Data before gating, as the assignment path does. An operand can
             // reach a target both ways at one statement -- `if (c < lim) c++;`
             // reads `c` in the condition and in the increment -- and the edge
@@ -932,8 +939,16 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // out four times over. The targets are function locals in any case:
         // they have no `symbol` row and no waveform, so they are attributed but
         // not re-attributed.
-        if (walkedSubs.insert(*sub).second)
+        if (walkedSubs.insert(*sub).second) {
+            // Depth, so a statement in the body knows it is not the enclosing
+            // construct's own. A `=` inside a function reached from an
+            // `assign` is still a `=`; reporting it as the continuous
+            // assignment's NULL made the same source line answer differently
+            // depending on who called it.
+            subDepth++;
             (*sub)->getBody().visit(*this);
+            subDepth--;
+        }
         activeSubs.erase(*sub);
     }
 
@@ -1078,7 +1093,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         for (auto& dst : targets) {
             if (loopVars.count(dst.sym))
                 continue;
-            emitAssign(dst, reads, expr.sourceRange, seq++, expr.isBlocking(), droppedConstants);
+            emitAssign(dst, reads, expr.sourceRange, seq++, expr.isBlocking(),
+                       droppedConstants, subDepth > 0);
             for (auto& src : reads)
                 emit(dst, src, false, expr.sourceRange);
             for (auto& src : gating)
@@ -1299,7 +1315,13 @@ void forEachDeclaration(const Scope& scope, F&& fn, const std::string& gen = "")
         switch (member.kind) {
             case SymbolKind::Variable:
             case SymbolKind::Net:
-            case SymbolKind::Parameter: {
+            case SymbolKind::Parameter:
+            // A type parameter is already part of the module's identity in
+            // `module.params`, so leaving it out of the declarations was the
+            // same declaration present in one table and absent from the other.
+            // A specparam is a declaration by any reading of the word.
+            case SymbolKind::TypeParameter:
+            case SymbolKind::Specparam: {
                 auto it = portDir.find(&member);
                 fn(member, gen, it == portDir.end()
                                     ? std::optional<ArgumentDirection>{}
@@ -1352,6 +1374,8 @@ std::string symbolKindName(SymbolKind kind) {
         case SymbolKind::Variable:      return "variable";
         case SymbolKind::Net:           return "net";
         case SymbolKind::Parameter:     return "parameter";
+        case SymbolKind::TypeParameter: return "type_parameter";
+        case SymbolKind::Specparam:     return "specparam";
         case SymbolKind::Port:          return "port";
         case SymbolKind::InterfacePort: return "interface_port";
         default:                        return "other";
@@ -1612,7 +1636,10 @@ private:
             row.kind = symbolKindName(sym.kind);
             if (dir)
                 row.direction = directionName(*dir);
-            if (ValueSymbol::isKind(sym.kind)) {
+            if (sym.kind == SymbolKind::TypeParameter) {
+                row.type = sym.as<TypeParameterSymbol>().targetType.getType().toString();
+            }
+            else if (ValueSymbol::isKind(sym.kind)) {
                 auto& vs = sym.as<ValueSymbol>();
                 row.type = vs.getType().toString();
                 if (vs.getType().isIntegral())
@@ -1625,6 +1652,12 @@ private:
                 auto& ip = sym.as<InterfacePortSymbol>();
                 if (ip.interfaceDef)
                     row.type = std::string(ip.interfaceDef->name);
+                else
+                    // A generic `interface bus` port names no definition, and
+                    // leaving `type` NULL left the first segment of `bus.va`
+                    // with nothing to resolve against. The word says which
+                    // case it is rather than leaving the reader to guess.
+                    row.type = "interface";
                 if (!ip.modport.empty())
                     row.type += "." + std::string(ip.modport);
             }
@@ -1697,6 +1730,18 @@ private:
                 addHierRef(false, r, kind, construct, at, evalCtx);
             }
         }
+        else if (expr) {
+            // Not a plain reference -- `@(posedge clks[2])`, a clock mux --
+            // so `signal` stays NULL, as documented. The signals it samples
+            // are still read, and for a module-local one no other table was
+            // reaching them: `clks` was declared, named by two sensitivity
+            // lists, and absent from every one of the five tables the doc
+            // says answer "what reads this".
+            std::vector<Ref> reads;
+            collectRefs(*expr, evalCtx, reads);
+            addStmtReads(reads, prefix, kind, isWait ? "wait" : "sensitivity",
+                         at, evalCtx);
+        }
         return ProcEventRow{std::move(signal), edge, isWait, at.file, at.line};
     }
 
@@ -1727,10 +1772,16 @@ private:
         std::vector<ProcEventRow> events;
         {
             std::vector<std::pair<const Expression*, std::string>> raw;
-            collectEdgeEvents(sens.timingControl, raw);
+            std::vector<const Expression*> iffs;
+            collectEdgeEvents(sens.timingControl, raw, &iffs);
             for (auto& [expr, edge] : raw)
                 events.push_back(eventRow(expr, edge, prefix, kind, construct,
                                           procAt, /*isWait=*/false, evalCtx));
+            for (auto* cond : iffs) {
+                std::vector<Ref> reads;
+                collectRefs(*cond, evalCtx, reads);
+                addStmtReads(reads, prefix, kind, "sensitivity", procAt, evalCtx);
+            }
         }
 
         // Input-port drivers belong to the parent, not to this module: the port
@@ -1862,7 +1913,8 @@ private:
         // is written: no branch conditions, because deciding which branch held
         // is the reader's job and encoding it here would state it as fact.
         [&](const Ref& dst, const std::vector<Ref>& operands, SourceRange where,
-            int64_t stmtSeq, bool blocking, int64_t droppedConstants) {
+            int64_t stmtSeq, bool blocking, int64_t droppedConstants,
+            bool inSubroutine) {
             if (!dst.sym || inputPorts.count(dst.sym))
                 return;
             AssignRow arow;
@@ -1895,9 +1947,15 @@ private:
             arow.file = at.file;
             arow.proc = procIndex;
             arow.seq = stmtSeq;
-            arow.blocking = (proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
-                                ? -1
-                                : (blocking ? 1 : 0);
+            // NULL means "a continuous assignment", which is a property of
+            // the statement, not of whoever reached it. A `=` inside a called
+            // function is a blocking assignment however the function was
+            // invoked; keying this on the enclosing procedure alone gave the
+            // same line NULL from an `assign` and 1 from an `always_ff`.
+            arow.blocking =
+                (!inSubroutine && proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
+                    ? -1
+                    : (blocking ? 1 : 0);
 
             std::vector<OperandRow> ops;
             for (auto& r : operands) {

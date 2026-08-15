@@ -138,7 +138,7 @@ referencing one of those is a row id**, so reading a name means joining
 
 | table | column | meaning |
 |---|---|---|
-| `module` | `id`, `name`, `params` | A definition plus its elaborated parameter values. The parameters are part of the identity: a different parameterisation resolves different generate branches and different widths, so it is a different netlist. |
+| `module` | `id`, `name`, `params` | A definition plus its elaborated parameter values — **and its localparams**, which slang models the same way. That only ever over-splits, never under-splits, so it remains a sound identity; but a key rebuilt from the overrides written at instantiation will not match it. The parameters are part of the identity: a different parameterisation resolves different generate branches and different widths, so it is a different netlist. |
 | `instance` | `id`, `name`, `module`, `parent` | The instance tree. `name` is the leaf, generate block included; the full path is the chain of names to the root. Paths are not stored — they are all distinct, so interning saves nothing and storing them costs the text twice once the lookup index is counted. |
 | `child` | `module`, `name`, `def_name`, `def_module` | What a module instantiates. `def_module` is NULL when slang could not resolve the definition — recorded rather than dropped, so "there is an instance here whose module I do not have" is distinguishable from "this module instantiates nothing". |
 
@@ -146,24 +146,24 @@ referencing one of those is a row id**, so reading a name means joining
 
 | table | column | meaning |
 |---|---|---|
-| `symbol` | `module`, `name`, `kind`, `type`, `width`, `direction`, `file`, `line`, `col` | Every declaration. `kind` is `variable`/`net`/`parameter`/`port`/`interface_port`. `direction` is `0`=in, `1`=out, `2`=inout, `3`=ref, and non-NULL exactly when the signal is an ordinary port — an `interface_port` has no direction. For an `interface_port`, `type` is the interface definition, with the declared modport when the port restricts itself to one (`simple_bus.master`); it is the name a reference like `bus.vld` resolves its first segment against. |
+| `symbol` | `module`, `name`, `kind`, `type`, `width`, `direction`, `file`, `line`, `col` | Every declaration. `kind` is `variable`/`net`/`parameter`/`type_parameter`/`specparam`/`port`/`interface_port`. A `type_parameter`'s `type` is the type it stands for; a generic `interface` port's is the word `interface`, since it names no definition. `direction` is `0`=in, `1`=out, `2`=inout, `3`=ref, and non-NULL exactly when the signal is an ordinary port — an `interface_port` has no direction. For an `interface_port`, `type` is the interface definition, with the declared modport when the port restricts itself to one (`simple_bus.master`); it is the name a reference like `bus.vld` resolves its first segment against. |
 
 One row per real signal. slang carries a `Port` symbol *and* the net or variable
 behind it; the port contributes its direction to the signal's row rather than a
 row of its own.
 
 This table exists because the rest of the schema is derived from edges, so a
-signal would otherwise appear only if it took part in dataflow. That is enough
-to trace a driver and wrong for everything else — a declared-but-unused signal,
-an output nobody drives, and a clock that only appears in a sensitivity list are
-all absent from an edge-derived view, and those are the ones worth asking about.
+signal would otherwise appear only if it took part in dataflow — a
+declared-but-unused signal, and a clock that only appears in a sensitivity
+list, would not be here at all.
 
-```sql
--- outputs nothing drives
-SELECT n.text FROM symbol s JOIN name n ON n.id = s.name
-WHERE s.direction = 1
-  AND NOT EXISTS (SELECT 1 FROM edge e WHERE e.module = s.module AND e.dst = s.name);
-```
+It does **not** offer "which outputs are undriven" as a query, and an earlier
+draft that did was wrong: an output driven by a child instance's output port
+has a `port` row and no `edge` row, so a `symbol` MINUS `edge` test reports
+every structurally driven output as dead — on a design of ordinary shape,
+nothing but false positives. Deciding that a signal is undriven means reading
+`edge`, `port` and `hier_ref` together and knowing which of them the design
+uses, which is the consumer's judgement to make, not a column here.
 
 ## Dataflow
 
@@ -180,8 +180,8 @@ WHERE s.direction = 1
 |---|---|---|
 | `assignment` | `id`, `module`, `dst`, `dst_lo`/`dst_hi`/`dst_exact` | One statement that writes a target. |
 | | `kind`, `construct`, `file`, `line` | As `edge`. |
-| | `proc`, `seq` | Which procedure in the module, and the order within it. Both are needed: `seq` restarts per procedure, so without `proc` two assignments from different `always` blocks read as one ordered sequence. `proc` is **NULL** when the statement is in no procedure — a net declared with an initialiser is a continuous assignment written at the declaration. |
-| | `blocking` | 1 for `=`, 0 for `<=`, NULL for a continuous assign. Not decoration — two assignments to one target in one block resolve by different rules, and it separates a block-local temporary written with `=` inside an `always_ff` from a real register. |
+| | `proc`, `seq` | Which procedure in the module, and the order within it — within the procedure's own statements. A subroutine's body is numbered *after* the call that invokes it, so `seq` is not execution order across a call. Both are needed: `seq` restarts per procedure, so without `proc` two assignments from different `always` blocks read as one ordered sequence. `proc` is **NULL** when the statement is in no procedure — a net declared with an initialiser is a continuous assignment written at the declaration. |
+| | `blocking` | 1 for `=`, 0 for `<=`, NULL for a continuous assign. It describes **the statement**, so a `=` inside a function keeps its 1 whether the function was reached from an `assign` or from an `always_ff` — while `kind`/`construct` beside it name the *enclosing* construct, which is how the same body reports `assign` from one caller and `always_ff` from another. Not decoration — two assignments to one target in one block resolve by different rules, and it separates a block-local temporary written with `=` inside an `always_ff` from a real register. |
 | | `dropped_operands` | Operands not recorded: compile-time constants, and references outside this module. A row with one operand and three dropped is not a row that reads one signal. |
 | `assign_operand` | `assignment`, `name`, `src_lo`/`src_hi`/`src_exact` | What the right-hand side reads. |
 | `proc_event` | `module`, `proc`, `signal`, `edge_kind`, `wait`, `file`, `line` | Every edge event a procedure triggers on **or waits on**. `signal` is NULL when the event expression is not a plain reference. `wait` is the discriminator: `0` is the procedure's sensitivity list, so the event triggers the block; `1` is an event control reached during execution (`@(posedge clk);` inside an initial block or a task), which suspends it and says nothing about what triggers it. **Filter on `wait = 0` to ask what a procedure is sensitive to** — an `initial` block has only `wait = 1` rows, and reading those as a trigger set makes it look clocked. |
@@ -198,7 +198,7 @@ statements rather than one merged set.
 | | `direction` | 0=in, 1=out, 2=inout, 3=ref, 4=unknown. NULL for an interface binding — an interface port has no direction. |
 | | `inner` | The signal inside the child that `port` stands for, when the connection names the formal something else (`module m(.ext_one(inner))`). NULL when the two are one name, which is the ordinary case. Without it a consumer holding the internal name has no way back to the binding. |
 | | `outer`, `outer_type` | The net in the *parent's* namespace. |
-| | `outer_width` | The width of the connection **as written**, looking through the implicit conversion slang inserts to fit the formal. Comparing it against the formal's `symbol.width` is how a width-mismatched connection is found. NULL for an element of an instance array, where every element shares the array's connection expression and the comparison has no meaning. |
+| | `outer_width` | The width of the connection **as written**, looking through the implicit conversion slang inserts to fit the formal. Comparing it against the formal's `symbol.width` is how a width-mismatched connection is found. NULL for an element of an instance array, where every element shares the array's connection expression and the comparison has no meaning — and NULL whenever the connection's type is not integral (an unpacked array or struct port), so `outer_width IS NULL` is not a test for "array element". |
 | | `outer_lo`/`outer_hi`/`outer_exact` | The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches bits 0..3 of `stim`, not all of it. Same encoding as `edge` — see [Bit ranges](#bit-ranges). NULL with exact=0 for an element of an instance array, as with `outer_width`. |
 | | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an expression, 4=an interface binding, 5=attached to a signal with no name in this module. |
 | | `modport` | The modport restricting an interface binding, when one does. NULL otherwise. |
@@ -234,7 +234,7 @@ interface instance; this row is how a reference on either side finds them.
 
 | table | column | meaning |
 |---|---|---|
-| `hier_ref` | `module`, `path` | One reference that leaves the module, **as written and normalised**: `bus.vld` through an interface port, `tb.u_dut.state` as an XMR. Whitespace and comments are removed, and constant selects are resolved where the reference is a member access (`b[2].sig`, not `b[g].sig`), so one reference interns as one name however it was spelled. A trailing select is *not* part of the path — the bits it selects are in `path_lo`/`path_hi`, as in `edge`. |
+| `hier_ref` | `module`, `path` | One reference that leaves the module, **as written and normalised**: `bus.vld` through an interface port, `tb.u_dut.state` as an XMR. Whitespace and comments are removed, so one reference interns as one name however it was spelled. Constant selects are resolved only where the reference is a chain of member accesses slang keeps as such; an XMR or an interface member is resolved to a *single* symbol, and there the text is kept verbatim — `arr[LO+1].vld` interns separately from `arr[1].vld`, and a genvar stays unresolved. Trailing selects are stripped to the root object, because that is what `path_lo`/`path_hi` are offsets into. A trailing select is *not* part of the path — the bits it selects are in `path_lo`/`path_hi`, as in `edge`. |
 | | `write` | 1 when the module writes the path, 0 when it reads it. An inout port connection tied to an external signal is recorded as the write. |
 | | `kind`, `construct` | The enclosing construct, in `edge`'s vocabulary — plus `kind='port'` with the direction in `construct` for a port connection tied to an external signal. |
 | | `file`, `line` | Where the reference is written. |
@@ -264,7 +264,7 @@ stored). And a **downward reference that stays inside the module's subtree**
 | `stmt_read` | `module`, `name` | One signal read by a statement that writes nothing this module can name. |
 | | `kind`, `construct` | As `edge`, plus the reading statement's own word as the construct: an assertion's (`assert`, `assume`, `cover`, `restrict`, `expect`), a system task's name (`$display`, `$error`, …), `wait` for a wait condition, or `call` for a void call to a user subroutine that assigns nothing. |
 | | `file`, `line` | The statement's own location. |
-| | `src_lo`/`src_hi`/`src_exact` | Bits of the thing read, spelled as everywhere else. An assertion's operands are walked for value references rather than through path analysis, so their ranges come back NULL with `src_exact = 0` — somewhere inside, and we cannot say where. |
+| | `src_lo`/`src_hi`/`src_exact` | Bits of the thing read, spelled as everywhere else. A **concurrent** assertion's operands are walked for value references rather than through path analysis, so their ranges come back NULL with `src_exact = 0`. An **immediate** assertion, a `wait` condition and a system task's arguments go through path analysis like any other read and carry real ranges. |
 
 One rule decides what lands here: **a statement that reads and writes nothing
 this module can name**. Such a statement has nowhere else to go — `edge`
@@ -311,6 +311,7 @@ Read them together with `*_exact`:
 | NULL | 1 | the whole object |
 | NULL | 0 | somewhere inside it, and we cannot say where (`q[i] <= d`) |
 | set | 1 | exactly those bits |
+| set | 0 | somewhere **within** those bits — a static outer select with a dynamic inner one (`mem2[1][i]`) narrows the range without pinning it |
 
 Storing both NULL cases the same way made uncertainty read as fact.
 
