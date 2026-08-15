@@ -67,6 +67,7 @@ elaborated tops whether or not `--top` was passed.
 - [Provenance](#provenance) — `source_file`, `meta`
 - [Naming rules](#naming-rules)
 - [What is deliberately not here](#what-is-deliberately-not-here)
+- [Why in-module replication is not folded](#why-in-module-replication-is-not-folded)
 - [Known limits](#known-limits)
 
 ## What it answers
@@ -435,3 +436,34 @@ go stale against a digest that can only say *that* it changed.
   warnings included, since the diagnostic responsible can be one.
 - Elaboration cost is slang's: memory scales with the number of elaborated
   instances, so a very large flat design wants `--top` on a subtree.
+
+## Why in-module replication is not folded
+
+Folding is across instances. A generate loop or an instance array *inside* a
+module is elaborated first, so its rows are per iteration — and that is a
+deliberate stop, not an unfinished one.
+
+Measured before deciding. On two real cores the question does not arise:
+picorv32 has no replication-derived rows at all among 4,455 edges, tinyriscv
+has 2 of 912 symbols and none of its 4,869 edges. On a synthetic bank of N
+lanes, rows grow linearly at about **83 bytes each** — a 1,024-lane module,
+far past anything ordinary, costs ~1 MB and exports in 0.03 s.
+
+The reason not to fold is not the size, though. It is what the iterations
+contain. Take the two statements in that loop:
+
+| statement | rows at N=64 | distinct contents |
+|---|---:|---:|
+| `assign par[i] = ^din[i*W +: W];` | 64 | **64** |
+| `always_ff @(posedge clk) tick <= clk;` | 64 | 1 |
+
+Only the second folds. The first differs in exactly the columns that make it
+useful — `dst_lo`/`dst_hi` walk 0,1,2… and `src_lo`/`src_hi` walk 0-7, 8-15,
+16-23 — because indexing by the iteration is what a generate loop is *for*. A
+loop body that ignores its genvar is the rare case.
+
+To fold the first, the row would have to store a stride and a base rather than
+a range, and the consumer would have to evaluate index arithmetic to recover
+the bits. That is the same trade this schema refuses for branch conditions:
+storing something a reader must compute against, in place of the fact itself.
+The bits are the answer, and one row per iteration is what states them.
