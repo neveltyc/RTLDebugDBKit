@@ -9,9 +9,23 @@ include directories, and optionally a top module.
 **Out:** one SQLite file. No runtime, no library, no simulator — anything that
 speaks SQL can read it.
 
-**Schema version 3.** `meta.schema_version` carries it. A reader that does not
+**Schema version 4.** `meta.schema_version` carries it. A reader that does not
 know the version should refuse the file rather than read it as though the layout
 had held.
+
+Version 4 made `instance.name` **one path segment, always**. A generate block
+is now a level of the tree in its own right, so `g_lane[3].u_dp` is two rows
+rather than one name containing a dot, and the walk below resolves one segment
+at a time as it says. Gate, switch and UDP instances gained `child` and
+`instance` rows too, so a netlist-style module no longer reads as instantiating
+nothing and `u_and` is a name you can look up.
+
+Both are why the version moved rather than being additions. `instance.module`
+is **NULL** for a level that is not a module instance, and `child.def_module`
+NULL now means "a primitive, which has no module row" as well as "a definition
+slang could not resolve". A v3 reader gets both wrong rather than missing them.
+To tell a generate level from a primitive: a primitive has a `child` row under
+its parent's module and a generate block does not.
 
 Version 3 added: the [`stmt_read`](#reads-with-no-target) table, so an
 assertion's reads and the read side of an outward write have somewhere to live;
@@ -88,8 +102,14 @@ set of edges, and a separate `instance` table expands them back into hierarchy.
 
 That is the difference between a database sized by the amount of unique RTL and
 one sized by the elaborated instance count, and on a large SoC it is the
-difference between practical and not. `instance` is the only table that grows
-with the design; everything else grows with the source.
+difference between practical and not.
+
+Folding is **across** instances, not within one. Replication written *inside* a
+module — a generate loop, an instance array — is elaborated before the fold is
+applied, so `child`, `symbol`, `port`, `edge` and `assignment` each carry one
+row per iteration. The same source with four lanes and with sixty-four gives
+6 and 66 `child` rows. What they grow with is the module's elaborated contents,
+not the file's line count; only `instance` grows with the whole design.
 
 Names inside a module are **module-relative**, generate-block prefix included
 (`g_lane[3].u_dp.data`). A consumer resolves a hierarchical path by walking down
@@ -122,13 +142,13 @@ referencing one of those is a row id**, so reading a name means joining
 |---|---|---|
 | [`module`](#hierarchy) | definition + parameter values it elaborated with | unique RTL |
 | [`instance`](#hierarchy) | elaborated instance | **the design** |
-| [`child`](#hierarchy) | instantiation written inside a module | unique RTL |
-| [`symbol`](#declarations) | declaration inside a module | unique RTL |
-| [`edge`](#dataflow) | dependency (one signal drives another) | unique RTL |
-| [`assignment`](#dataflow) | statement that writes a target | unique RTL |
+| [`child`](#hierarchy) | instantiation written inside a module, primitives included | elaborated module contents |
+| [`symbol`](#declarations) | declaration inside a module | elaborated module contents |
+| [`edge`](#dataflow) | dependency (one signal drives another) | elaborated module contents |
+| [`assignment`](#dataflow) | statement that writes a target | elaborated module contents |
 | [`assign_operand`](#dataflow) | signal read by an assignment's RHS | unique RTL |
 | [`proc_event`](#dataflow) | edge event a procedure triggers on or waits on | unique RTL |
-| [`port`](#crossing-a-module-boundary) | port connection on a child instance | unique RTL |
+| [`port`](#crossing-a-module-boundary) | port connection on a child instance | elaborated module contents |
 | [`hier_ref`](#leaving-the-hierarchy) | reference that leaves the module, as written | unique RTL |
 | [`stmt_read`](#reads-with-no-target) | signal read by a statement that writes nothing nameable | unique RTL |
 | [`source_file`](#provenance) | file slang actually read | source tree |
@@ -139,8 +159,8 @@ referencing one of those is a row id**, so reading a name means joining
 | table | column | meaning |
 |---|---|---|
 | `module` | `id`, `name`, `params` | A definition plus its elaborated parameter values — **and its localparams**, which slang models the same way. That only ever over-splits, never under-splits, so it remains a sound identity; but a key rebuilt from the overrides written at instantiation will not match it. The parameters are part of the identity: a different parameterisation resolves different generate branches and different widths, so it is a different netlist. |
-| `instance` | `id`, `name`, `module`, `parent` | The instance tree. `name` is the leaf, generate block included; the full path is the chain of names to the root. Paths are not stored — they are all distinct, so interning saves nothing and storing them costs the text twice once the lookup index is counted. |
-| `child` | `module`, `name`, `def_name`, `def_module` | What a module instantiates. `def_module` is NULL when slang could not resolve the definition — recorded rather than dropped, so "there is an instance here whose module I do not have" is distinguishable from "this module instantiates nothing". |
+| `instance` | `id`, `name`, `module`, `parent` | The instance tree. `name` is **one path segment** — a generate block is its own level, so the chain of names to the root *is* the hierarchical path, joined with `.`. `module` is NULL for a level that is not a module instance (a generate block, or a primitive). Paths are not stored — they are all distinct, so interning saves nothing and storing them costs the text twice once the lookup index is counted. |
+| `child` | `module`, `name`, `def_name`, `def_module` | What a module instantiates. `def_module` is NULL either when slang could not resolve the definition or when the instantiation is a **primitive** — a gate, switch or UDP, which has no module row; `def_name` names it (`and`, `my_latch`) in both cases. Recorded rather than dropped, so "there is an instance here whose module I do not have" is distinguishable from "this module instantiates nothing". |
 
 ## Declarations
 

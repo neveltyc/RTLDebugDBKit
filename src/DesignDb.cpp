@@ -359,8 +359,15 @@ CREATE TABLE stmt_read(
 -- than with the source, which is why it carries nothing but identity.
 CREATE TABLE instance(
     id      INTEGER PRIMARY KEY,
+    -- One path segment, never more. A generate block is a level of its own,
+    -- so `g_lane[3].u_dp` is two rows rather than one name containing a dot:
+    -- resolving a path is then one indexed lookup per segment, which is the
+    -- whole reason the paths themselves are not stored.
     name    INTEGER NOT NULL REFERENCES name(id),
-    module  INTEGER NOT NULL REFERENCES module(id),
+    -- NULL for a generate block, which is a naming level rather than an
+    -- instantiation and has no module to point at. `module IS NULL` is how a
+    -- consumer tells the two apart; every other row has one.
+    module  INTEGER REFERENCES module(id),
     parent  INTEGER REFERENCES instance(id));
 )SQL";
 
@@ -883,7 +890,7 @@ void Writer::addInstance(const std::string& name, int64_t moduleId, int64_t pare
     sqlite3_reset(insInstance);
     sqlite3_bind_int64(insInstance, 1, rowId);
     sqlite3_bind_int64(insInstance, 2, internName(name));
-    sqlite3_bind_int64(insInstance, 3, moduleId);
+    bindOptId(insInstance, 3, moduleId);   // NULL for a generate block
     if (parentId)
         sqlite3_bind_int64(insInstance, 4, parentId);
     else

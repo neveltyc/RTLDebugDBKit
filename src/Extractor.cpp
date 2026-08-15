@@ -1688,6 +1688,19 @@ private:
             stats.ports += static_cast<int64_t>(ports.size());
             writer.addPorts(moduleId, defModule, ports);
         });
+        // A gate, switch or UDP is an instantiation written inside the module,
+        // so it belongs here beside the module instances. Its `def_module` is
+        // NULL because a primitive has no module row -- `def_name` carries
+        // what it is (`and`, `my_latch`), which is the only place that name
+        // was recoverable from before.
+        forEachPrimitive(body, [&](const PrimitiveInstanceSymbol& prim) {
+            std::string primName;
+            relativePath(prim, prefix, primName);
+            if (primName.empty())
+                primName = "<unnamed>";
+            children.push_back(ChildRow{primName,
+                                        std::string(prim.primitiveType.name), 0});
+        });
         // Instantiations slang could not resolve are recorded with a null
         // child_module: a consumer can then tell "there is an instance here
         // whose module I do not have" apart from "this module instantiates
@@ -2709,22 +2722,81 @@ private:
     void visitInstance(const InstanceSymbol& inst, int64_t parentRow,
                        const std::string& parentPrefix) {
         int64_t moduleId = moduleIdFor(inst);
-        int64_t rowId = ++instanceRow;
-        // The name relative to the parent instance, so an instance inside a
-        // generate block keeps the block in its name (`g_lane[3].u_dp`) and a
-        // path still rejoins by concatenating with '.'.
+        int64_t rowId = addLevel(std::string(inst.name), moduleId, parentRow,
+                                 inst, parentPrefix);
+        visitScope(inst.body, rowId, inst.getHierarchicalPath());
+    }
+
+    /// One row of the instance tree, named relative to its parent.
+    int64_t addLevel(std::string fallbackName, int64_t moduleId, int64_t parentRow,
+                     const Symbol& sym, const std::string& parentPrefix) {
         std::string name;
-        if (parentPrefix.empty() || !relativePath(inst, parentPrefix, name))
-            name = std::string(inst.name);
+        if (parentPrefix.empty() || !relativePath(sym, parentPrefix, name))
+            name = std::move(fallbackName);
         if (!seenSiblings.insert({parentRow, name}).second)
             stats.duplicatePaths++;
+        const int64_t rowId = ++instanceRow;
         writer.addInstance(name, moduleId, parentRow, rowId);
         stats.instances++;
+        return rowId;
+    }
 
-        const std::string prefix = inst.getHierarchicalPath();
-        forEachInstance(inst.body, [&](const InstanceSymbol& child) {
-            visitInstance(child, rowId, prefix);
-        });
+    /// The tree below one scope: child instances, primitives, and a level of
+    /// its own for every generate block.
+    ///
+    /// A generate block is a level because it is a path segment. Gluing it onto
+    /// the child's leaf name instead -- `g_lane[3].u_dp` in one row -- made a
+    /// name that is not one segment, and the documented resolution, one indexed
+    /// lookup per segment, stalled at the first generate level. It has no
+    /// module, so its `module` is NULL.
+    void visitScope(const Scope& scope, int64_t parentRow,
+                    const std::string& parentPrefix) {
+        for (auto& member : scope.members()) {
+            switch (member.kind) {
+                case SymbolKind::Instance:
+                    visitInstance(member.as<InstanceSymbol>(), parentRow, parentPrefix);
+                    break;
+                case SymbolKind::PrimitiveInstance: {
+                    // A gate is an instantiation like any other. Leaving it out
+                    // made a netlist-style module read as instantiating
+                    // nothing, and its instance name unrecoverable.
+                    auto& prim = member.as<PrimitiveInstanceSymbol>();
+                    addLevel(std::string(prim.name), 0, parentRow, prim, parentPrefix);
+                    break;
+                }
+                case SymbolKind::GenerateBlock: {
+                    auto& block = member.as<GenerateBlockSymbol>();
+                    if (block.isUninstantiated)
+                        break;
+                    const int64_t rowId = addLevel(generateSegment(block), 0,
+                                                   parentRow, block, parentPrefix);
+                    visitScope(block, rowId, block.getHierarchicalPath());
+                    break;
+                }
+                case SymbolKind::GenerateBlockArray: {
+                    auto& arr = member.as<GenerateBlockArraySymbol>();
+                    std::string base(arr.name);
+                    if (base.empty())
+                        base = arr.getExternalName();
+                    for (auto& entry : arr.entries) {
+                        std::string segment = base;
+                        if (entry->kind == SymbolKind::GenerateBlock)
+                            segment += generateSegment(entry->as<GenerateBlockSymbol>());
+                        const int64_t rowId = addLevel(segment, 0, parentRow,
+                                                       entry->asSymbol(), parentPrefix);
+                        visitScope(*entry, rowId, entry->asSymbol().getHierarchicalPath());
+                    }
+                    break;
+                }
+                case SymbolKind::InstanceArray:
+                    // The elements already carry `[i]` in their own names, so
+                    // the array is not a level of its own.
+                    visitScope(member.as<InstanceArraySymbol>(), parentRow, parentPrefix);
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     Compilation& compilation;

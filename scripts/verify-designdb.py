@@ -43,8 +43,8 @@ def check(what, sql, expect_at_least=1):
 if mode:
     # The facts every reader relies on, whichever example is loaded.
     version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if not version or version[0] != "3":
-        sys.exit(f"schema_version is {version and version[0]}, expected 3")
+    if not version or version[0] != "4":
+        sys.exit(f"schema_version is {version and version[0]}, expected 4")
     top = con.execute("SELECT value FROM meta WHERE key='top'").fetchone()
     if not top or top[0] != mode:
         sys.exit(f"meta.top is {top and top[0]!r}, expected {mode!r} without --top")
@@ -79,6 +79,16 @@ if mode:
         sys.exit(f"{orphaned} assignment(s) have no edge at the same "
                  "module/dst/file/line; the edge dedup key is dropping statements")
     print("ok: every assignment is matched by an edge at the same place")
+    # A name in the instance tree is one path segment. A generate block glued
+    # onto the child's leaf name made a row the documented per-segment walk
+    # cannot resolve.
+    multi = con.execute("""
+        SELECT count(*) FROM instance i JOIN name n ON n.id = i.name
+        WHERE instr(n.text, '.') > 0""").fetchone()[0]
+    if multi:
+        sys.exit(f"{multi} instance row(s) hold more than one path segment; "
+                 "a generate block is a level of its own")
+    print("ok: every instance name is a single path segment")
 
 if mode == "constructs":
     check("the self-feedback edge (cnt -> cnt)", """

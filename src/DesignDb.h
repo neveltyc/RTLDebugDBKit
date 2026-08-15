@@ -18,6 +18,13 @@ struct sqlite3_stmt;
 
 namespace designdb {
 
+/// v4 gives a generate block an `instance` row of its own, so a name is
+/// always one path segment and `instance.module` is NULL for that level; and
+/// it gives gate, switch and UDP instances `child` and `instance` rows, so
+/// `child.def_module` NULL now means "a primitive, which has no module row"
+/// as well as "a definition slang could not resolve" -- both readings a v3
+/// consumer would get wrong rather than merely miss.
+///
 /// Bumped whenever a column's meaning changes -- or its value domain grows, as
 /// in v2, where `port.conn_kind` gained kinds a v1 reader would have misread
 /// as plain nets. A reader that does not know the version must refuse the file
@@ -29,7 +36,7 @@ namespace designdb {
 /// procedure. A reader that joins it against `proc_event.proc`, or indexes
 /// procedures by it, reads that as a fact about procedure 0 unless it is told
 /// the layout changed.
-inline constexpr int SchemaVersion = 3;
+inline constexpr int SchemaVersion = 4;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
