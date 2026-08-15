@@ -659,6 +659,79 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         visitDefault(stmt);
     }
 
+    /// `wait (done);` -- the condition is read, and the statement writes
+    /// nothing. The body, if there is one, is walked as usual and its own
+    /// writes are recorded normally.
+    void handle(const WaitStatement& stmt) {
+        std::vector<Ref> reads;
+        collectRefs(stmt.cond, eval, reads);
+        emitRead(reads, "wait", stmt.sourceRange);
+        visitDefault(stmt);
+    }
+
+    /// A statement whose whole effect is to read: `$display("%0h", x);`,
+    /// `$error(...)`, a void call to a task that only samples.
+    ///
+    /// The rule the assertion handlers above are a special case of -- a
+    /// statement that reads and writes nothing this module can name still
+    /// read. Without it, a signal a testbench only ever prints came back as
+    /// one nothing in the design had ever looked at, which is a wrong answer
+    /// rather than a coarse one: the `$display` is right there in the source.
+    ///
+    /// Only calls whose own subroutine assigns nothing reach here. A task that
+    /// writes is walked by `handle(CallExpression)` and its writes are paired
+    /// with their targets in the ordinary way, so its reads are already
+    /// attributed and must not be recorded twice.
+    void handle(const ExpressionStatement& stmt) {
+        if (stmt.expr.kind != ExpressionKind::Call) {
+            visitDefault(stmt);
+            return;
+        }
+        auto& call = stmt.expr.as<CallExpression>();
+        std::vector<Ref> reads;
+        collectRefs(stmt.expr, eval, reads);
+        collectCallReads(stmt.expr, reads);
+        if (!reads.empty() && !callWrites(call))
+            emitRead(reads, callWord(call), stmt.sourceRange);
+        visitDefault(stmt);
+    }
+
+    /// The word for a call, as `construct`: the system task's own name
+    /// (`$display`), or `call` for a void call to a user subroutine.
+    static std::string callWord(const CallExpression& call) {
+        if (call.isSystemCall())
+            return std::string(call.getSubroutineName());
+        return "call";
+    }
+
+    /// Whether a call can assign anything at all, directly or through what it
+    /// calls. A system call cannot; a user subroutine is asked for its drivers.
+    bool callWrites(const CallExpression& call) {
+        auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
+        if (!sub || !*sub)
+            return false;                 // a system call writes no signal
+        struct WriteFinder : ASTVisitor<WriteFinder, VisitFlags::AllGood> {
+            bool found = false;
+            void handle(const AssignmentExpression&) { found = true; }
+            void handle(const UnaryExpression& e) {
+                switch (e.op) {
+                    case UnaryOperator::Preincrement:
+                    case UnaryOperator::Predecrement:
+                    case UnaryOperator::Postincrement:
+                    case UnaryOperator::Postdecrement:
+                        found = true;
+                        return;
+                    default:
+                        visitDefault(e);
+                        return;
+                }
+            }
+        };
+        WriteFinder f;
+        (*sub)->getBody().visit(f);
+        return f.found;
+    }
+
     /// A statement-level event control: `@(posedge clk); …` in an initial
     /// block or a task. It is a wait rather than sensitivity, but the signal
     /// is sampled either way, and the export had no trace of the read at all.

@@ -262,13 +262,14 @@ stored). And a **downward reference that stays inside the module's subtree**
 | table | column | meaning |
 |---|---|---|
 | `stmt_read` | `module`, `name` | One signal read by a statement that writes nothing this module can name. |
-| | `kind`, `construct` | As `edge`, plus the assertion's own word as the construct: `assert`, `assume`, `cover`, `restrict`, `expect`. |
+| | `kind`, `construct` | As `edge`, plus the reading statement's own word as the construct: an assertion's (`assert`, `assume`, `cover`, `restrict`, `expect`), a system task's name (`$display`, `$error`, …), `wait` for a wait condition, or `call` for a void call to a user subroutine that assigns nothing. |
 | | `file`, `line` | The statement's own location. |
 | | `src_lo`/`src_hi`/`src_exact` | Bits of the thing read, spelled as everywhere else. An assertion's operands are walked for value references rather than through path analysis, so their ranges come back NULL with `src_exact = 0` — somewhere inside, and we cannot say where. |
 
-Two shapes land here, and they have the same problem: `edge` requires a `dst`,
-and an `assign_operand` row hangs off an `assignment` that cannot exist without
-a module-relative target.
+One rule decides what lands here: **a statement that reads and writes nothing
+this module can name**. Such a statement has nowhere else to go — `edge`
+requires a `dst`, and an `assign_operand` row hangs off an `assignment` that
+cannot exist without a module-relative target.
 
 - **An assertion** writes nothing at all. `assert (req !== 1'bx)` and
   `assert property (@(posedge clk) req |-> ##1 ack)` read `req`, `ack` and
@@ -278,6 +279,16 @@ a module-relative target.
   `assign bus.vld = |payload;` through an interface port. The write is in
   `hier_ref`; this is the read side of the same statement, at the same
   `file`/`line`. An operand that is *itself* outward goes to `hier_ref` too.
+- **A statement whose whole effect is to read**: a system task's arguments
+  (`$display("%0h", watched);`), a wait condition (`wait (done);`), a void call
+  to a subroutine that assigns nothing. A testbench that only ever prints a
+  signal was otherwise reporting it as one nothing had looked at.
+
+A call that *does* write is not here: its reads are already attributed through
+the edges pairing them with what the subroutine assigns, and recording them
+again would double-count. The same goes for a condition whose branch writes —
+`if (x) r <= 1;` makes `x` a control edge on `r`, which is the more informative
+row.
 
 **Answering "what reads this signal" means a union**: `edge.src`,
 `assign_operand.name`, `proc_event.signal`, `hier_ref` where `write = 0`, and

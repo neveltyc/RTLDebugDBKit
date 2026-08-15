@@ -53,6 +53,18 @@ module checks(input logic clk, input logic req, input logic ack);
     always_comb assert (req !== 1'bx || ack !== 1'bx);
 endmodule
 
+// Statements whose whole effect is to read. Nothing here writes anything the
+// module can name, so before these were recorded the signals came back as
+// ones no part of the design had ever looked at -- while the source prints
+// them and waits on them.
+module observers(input logic clk, input logic [7:0] watched, input logic done);
+    initial begin
+        $display("watched=%0h", watched);   // a system task's argument
+        wait (done);                        // a wait condition
+    end
+    final $display("last watched=%0h", watched);
+endmodule
+
 module gates(input logic a, input logic b, input logic en, output logic y);
     wire yi, yn, o1, o2, zt, pu;
     wire [2:0] sr;
@@ -97,6 +109,9 @@ module constructs;
 
     logic ack = 1'b0;
     checks u_checks(.clk(clk), .req(rst_n), .ack(ack));
+
+    logic done = 1'b0;
+    observers u_obs(.clk(clk), .watched(cnt_o), .done(done));
 
     logic [7:0] observed;
     always_comb observed = u_cnt.cnt;       // downward XMR read

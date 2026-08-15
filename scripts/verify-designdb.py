@@ -133,6 +133,28 @@ if mode == "constructs":
         SELECT count(*) FROM edge e
         JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
         WHERE s.text = 'bump.v' AND d.text = 'q'""")
+    # A statement whose whole effect is to read -- a system task's argument, a
+    # wait condition -- writes nothing the module can name, so its reads have
+    # no target to hang from. Without these the signal answers "nobody reads
+    # me" while the source is printing it.
+    check("the system task argument's read", """
+        SELECT count(*) FROM stmt_read r JOIN name n ON n.id = r.name
+        JOIN module m ON m.id = r.module
+        WHERE m.name = 'observers' AND n.text = 'watched'
+          AND r.construct = '$display'""", 2)
+    check("the wait condition's read", """
+        SELECT count(*) FROM stmt_read r JOIN name n ON n.id = r.name
+        JOIN module m ON m.id = r.module
+        WHERE m.name = 'observers' AND n.text = 'done' AND r.construct = 'wait'""")
+    # A call that *does* write is attributed through its edges instead, and
+    # must not also be recorded as a bare read.
+    dupe = con.execute("""
+        SELECT count(*) FROM stmt_read r JOIN module m ON m.id = r.module
+        WHERE m.name = 'viacall'""").fetchone()[0]
+    if dupe:
+        sys.exit(f"{dupe} stmt_read row(s) for a call that writes; its reads "
+                 "are already attributed through the edge chain")
+    print("ok: a writing call is not also recorded as a bare read")
     # An immediate assertion writes nothing, so its reads live in stmt_read.
     check("the immediate assertion's reads", """
         SELECT count(*) FROM stmt_read r JOIN module m ON m.id = r.module
