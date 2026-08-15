@@ -1135,21 +1135,13 @@ void forEachPrimitive(const Scope& scope, F&& fn) {
     forEachOfKind<SymbolKind::PrimitiveInstance, PrimitiveInstanceSymbol>(scope, fn);
 }
 
-/// (target, source, file, line, target bits, source bits) already emitted for
-/// one module.
-///
-/// The bit range belongs in the key: two part-selects of one signal assigned
-/// from one source on one line are two edges, and without it the second is
-/// discarded. So does the file, and for a sharper reason -- a line number is
-/// only unique within one file, and a module whose task body comes from an
-/// `include`d header has two sources of statements. Keyed on the line alone,
-/// a statement in the header silently deleted the edges of a statement at the
-/// same line number in the module's own file; `assignment`, which does not
-/// dedup, kept both, so the two tables disagreed about how many statements
-/// drive the target. The file is interned to an id so the key stays cheap to
-/// compare.
+/// (target, source, line) triples already emitted for one module.
+/// (target, source, line, target bits, source bits) already emitted for one
+/// module. The bit range belongs in the key: two part-selects of one signal
+/// assigned from one source on one line are two edges, and without it the
+/// second is discarded.
 using SeenSet = std::set<std::tuple<const ValueSymbol*, const ValueSymbol*, uint32_t,
-                                    uint32_t, uint64_t, uint64_t, uint64_t, uint64_t>>;
+                                    uint64_t, uint64_t, uint64_t, uint64_t>>;
 
 /// Calls `fn` for every instantiation in `scope` whose module slang could not
 /// resolve, descending generate blocks exactly as `forEachInstance` does.
@@ -1394,18 +1386,6 @@ private:
             return;   // no origin to record; caching the miss would suppress
                       // the next sighting, which may well have one
         fileOrigins.emplace(asWritten, path.string());
-    }
-
-    /// A small id for a file name, so the dedup key can carry the file without
-    /// carrying the string. Ids are global rather than per module, which costs
-    /// nothing: the set they key is cleared for each module anyway.
-    uint32_t fileKey(const std::string& path) {
-        if (path.empty())
-            return 0;
-        auto [it, added] = fileKeyIds.try_emplace(path,
-                                                  uint32_t(fileKeyIds.size() + 1));
-        (void)added;
-        return it->second;
     }
 
     /// Where a location is, with its file's origin recorded on the way past.
@@ -1669,15 +1649,6 @@ private:
         // as a procedure that yielded nothing.
         bool reached = false;
 
-        // A null-source edge is the truth only when *no* operand of the
-        // statement had a name in this module. The emit callback sees one
-        // operand at a time, so the decision waits until the walk is done:
-        // `namedSource` records the targets some operand did reach,
-        // `pendingNull` the rows to write for the ones none did.
-        using StmtKey = std::tuple<const ValueSymbol*, std::string, uint32_t>;
-        std::set<StmtKey> namedSource;
-        std::map<StmtKey, EdgeRow> pendingNull;
-
         StatementWalker walker([&](const Ref& dst, const Ref& src, bool gatingEdge,
                                    SourceRange where) {
             reached = true;
@@ -1704,8 +1675,7 @@ private:
             const uint32_t stmtLine = at.line;
             const auto dk = keyRange(dst);
             const auto sk = src.sym ? keyRange(src) : std::make_pair<uint64_t, uint64_t>(0, 0);
-            if (!seen.emplace(dst.sym, src.sym, fileKey(at.file), stmtLine,
-                              dk.first, dk.second,
+            if (!seen.emplace(dst.sym, src.sym, stmtLine, dk.first, dk.second,
                               sk.first, sk.second)
                      .second)
                 return;
@@ -1726,35 +1696,23 @@ private:
                 if (!relativePath(*src.sym, prefix, row.src)) {
                     addHierRef(false, src, kind, construct, at, evalCtx);
                     // The operand has no name this row can carry, but the
-                    // statement may still drive the target from outside the
-                    // module entirely -- `assign seen = bus.vld` in an
-                    // interface-using design -- and dropping the row outright
-                    // made that read as "nothing drives it".
+                    // statement still drives the target. Returning here left
+                    // an output assigned only from outside the module -- every
+                    // `assign seen = bus.vld` in an interface-using design --
+                    // with no edge row at all, so a driver query answered
+                    // "nothing drives it" about a signal that is plainly
+                    // driven. Recorded as a null source, exactly as `q <= 8'h0`
+                    // is; what the source actually was is in `hier_ref` at this
+                    // module, file and line.
                     //
-                    // Held back rather than written here. Whether a null
-                    // source is the truth depends on the statement's *other*
-                    // operands, which this callback sees one at a time: an
-                    // earlier version wrote the row per outward operand, so
-                    // `assign y = a & bus.vld` claimed both that `a` drives y
-                    // and that nothing does. It is materialised after the walk,
-                    // and only for a target no named operand reached.
-                    //
-                    // Finished here rather than at the push site below, which
-                    // this path never reaches: `relativePath` writes the
-                    // *absolute* path into `row.src` when it fails, so leaving
-                    // it would leak one instance's hierarchy into a folded row.
+                    // Re-keyed, because the dedup above ran on the operand's
+                    // symbol: two external operands in one statement reach here
+                    // separately and would otherwise write the same row twice.
+                    if (!seen.emplace(dst.sym, nullptr, stmtLine, dk.first,
+                                      dk.second, uint64_t(0), uint64_t(0))
+                             .second)
+                        return;
                     row.src.clear();
-                    row.srcType.clear();
-                    row.srcBits.reset();
-                    row.srcExact = true;
-                    row.dstType = typeOf(*dst.sym);
-                    row.kind = kind;
-                    row.construct = construct;
-                    row.control = gatingEdge;
-                    row.file = at.file;
-                    row.line = at.line;
-                    pendingNull.try_emplace({dst.sym, at.file, stmtLine}, row);
-                    return;
                 }
                 else {
                     row.srcType = typeOf(*src.sym);
@@ -1773,8 +1731,6 @@ private:
             row.control = gatingEdge;
             row.file = at.file;
             row.line = at.line;
-            if (src.sym)
-                namedSource.emplace(dst.sym, at.file, at.line);
             out.push_back(std::move(row));
         },
         // One row per assignment statement, so a target written in several
@@ -1863,21 +1819,6 @@ private:
             proc.analyzedSymbol->as<ProceduralBlockSymbol>().getBody().visit(walker);
         else if (proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
             proc.analyzedSymbol->as<ContinuousAssignSymbol>().getAssignment().visit(walker);
-
-        // The statements whose every operand turned out to live outside this
-        // module: the target is driven, and this row is what says so.
-        for (auto& [key, row] : pendingNull) {
-            if (namedSource.count(key))
-                continue;
-            auto& [dstSym, keyFile, keyLine] = key;
-            const auto dk = std::make_pair(row.dstBits ? row.dstBits->first : uint64_t(0),
-                                           row.dstBits ? row.dstBits->second : uint64_t(0));
-            if (!seen.emplace(dstSym, nullptr, fileKey(keyFile), keyLine,
-                              dk.first, dk.second, uint64_t(0), uint64_t(0))
-                     .second)
-                continue;
-            out.push_back(row);
-        }
 
         writer.addProcEvents(moduleId, procIndex, events);
 
@@ -1990,8 +1931,7 @@ private:
                 if (!r.sym)
                     continue;
                 const auto sk = keyRange(r);
-                if (!seen.emplace(&net, r.sym, fileKey(at.file), at.line,
-                                  uint64_t(0), uint64_t(0),
+                if (!seen.emplace(&net, r.sym, at.line, uint64_t(0), uint64_t(0),
                                   sk.first, sk.second)
                          .second) {
                     anySource = true;
@@ -2009,8 +1949,7 @@ private:
             }
             // `wire w = 1'b0;` drives w as surely as `assign w = 1'b0;` does.
             if (!anySource &&
-                seen.emplace(&net, nullptr, fileKey(at.file), at.line,
-                             uint64_t(0), uint64_t(0),
+                seen.emplace(&net, nullptr, at.line, uint64_t(0), uint64_t(0),
                              uint64_t(0), uint64_t(0))
                     .second) {
                 out.push_back(std::move(base));
@@ -2142,8 +2081,7 @@ private:
                         continue;
                     const Ref& src = srcTerm.ref;
                     const auto sk = keyRange(src);
-                    if (!seen.emplace(dst.sym, src.sym, fileKey(at.file), at.line,
-                                      dk.first, dk.second,
+                    if (!seen.emplace(dst.sym, src.sym, at.line, dk.first, dk.second,
                                       sk.first, sk.second)
                              .second) {
                         anyInput = true;   // already recorded, still an input
@@ -2167,8 +2105,7 @@ private:
                 // exactly as `q <= 8'h0` is named; without it the net reads as
                 // undriven.
                 if (!anyInput &&
-                    seen.emplace(dst.sym, nullptr, fileKey(at.file), at.line,
-                                 dk.first, dk.second,
+                    seen.emplace(dst.sym, nullptr, at.line, dk.first, dk.second,
                                  uint64_t(0), uint64_t(0))
                         .second) {
                     out.push_back(std::move(base));
@@ -2587,7 +2524,6 @@ private:
     /// Not by text: two references can share a spelling and be different
     /// references, which is what a generate loop does to `b[g].sig`.
     std::set<std::pair<const Expression*, bool>> hierSeen;
-    std::unordered_map<std::string, uint32_t> fileKeyIds;
     // As-written file spelling -> the absolute path its buffer came from.
     std::unordered_map<std::string, std::string> fileOrigins;
     int64_t instanceRow = 0;

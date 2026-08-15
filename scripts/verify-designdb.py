@@ -61,6 +61,25 @@ if mode:
                  "or otherwise fileless location poisoned the origin lookup")
     print("ok: every file row joined to source_file")
 
+if mode:
+    # Every statement that writes a target must appear in BOTH tables. `edge`
+    # deduplicates and `assignment` does not, so a key that is too coarse
+    # deletes edges while leaving the assignment behind -- which is exactly
+    # what happened when the key carried a line number without the file, and a
+    # task body in an `include`d header shared a line with a statement in the
+    # module's own file. This invariant catches that whole class without
+    # needing two files to collide on a chosen number.
+    orphaned = con.execute("""
+        SELECT count(*) FROM assignment a
+        WHERE NOT EXISTS (
+            SELECT 1 FROM edge e
+            WHERE e.module = a.module AND e.dst = a.dst
+              AND e.file IS a.file AND e.line = a.line)""").fetchone()[0]
+    if orphaned:
+        sys.exit(f"{orphaned} assignment(s) have no edge at the same "
+                 "module/dst/file/line; the edge dedup key is dropping statements")
+    print("ok: every assignment is matched by an edge at the same place")
+
 if mode == "constructs":
     check("the self-feedback edge (cnt -> cnt)", """
         SELECT count(*) FROM edge e
