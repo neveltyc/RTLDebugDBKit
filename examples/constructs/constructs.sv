@@ -58,9 +58,13 @@ endmodule
 // ones no part of the design had ever looked at -- while the source prints
 // them and waits on them.
 module observers(input logic clk, input logic [7:0] watched, input logic done);
+    logic [7:0] loaded [0:1];
     initial begin
         $display("watched=%0h", watched);   // a system task's argument
         wait (done);                        // a wait condition
+        // The argument a system task *writes* is not a read of it. Recorded
+        // as one, `loaded` said it read itself at the line that loads it.
+        $readmemh("nonexistent.hex", loaded);
     end
     final $display("last watched=%0h", watched);
 endmodule

@@ -163,10 +163,24 @@ std::string canonicalPath(const Expression* e, EvalContext& eval) {
             return false;
         switch (x->kind) {
             case ExpressionKind::NamedValue: {
-                auto name = x->as<ValueExpressionBase>().symbol.name;
-                if (name.empty())
+                auto& sym = x->as<ValueExpressionBase>().symbol;
+                if (sym.name.empty())
                     return false;
-                out += name;
+                // A package item is written with its package, and the doc says
+                // that spelling is what makes it storable -- a bare `mask`
+                // resolves against imports a reader cannot see. Emitting the
+                // name alone dropped the qualifier, so `pkg::mask` became
+                // `mask` and was then discarded by the bare-name rule, while
+                // `pkg::cfg.mode` survived reading like a module-relative
+                // reference to something called `cfg`.
+                if (auto* scope = sym.getParentScope()) {
+                    auto& owner = scope->asSymbol();
+                    if (owner.kind == SymbolKind::Package && !owner.name.empty()) {
+                        out += owner.name;
+                        out += "::";
+                    }
+                }
+                out += sym.name;
                 return true;
             }
             case ExpressionKind::MemberAccess: {
@@ -241,16 +255,42 @@ std::string normalizedText(const Expression* e, const SourceManager& sm,
             i = end + 1;
             continue;
         }
-        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/')
-            return {};      // a line comment inside a reference: give up
+        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/') {
+            // A line comment runs to the newline, which is inside the range
+            // when the reference spans lines. Skipping it is the same removal
+            // the block-comment case does; giving up here discarded the row
+            // outright, so `tb. // why\n u_deep.flag` was recorded nowhere.
+            auto nl = raw.find('\n', i + 2);
+            if (nl == std::string_view::npos)
+                break;
+            i = nl;
+            continue;
+        }
         if (!std::isspace(static_cast<unsigned char>(raw[i])))
             out += raw[i];
     }
-    // A trailing select is the bit range, which has columns of its own.
-    if (stripTrailingSelect && !out.empty() && out.back() == ']') {
-        auto open = out.rfind('[');
-        if (open != std::string::npos && open > 0)
-            out.resize(open);
+    // Trailing selects are the bit range, which has columns of its own -- and
+    // *every* one of them, matched by bracket depth.
+    //
+    // `rfind('[')` was wrong twice. It finds the innermost bracket when the
+    // index itself contains a select, so `mem[idx[1]]` truncated to
+    // `mem[idx`, naming nothing. And it removed one group where the bits are
+    // offsets into the *root* object: `mem2[1][2]` kept `mem2[1]`, an 8-bit
+    // object, beside offsets 10..10 that index the 32-bit one -- a path and a
+    // range describing different things.
+    while (stripTrailingSelect && !out.empty() && out.back() == ']') {
+        int depth = 0;
+        size_t i = out.size();
+        while (i > 0) {
+            --i;
+            if (out[i] == ']')
+                depth++;
+            else if (out[i] == '[' && --depth == 0)
+                break;
+        }
+        if (depth != 0 || i == 0)
+            break;              // unbalanced, or nothing but a select
+        out.resize(i);
     }
     return out;
 }
@@ -691,9 +731,44 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         std::vector<Ref> reads;
         collectRefs(stmt.expr, eval, reads);
         collectCallReads(stmt.expr, reads);
+        // What the statement writes is not what it reads. slang models a
+        // system task's output argument as an assignment inside the call --
+        // which is how the write already reaches `assignment` -- and taking
+        // every operand made `$readmemh("f", mem)` report that `mem` reads
+        // itself, at the very line that loads it.
+        std::set<const ValueSymbol*> written;
+        collectWrittenTargets(stmt.expr, written);
+        if (!written.empty()) {
+            reads.erase(std::remove_if(reads.begin(), reads.end(),
+                                       [&](const Ref& r) {
+                                           return r.sym && written.count(r.sym);
+                                       }),
+                        reads.end());
+        }
         if (!reads.empty() && !callWrites(call))
             emitRead(reads, callWord(call), stmt.sourceRange);
         visitDefault(stmt);
+    }
+
+    /// Every symbol an expression assigns, however deeply nested.
+    void collectWrittenTargets(const Expression& expr,
+                               std::set<const ValueSymbol*>& out) {
+        struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
+            StatementWalker& self;
+            std::set<const ValueSymbol*>& out;
+            Finder(StatementWalker& self, std::set<const ValueSymbol*>& out) :
+                self(self), out(out) {}
+            void handle(const AssignmentExpression& e) {
+                std::vector<Ref> targets;
+                collectRefs(e.left(), self.eval, targets, /*skipSelectors=*/true);
+                for (auto& t : targets)
+                    if (t.sym)
+                        out.insert(t.sym);
+                visitDefault(e);
+            }
+        };
+        Finder f(*this, out);
+        expr.visit(f);
     }
 
     /// The word for a call, as `construct`: the system task's own name
@@ -1480,7 +1555,12 @@ private:
         std::string text = canonicalPath(r.origin, eval);
         if (text.empty())
             text = normalizedText(r.origin, sourceManager);
-        if (text.empty() || text.find('.') == std::string::npos) {
+        // A path, or a package qualification. `pkg::mask` is stored for the
+        // reason the doc gives -- it names where to look -- while a bare
+        // `mask` resolves against imports a reader cannot see and stays a
+        // count. Testing only for a dot discarded the qualified form too.
+        if (text.empty() || (text.find('.') == std::string::npos &&
+                             text.find("::") == std::string::npos)) {
             stats.external++;
             return;
         }
@@ -2437,7 +2517,16 @@ private:
                     // connected -- the same ambiguity the unconnected row above
                     // exists to remove, reintroduced one branch later. What it
                     // is tied to is in `hier_ref` at this file and line.
-                    row.conn = PortConn::External;
+                    // An operand of an expression stays kind 3 even when it
+                    // has no name here. Overwriting it with 5 made
+                    // `.a(tb.glob & b)` look like `.a(tb.glob)` -- an alias --
+                    // so every reader of `a` was attributed to `tb.glob`,
+                    // which is the misattribution kind 3 exists to prevent.
+                    // Kind 5 is for a whole connection that happens to be
+                    // unnameable; what it is tied to is in `hier_ref` either
+                    // way.
+                    row.conn = cn.expression ? PortConn::Expression
+                                             : PortConn::External;
                     row.outerWidth = exprWidth;
                     row.file = file;
                     row.line = line;
@@ -2508,6 +2597,15 @@ private:
             case ExpressionKind::Concatenation:
                 for (auto* op : expr.as<ConcatenationExpression>().operands())
                     collectConnRefs(*op, ctx, out);
+                return;
+            case ExpressionKind::Replication:
+                // `{2{two}}` wires `two` into the formal exactly as
+                // `{two, two}` does. Without this case it fell through to the
+                // expression branch and the same netlist got kind 3 from one
+                // spelling and kind 0 from the other -- opposite advice to the
+                // consumer about whether the port aliases the net. The count
+                // is a constant and reads nothing.
+                collectConnRefs(expr.as<ReplicationExpression>().concat(), ctx, out);
                 return;
             case ExpressionKind::Conversion:
                 collectConnRefs(expr.as<ConversionExpression>().operand(), ctx, out);

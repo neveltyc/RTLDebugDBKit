@@ -172,6 +172,14 @@ if mode == "constructs":
         JOIN module m ON m.id = r.module
         WHERE m.name = 'observers' AND n.text = 'watched'
           AND r.construct = '$display'""", 2)
+    # A system task's *written* argument is not a read of it.
+    loadedread = con.execute("""
+        SELECT count(*) FROM stmt_read r JOIN name n ON n.id = r.name
+        WHERE n.text = 'loaded'""").fetchone()[0]
+    if loadedread:
+        sys.exit(f"{loadedread} stmt_read row(s) for `loaded`, which $readmemh "
+                 "writes rather than reads")
+    print("ok: a system task's written argument is not recorded as a read")
     check("the wait condition's read", """
         SELECT count(*) FROM stmt_read r JOIN name n ON n.id = r.name
         JOIN module m ON m.id = r.module
