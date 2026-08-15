@@ -2164,15 +2164,30 @@ private:
             inArray = ps->asSymbol().kind == SymbolKind::InstanceArray;
         // For evaluating the constant selects inside connection expressions.
         EvalContext evalCtx(child);
-        // The instance's own location: every connection on it is written at the
-        // same place, so resolving it per connection re-derived one answer once
-        // per port -- 200 times over on a wide instance.
-        const Where at = locate(child.location);
-        const std::string& file = at.file;
-        const uint32_t line = at.line;
+        // The instantiation's own location. It is the fallback, not the answer:
+        // a connection is written where *it* is written.
+        //
+        // An earlier version resolved this once per instance on the grounds
+        // that it is loop-invariant, which is true of the instantiation and
+        // false of the thing being recorded. Any instance wide enough to
+        // matter is written one port per line, so every connection reported
+        // the line of the `foo u_foo (` above it: a driver query pointed at
+        // the instantiation instead of at `.wb_rst_i(~rst_n)`, reading the
+        // text back gave the instantiation header, and no two ports of one
+        // instance could be told apart by position at all. On one SoC that
+        // was every multi-port instance without exception.
+        const Where instAt = locate(child.location);
         for (auto* conn : child.getPortConnections()) {
             if (!conn)
                 continue;
+            // Where this connection is written. The expression is the only
+            // part of it slang keeps a location for; a port left unconnected
+            // has none, and falls back to the instantiation.
+            const Expression* connExpr = conn->getExpression();
+            const Where at = connExpr ? locate(connExpr->sourceRange.start(), instAt)
+                                      : instAt;
+            const std::string& file = at.file;
+            const uint32_t line = at.line;
 
             // An interface port carries no net, but the *binding* is the alias
             // that makes `child.bus.*` resolvable at all: the signals live in
@@ -2247,8 +2262,7 @@ private:
             if (conn->port.kind != SymbolKind::Port)
                 continue;
             auto& port = conn->port.as<PortSymbol>();
-
-            const Expression* expr = conn->getExpression();
+            const Expression* expr = connExpr;
 
             std::string dir;
             switch (port.direction) {

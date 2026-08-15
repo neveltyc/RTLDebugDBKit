@@ -99,7 +99,16 @@ module constructs;
     gates u_gates(.a(clk), .b(state == RUN), .en(1'b1), .y(gy));
 
     logic [7:0] cnt_o;
-    counter u_cnt(.clk(clk), .rst_n(rst_n), .cnt(cnt_o));
+    // Written one port per line, which is how any instance wide enough to
+    // matter is written. Each connection's row has to name its own line: with
+    // the instantiation's line on all of them, no two ports of one instance
+    // can be told apart by position, and reading the text back gives the
+    // header rather than the connection.
+    counter u_cnt(
+        .clk   (clk),
+        .rst_n (rst_n),
+        .cnt   (cnt_o)
+    );
 
     logic ni_y;
     netinit u_netinit(.a(clk), .b(rst_n), .y(ni_y));

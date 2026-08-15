@@ -202,7 +202,7 @@ statements rather than one merged set.
 | | `outer_lo`/`outer_hi`/`outer_exact` | The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches bits 0..3 of `stim`, not all of it. Same encoding as `edge` — see [Bit ranges](#bit-ranges). NULL with exact=0 for an element of an instance array, as with `outer_width`. |
 | | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an expression, 4=an interface binding, 5=attached to a signal with no name in this module. |
 | | `modport` | The modport restricting an interface binding, when one does. NULL otherwise. |
-| | `file`, `line` | Where the connection is written, in the parent. |
+| | `file`, `line` | Where the connection itself is written, in the parent — not the instantiation's own line, which on an instance written one port per line would be the same for every row and would tell two ports of it apart from neither each other nor the header. A port left **unconnected** has no connection text to point at and falls back to the instantiation. |
 
 Both directions are indexed, because the two queries need opposite ones: a
 driver query walks inward from a net, a load query outward from a formal. This

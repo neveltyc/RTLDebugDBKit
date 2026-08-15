@@ -97,6 +97,17 @@ if mode == "constructs":
     if nulls:
         sys.exit(f"{nulls} gate row(s) on `sr` claim no source; the chain is severed")
     print("ok: no gate on `sr` claims to drive from nothing")
+    # A connection is written where it is written. `u_cnt` spans one port per
+    # line, so its three rows must carry three different lines -- taking the
+    # instantiation's line for all of them made the ports indistinguishable by
+    # position and pointed a driver query at the header.
+    spread = con.execute("""
+        SELECT count(DISTINCT p.line) FROM port p JOIN name c ON c.id = p.child
+        WHERE c.text = 'u_cnt'""").fetchone()[0]
+    if spread < 3:
+        sys.exit(f"u_cnt's connections share {spread} distinct line(s) across 3 "
+                 "ports; they are written one per line and must say so")
+    print(f"ok: each connection on u_cnt names its own line ({spread})")
     check("the part-select port connection (.idx(stim[3:0]))", """
         SELECT count(*) FROM port
         WHERE outer_lo = 0 AND outer_hi = 3 AND outer_exact = 1""")
