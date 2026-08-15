@@ -464,7 +464,10 @@ int main(int argc, char** argv) {
                          astats.memoryUsage / 1e6);
         }
 
-        designdb::Writer writer(opt.output);
+        const std::string tmpPath = opt.output + ".tmp";
+        designdb::Stats stats;
+        {
+        designdb::Writer writer(tmpPath);
         writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
         writer.setMeta("tool", "rtl-designdb");
         // The *elaborated* tops, not the --top argument: slang picks tops even
@@ -500,8 +503,43 @@ int main(int argc, char** argv) {
             writer.addSourceFile(path, digest);
         }
 
-        auto stats = designdb::extract(compilation, analysis, writer);
+        stats = designdb::extract(compilation, analysis, writer);
+
+        const char* analysisStatus;
+        if (fatal || astats.numScopes == 0)
+            analysisStatus = "hierarchy_only";
+        else if (numErrors || stats.emptyProcedures)
+            analysisStatus = "partial";
+        else
+            analysisStatus = "complete";
+        writer.setMeta("analysis_status", analysisStatus);
+        writer.setMeta("error_count", std::to_string(numErrors));
+        writer.setMeta("warning_count", std::to_string(numWarnings));
+        writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
+        writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
+        writer.setMeta("tool_version", RTLDESIGNDB_VERSION);
+        writer.setMeta("slang_version", RTLDESIGNDB_SLANG_TAG);
+        {
+            std::string cfg;
+            for (auto& f : opt.files) { cfg += f; cfg += '\n'; }
+            for (auto& d : opt.defines) { cfg += d; cfg += '\n'; }
+            for (auto& i : opt.includeDirs) { cfg += i; cfg += '\n'; }
+            cfg += opt.singleUnit ? "single-unit\n" : "multi-unit\n";
+            for (auto inst : compilation.getRoot().topInstances) {
+                cfg += inst->name;
+                cfg += '\n';
+            }
+            cfg += RTLDESIGNDB_VERSION "\n";
+            cfg += RTLDESIGNDB_SLANG_TAG "\n";
+            writer.setMeta("config_digest", designdb::digest(cfg));
+        }
+
         writer.finish();
+        }
+        // Writer destroyed — the database file is closed and complete.
+        // Atomic rename replaces the target so a crash mid-export never
+        // leaves a partial database under the real name.
+        std::filesystem::rename(tmpPath, opt.output);
 
         if (!opt.quiet) {
             std::printf("%s: %lld modules, %lld instances, %lld symbols, %lld edges, "

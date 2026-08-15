@@ -1010,4 +1010,10 @@ std::string fileDigest(const std::string& path) {
     return s.final();
 }
 
+std::string digest(std::string_view data) {
+    Sha256 s;
+    s.update(reinterpret_cast<const unsigned char*>(data.data()), data.size());
+    return s.final();
+}
+
 } // namespace designdb

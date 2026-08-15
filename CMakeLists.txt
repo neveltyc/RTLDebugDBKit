@@ -44,10 +44,11 @@ include(${CPM_DOWNLOAD_LOCATION})
 # Mind the tag spelling: slang tags a release `vN.M`, with no patch component --
 # `v11.0`, never `v11.0.0`. A three-part tag does not exist upstream, and CPM
 # reports the miss as a failed fetch rather than as a pin that names nothing.
+set(DESIGNDB_SLANG_TAG "v11.0")
 cpmaddpackage(
   NAME slang
   GITHUB_REPOSITORY MikePopoloski/slang
-  GIT_TAG v11.0
+  GIT_TAG ${DESIGNDB_SLANG_TAG}
   OPTIONS
     "SLANG_INCLUDE_TESTS OFF"
     "SLANG_INCLUDE_TOOLS OFF"
@@ -84,5 +85,8 @@ add_executable(rtl-designdb
 
 target_include_directories(rtl-designdb PRIVATE src)
 target_link_libraries(rtl-designdb PRIVATE slang::slang designdb_sqlite)
+target_compile_definitions(rtl-designdb PRIVATE
+  RTLDESIGNDB_VERSION="${PROJECT_VERSION}"
+  RTLDESIGNDB_SLANG_TAG="${DESIGNDB_SLANG_TAG}")
 
 install(TARGETS rtl-designdb RUNTIME DESTINATION bin)

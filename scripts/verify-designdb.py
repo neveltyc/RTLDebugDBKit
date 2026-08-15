@@ -48,6 +48,27 @@ if mode:
     top = con.execute("SELECT value FROM meta WHERE key='top'").fetchone()
     if not top or top[0] != mode:
         sys.exit(f"meta.top is {top and top[0]!r}, expected {mode!r} without --top")
+    status = con.execute("SELECT value FROM meta WHERE key='analysis_status'").fetchone()
+    if not status or status[0] not in ("complete", "partial", "hierarchy_only"):
+        sys.exit(f"analysis_status is {status and status[0]!r}, expected one of "
+                 "complete/partial/hierarchy_only")
+    print(f"ok: analysis_status = {status[0]}")
+    for key in ("error_count", "warning_count", "unresolved_count", "empty_procedure_count"):
+        row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if not row or not row[0].isdigit():
+            sys.exit(f"meta.{key} is missing or non-numeric")
+    print("ok: diagnostic counts present")
+    tv = con.execute("SELECT value FROM meta WHERE key='tool_version'").fetchone()
+    if not tv or not tv[0]:
+        sys.exit("meta.tool_version is missing")
+    sv = con.execute("SELECT value FROM meta WHERE key='slang_version'").fetchone()
+    if not sv or not sv[0]:
+        sys.exit("meta.slang_version is missing")
+    print(f"ok: tool_version={tv[0]}, slang_version={sv[0]}")
+    cd = con.execute("SELECT value FROM meta WHERE key='config_digest'").fetchone()
+    if not cd or len(cd[0]) != 64:
+        sys.exit("meta.config_digest is missing or not a SHA-256")
+    print("ok: config_digest present")
     check("file rows joined to source_file",
           "SELECT count(*) FROM file WHERE source_file IS NOT NULL")
     # Every file row, not merely one. The origin of a file is learned from the

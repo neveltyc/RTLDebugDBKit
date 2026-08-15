@@ -314,4 +314,7 @@ private:
 /// SHA-256 of a file, empty when it cannot be read.
 std::string fileDigest(const std::string& path);
 
+/// SHA-256 of an in-memory buffer.
+std::string digest(std::string_view data);
+
 } // namespace designdb

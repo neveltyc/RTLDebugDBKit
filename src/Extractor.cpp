@@ -502,6 +502,12 @@ std::pair<uint64_t, uint64_t> keyRange(const Ref& r) {
                    : std::make_pair(r.lo, r.hi);
 }
 
+uint8_t kindTag(std::string_view k) {
+    if (k == "procedural") return 1;
+    if (k == "primitive") return 2;
+    return 0;
+}
+
 /// Collects every value path in an expression, each with its bit range.
 /// Constants filtered out by the last collectRefs call. A consumer seeing an
 /// assignment with one operand cannot otherwise tell "it reads one signal" from
@@ -1239,8 +1245,16 @@ void forEachPrimitive(const Scope& scope, F&& fn) {
 /// dedup, kept both, so the two tables disagreed about how many statements
 /// drive the target. The file is interned to an id so the key stays cheap to
 /// compare.
+///
+/// control, dst_exact, src_exact and kind belong in the key for the same
+/// reason the bit range does: they are stored columns, and two edges that
+/// differ only on one of them are semantically distinct. Without control,
+/// `if (a) y = a` collapses the data edge and the condition edge into one;
+/// without dst_exact, `y[i] = a` and `y = {2{a}}` collapse a dynamic
+/// partial write and a precise full write into one.
 using SeenSet = std::set<std::tuple<const ValueSymbol*, const ValueSymbol*, uint32_t,
-                                    uint32_t, uint64_t, uint64_t, uint64_t, uint64_t>>;
+                                    uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                    bool, bool, bool, uint8_t>>;
 
 /// Calls `fn` for every instantiation in `scope` whose module slang could not
 /// resolve, descending generate blocks exactly as `forEachInstance` does.
@@ -1850,7 +1864,10 @@ private:
             const auto sk = src.sym ? keyRange(src) : std::make_pair<uint64_t, uint64_t>(0, 0);
             if (!seen.emplace(dst.sym, src.sym, fileKey(at.file), stmtLine,
                               dk.first, dk.second,
-                              sk.first, sk.second)
+                              sk.first, sk.second,
+                              gatingEdge, dst.exact,
+                              src.sym ? src.exact : true,
+                              kindTag(kind))
                      .second)
                 return;
             EdgeRow row;
@@ -2024,7 +2041,9 @@ private:
             const auto dk = std::make_pair(row.dstBits ? row.dstBits->first : uint64_t(0),
                                            row.dstBits ? row.dstBits->second : uint64_t(0));
             if (!seen.emplace(dstSym, nullptr, fileKey(keyFile), keyLine,
-                              dk.first, dk.second, uint64_t(0), uint64_t(0))
+                              dk.first, dk.second, uint64_t(0), uint64_t(0),
+                              row.control, row.dstExact, true,
+                              kindTag(row.kind))
                      .second)
                 continue;
             out.push_back(row);
@@ -2143,7 +2162,9 @@ private:
                 const auto sk = keyRange(r);
                 if (!seen.emplace(&net, r.sym, fileKey(at.file), at.line,
                                   uint64_t(0), uint64_t(0),
-                                  sk.first, sk.second)
+                                  sk.first, sk.second,
+                                  false, true, r.exact,
+                                  kindTag("continuous_assign"))
                          .second) {
                     anySource = true;
                     continue;
@@ -2162,7 +2183,9 @@ private:
             if (!anySource &&
                 seen.emplace(&net, nullptr, fileKey(at.file), at.line,
                              uint64_t(0), uint64_t(0),
-                             uint64_t(0), uint64_t(0))
+                             uint64_t(0), uint64_t(0),
+                             false, true, true,
+                             kindTag("continuous_assign"))
                     .second) {
                 out.push_back(std::move(base));
             }
@@ -2295,7 +2318,9 @@ private:
                     const auto sk = keyRange(src);
                     if (!seen.emplace(dst.sym, src.sym, fileKey(at.file), at.line,
                                       dk.first, dk.second,
-                                      sk.first, sk.second)
+                                      sk.first, sk.second,
+                                      false, dst.exact, src.exact,
+                                      kindTag("primitive"))
                              .second) {
                         anyInput = true;   // already recorded, still an input
                         continue;
@@ -2320,7 +2345,9 @@ private:
                 if (!anyInput &&
                     seen.emplace(dst.sym, nullptr, fileKey(at.file), at.line,
                                  dk.first, dk.second,
-                                 uint64_t(0), uint64_t(0))
+                                 uint64_t(0), uint64_t(0),
+                                 false, dst.exact, true,
+                                 kindTag("primitive"))
                         .second) {
                     out.push_back(std::move(base));
                 }
