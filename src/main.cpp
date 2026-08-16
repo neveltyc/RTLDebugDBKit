@@ -531,8 +531,8 @@ int main(int argc, char** argv) {
         {
             std::string cfg;
             for (auto& f : opt.files) { cfg += f; cfg += '\n'; }
-            for (auto& d : opt.defines) { cfg += d; cfg += '\n'; }
             for (auto& i : opt.includeDirs) { cfg += i; cfg += '\n'; }
+            for (auto& d : opt.defines) { cfg += d; cfg += '\n'; }
             cfg += opt.singleUnit ? "single-unit\n" : "multi-unit\n";
             for (auto inst : compilation.getRoot().topInstances) {
                 cfg += inst->name;
