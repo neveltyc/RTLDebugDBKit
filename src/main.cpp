@@ -505,6 +505,15 @@ int main(int argc, char** argv) {
 
         stats = designdb::extract(compilation, analysis, writer);
 
+        writer.finish();
+
+        // Status and versions are written after finish() so the data and
+        // indexes are complete before the meta seal lands.  setMeta()
+        // operates outside the batch transaction, so it works after
+        // finish(); and atomic rename below means the consumer never sees
+        // an intermediate state regardless -- this ordering is an extra
+        // defence so that a reader of the temp file can tell whether the
+        // export ran to completion.
         const char* analysisStatus;
         if (fatal || astats.numScopes == 0)
             analysisStatus = "hierarchy_only";
@@ -534,8 +543,6 @@ int main(int argc, char** argv) {
             cfg += RTLDESIGNDB_SLANG_TAG "\n";
             writer.setMeta("config_digest", designdb::digest(cfg));
         }
-
-        writer.finish();
         }
         // Writer destroyed — the database file is closed and complete.
         // Atomic rename replaces the target so a crash mid-export never

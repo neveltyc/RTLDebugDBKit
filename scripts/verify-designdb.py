@@ -74,7 +74,37 @@ for tbl, lo, hi in (
         f'AND "{hi}" IS NOT NULL AND "{lo}" > "{hi}"').fetchone()[0]
     if bad:
         sys.exit(f"{bad} row(s) in {tbl} have {lo} > {hi}")
+# direction is an enum, not a boolean: 0=in 1=out 2=inout 3=ref, NULL when
+# the declaration is not a port or the binding is an interface.
+for tbl in ("symbol", "port"):
+    bad = con.execute(
+        f'SELECT count(*) FROM "{tbl}" WHERE direction NOT IN (0, 1, 2, 3) '
+        f'AND direction IS NOT NULL').fetchone()[0]
+    if bad:
+        sys.exit(f"{bad} row(s) in {tbl}.direction outside {{0, 1, 2, 3, NULL}}")
+print("ok: direction values are valid")
 print("ok: range lo <= hi")
+
+# Global meta keys -- these are written unconditionally, so a database
+# that lacks them was either not finished or produced by an older version.
+status = con.execute("SELECT value FROM meta WHERE key='analysis_status'").fetchone()
+if not status or status[0] not in ("complete", "partial", "hierarchy_only"):
+    sys.exit(f"analysis_status is {status and status[0]!r}, expected one of "
+             "complete/partial/hierarchy_only")
+for key in ("error_count", "warning_count", "unresolved_count", "empty_procedure_count"):
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if not row or not row[0].isdigit():
+        sys.exit(f"meta.{key} is missing or non-numeric")
+tv = con.execute("SELECT value FROM meta WHERE key='tool_version'").fetchone()
+sv = con.execute("SELECT value FROM meta WHERE key='slang_version'").fetchone()
+cd = con.execute("SELECT value FROM meta WHERE key='config_digest'").fetchone()
+if not tv or not tv[0]:
+    sys.exit("meta.tool_version is missing")
+if not sv or not sv[0]:
+    sys.exit("meta.slang_version is missing")
+if not cd or len(cd[0]) != 64:
+    sys.exit("meta.config_digest is missing or not a SHA-256")
+print(f"ok: meta seal present (analysis_status={status[0]})")
 
 
 def check(what, sql, expect_at_least=1):
@@ -85,34 +115,14 @@ def check(what, sql, expect_at_least=1):
 
 
 if mode:
-    # The facts every reader relies on, whichever example is loaded.
+    # Mode-specific meta: schema version and elaborated top are tied to the
+    # example, so they stay here rather than in the universal section above.
     version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if not version or version[0] != "4":
         sys.exit(f"schema_version is {version and version[0]}, expected 4")
     top = con.execute("SELECT value FROM meta WHERE key='top'").fetchone()
     if not top or top[0] != mode:
         sys.exit(f"meta.top is {top and top[0]!r}, expected {mode!r} without --top")
-    status = con.execute("SELECT value FROM meta WHERE key='analysis_status'").fetchone()
-    if not status or status[0] not in ("complete", "partial", "hierarchy_only"):
-        sys.exit(f"analysis_status is {status and status[0]!r}, expected one of "
-                 "complete/partial/hierarchy_only")
-    print(f"ok: analysis_status = {status[0]}")
-    for key in ("error_count", "warning_count", "unresolved_count", "empty_procedure_count"):
-        row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        if not row or not row[0].isdigit():
-            sys.exit(f"meta.{key} is missing or non-numeric")
-    print("ok: diagnostic counts present")
-    tv = con.execute("SELECT value FROM meta WHERE key='tool_version'").fetchone()
-    if not tv or not tv[0]:
-        sys.exit("meta.tool_version is missing")
-    sv = con.execute("SELECT value FROM meta WHERE key='slang_version'").fetchone()
-    if not sv or not sv[0]:
-        sys.exit("meta.slang_version is missing")
-    print(f"ok: tool_version={tv[0]}, slang_version={sv[0]}")
-    cd = con.execute("SELECT value FROM meta WHERE key='config_digest'").fetchone()
-    if not cd or len(cd[0]) != 64:
-        sys.exit("meta.config_digest is missing or not a SHA-256")
-    print("ok: config_digest present")
     check("file rows joined to source_file",
           "SELECT count(*) FROM file WHERE source_file IS NOT NULL")
     # Every file row, not merely one. The origin of a file is learned from the
