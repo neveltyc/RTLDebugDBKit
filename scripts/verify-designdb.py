@@ -125,6 +125,94 @@ if rootless:
     sys.exit(f"{rootless} root instance(s) claim a child row; nothing declares a top")
 print("ok: every child expands and every module instance names its child")
 
+# The stable query interface: from v8 the seven views are contract, and all
+# three parts of that contract are asserted -- they exist, they carry exactly
+# their documented columns, and each one's row count equals its base table's.
+# The count check earns its keep twice over: SQLite resolves a view's column
+# references only when the view is queried, so counting every view is also
+# what proves the stored SQL still matches the tables underneath; and a count
+# that exceeds the base is a join fanning out, which is the one defect a
+# hand-edited view is most likely to introduce.
+VIEW_COLUMNS = {
+    "v_database_info": [
+        "schema_version", "tool_version", "slang_version", "producer_revision",
+        "top", "analysis_status", "error_count", "warning_count",
+        "unresolved_count", "empty_procedure_count", "duplicate_path_count",
+        "config_digest"],
+    "v_tree_node": [
+        "instance_id", "parent_instance_id", "instance_name", "node_kind",
+        "module_id", "module_name", "module_params", "child_id", "child_kind",
+        "definition_module_id", "definition_name"],
+    "v_signal": [
+        "module_id", "module_name", "module_params", "signal_name",
+        "symbol_kind", "type_text", "width", "direction", "direction_name",
+        "file_path", "source_path", "source_line", "source_column"],
+    "v_port_connection": [
+        "parent_module_id", "parent_module_name", "parent_module_params",
+        "child_instance_name", "child_id", "child_module_id",
+        "child_module_name", "child_module_params", "formal_port_name",
+        "inner_signal_name", "direction", "direction_name",
+        "outer_signal_name", "outer_type_text",
+        "outer_width", "outer_lo", "outer_hi", "outer_exact",
+        "connection_kind", "connection_kind_name", "modport_name",
+        "file_path", "source_path", "source_line"],
+    "v_dependency": [
+        "module_id", "module_name", "module_params",
+        "source_name", "source_type", "source_lo", "source_hi", "source_exact",
+        "target_name", "target_type", "target_lo", "target_hi", "target_exact",
+        "dependency_kind", "construct", "is_control", "mapping_exact",
+        "file_path", "source_path", "source_line"],
+    "v_driver": [
+        "module_id", "module_name", "module_params",
+        "signal_name", "signal_type", "signal_lo", "signal_hi", "signal_exact",
+        "driver_name", "driver_type", "driver_lo", "driver_hi", "driver_exact",
+        "dependency_kind", "construct", "is_control", "mapping_exact",
+        "file_path", "source_path", "source_line"],
+    "v_load": [
+        "module_id", "module_name", "module_params",
+        "signal_name", "signal_type", "signal_lo", "signal_hi", "signal_exact",
+        "load_name", "load_type", "load_lo", "load_hi", "load_exact",
+        "dependency_kind", "construct", "is_control", "mapping_exact",
+        "file_path", "source_path", "source_line"],
+}
+have_views = {r[0] for r in con.execute(
+    "SELECT name FROM sqlite_master WHERE type='view'")}
+missing_views = sorted(set(VIEW_COLUMNS) - have_views)
+if missing_views:
+    sys.exit(f"missing view(s): {', '.join(missing_views)}")
+for v, want in VIEW_COLUMNS.items():
+    got = [r[1] for r in con.execute(f"PRAGMA table_info({v})")]
+    if got != want:
+        sys.exit(f"{v} columns are {got}; the contract says {want}")
+print("ok: the seven stable views exist with their contracted columns")
+
+for v, base in (
+    ("v_tree_node", "SELECT count(*) FROM instance"),
+    ("v_signal", "SELECT count(*) FROM symbol"),
+    ("v_port_connection", "SELECT count(*) FROM port"),
+    ("v_dependency", "SELECT count(*) FROM edge"),
+    ("v_driver", "SELECT count(*) FROM edge"),
+    ("v_load", "SELECT count(*) FROM edge WHERE src IS NOT NULL"),
+    ("v_database_info", "SELECT 1"),
+):
+    nv = con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]
+    nb = con.execute(base).fetchone()[0]
+    if nv != nb:
+        sys.exit(f"{v} has {nv} row(s) where its base has {nb}; "
+                 "a view join is fanning out or filtering")
+print("ok: every view's row count equals its base table's")
+
+# port.child_id is the join key between the two hierarchy views, so it has to
+# point at a child of the very module the port row belongs to -- a cross-module
+# id would join a binding onto another module's instantiation and no other
+# check would notice.
+crossed_child = con.execute("""
+    SELECT count(*) FROM port p JOIN child c ON c.id = p.child_id
+    WHERE c.module != p.module""").fetchone()[0]
+if crossed_child:
+    sys.exit(f"{crossed_child} port row(s) name a child of a different module")
+print("ok: every port row names a child of its own module")
+
 # Global meta keys -- these are written unconditionally, so a database
 # that lacks them was either not finished or produced by an older version.
 #
@@ -137,7 +225,7 @@ print("ok: every child expands and every module instance names its child")
 # The required `meta` key set below is part of that version: a database written
 # before those keys existed is not a v5 database, and this check is what stops
 # it being read as one.
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
 if not version or version[0] != SCHEMA_VERSION:
     sys.exit(f"schema_version is {version and version[0]!r}, expected {SCHEMA_VERSION!r}")
@@ -177,6 +265,23 @@ elif status[0] == "partial":
         sys.exit("analysis_status is 'partial' but every count that would "
                  f"explain it is zero: {({k: counts[k] for k in INCOMPLETE})}")
 print(f"ok: meta seal present and self-consistent (analysis_status={status[0]})")
+
+# v_database_info must agree with the meta rows it pivots, and its counts must
+# come back as integers -- the CAST in the view is part of the contract, since
+# the key-value table underneath stores TEXT.
+info = con.execute("""
+    SELECT schema_version, analysis_status, error_count,
+           typeof(error_count) FROM v_database_info""").fetchone()
+if info[0] != SCHEMA_VERSION or info[1] != status[0]:
+    sys.exit(f"v_database_info says (schema={info[0]!r}, status={info[1]!r}) "
+             f"but meta says ({SCHEMA_VERSION!r}, {status[0]!r})")
+if info[3] != "integer":
+    sys.exit(f"v_database_info.error_count is {info[3]}, expected integer; "
+             "the view's CAST is missing")
+if info[2] != counts["error_count"]:
+    sys.exit(f"v_database_info.error_count is {info[2]}, "
+             f"meta says {counts['error_count']}")
+print("ok: v_database_info agrees with meta and casts its counts")
 
 
 def check(what, sql, expect_at_least=1):
@@ -477,6 +582,143 @@ if mode == "constructs":
                  "the per-statement read set is the one thing the join cannot give")
     print("ok: assign_operand separates the two statements exactly")
 
+    # ---- the stable views, asked the questions consumers will ask them ----
+    # Same facts the raw-table checks above pin, but through the interface a
+    # consumer actually uses -- so a view that drifts from its base fails here
+    # even while the base stays correct.
+    vdrv = con.execute("""
+        SELECT driver_name, signal_name, mapping_exact FROM v_driver
+        WHERE module_name = 'packing' AND signal_name LIKE 'packed_%'
+        ORDER BY signal_name""").fetchall()
+    if vdrv != [("swap_lo", "packed_hi", 1), ("swap_hi", "packed_lo", 1)]:
+        sys.exit(f"v_driver reports {vdrv} for packing; expected the crossed "
+                 "halves, each mapping_exact=1")
+    print("ok: v_driver pairs the concatenation's halves without crossing them")
+    arith = con.execute("""
+        SELECT count(*) FROM v_driver
+        WHERE module_name = 'counter' AND signal_name = 'cnt'
+          AND driver_name = 'cnt' AND mapping_exact = 0""").fetchone()[0]
+    if not arith:
+        sys.exit("v_driver claims a per-bit mapping for cnt <= cnt + 1")
+    print("ok: v_driver reports the arithmetic self-feedback as range-level")
+    ctl = con.execute("""
+        SELECT count(*) FROM v_driver
+        WHERE module_name = 'branches' AND signal_name = 'sel'
+          AND driver_name = 'c' AND is_control = 1""").fetchone()[0]
+    if not ctl:
+        sys.exit("v_driver lost the branch condition c -> sel (is_control=1)")
+    print("ok: v_driver keeps the control dependency, marked is_control")
+    dyn = con.execute("""
+        SELECT driver_exact, mapping_exact FROM v_driver
+        WHERE module_name = 'pick' AND signal_name = 'q'
+          AND driver_name = 'bus'""").fetchall()
+    if dyn != [(0, 0)]:
+        sys.exit(f"v_driver reports {dyn} for `q = bus[i]`; a dynamic select "
+                 "must be driver_exact=0 and mapping_exact=0")
+    print("ok: v_driver exposes the dynamic select as an upper bound")
+    nulldrv = con.execute("""
+        SELECT count(*) FROM v_driver
+        WHERE module_name = 'gates' AND signal_name = 'pu'
+          AND driver_name IS NULL""").fetchone()[0]
+    if nulldrv != 1:
+        sys.exit(f"the pullup's null driver has {nulldrv} v_driver row(s); a "
+                 "statement that drives while reading nothing must keep its row")
+    print("ok: v_driver keeps the null-driver row (a real driving statement)")
+
+    # The tree, classified by node_kind rather than by NULL patterns.
+    roots = con.execute("""
+        SELECT count(*) FROM v_tree_node
+        WHERE node_kind = 'root' AND module_name = 'constructs'""").fetchone()[0]
+    if roots != 1:
+        sys.exit(f"{roots} root node(s) named constructs, expected exactly 1")
+    print("ok: v_tree_node has exactly one root, and it is the top")
+    gens = con.execute("""
+        SELECT count(*) FROM v_tree_node
+        WHERE node_kind = 'generate' AND instance_name LIKE 'g_rep[%'""").fetchone()[0]
+    if gens != 2:
+        sys.exit(f"{gens} generate node(s) for g_rep, expected 2")
+    print("ok: v_tree_node reports the generate levels as their own kind")
+    check("v_tree_node's primitive nodes", """
+        SELECT count(*) FROM v_tree_node WHERE node_kind = 'primitive'""", 7)
+    check("module nodes expanded from the generate's child rows", """
+        SELECT count(*) FROM v_tree_node
+        WHERE node_kind = 'module' AND definition_name = 'decode'""", 3)
+    unk = con.execute(
+        "SELECT count(*) FROM v_tree_node WHERE node_kind IS NULL").fetchone()[0]
+    if unk:
+        sys.exit(f"{unk} tree node(s) have no node_kind; an unclassifiable "
+                 "state must fail here, not be relabelled")
+    print("ok: every tree node has a node_kind")
+
+    # Connection kinds through the view, name and number agreeing.
+    for kind, kname, what in ((1, "constant", "u_pick2's tied-off bus"),
+                              (2, "unconnected", "u_pick2's open q"),
+                              (3, "expression_operand", "the state == RUN operand")):
+        n = con.execute("""
+            SELECT count(*) FROM v_port_connection
+            WHERE connection_kind = ? AND connection_kind_name = ?""",
+            (kind, kname)).fetchone()[0]
+        if not n:
+            sys.exit(f"no v_port_connection row for {what} "
+                     f"(kind {kind} named {kname!r})")
+    unnamed = con.execute("""
+        SELECT count(*) FROM v_port_connection
+        WHERE connection_kind_name IS NULL""").fetchone()[0]
+    if unnamed:
+        sys.exit(f"{unnamed} port connection(s) have a kind the view cannot name")
+    print("ok: v_port_connection names every connection kind, constants and "
+          "unconnected included")
+
+    # The join the composition doctrine rests on: v_tree_node.child_id =
+    # v_port_connection.child_id, and it must work exactly where names do not.
+    # Under the generate, the tree spells `u_dec` and the port rows spell
+    # `g_rep[0].u_dec`, so the name join finds nothing -- the first release of
+    # the views shipped with only the names exposed, and cross-module tracing
+    # died at every generate boundary. Each of the two u_dec instances must
+    # reach its own two bindings, through its own child row.
+    hops = con.execute("""
+        SELECT t.child_id, count(p.formal_port_name)
+        FROM v_tree_node t
+        LEFT JOIN v_port_connection p ON p.child_id = t.child_id
+        WHERE t.node_kind = 'module' AND t.definition_name = 'decode'
+          AND t.instance_name = 'u_dec'
+        GROUP BY t.child_id ORDER BY t.child_id""").fetchall()
+    if len(hops) != 2 or any(n != 2 for _, n in hops):
+        sys.exit(f"the generate instances' boundary hop returned {hops}; "
+                 "each g_rep[*].u_dec must reach its own 2 port rows "
+                 "through child_id")
+    print("ok: v_tree_node joins v_port_connection on child_id across a generate")
+    misjoin = con.execute("""
+        SELECT count(*) FROM v_tree_node t
+        JOIN v_port_connection p ON p.child_instance_name = t.instance_name
+        WHERE t.instance_name = 'u_dec'""").fetchone()[0]
+    if misjoin:
+        sys.exit(f"the name join under the generate returned {misjoin} row(s); "
+                 "the example no longer shows why child_id is the key")
+    print("ok: the name join still finds nothing there, which is why the key exists")
+
+    # Two parameterisations of one definition are two module variants, and a
+    # query by module_name alone mixes them. The formal interface keys on
+    # module_id from the selected tree node; this pins both halves -- the
+    # mixing is real, and the id separates it.
+    mixed = con.execute("""
+        SELECT count(DISTINCT module_id) FROM v_driver
+        WHERE module_name = 'scaled' AND signal_name = 'q'""").fetchone()[0]
+    if mixed != 2:
+        sys.exit(f"a module_name query over `scaled` sees {mixed} variant(s), "
+                 "expected 2; the example no longer demonstrates the mixing")
+    print("ok: a module_name driver query really does mix parameterisations (2)")
+    per_variant = con.execute("""
+        SELECT t.instance_name, count(*), count(DISTINCT d.module_params)
+        FROM v_tree_node t
+        JOIN v_driver d ON d.module_id = t.module_id AND d.signal_name = 'q'
+        WHERE t.instance_name IN ('u_sc1', 'u_sc2')
+        GROUP BY t.instance_id ORDER BY t.instance_name""").fetchall()
+    if per_variant != [("u_sc1", 1, 1), ("u_sc2", 1, 1)]:
+        sys.exit(f"per-variant driver queries returned {per_variant}; keying on "
+                 "the tree node's module_id must isolate each parameterisation")
+    print("ok: module_id from the tree node isolates each parameterisation")
+
 if mode == "interfaces":
     check("the interface binding (conn_kind=4)",
           "SELECT count(*) FROM port WHERE conn_kind = 4", 2)
@@ -559,6 +801,34 @@ if mode == "interfaces":
             sys.exit(f"{n} interned name(s) contain {what}; "
                      "hier_ref paths are not being normalised")
     print("ok: no interned name carries a space, a comment or a select")
+
+    # ---- the stable views over the interface constructs ----
+    ifc = con.execute("""
+        SELECT count(*) FROM v_port_connection
+        WHERE connection_kind = 4 AND connection_kind_name = 'interface'
+          AND modport_name = 'src'""").fetchone()[0]
+    if ifc < 2:
+        sys.exit(f"{ifc} interface binding(s) with modport 'src' in "
+                 "v_port_connection, expected at least 2")
+    print(f"ok: v_port_connection reports the interface bindings with their "
+          f"modport ({ifc})")
+    ext = con.execute("""
+        SELECT count(*) FROM v_port_connection
+        WHERE connection_kind_name = 'external_reference'
+          AND outer_signal_name IS NULL""").fetchone()[0]
+    if not ext:
+        sys.exit("the external tie lost its v_port_connection row; a NULL "
+                 "outer with kind 5 is 'tied to something unnameable here', "
+                 "not 'unconnected'")
+    print("ok: v_port_connection keeps the external tie distinct from unconnected")
+    seen = con.execute("""
+        SELECT count(*) FROM v_driver
+        WHERE module_name = 'consumer' AND signal_name = 'seen'
+          AND driver_name IS NULL""").fetchone()[0]
+    if seen != 1:
+        sys.exit(f"{seen} null-driver v_driver row(s) for `seen`; a target fed "
+                 "only from outside the module must keep its driving statement")
+    print("ok: v_driver names the statement driving a target fed from outside")
 
 if mode == "assertions":
     check("the concurrent assertion's reads", """

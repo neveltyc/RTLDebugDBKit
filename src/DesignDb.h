@@ -73,7 +73,25 @@ namespace designdb {
 /// src_exact/dst_exact: those describe each end's own range, while this describes
 /// the correspondence between the ends. `q = a + b` knows both ranges exactly and
 /// still cannot say which bit reaches which, because a carry crosses them.
-inline constexpr int SchemaVersion = 7;
+///
+/// v8 added the stable query interface: seven views (v_database_info,
+/// v_tree_node, v_signal, v_port_connection, v_dependency, v_driver, v_load)
+/// that resolve the intern tables and spell out the NULL conventions, so an
+/// ordinary consumer never joins `name`/`type`/`file` or decodes `conn_kind`
+/// itself. The version moves because a v8 consumer may rely on the views
+/// existing with exactly their contracted columns -- a v7 file answers those
+/// queries with "no such table". From here on: removing or renaming a view or
+/// a view column, changing a column's semantics or NULL rules, or changing a
+/// view's row granularity all bump the version; changing only how a view is
+/// computed, with the contract intact, does not.
+///
+/// v8 also gave `port` a `child_id` foreign key, surfaced by both hierarchy
+/// views, because without it the composition the views promise did not hold:
+/// the tree spells an instance one segment at a time (`u_dec`) and the folded
+/// port rows spell it whole (`g_rep[0].u_dec`), so joining the two by name
+/// returned nothing exactly at generate boundaries -- and (module, name) is no
+/// substitute key, since two unnamed gates in one module legally share a name.
+inline constexpr int SchemaVersion = 8;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
@@ -324,7 +342,12 @@ public:
     /// when it later expands this module -- which is why they are returned
     /// rather than discarded.
     std::vector<int64_t> addChildren(int64_t moduleId, const std::vector<ChildRow>& rows);
-    void addPorts(int64_t moduleId, int64_t defModuleId, const std::vector<PortRow>& rows);
+    /// `childId` is the `child` row the connections bind -- every port row
+    /// belongs to exactly one instantiation, and the id rather than the name
+    /// is what a consumer joins on, since two unnamed gates in one module can
+    /// legally share a name.
+    void addPorts(int64_t moduleId, int64_t defModuleId, int64_t childId,
+                  const std::vector<PortRow>& rows);
     void addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows);
     void addStmtReads(int64_t moduleId, const std::vector<StmtReadRow>& rows);
     void addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows);

@@ -9,9 +9,27 @@ include directories, and optionally a top module.
 **Out:** one SQLite file. No runtime, no library, no simulator — anything that
 speaks SQL can read it.
 
-**Schema version 7.** `meta.schema_version` carries it. A reader that does not
+**Schema version 8.** `meta.schema_version` carries it. A reader that does not
 know the version should refuse the file rather than read it as though the layout
 had held.
+
+Version 8 added the [stable query interface](#stable-query-interface): seven
+views — `v_database_info`, `v_tree_node`, `v_signal`, `v_port_connection`,
+`v_dependency`, `v_driver`, `v_load` — that resolve the intern tables and spell
+out the NULL conventions, so an ordinary consumer never joins `name`/`type`/
+`file` or decodes `conn_kind` itself. The version moves because the views'
+existence and column sets are now contract, and a v7 file answers those queries
+with "no such table". From here on, removing or renaming a view or view column,
+changing a column's semantics or NULL rules, or changing a view's row
+granularity bumps the version; changing only how a view is computed, with its
+contract intact, does not.
+
+v8 also gave `port` a **`child_id`** foreign key (indexed, surfaced by both
+hierarchy views), because without it the composition the views promise did not
+hold: the tree spells an instance one segment at a time while port rows carry
+the folded generate-prefixed spelling, so joining the two by name returned
+nothing exactly at generate boundaries — and `(module, name)` is no substitute
+key, since two unnamed gates in one module legally share a name.
 
 Version 7 stopped crossing the two sides of an assignment. Every target used to
 be paired with every operand, so
@@ -99,6 +117,7 @@ elaborated tops whether or not `--top` was passed.
 - [What it answers](#what-it-answers)
 - [The model: folded](#the-model-folded)
 - [Table index](#table-index)
+- [Stable query interface](#stable-query-interface) — the seven views
 - [Hierarchy](#hierarchy) — `module`, `instance`, `child`
 - [Declarations](#declarations) — `symbol`
 - [Dataflow](#dataflow) — `edge`, `assignment`, `assign_operand`, `proc_event`
@@ -196,6 +215,100 @@ referencing one of those is a row id**, so reading a name means joining
 | [`stmt_read`](#reads-with-no-target) | signal read by a statement that writes nothing nameable | unique RTL |
 | [`source_file`](#provenance) | file slang actually read | source tree |
 | [`meta`](#provenance) | key/value (schema version, tool, top) | fixed |
+
+## Stable query interface
+
+**Start here as a consumer.** Seven views resolve the intern tables and spell
+out the NULL conventions, so ordinary queries never join `name`, `type`, `file`
+or `source_file`, and never decode `conn_kind` or NULL patterns by hand. The
+base tables remain the normative storage layer — the views add no data, no
+precomputation and no size — but from v8 the views' existence and column sets
+are part of the schema contract, verified by `verify-designdb.py` on every
+export.
+
+| view | one row is | built on |
+|---|---|---|
+| `v_database_info` | the whole database (exactly one row) | `meta`, pivoted to fixed columns with counts CAST to INTEGER |
+| `v_tree_node` | one node of the expanded instance tree | `instance` + resolved names + `node_kind` |
+| `v_signal` | one declaration in one module variant | `symbol` + type text + both file spellings |
+| `v_port_connection` | one port binding in the **folded** model | `port` + `connection_kind_name` + coalesced inner name + `child_id`, the join key to `v_tree_node` |
+| `v_dependency` | one intra-module dependency | `edge`, direction-neutral |
+| `v_driver` | one direct driving relation of `signal_name` | `v_dependency`, read from the target's side |
+| `v_load` | one direct load of `signal_name` | `v_dependency`, read from the source's side, null-source rows excluded |
+
+Rules a consumer can rely on:
+
+- **One view row is one base row.** Every join inside a view is against a
+  primary key, so nothing fans out; `count(view) == count(base)` is asserted.
+- **`v_driver` and `v_load` are one step, inside one module.** Fan-in cones,
+  root drivers and anything crossing an instance boundary are the consumer's
+  loop: follow `v_driver`/`v_load` inside the module, cross the boundary with
+  `v_port_connection`, and walk levels with `v_tree_node`.
+- **The two hierarchy views join on `child_id`, and on nothing else.**
+  `v_tree_node.child_id = v_port_connection.child_id` is the boundary-crossing
+  hop. The *names* do not relate them: the tree spells an instance one segment
+  at a time (`u_dec`) while port rows carry the folded spelling with the
+  generate prefix (`g_rep[0].u_dec`), so a name join returns nothing exactly
+  where a trace needs it.
+- **Key on `module_id`, not `module_name`.** One definition elaborated with two
+  parameter sets is two module variants, and a `module_name` filter returns rows
+  from all of them. The tree node you selected carries the right `module_id`;
+  name (plus `module_params`) is for a human browsing.
+- **`v_dependency` does not name the assignment statement.** `edge` and
+  `assignment` are [independent projections](#they-are-two-projections-not-two-halves-of-a-join);
+  per-statement operands stay in `assign_operand`.
+- **Bit ranges keep `edge`'s semantics unchanged**: LSB-relative offsets into
+  the flattened object, `NULL` + `exact=1` the whole object, `NULL` + `exact=0`
+  somewhere unknown inside it — see [Bit ranges](#bit-ranges).
+- **`mapping_exact=0` does not mean the dependency is doubtful.** The source
+  reaches the target; only the bit-for-bit correspondence is unavailable — see
+  [Bit correspondence](#bit-correspondence).
+- **`driver_name` NULL is a real driving statement** (`assign q = 1'b0;`, a
+  target fed only from outside the module). It is kept in `v_driver` and, being
+  no signal's load, excluded from `v_load`.
+- **Read `connection_kind`, not NULL patterns**: a constant tie, an unconnected
+  port and an external tie all have `outer_signal_name` NULL, and the kind is
+  what tells them apart.
+- **`node_kind` classifies the tree**: `root` and `generate` are structural
+  levels nothing declared; `module` descends; `primitive`'s dataflow is already
+  in the parent's edges; `unresolved` is a black box with no dataflow anywhere.
+
+Four queries that cover most consumers. The driver/load forms take `module_id`
+from the tree node already selected — filtering by `module_name` instead would
+mix every parameterisation of that definition:
+
+```sql
+-- The children of one tree node.
+SELECT instance_id, instance_name, node_kind, module_id, module_name
+FROM v_tree_node
+WHERE parent_instance_id = ?;
+```
+
+```sql
+-- What directly drives this signal, in the selected node's module variant.
+SELECT driver_name, driver_lo, driver_hi, driver_exact,
+       is_control, mapping_exact, file_path, source_line
+FROM v_driver
+WHERE module_id = ? AND signal_name = ?;
+```
+
+```sql
+-- What this signal directly feeds, in the same variant.
+SELECT load_name, load_lo, load_hi, is_control, file_path, source_line
+FROM v_load
+WHERE module_id = ? AND signal_name = ?;
+```
+
+```sql
+-- Cross the boundary: the selected instance's port bindings.
+SELECT formal_port_name, direction_name, outer_signal_name,
+       connection_kind_name, outer_lo, outer_hi
+FROM v_port_connection
+WHERE child_id = ?;   -- the tree node's child_id
+```
+
+All four resolve through the existing indexes (`edge_by_dst`, `edge_by_src`,
+`instance_by_parent`, `port_by_child`); the views add none of their own.
 
 ## Hierarchy
 
@@ -409,6 +522,7 @@ statements and there would be nothing single to point at — see
 | | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an expression, 4=an interface binding, 5=attached to a signal with no name in this module. |
 | | `modport` | The modport restricting an interface binding, when one does. NULL otherwise. |
 | | `file`, `line` | Where the connection itself is written, in the parent — not the instantiation's own line, which on an instance written one port per line would be the same for every row and would tell two ports of it apart from neither each other nor the header. A port left **unconnected** has no connection text to point at and falls back to the instantiation. |
+| | `child_id` | The [`child`](#hierarchy) row this binding belongs to — the stable key relating a port row to the hierarchy, and through `instance.child` to the expanded tree. The *name* in `child` above is not that key: it carries the folded spelling with the generate prefix (`g_rep[0].u_dec`) while the tree spells one segment per level, and two unnamed gates in one module legally share a name. Indexed (`port_by_child`): a trace crosses every boundary through this column. |
 
 Both directions are indexed, because the two queries need opposite ones: a
 driver query walks inward from a net, a load query outward from a formal. This

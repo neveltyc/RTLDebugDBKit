@@ -1919,6 +1919,13 @@ private:
         writer.addSymbols(moduleId, symbols);
 
         std::vector<ChildRow> children;
+        // The instances whose port bindings are emitted below, in lockstep with
+        // the leading entries of `children`. A port row names the child row it
+        // binds (port.child_id), and those ids only exist once addChildren has
+        // run -- so the ports move after it, and the pairing is positional.
+        // Positional deliberately, not by name: two unnamed gates in one module
+        // share a name, so a name lookup hands both the first id.
+        std::vector<const InstanceSymbol*> instChildren;
         forEachInstance(body, [&](const InstanceSymbol& child) {
             // Named relative to the module, generate-block prefix included, so
             // the row reads the same for every instance that shares this body.
@@ -1930,10 +1937,7 @@ private:
             children.push_back(ChildRow{childName,
                                         std::string(child.getDefinition().name),
                                         defModule, ChildKind::Module});
-            std::vector<PortRow> ports;
-            emitPorts(child, childName, prefix, ports, body);
-            stats.ports += static_cast<int64_t>(ports.size());
-            writer.addPorts(moduleId, defModule, ports);
+            instChildren.push_back(&child);
         });
         // A gate, switch or UDP is an instantiation written inside the module,
         // so it belongs here beside the module instances. Its `def_module` is
@@ -1975,6 +1979,17 @@ private:
         const std::vector<int64_t> ids = writer.addChildren(moduleId, children);
         for (size_t i = 0; i < ids.size(); i++)
             byName.emplace(children[i].name, ids[i]);
+
+        // Ports now that every instantiation has its row id: ids[k] belongs to
+        // instChildren[k] because the instance loop above filled `children` and
+        // `instChildren` in lockstep, and primitives and unresolved rows were
+        // appended after the instances.
+        for (size_t k = 0; k < instChildren.size(); k++) {
+            std::vector<PortRow> ports;
+            emitPorts(*instChildren[k], children[k].name, prefix, ports, body);
+            stats.ports += static_cast<int64_t>(ports.size());
+            writer.addPorts(moduleId, children[k].defModule, ids[k], ports);
+        }
 
         writer.addHierRefs(moduleId, hierRefs);
         writer.addStmtReads(moduleId, stmtReads);

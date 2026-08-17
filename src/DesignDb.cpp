@@ -279,7 +279,19 @@ CREATE TABLE port(
     -- otherwise, and for every non-interface row.
     modport      INTEGER REFERENCES name(id),
     file         INTEGER REFERENCES file(id),
-    line         INTEGER);
+    line         INTEGER,
+    -- The `child` row this binding belongs to -- the stable key that relates a
+    -- port row to the hierarchy, and through instance.child to the expanded
+    -- tree. It exists because the *name* here is not that key: `child` above
+    -- is the instance name as the folded model spells it, generate prefix
+    -- included (`g_rep[0].u_dec`), while the instance tree spells the same
+    -- level one segment at a time (`g_rep[0]`, then `u_dec`) -- so a consumer
+    -- holding a tree node had to rebuild the folded spelling before it could
+    -- find the node's port rows. Nor is (module, name) something to join on:
+    -- two unnamed gates in one module legally share a name, and a join on it
+    -- fans out. The id is assigned by the exporter, so it is collision-proof
+    -- where the name is not.
+    child_id     INTEGER NOT NULL REFERENCES child(id));
 
 -- Assignments, one row per statement that writes a target.
 --
@@ -501,12 +513,269 @@ CREATE INDEX symbol_by_name   ON symbol(name);
 -- in the child. A driver query needs the first, a load query the second.
 CREATE INDEX port_by_outer    ON port(module, outer);
 CREATE INDEX port_by_formal   ON port(def_module, port);
+-- The boundary-crossing hop of a trace: a tree node's child_id to its port
+-- rows. Not a view index (SQLite has none) -- it is the access path of the
+-- port.child_id foreign key, which the documented v_tree_node-to-
+-- v_port_connection join takes on every instance boundary.
+CREATE INDEX port_by_child    ON port(child_id);
 -- The descent index: resolving a hierarchical path means one lookup per
 -- segment against this. Not unique -- a design that only partially elaborates
 -- can produce two siblings with the same name, and refusing the second would
 -- abort an export that is otherwise perfectly usable. The count is reported.
 CREATE INDEX instance_by_parent ON instance(parent, name);
 CREATE INDEX instance_by_module ON instance(module);
+)SQL";
+
+// The stable query interface: seven views that resolve the intern tables so a
+// consumer never joins `name`, `type`, `file` or `source_file` itself. They are
+// part of the schema-version contract from v8 on -- their existence, their
+// column sets and their row granularity are what a consumer may rely on, and
+// verify-designdb.py asserts all three.
+//
+// Ground rules, so the views stay what they claim to be:
+//
+//   * One view row is one base-table row. Every join here is against a primary
+//     key, so no LEFT JOIN can fan out, and the verifier checks
+//     count(view) == count(base) to keep it that way.
+//   * Explicit column lists, never SELECT * -- a column added to a base table
+//     must not silently change a view's contract.
+//   * No transitive closure. v_driver and v_load are one step inside one
+//     module; walking a fan-in cone or crossing instances is the consumer's
+//     loop, composed from v_dependency + v_port_connection + v_tree_node --
+//     joined on child_id, the one key both hierarchy views expose.
+//   * Nothing joins `edge` to `assignment`. The two are independent
+//     projections, and (module, dst, file, line) is not a key between them --
+//     the views must not resurrect the cross product v7 removed.
+//   * Plain CREATE VIEW, not IF NOT EXISTS: the writer only ever creates a
+//     fresh database, so a name collision is a bug to fail on, not to accept.
+//
+// SQLite resolves a view's column references when the view is *queried*, not
+// when it is created -- a view naming a dropped column is created without
+// complaint and fails on first use. The verifier's row-count checks query
+// every view, which is what makes a stale view a caught error rather than a
+// consumer's surprise.
+constexpr const char* kViews = R"SQL(
+-- The meta table pivoted to one fixed row, so "which schema, which status" is
+-- one SELECT with no key-value handling. Counts are CAST so a consumer gets
+-- integers, not the TEXT the key-value table stores. The view only reshapes;
+-- required-key enforcement stays in the verifier.
+CREATE VIEW v_database_info AS
+SELECT
+    MAX(CASE WHEN key = 'schema_version'        THEN value END) AS schema_version,
+    MAX(CASE WHEN key = 'tool_version'          THEN value END) AS tool_version,
+    MAX(CASE WHEN key = 'slang_version'         THEN value END) AS slang_version,
+    MAX(CASE WHEN key = 'producer_revision'     THEN value END) AS producer_revision,
+    MAX(CASE WHEN key = 'top'                   THEN value END) AS top,
+    MAX(CASE WHEN key = 'analysis_status'       THEN value END) AS analysis_status,
+    CAST(MAX(CASE WHEN key = 'error_count'
+                  THEN value END) AS INTEGER) AS error_count,
+    CAST(MAX(CASE WHEN key = 'warning_count'
+                  THEN value END) AS INTEGER) AS warning_count,
+    CAST(MAX(CASE WHEN key = 'unresolved_count'
+                  THEN value END) AS INTEGER) AS unresolved_count,
+    CAST(MAX(CASE WHEN key = 'empty_procedure_count'
+                  THEN value END) AS INTEGER) AS empty_procedure_count,
+    CAST(MAX(CASE WHEN key = 'duplicate_path_count'
+                  THEN value END) AS INTEGER) AS duplicate_path_count,
+    MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest
+FROM meta;
+
+-- One row per `instance`: the expanded tree, with names resolved and the node's
+-- nature spelled out. node_kind is the classification a consumer had to derive
+-- from NULL combinations before: root and generate are structural (nothing was
+-- written as an instance), the other three are child.kind -- and a trace stops
+-- differently at each, which is why the word matters. An inconsistent row
+-- yields NULL rather than 'unknown': naming it would hide exactly the state
+-- the verifier exists to reject.
+--
+-- No source location -- instance and child do not carry one, and a view must
+-- not invent columns it cannot fill. No precomputed path either: the chain of
+-- instance_name up parent_instance_id IS the path, one segment per row.
+CREATE VIEW v_tree_node AS
+SELECT
+    i.id         AS instance_id,
+    i.parent     AS parent_instance_id,
+    n.text       AS instance_name,
+    CASE WHEN i.parent IS NULL THEN 'root'
+         WHEN i.child IS NULL AND i.module IS NULL THEN 'generate'
+         ELSE c.kind END AS node_kind,
+    i.module     AS module_id,
+    m.name       AS module_name,
+    m.params     AS module_params,
+    i.child      AS child_id,
+    c.kind       AS child_kind,
+    c.def_module AS definition_module_id,
+    dn.text      AS definition_name
+FROM instance i
+JOIN name n        ON n.id = i.name
+LEFT JOIN module m ON m.id = i.module
+LEFT JOIN child c  ON c.id = i.child
+LEFT JOIN name dn  ON dn.id = c.def_name;
+
+-- One row per `symbol`: a declaration in a module variant, with its type text
+-- and both spellings of its file -- file_path as written in the filelist,
+-- source_path absolute on disk. They genuinely differ and each is the right
+-- answer to a different question, so neither substitutes for the other.
+CREATE VIEW v_signal AS
+SELECT
+    s.module     AS module_id,
+    m.name       AS module_name,
+    m.params     AS module_params,
+    n.text       AS signal_name,
+    s.kind       AS symbol_kind,
+    t.text       AS type_text,
+    s.width      AS width,
+    s.direction  AS direction,
+    CASE s.direction WHEN 0 THEN 'input' WHEN 1 THEN 'output'
+                     WHEN 2 THEN 'inout' WHEN 3 THEN 'ref' END AS direction_name,
+    f.path       AS file_path,
+    sf.path      AS source_path,
+    s.line       AS source_line,
+    s.col        AS source_column
+FROM symbol s
+JOIN module m            ON m.id = s.module
+JOIN name n              ON n.id = s.name
+LEFT JOIN type t         ON t.id = s.type
+LEFT JOIN file f         ON f.id = s.file
+LEFT JOIN source_file sf ON sf.id = f.source_file;
+
+-- One row per `port`: a binding in the FOLDED model, shared by every instance
+-- of the parent -- which is why there is no instance_id here to ask for.
+-- child_id is the join key to the hierarchy: v_tree_node.child_id equals it,
+-- and that pair is the ONLY documented way to relate the two views. The names
+-- do not relate them -- child_instance_name is the folded spelling with the
+-- generate prefix (`g_rep[0].u_dec`) while v_tree_node.instance_name is one
+-- segment (`u_dec`), so a name join returns nothing exactly where the id is
+-- needed most.
+-- inner_signal_name is already coalesced: NULL inner means "the formal's own
+-- name", and every consumer repeating that COALESCE was the reason to do it
+-- once here. connection_kind decides what NULL means elsewhere in the row
+-- (constant, unconnected and external ties all have no outer name), so read
+-- it rather than testing outer_signal_name IS NULL.
+CREATE VIEW v_port_connection AS
+SELECT
+    p.module      AS parent_module_id,
+    pm.name       AS parent_module_name,
+    pm.params     AS parent_module_params,
+    cn.text       AS child_instance_name,
+    p.child_id    AS child_id,
+    p.def_module  AS child_module_id,
+    cm.name       AS child_module_name,
+    cm.params     AS child_module_params,
+    fp.text       AS formal_port_name,
+    COALESCE(inn.text, fp.text) AS inner_signal_name,
+    p.direction   AS direction,
+    CASE p.direction WHEN 0 THEN 'input' WHEN 1 THEN 'output'
+                     WHEN 2 THEN 'inout' WHEN 3 THEN 'ref' END AS direction_name,
+    onm.text      AS outer_signal_name,
+    ot.text       AS outer_type_text,
+    p.outer_width AS outer_width,
+    p.outer_lo    AS outer_lo,
+    p.outer_hi    AS outer_hi,
+    p.outer_exact AS outer_exact,
+    p.conn_kind   AS connection_kind,
+    CASE p.conn_kind WHEN 0 THEN 'signal'
+                     WHEN 1 THEN 'constant'
+                     WHEN 2 THEN 'unconnected'
+                     WHEN 3 THEN 'expression_operand'
+                     WHEN 4 THEN 'interface'
+                     WHEN 5 THEN 'external_reference' END AS connection_kind_name,
+    mp.text       AS modport_name,
+    f.path        AS file_path,
+    sf.path       AS source_path,
+    p.line        AS source_line
+FROM port p
+JOIN module pm           ON pm.id = p.module
+JOIN name cn             ON cn.id = p.child
+LEFT JOIN module cm      ON cm.id = p.def_module
+JOIN name fp             ON fp.id = p.port
+LEFT JOIN name inn       ON inn.id = p.inner
+LEFT JOIN name onm       ON onm.id = p.outer
+LEFT JOIN type ot        ON ot.id = p.outer_type
+LEFT JOIN name mp        ON mp.id = p.modport
+LEFT JOIN file f         ON f.id = p.file
+LEFT JOIN source_file sf ON sf.id = f.source_file;
+
+-- One row per `edge`: the direction-neutral base v_driver and v_load rename.
+-- source_name NULL is a real record -- a statement that drives the target
+-- while reading nothing nameable (`assign q = 1'b0;`) -- and is preserved, not
+-- filtered. Bit ranges keep edge's semantics unchanged: LSB-relative offsets
+-- into the flattened object, NULL+exact=1 the whole object, NULL+exact=0
+-- somewhere unknown inside it; and mapping_exact=0 means the dependency is
+-- real but only traceable at range granularity, not that it is doubtful.
+CREATE VIEW v_dependency AS
+SELECT
+    e.module    AS module_id,
+    m.name      AS module_name,
+    m.params    AS module_params,
+    sn.text     AS source_name,
+    st.text     AS source_type,
+    e.src_lo    AS source_lo,
+    e.src_hi    AS source_hi,
+    e.src_exact AS source_exact,
+    dn.text     AS target_name,
+    dt.text     AS target_type,
+    e.dst_lo    AS target_lo,
+    e.dst_hi    AS target_hi,
+    e.dst_exact AS target_exact,
+    e.kind      AS dependency_kind,
+    e.construct AS construct,
+    e.control   AS is_control,
+    e.map_exact AS mapping_exact,
+    f.path      AS file_path,
+    sf.path     AS source_path,
+    e.line      AS source_line
+FROM edge e
+JOIN module m            ON m.id = e.module
+LEFT JOIN name sn        ON sn.id = e.src
+LEFT JOIN type st        ON st.id = e.src_type
+JOIN name dn             ON dn.id = e.dst
+LEFT JOIN type dt        ON dt.id = e.dst_type
+LEFT JOIN file f         ON f.id = e.file
+LEFT JOIN source_file sf ON sf.id = f.source_file;
+
+-- v_dependency read from the target's side: one row per direct driving
+-- relation of signal_name. driver_name NULL stays -- the statement drives the
+-- signal even though no source can be named -- and control edges stay, marked
+-- is_control=1, for the consumer to keep or drop. One step, in-module: the
+-- root driver across hierarchy is a walk the consumer composes.
+CREATE VIEW v_driver AS
+SELECT
+    module_id, module_name, module_params,
+    target_name  AS signal_name,
+    target_type  AS signal_type,
+    target_lo    AS signal_lo,
+    target_hi    AS signal_hi,
+    target_exact AS signal_exact,
+    source_name  AS driver_name,
+    source_type  AS driver_type,
+    source_lo    AS driver_lo,
+    source_hi    AS driver_hi,
+    source_exact AS driver_exact,
+    dependency_kind, construct, is_control, mapping_exact,
+    file_path, source_path, source_line
+FROM v_dependency;
+
+-- v_dependency read from the source's side: one row per direct load of
+-- signal_name. Null-source edges are no signal's load, so they are the one
+-- thing filtered out; control edges stay, marked, exactly as in v_driver.
+CREATE VIEW v_load AS
+SELECT
+    module_id, module_name, module_params,
+    source_name  AS signal_name,
+    source_type  AS signal_type,
+    source_lo    AS signal_lo,
+    source_hi    AS signal_hi,
+    source_exact AS signal_exact,
+    target_name  AS load_name,
+    target_type  AS load_type,
+    target_lo    AS load_lo,
+    target_hi    AS load_hi,
+    target_exact AS load_exact,
+    dependency_kind, construct, is_control, mapping_exact,
+    file_path, source_path, source_line
+FROM v_dependency
+WHERE source_name IS NOT NULL;
 )SQL";
 
 // Rows per transaction. Committing per row is orders of magnitude slower;
@@ -565,7 +834,7 @@ Writer::Writer(const std::string& path) {
     prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
     prepare("INSERT INTO child VALUES(?,?,?,?,?,?)", &insChild);
     prepare("INSERT INTO instance VALUES(?,?,?,?,?)", &insInstance);
-    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
+    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?)", &insProcEvent);
@@ -838,7 +1107,7 @@ std::vector<int64_t> Writer::addChildren(int64_t moduleId,
     return ids;
 }
 
-void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
+void Writer::addPorts(int64_t moduleId, int64_t defModuleId, int64_t childId,
                       const std::vector<PortRow>& rows) {
     for (auto& r : rows) {
         sqlite3_reset(insPort);
@@ -873,6 +1142,7 @@ void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
         bindOptId(insPort, 14, internName(r.modport));
         bindOptId(insPort, 15, internFile(r.file));
         sqlite3_bind_int64(insPort, 16, r.line);
+        sqlite3_bind_int64(insPort, 17, childId);
         step(insPort);
         if (++pending >= kBatch) {
             commit();
@@ -1038,6 +1308,10 @@ void Writer::addInstance(const std::string& name, int64_t moduleId, int64_t pare
 void Writer::finish() {
     commit();
     exec(kIndexes);
+    // After the indexes: views are stored SQL and cost the write path nothing,
+    // but creating them here keeps the publish order legible -- data, then
+    // indexes, then the query interface over both.
+    exec(kViews);
 }
 
 // ---------------------------------------------------------------- SHA-256

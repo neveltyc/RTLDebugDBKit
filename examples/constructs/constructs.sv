@@ -108,6 +108,23 @@ module packing(input logic [3:0] swap_hi, input logic [3:0] swap_lo,
     assign bits = {swap_hi, swap_lo};
 endmodule
 
+// A dynamic select: which bit of `bus` reaches `q` is decided at runtime, so
+// the source range is an upper bound (source_exact=0) and no per-bit mapping
+// can be claimed (mapping_exact=0). The index is read as data in its own right.
+module pick(input logic [7:0] bus, input logic [2:0] i, output logic q);
+    assign q = bus[i];
+endmodule
+
+// One definition, two parameterisations: two module variants, two module_ids.
+// A driver query by module_name alone returns rows from both, which is why the
+// formal interface keys on module_id, taken from the selected tree node --
+// name-plus-params is for a human browsing, name alone answers a different
+// question than "this instance".
+module scaled #(parameter int W = 1)(input logic [W-1:0] d,
+                                     output logic [W-1:0] q);
+    assign q = ~d;
+endmodule
+
 module constructs;
     `DECLARE_TRACE(trace)                   // declared inside a macro body
 
@@ -159,6 +176,28 @@ module constructs;
     logic [7:0] p_bits;
     packing u_pack(.swap_hi(stim[7:4]), .swap_lo(stim[3:0]),
                    .packed_hi(p_hi), .packed_lo(p_lo), .bits(p_bits));
+
+    logic pk;
+    pick u_pick(.bus(stim), .i(cnt_o[2:0]), .q(pk));
+    // One instance carrying the two connection kinds nothing else here has:
+    // a port tied to a constant (conn_kind=1) and a port left unconnected
+    // (conn_kind=2). Recorded rather than omitted -- "nobody connected it"
+    // must stay distinct from "the exporter did not get that far".
+    pick u_pick2(.bus(8'h5A), .i(cnt_o[2:0]), .q());
+
+    // A generate loop is a naming level of its own: the tree holds g_rep[0]
+    // and g_rep[1] as nodes with neither module nor child row, while the
+    // folded `child` rows under `constructs` spell the whole path
+    // (`g_rep[0].u_dec`). The two spellings are what instance.child relates.
+    for (genvar gi = 0; gi < 2; gi++) begin : g_rep
+        logic [15:0] oh_g;
+        decode u_dec(.idx(stim[3:0]), .onehot(oh_g));
+    end
+
+    logic sc1_q;
+    logic [1:0] sc2_d = 2'b00, sc2_q;
+    scaled #(.W(1)) u_sc1(.d(trace[0]), .q(sc1_q));
+    scaled #(.W(2)) u_sc2(.d(sc2_d), .q(sc2_q));
 
 `include "seq.svh"
 

@@ -65,7 +65,10 @@ grows with the design.
 
 **[doc/designdb-schema.md](doc/designdb-schema.md) is the field reference** —
 every table and column, the bit-range encoding, the naming rules, what the
-schema deliberately does not record, and the known limits.
+schema deliberately does not record, and the known limits. Consumers start at
+its **stable query interface**: seven views (`v_tree_node`, `v_driver`,
+`v_load`, …) that resolve the intern tables, so ordinary queries never join
+`name`/`type`/`file` by hand.
 
 ## Measurements
 
