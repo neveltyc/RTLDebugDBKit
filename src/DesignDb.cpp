@@ -73,24 +73,45 @@ CREATE TABLE file(
 
 -- Intra-module dataflow, in the module's own namespace.
 --
--- This is a deduplicated dependency graph, not a statement list, and it is
--- related to `assignment` many-to-many rather than one-to-one. Both directions
--- of that are real, so neither can be tightened into a foreign key:
+-- `edge` and `assignment` are two independent projections of the same
+-- statements, and there is deliberately no key that recovers one from the
+-- other. **(module, dst, file, line) is not a join key.** An earlier version of
+-- this comment said it was, which was wrong in a way that returns rows rather
+-- than failing:
+--
+--     always_ff @(posedge clk) begin if (c) q <= a; else q <= b; end
+--
+-- is two assignments and three edges (a->q, b->q, and c->q with control=1), and
+-- every one of those five rows carries the same module, dst, file and line.
+-- Joining on them pairs each assignment with all three edges, so a consumer
+-- asking what the first statement reads is told `a`, `b` and `c`. The line is
+-- shared by construction -- a statement is written where it is written -- so
+-- this is the ordinary case, not a corner one.
+--
+-- Nor can the relation be tightened into a foreign key, in either direction:
 --
 --   * One edge, many assignments. Two statements writing the same target from
 --     the same source on the same line collapse to one row -- deliberately, so
---     a connectivity query answers "does a reach y" once rather than once per
---     statement. `assignment` keeps the statements apart; that is its job.
+--     a connectivity query answers "does a reach q" once rather than once per
+--     statement.
 --   * One edge, no assignment. A gate contributes edges and no statement at
 --     all, and a subroutine call binds its actuals to its formals -- the
 --     `d -> bump.v` half of `always_ff @(posedge clk) bump(d);` is an edge
 --     with no assignment row behind it, because no assignment was written.
 --
--- So an `edge.assignment` column could only name one statement out of several,
--- or NULL for a binding that is genuinely dataflow: it would be less true than
--- the join it replaced. A consumer that needs the statements joins on
--- (module, dst, file, line) and expects a set back. A consumer that needs
--- connectivity reads this table and ignores `assignment` entirely.
+-- So each projection answers its own questions and neither substitutes for the
+-- other:
+--
+--   * What does *this statement* read?  `assign_operand`, keyed on
+--     `assignment.id`. It is exact: for the block above it gives `a` to the
+--     first assignment and `b` to the second, which is the answer the join
+--     above gets wrong.
+--   * Does a reach q at all, through anything?  This table.
+--
+-- What no table answers is which branch condition gates which statement: the
+-- `c -> q` edge records that `c` reaches `q` as a condition, not which of the
+-- two assignments it guards. That is the deliberate omission `assignment`
+-- documents below, not an accident of this one.
 CREATE TABLE edge(
     module   INTEGER NOT NULL REFERENCES module(id),
     -- Null when the right-hand side reads nothing at all: `q <= 8'h0`.

@@ -85,6 +85,16 @@ module gates(input logic a, input logic b, input logic en, output logic y);
     assign y = zt;
 endmodule
 
+// Two assignments to one target, on one line, under a condition. All of
+// `edge` and `assignment` agree on module, dst, file and line here, so joining
+// the two tables on those columns pairs each statement with every edge --
+// including the branch condition's. `assign_operand` is what separates them,
+// and the database asserts that it does.
+module branches(input logic clk, input logic c, input logic [7:0] a,
+                input logic [7:0] b, output logic [7:0] sel);
+    always_ff @(posedge clk) begin if (c) sel <= a; else sel <= b; end
+endmodule
+
 module constructs;
     `DECLARE_TRACE(trace)                   // declared inside a macro body
 
@@ -128,6 +138,9 @@ module constructs;
 
     logic [7:0] observed;
     always_comb observed = u_cnt.cnt;       // downward XMR read
+
+    logic [7:0] sel;
+    branches u_br(.clk(clk), .c(done), .a(stim), .b(cnt_o), .sel(sel));
 
 `include "seq.svh"
 

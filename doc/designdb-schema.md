@@ -9,9 +9,18 @@ include directories, and optionally a top module.
 **Out:** one SQLite file. No runtime, no library, no simulator — anything that
 speaks SQL can read it.
 
-**Schema version 4.** `meta.schema_version` carries it. A reader that does not
+**Schema version 5.** `meta.schema_version` carries it. A reader that does not
 know the version should refuse the file rather than read it as though the layout
 had held.
+
+Version 5 changed no table and no column. It moved because the version is the
+**consumption contract**, not the DDL: `meta` gained `duplicate_path_count` and
+`producer_revision` as rows that are now always written, and `analysis_status`
+gained a constraint it did not have — it must agree with the counts beside it,
+so `complete` next to a non-zero `error_count` is a malformed file rather than a
+merely surprising one. Because `meta` is key-value, a v4 reader sees the new
+rows as rows it does not query; what changed is the set a consumer may *rely*
+on, and a database written before this would otherwise also answer `4`.
 
 Version 4 made `instance.name` **one path segment, always**. A generate block
 is now a level of the tree in its own right, so `g_lane[3].u_dp` is two rows
@@ -211,6 +220,41 @@ uses, which is the consumer's judgement to make, not a column here.
 keeps the statements apart, so a target written in four places reads as four
 statements rather than one merged set.
 
+### They are two projections, not two halves of a join
+
+There is no key that recovers one from the other, and
+**`(module, dst, file, line)` is not one.** Those columns are shared by every
+statement written on a line, so joining on them returns a cross product rather
+than an error:
+
+```systemverilog
+always_ff @(posedge clk) begin if (c) q <= a; else q <= b; end
+```
+
+is two `assignment` rows and three `edge` rows — `a → q`, `b → q`, and `c → q`
+with `control = 1` — and all five carry the same module, `dst`, file and line.
+Joined on them, each assignment pairs with all three edges, and a consumer
+asking what the first statement reads is told `a`, `b` *and* `c`.
+
+Ask each table what it can answer:
+
+| question | table |
+|---|---|
+| What does **this statement** read? | `assign_operand`, keyed on `assignment.id`. Exact: `a` for the first assignment above, `b` for the second. |
+| Does `a` reach `q` **at all**? | `edge`. Deduplicated on purpose — one row however many statements produced it. |
+| In what order, in which procedure, blocking or not? | `assignment` — `proc`, `seq`, `blocking`. |
+
+Neither direction can be tightened into a foreign key. One edge covers many
+assignments by design; and some edges have no assignment at all — a gate is not
+a statement, and a subroutine call's actual-to-formal binding
+(`always_ff @(posedge clk) bump(d);`) is dataflow nobody wrote an assignment
+for.
+
+**Which branch condition guards which statement is not recorded.** The `c → q`
+edge says `c` reaches `q` as a condition, not which of the two assignments it
+gates. That is the [deliberate omission](#what-is-deliberately-not-here) below,
+not a gap in this pair of tables.
+
 ## Crossing a module boundary
 
 | table | column | meaning |
@@ -341,7 +385,35 @@ Storing both NULL cases the same way made uncertainty read as fact.
 | table | meaning |
 |---|---|
 | `source_file` | Every file slang actually read, with its SHA-256 — including headers reached by `` `include ``, which are exactly the files that change without the filelist changing. `file.source_file` joins every interned as-written path to its hashed row, so checking freshness never means matching spellings. |
-| `meta` | Schema version, tool name, top module. `top` holds the *elaborated* top(s), space-separated when the design has several — written whether or not `--top` was passed. A reader that does not know the version should refuse the file rather than read it as though the layout had held. |
+| `meta` | Key/value. Every key below is written on every successful export — that set is part of the schema version, so a v5 database always has all of them. A reader that does not know the version should refuse the file rather than read it as though the layout had held. |
+
+Every row of `meta` is written after the data and the indexes are complete, so
+a file carrying them is a file whose export ran to the end.
+
+| key | meaning |
+|---|---|
+| `schema_version` | This document's version. `5`. |
+| `tool` | Always `rtl-designdb`. |
+| `top` | The *elaborated* top(s), space-separated when the design has several — written whether or not `--top` was passed. |
+| `analysis_status` | `complete`, `partial`, or `hierarchy_only`. See below. |
+| `error_count`, `warning_count` | Elaboration diagnostics. |
+| `unresolved_count` | Instantiations whose module slang could not resolve — black boxes. Recorded with a null `child.def_module` rather than dropped. |
+| `empty_procedure_count` | Procedures the analysis says drive something but from which nothing could be extracted, normally a statement slang marked bad. |
+| `duplicate_path_count` | Instances whose hierarchical path was already taken. Non-zero means a path lookup may be ambiguous. |
+| `tool_version` | The exporter's release version. |
+| `slang_version` | The slang tag it was built against. |
+| `producer_revision` | The commit it was built from (`git describe --always --dirty --tags`), or `unknown` outside a checkout. `tool_version` moves once a release; extraction semantics move more often, so this is what tells two exporters apart. |
+| `config_digest` | SHA-256 over the generation conditions: input files, include directories, defines, single/multi-unit, elaborated tops, default timescale, tool and slang version — each tagged and length-prefixed, so `+incdir+a +define+b` and `+incdir+a+b` do not collide. Equal digests mean two databases were produced under the same conditions; it is not a build command you can replay. |
+
+**`analysis_status` agrees with the counts.** `complete` requires
+`error_count`, `empty_procedure_count` and `duplicate_path_count` all zero;
+`partial` requires at least one of them non-zero. `hierarchy_only` means the
+compilation was fatally errored or nothing was analysed — the dataflow tables
+are empty because none could be read, which a consumer must not report as "this
+design has no drivers". `warning_count` and `unresolved_count` constrain
+nothing: plenty of warnings say nothing about extraction, and a design that
+instantiates a vendor macro it has no source for is as complete as its sources
+allow.
 
 ## Naming rules
 

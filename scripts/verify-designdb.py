@@ -90,10 +90,14 @@ print("ok: range lo <= hi")
 #
 # schema_version belongs here and not beside meta.top: what `top` should be
 # depends on which example was loaded, but every database this tool writes is
-# schema 4 whatever the design. Checking it only in the mode-specific branch
-# meant a plain `verify-designdb.py design.db` accepted a database claiming
-# schema 999.
-SCHEMA_VERSION = "4"
+# one fixed version whatever the design. Checking it only in the mode-specific
+# branch meant a plain `verify-designdb.py design.db` accepted a database
+# claiming schema 999.
+#
+# The required `meta` key set below is part of that version: a database written
+# before those keys existed is not a v5 database, and this check is what stops
+# it being read as one.
+SCHEMA_VERSION = "5"
 version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
 if not version or version[0] != SCHEMA_VERSION:
     sys.exit(f"schema_version is {version and version[0]!r}, expected {SCHEMA_VERSION!r}")
@@ -169,6 +173,12 @@ if mode:
     # task body in an `include`d header shared a line with a statement in the
     # module's own file. This invariant catches that whole class without
     # needing two files to collide on a chosen number.
+    #
+    # An EXISTENCE check, not a pairing. These columns are shared by every
+    # statement on a line, so matching one here says an edge survived for that
+    # statement's target -- not that this edge came from this assignment.
+    # Joining the two tables on them to recover operands returns a cross
+    # product; `assign_operand` is what answers that, keyed on assignment.id.
     orphaned = con.execute("""
         SELECT count(*) FROM assignment a
         WHERE NOT EXISTS (
@@ -335,6 +345,34 @@ if mode == "constructs":
         SELECT count(*) FROM assignment a
         JOIN file f ON f.id = a.file JOIN name d ON d.id = a.dst
         WHERE f.path LIKE '%seq.svh' AND d.text = 'u_cnt.dbg'""")
+
+    # `if (c) sel <= a; else sel <= b;` -- two statements, three edges (the
+    # condition is one), and all five rows carrying the same module, dst, file
+    # and line. This is why those columns are not a join key, and the assertion
+    # is here so the claim in the schema doc stays true rather than becoming
+    # folklore: the naive join must still over-pair, and `assign_operand` must
+    # still be the thing that does not.
+    pairs = con.execute("""
+        SELECT count(*) FROM assignment a
+        JOIN edge e ON e.module = a.module AND e.dst = a.dst
+                   AND e.file IS a.file AND e.line = a.line
+        JOIN module m ON m.id = a.module
+        WHERE m.name = 'branches'""").fetchone()[0]
+    if pairs != 6:
+        sys.exit(f"the branches join produced {pairs} pair(s), expected the 2x3 "
+                 "cross product; the example no longer demonstrates why "
+                 "(module, dst, file, line) cannot recover the relation")
+    print(f"ok: the naive edge/assignment join over-pairs, as documented ({pairs})")
+    ops = con.execute("""
+        SELECT a.seq, n.text FROM assign_operand ao
+        JOIN assignment a ON a.id = ao.assignment
+        JOIN name n ON n.id = ao.name
+        JOIN module m ON m.id = a.module
+        WHERE m.name = 'branches' ORDER BY a.seq, n.text""").fetchall()
+    if ops != [(0, "a"), (1, "b")]:
+        sys.exit(f"branches assign_operand is {ops}, expected [(0,'a'), (1,'b')]; "
+                 "the per-statement read set is the one thing the join cannot give")
+    print("ok: assign_operand separates the two statements exactly")
 
 if mode == "interfaces":
     check("the interface binding (conn_kind=4)",

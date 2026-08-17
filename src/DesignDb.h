@@ -36,7 +36,19 @@ namespace designdb {
 /// procedure. A reader that joins it against `proc_event.proc`, or indexes
 /// procedures by it, reads that as a fact about procedure 0 unless it is told
 /// the layout changed.
-inline constexpr int SchemaVersion = 4;
+///
+/// v5 moved with no table or column change at all, which is the point: the
+/// version is the *consumption contract*, not the DDL. `meta` gained
+/// `duplicate_path_count` and `producer_revision` as required rows, and
+/// `analysis_status` gained a constraint it did not have -- it must now agree
+/// with the counts beside it, so `complete` alongside a non-zero error count is
+/// a malformed file rather than a merely surprising one. Both a database
+/// written before this and one written after would otherwise answer `4`, and a
+/// consumer checking the version could not tell which contract it held. Since
+/// `meta` is key-value, the rows are invisible to a reader that does not look
+/// for them; it is the *required* set that changed, and that is exactly what a
+/// version exists to state.
+inline constexpr int SchemaVersion = 5;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
