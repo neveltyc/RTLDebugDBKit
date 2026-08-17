@@ -131,6 +131,7 @@ examples/constructs/    self-feedback, primitives, waits, XMRs, interfaces,
                         assertions -- exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
+                        designdb-coverage.py (what an export had to approximate),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 
