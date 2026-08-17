@@ -31,6 +31,16 @@ module relay(simple_bus.src bus);
     producer u_prod(.bus(bus));
 endmodule
 
+// Two outward writes, each fed by a different local signal, on one line. The
+// write lands in hier_ref and the read in stmt_read, so before those rows
+// carried a statement ordinal the two were indistinguishable: `bus.vld` could
+// be read as fed by `ready` or by `payload`, and so could `bus.data`. This is
+// the shape interface RTL mostly is -- a modport driver computing from local
+// state -- which is why it is the case worth pinning.
+module driver_pair(simple_bus.src bus, input logic ready, input logic [7:0] payload);
+    assign bus.vld = ready; assign bus.data = payload;
+endmodule
+
 module sink(input logic s);
 endmodule
 
@@ -59,4 +69,9 @@ module interfaces;
     relay    u_relay(.bus(bus));
     consumer u_cons(.bus(bus), .seen(seen), .nib(nib));
     watcher  u_watch();
+
+    simple_bus  bus2(clk);
+    logic       ready = 1'b0;
+    logic [7:0] payload = 8'h00;
+    driver_pair u_drv(.bus(bus2), .ready(ready), .payload(payload));
 endmodule

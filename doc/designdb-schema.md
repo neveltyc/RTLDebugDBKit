@@ -9,9 +9,27 @@ include directories, and optionally a top module.
 **Out:** one SQLite file. No runtime, no library, no simulator — anything that
 speaks SQL can read it.
 
-**Schema version 5.** `meta.schema_version` carries it. A reader that does not
+**Schema version 6.** `meta.schema_version` carries it. A reader that does not
 know the version should refuse the file rather than read it as though the layout
 had held.
+
+Version 6 gave names to two relations that were being guessed from file and line.
+
+`assignment`, `hier_ref` and `stmt_read` gained **`stmt`**, a per-module
+statement ordinal. A statement whose target is *outward* has no `assignment` row
+to gather its parts — the write goes to `hier_ref` and the reads to `stmt_read` —
+so `assign top.a = x; assign top.b = y;` exported two writes and two reads that
+a consumer could pair four ways when the RTL supports one. See
+[Statement identity](#statement-identity).
+
+`child` gained **`id`** and **`kind`**, and `instance` gained **`child`**.
+`def_module IS NULL` had meant "a primitive" and "a definition slang could not
+find" indistinguishably, though a trace stopping at one means something quite
+different from a trace stopping at the other; the folded and expanded hierarchy
+tables were related by nothing a consumer could join on; and an unresolved
+instantiation had no `instance` row at all, so a path through a black box did not
+resolve and the tree reported the same emptiness as a module that instantiates
+nothing. All three are fixed together in [Hierarchy](#hierarchy).
 
 Version 5 changed no table and no column. It moved because the version is the
 **consumption contract**, not the DDL: `meta` gained `duplicate_path_count` and
@@ -152,7 +170,7 @@ referencing one of those is a row id**, so reading a name means joining
 |---|---|---|
 | [`module`](#hierarchy) | definition + parameter values it elaborated with | unique RTL |
 | [`instance`](#hierarchy) | elaborated instance | **the design** |
-| [`child`](#hierarchy) | instantiation written inside a module, primitives included | elaborated module contents |
+| [`child`](#hierarchy) | instantiation written inside a module — modules, primitives and unresolved black boxes, told apart by `kind` | elaborated module contents |
 | [`symbol`](#declarations) | declaration inside a module | elaborated module contents |
 | [`edge`](#dataflow) | dependency (one signal drives another) | elaborated module contents |
 | [`assignment`](#dataflow) | statement that writes a target | elaborated module contents |
@@ -169,8 +187,43 @@ referencing one of those is a row id**, so reading a name means joining
 | table | column | meaning |
 |---|---|---|
 | `module` | `id`, `name`, `params` | A definition plus its elaborated parameter values — **and its localparams**, which slang models the same way. That only ever over-splits, never under-splits, so it remains a sound identity; but a key rebuilt from the overrides written at instantiation will not match it. The parameters are part of the identity: a different parameterisation resolves different generate branches and different widths, so it is a different netlist. |
-| `instance` | `id`, `name`, `module`, `parent` | The instance tree. `name` is **one path segment** — a generate block is its own level, so the chain of names to the root *is* the hierarchical path, joined with `.`. `module` is NULL for a level that is not a module instance (a generate block, or a primitive). Paths are not stored — they are all distinct, so interning saves nothing and storing them costs the text twice once the lookup index is counted. |
-| `child` | `module`, `name`, `def_name`, `def_module` | What a module instantiates. `def_module` is NULL either when slang could not resolve the definition or when the instantiation is a **primitive** — a gate, switch or UDP, which has no module row; `def_name` names it (`and`, `my_latch`) in both cases. Recorded rather than dropped, so "there is an instance here whose module I do not have" is distinguishable from "this module instantiates nothing". |
+| `instance` | `id`, `name`, `module`, `parent` | The instance tree. `name` is **one path segment** — a generate block is its own level, so the chain of names to the root *is* the hierarchical path, joined with `.`. `module` is NULL for a level that is not a module instance (a generate block, a primitive, or an unresolved black box). Paths are not stored — they are all distinct, so interning saves nothing and storing them costs the text twice once the lookup index is counted. |
+| | `child` | The instantiation in the parent's module body this row expands. NULL only for the root and for a generate block — neither is something anyone wrote as an instance. See below. |
+| `child` | `id`, `module`, `name`, `def_name`, `def_module` | What a module instantiates. `def_name` always names the definition as written (`counter`, `and`, `my_latch`); `def_module` points at its rows when there are any. |
+| | `kind` | `module`, `primitive`, or `unresolved` — what `def_module IS NULL` could not say. |
+
+### The two hierarchies, and how they relate
+
+`child` is folded (one row per instantiation *written*, shared by every instance
+of the enclosing module) and `instance` is expanded (one row per instantiation
+*elaborated*). `instance.child` is the link, and it is one-to-many in the
+direction you would expect: a `child` row of a module instantiated 32 times has
+32 `instance` rows pointing at it.
+
+The two also spell names differently, which is why the link is worth storing
+rather than recomputing. For
+
+```systemverilog
+for (genvar i = 0; i < 2; i++) begin : g
+    leaf u_leaf(...);
+end
+```
+
+`child` holds `g[0].u_leaf` and `g[1].u_leaf` — the whole path, relative to the
+module body — while `instance` holds `g[0]` and `g[1]` as levels of their own with
+`u_leaf` beneath each. Recovering one from the other meant re-parsing the text and
+walking it segment by segment; `instance.child` is that work done once.
+
+**`child.kind` is not decoration — the three kinds stop a trace differently.**
+
+| kind | `def_module` | has an `instance` row | what it means when a trace arrives |
+|---|---|---|---|
+| `module` | its module | yes | Descend: the module's own rows continue the trace. |
+| `primitive` | NULL | yes | Do not descend. A gate has no module and never will; its dataflow is already in the parent's `edge` rows with `kind='primitive'`. |
+| `unresolved` | NULL | yes | Stop. This is a black box — slang could not find the definition, so no dataflow for it exists anywhere in the database. Counted in `meta.unresolved_count`; these are the individual rows. |
+
+A generate level is none of the three: it has `module IS NULL` *and*
+`child IS NULL`, which is what distinguishes it from a primitive or a black box.
 
 ## Declarations
 
@@ -213,6 +266,7 @@ uses, which is the consumer's judgement to make, not a column here.
 | | `proc`, `seq` | Which procedure in the module, and the order within it — within the procedure's own statements. A subroutine's body is numbered *after* the call that invokes it, so `seq` is not execution order across a call. Both are needed: `seq` restarts per procedure, so without `proc` two assignments from different `always` blocks read as one ordered sequence. `proc` is **NULL** when the statement is in no procedure — a net declared with an initialiser is a continuous assignment written at the declaration. |
 | | `blocking` | 1 for `=`, 0 for `<=`, NULL for a continuous assign. It describes **the statement**, so a `=` inside a function keeps its 1 whether the function was reached from an `assign` or from an `always_ff` — while `kind`/`construct` beside it name the *enclosing* construct, which is how the same body reports `assign` from one caller and `always_ff` from another. Not decoration — two assignments to one target in one block resolve by different rules, and it separates a block-local temporary written with `=` inside an `always_ff` from a real register. |
 | | `dropped_operands` | Operands not recorded: compile-time constants, and references outside this module. A row with one operand and three dropped is not a row that reads one signal. |
+| | `stmt` | Which statement in the module, as [an ordinal](#statement-identity). Shared with the `hier_ref` and `stmt_read` rows of the same statement — which is how an assignment that also reads something outward is related to that reference. |
 | `assign_operand` | `assignment`, `name`, `src_lo`/`src_hi`/`src_exact` | What the right-hand side reads. |
 | `proc_event` | `module`, `proc`, `signal`, `edge_kind`, `wait`, `file`, `line` | Every edge event a procedure triggers on **or waits on**. `signal` is NULL when the event expression is not a plain reference. `wait` is the discriminator: `0` is the procedure's sensitivity list, so the event triggers the block; `1` is an event control reached during execution (`@(posedge clk);` inside an initial block or a task), which suspends it and says nothing about what triggers it. **Filter on `wait = 0` to ask what a procedure is sensitive to** — an `initial` block has only `wait = 1` rows, and reading those as a trigger set makes it look clocked. |
 
@@ -254,6 +308,46 @@ for.
 edge says `c` reaches `q` as a condition, not which of the two assignments it
 gates. That is the [deliberate omission](#what-is-deliberately-not-here) below,
 not a gap in this pair of tables.
+
+### Statement identity
+
+`assignment`, `hier_ref` and `stmt_read` each carry **`stmt`**: an ordinal the
+exporter assigns while walking a module. Rows sharing `(module, stmt)` came from
+one statement. The number is meaningless outside its module and is not an id into
+any table — it exists to say "these rows are one statement".
+
+For a statement writing a target the module *can* name, `assignment.id` already
+did this job and `assign_operand` hangs off it. `stmt` matters where there is no
+assignment row to hang from — a write that leaves the module:
+
+```systemverilog
+assign top.a = x; assign top.b = y;
+```
+
+The writes land in `hier_ref`, the reads in `stmt_read`, and every one of those
+four rows carries the same module, file and line. Pairing them on those columns
+gives `top.a` fed by both `x` and `y`, and `top.b` likewise — four answers where
+the source gives two. Pairing on `stmt` gives exactly `top.a ← x` and
+`top.b ← y`:
+
+```sql
+SELECT hp.text AS writes, rn.text AS fed_by
+FROM hier_ref h
+JOIN name hp ON hp.id = h.path
+JOIN stmt_read r ON r.module = h.module AND r.stmt = h.stmt
+JOIN name rn ON rn.id = r.name
+WHERE h.write = 1;
+```
+
+This is what makes an interface or XMR driver chain resolvable at all, which is
+most of what a modport driver is: `assign bus.vld = ready;` beside
+`assign bus.data = payload;` is the ordinary shape of that code, not a
+contrived one.
+
+`stmt` is NULL where a row belongs to no statement the walk opened. `edge`
+deliberately has no `stmt` column: it is deduplicated, so one row can be several
+statements and there would be nothing single to point at — see
+[above](#they-are-two-projections-not-two-halves-of-a-join).
 
 ## Crossing a module boundary
 
@@ -304,6 +398,7 @@ interface instance; this row is how a reference on either side finds them.
 | | `kind`, `construct` | The enclosing construct, in `edge`'s vocabulary — plus `kind='port'` with the direction in `construct` for a port connection tied to an external signal. |
 | | `file`, `line` | Where the reference is written. |
 | | `path_lo`/`path_hi`/`path_exact` | The bits the reference touches, as everywhere else. |
+| | `stmt` | Which statement produced the reference, as [an ordinal](#statement-identity). This is what pairs an outward *write* with the `stmt_read` rows that fed it; file and line cannot, because two outward writes on one line share them. |
 
 The target of such a reference cannot go into `edge` or `port` rows: those name
 signals in the module's own namespace, shared by every instance of it, and an
@@ -330,6 +425,7 @@ stored). And a **downward reference that stays inside the module's subtree**
 | | `kind`, `construct` | As `edge`, plus the reading statement's own word as the construct: an assertion's (`assert`, `assume`, `cover`, `restrict`, `expect`), a system task's name (`$display`, `$error`, …), `wait` for a wait condition, or `call` for a void call to a user subroutine that assigns nothing. |
 | | `file`, `line` | The statement's own location. |
 | | `src_lo`/`src_hi`/`src_exact` | Bits of the thing read, spelled as everywhere else. A **concurrent** assertion's operands are walked for value references rather than through path analysis, so their ranges come back NULL with `src_exact = 0`. An **immediate** assertion, a `wait` condition and a system task's arguments go through path analysis like any other read and carry real ranges. |
+| | `stmt` | The statement this read belongs to, as [an ordinal](#statement-identity). Join it against `hier_ref.stmt` to find the outward write this read actually fed, rather than every outward write on the line. |
 
 One rule decides what lands here: **a statement that reads and writes nothing
 this module can name**. Such a statement has nowhere else to go — `edge`
@@ -478,8 +574,11 @@ go stale against a digest that can only say *that* it changed.
   has no `assignment` row, since that row cannot exist without a
   module-relative target. The write is in `hier_ref`, an outward operand joins
   it there, and an operand inside the module is in
-  [`stmt_read`](#reads-with-no-target) — but the three are related only by
-  sharing a `module`, `file` and `line`.
+  [`stmt_read`](#reads-with-no-target). The three carry a shared
+  [`stmt`](#statement-identity) ordinal, so they can be reassembled into the one
+  statement they came from; what is still missing is the statement's `proc`,
+  `seq` and `blocking`, which only `assignment` records and which such a
+  statement therefore has nowhere to put.
 - A port that stands for a *concatenation* of internal signals
   (`module m(.ext_pair({hi, lo}))`) records the binding, but `hi` and `lo`
   keep a NULL `symbol.direction`: slang offers the concatenation through

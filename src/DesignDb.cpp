@@ -154,12 +154,27 @@ CREATE TABLE edge(
     dst_lo    INTEGER, dst_hi INTEGER, dst_exact INTEGER);
 
 -- What a module instantiates. Expanding `instance` against this is what turns
--- the folded model back into hierarchy.
+-- the folded model back into hierarchy, and `instance.child` is the link that
+-- makes the expansion an id lookup rather than a name-parsing exercise.
 CREATE TABLE child(
-    module       INTEGER NOT NULL REFERENCES module(id),
+    id         INTEGER PRIMARY KEY,
+    module     INTEGER NOT NULL REFERENCES module(id),
     name       INTEGER NOT NULL REFERENCES name(id),
     def_name   INTEGER REFERENCES name(id),      -- what it instantiates, as text
-    def_module INTEGER REFERENCES module(id));   -- and as a module row
+    def_module INTEGER REFERENCES module(id),    -- and as a module row
+    -- What sort of thing this is, because `def_module IS NULL` does not say.
+    -- Three states shared that one spelling and a consumer could not tell them
+    -- apart, though a trace stopping at each means something different:
+    --
+    --   module      an ordinary instance; `def_module` names its rows.
+    --   primitive   a gate, switch or UDP. It has no module row and never will;
+    --               its dataflow is already in the parent's `primitive` edges,
+    --               so a trace does not stop here, it continues in the parent.
+    --   unresolved  a definition slang could not find. There is no dataflow
+    --               anywhere for it -- this is a black box, and a trace really
+    --               does stop. Counted in `meta.unresolved_count`; this is
+    --               where the individual rows are.
+    kind       TEXT);
 
 -- Every declaration in a module. The rest of the schema is edge-derived, so a
 -- signal appears there only if it takes part in dataflow; this is what makes
@@ -297,7 +312,12 @@ CREATE TABLE assignment(
     -- Operands not recorded: compile-time constants, and references outside
     -- this module. A row with one operand and three dropped is not the same as
     -- a row that reads one signal, and without this they look identical.
-    dropped_operands INTEGER);
+    dropped_operands INTEGER,
+    -- Which statement in the module wrote this, as an ordinal the exporter
+    -- assigns. See `hier_ref.stmt` for what it is for -- it is the same number,
+    -- and it is what relates a row here to the outward writes and reads of the
+    -- same statement.
+    stmt     INTEGER);
 
 -- The edge events a procedure triggers on. Every one of them, because an event
 -- list has no order: `@(posedge clk or negedge rst_n)` and
@@ -367,7 +387,24 @@ CREATE TABLE hier_ref(
     construct TEXT,
     file   INTEGER REFERENCES file(id),
     line   INTEGER,
-    path_lo INTEGER, path_hi INTEGER, path_exact INTEGER);
+    path_lo INTEGER, path_hi INTEGER, path_exact INTEGER,
+    -- Which statement produced this, as an ordinal the exporter assigns while
+    -- walking the module. Rows sharing (module, stmt) came from one statement;
+    -- the number means nothing outside its module and is not an id in a table.
+    --
+    -- It exists because a statement whose target is outward has no `assignment`
+    -- row to hang its parts from: the write lands here, the reads it made land
+    -- in `stmt_read`, and any further outward operand lands here too. Before
+    -- this, those parts shared only module, file and line, so
+    --
+    --     assign top.a = x; assign top.b = y;
+    --
+    -- exported two writes and two reads that a consumer could only pair four
+    -- ways -- `top.a` from `x` *and* from `y`, `top.b` likewise -- when the RTL
+    -- says exactly one of those four. `edge` has the same shape of problem and
+    -- deliberately does not solve it, because a deduplicated dependency graph
+    -- has no statement to point at; these tables are not deduplicated and do.
+    stmt   INTEGER);
 
 -- A statement that reads signals without writing anything this module can
 -- name. Two shapes reach it: an assertion, which writes nothing at all, and an
@@ -393,7 +430,11 @@ CREATE TABLE stmt_read(
     line      INTEGER,
     -- Bits of the thing read, spelled `src_*` as everywhere else that records
     -- a read.
-    src_lo    INTEGER, src_hi INTEGER, src_exact INTEGER);
+    src_lo    INTEGER, src_hi INTEGER, src_exact INTEGER,
+    -- The statement these reads belong to, as `hier_ref.stmt`. Joining on it is
+    -- what pairs a read with the outward write it fed, rather than with every
+    -- outward write on the line.
+    stmt      INTEGER);
 
 -- The instance tree. This is the one table that scales with the design rather
 -- than with the source, which is why it carries nothing but identity.
@@ -405,10 +446,26 @@ CREATE TABLE instance(
     -- whole reason the paths themselves are not stored.
     name    INTEGER NOT NULL REFERENCES name(id),
     -- NULL for a generate block, which is a naming level rather than an
-    -- instantiation and has no module to point at. `module IS NULL` is how a
-    -- consumer tells the two apart; every other row has one.
+    -- instantiation and has no module to point at. Also NULL for a primitive
+    -- and for an unresolved instantiation, neither of which has a module row --
+    -- `child.kind`, reached through `child` below, is what separates those
+    -- three; `module IS NULL` alone does not.
     module  INTEGER REFERENCES module(id),
-    parent  INTEGER REFERENCES instance(id));
+    parent  INTEGER REFERENCES instance(id),
+    -- The instantiation in the parent's module body that this row expands.
+    --
+    -- The two hierarchy tables were otherwise related by nothing: `child` is
+    -- folded and spells a generate-nested name whole (`g[0].u_leaf`), while
+    -- `instance` is expanded and one segment per row (`g[0]` then `u_leaf`), so
+    -- matching them meant re-parsing the text and walking segments -- work the
+    -- database could do once and did not. One `child` row expands to as many
+    -- `instance` rows as there are instances of the enclosing module, which is
+    -- the ordinary one-to-many this column now states.
+    --
+    -- NULL only where there is genuinely no instantiation to point at: the root,
+    -- and a generate block, which is a level the elaboration invented rather
+    -- than something written as an instance.
+    child   INTEGER REFERENCES child(id));
 )SQL";
 
 constexpr const char* kIndexes = R"SQL(
@@ -488,15 +545,15 @@ Writer::Writer(const std::string& path) {
     exec(kSchema);
 
     prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
-    prepare("INSERT INTO child VALUES(?,?,?,?)", &insChild);
-    prepare("INSERT INTO instance VALUES(?,?,?,?)", &insInstance);
+    prepare("INSERT INTO child VALUES(?,?,?,?,?,?)", &insChild);
+    prepare("INSERT INTO instance VALUES(?,?,?,?,?)", &insInstance);
     prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
-        prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
+        prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?)", &insProcEvent);
         prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?)", &insAssignOp);
-        prepare("INSERT INTO stmt_read VALUES(?,?,?,?,?,?,?,?,?)", &insStmtRead);
-        prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?)", &insHierRef);
+        prepare("INSERT INTO stmt_read VALUES(?,?,?,?,?,?,?,?,?,?)", &insStmtRead);
+        prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?,?)", &insHierRef);
         begin();
     }
     catch (...) {
@@ -733,22 +790,33 @@ void Writer::addEdges(int64_t moduleId, const std::vector<EdgeRow>& rows) {
     }
 }
 
-void Writer::addChildren(int64_t moduleId, const std::vector<ChildRow>& rows) {
+std::vector<int64_t> Writer::addChildren(int64_t moduleId,
+                                         const std::vector<ChildRow>& rows) {
+    std::vector<int64_t> ids;
+    ids.reserve(rows.size());
     for (auto& r : rows) {
         sqlite3_reset(insChild);
-        sqlite3_bind_int64(insChild, 1, moduleId);
-        sqlite3_bind_int64(insChild, 2, internName(r.name));
-        bindOptId(insChild, 3, internName(r.defName));
+        sqlite3_bind_null(insChild, 1);                    // autoincrement id
+        sqlite3_bind_int64(insChild, 2, moduleId);
+        sqlite3_bind_int64(insChild, 3, internName(r.name));
+        bindOptId(insChild, 4, internName(r.defName));
         if (r.defModule)
-            sqlite3_bind_int64(insChild, 4, r.defModule);
+            sqlite3_bind_int64(insChild, 5, r.defModule);
         else
-            sqlite3_bind_null(insChild, 4);
+            sqlite3_bind_null(insChild, 5);
+        sqlite3_bind_text(insChild, 6,
+                          r.kind == ChildKind::Primitive    ? "primitive"
+                          : r.kind == ChildKind::Unresolved ? "unresolved"
+                                                            : "module",
+                          -1, SQLITE_STATIC);
         step(insChild);
+        ids.push_back(sqlite3_last_insert_rowid(db));
         if (++pending >= kBatch) {
             commit();
             begin();
         }
     }
+    return ids;
 }
 
 void Writer::addPorts(int64_t moduleId, int64_t defModuleId,
@@ -831,6 +899,9 @@ void Writer::addStmtReads(int64_t moduleId, const std::vector<StmtReadRow>& rows
         sqlite3_bind_int64(insStmtRead, 6, r.line);
         bindOptRange(insStmtRead, 7, 8, r.bits);
         sqlite3_bind_int(insStmtRead, 9, r.exact ? 1 : 0);
+        // Ordinals start at 1, so 0 spells "not attributed to a statement" and
+        // stores as NULL -- the stored number is the ordinal itself, unshifted.
+        bindOptId(insStmtRead, 10, r.stmt);
         step(insStmtRead);
         if (++pending >= kBatch) {
             commit();
@@ -865,6 +936,7 @@ int64_t Writer::addAssignment(int64_t moduleId, const AssignRow& row,
     else
         sqlite3_bind_int(insAssign, 13, row.blocking);
     sqlite3_bind_int64(insAssign, 14, row.dropped);
+    bindOptId(insAssign, 15, row.stmt);
     step(insAssign);
     const int64_t id = sqlite3_last_insert_rowid(db);
 
@@ -917,6 +989,7 @@ void Writer::addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows) 
         sqlite3_bind_int64(insHierRef, 7, r.line);
         bindOptRange(insHierRef, 8, 9, r.bits);
         sqlite3_bind_int(insHierRef, 10, r.exact ? 1 : 0);
+        bindOptId(insHierRef, 11, r.stmt);
         step(insHierRef);
         if (++pending >= kBatch) {
             commit();
@@ -926,7 +999,7 @@ void Writer::addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows) 
 }
 
 void Writer::addInstance(const std::string& name, int64_t moduleId, int64_t parentId,
-                         int64_t rowId) {
+                         int64_t rowId, int64_t childId) {
     sqlite3_reset(insInstance);
     sqlite3_bind_int64(insInstance, 1, rowId);
     sqlite3_bind_int64(insInstance, 2, internName(name));
@@ -935,6 +1008,7 @@ void Writer::addInstance(const std::string& name, int64_t moduleId, int64_t pare
         sqlite3_bind_int64(insInstance, 4, parentId);
     else
         sqlite3_bind_null(insInstance, 4);
+    bindOptId(insInstance, 5, childId);    // NULL for the root and generate levels
     step(insInstance);
     if (++pending >= kBatch) {
         commit();

@@ -48,7 +48,20 @@ namespace designdb {
 /// `meta` is key-value, the rows are invisible to a reader that does not look
 /// for them; it is the *required* set that changed, and that is exactly what a
 /// version exists to state.
-inline constexpr int SchemaVersion = 5;
+///
+/// v6 gave the relations that were being guessed from file and line a name.
+/// `assignment`, `hier_ref` and `stmt_read` gained `stmt`, a per-module
+/// statement ordinal, because a statement writing an *outward* target has no
+/// assignment row to gather its parts: `assign top.a = x; assign top.b = y;`
+/// exported two writes and two reads that could be paired four ways, of which
+/// the RTL supports one. `child` gained `id` and `kind`, and `instance` gained
+/// `child`: `def_module IS NULL` meant "primitive" and "unresolved black box"
+/// indistinguishably though a trace stopping at each means something different,
+/// the two hierarchy tables were related by nothing a consumer could join on,
+/// and an unresolved instantiation had no `instance` row at all -- so a path
+/// through a black box did not resolve, and the tree reported the same emptiness
+/// as a module that instantiates nothing.
+inline constexpr int SchemaVersion = 6;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
@@ -99,6 +112,9 @@ struct AssignRow {
     /// outside this module. Without it a row with one operand cannot be told
     /// apart from a row with one operand and three that were filtered.
     int64_t dropped = 0;   // operands not recorded
+    /// Which statement in the module this came from; 0 for none, stored NULL.
+    /// Shared with the `hier_ref` and `stmt_read` rows of the same statement.
+    int64_t stmt = 0;
 };
 
 /// One operand of an assignment.
@@ -194,13 +210,24 @@ struct StmtReadRow {
     uint32_t line = 0;
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
+    /// The statement these reads belong to; 0 for none, stored NULL. Joining on
+    /// it is what pairs a read with the outward write it actually fed.
+    int64_t stmt = 0;
 };
+
+/// What sort of instantiation a `child` row records. `def_module` is NULL for
+/// all but Module, and a consumer reading only that cannot tell a gate (whose
+/// dataflow is in the parent's edges) from a black box (whose dataflow does not
+/// exist anywhere) -- though a trace stopping at one means something different
+/// from a trace stopping at the other.
+enum class ChildKind { Module, Primitive, Unresolved };
 
 /// One instantiation inside a module body.
 struct ChildRow {
     std::string name;         // instance name, generate-block prefix included
     std::string defName;   // the definition it instantiates
     int64_t defModule = 0;  // module row id, resolved by the caller
+    ChildKind kind = ChildKind::Module;
 };
 
 /// One reference that leaves the module, exactly as written in the source:
@@ -220,6 +247,11 @@ struct HierRefRow {
     uint32_t line = 0;
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
+    /// Which statement produced this reference; 0 for none, stored NULL. A
+    /// statement writing an outward target has no `assignment` row to gather its
+    /// parts, so this is what says the write here and the reads in `stmt_read`
+    /// are one statement rather than two that share a line.
+    int64_t stmt = 0;
 };
 
 /// Writes the database. One writer, deliberately: SQLite serialises writers, so
@@ -269,7 +301,11 @@ public:
     /// text for 20207 distinct strings. Every identifier shares one table, so a
     /// name used as a port on one row and as a net on another is stored once.
     int64_t internName(const std::string& text);
-    void addChildren(int64_t moduleId, const std::vector<ChildRow>& rows);
+    /// Writes the instantiations of one module variant and returns their row
+    /// ids, in the order given. The caller needs them to fill `instance.child`
+    /// when it later expands this module -- which is why they are returned
+    /// rather than discarded.
+    std::vector<int64_t> addChildren(int64_t moduleId, const std::vector<ChildRow>& rows);
     void addPorts(int64_t moduleId, int64_t defModuleId, const std::vector<PortRow>& rows);
     void addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows);
     void addStmtReads(int64_t moduleId, const std::vector<StmtReadRow>& rows);
@@ -291,8 +327,10 @@ public:
     /// index is counted. A consumer resolves `a.b.c` by walking down from the
     /// root a segment at a time against the (parent, name) index -- three
     /// indexed lookups, no recursion over the table.
+    /// `childId` is the `child` row this expands, 0 for the root and for a
+    /// generate level -- neither is an instantiation anyone wrote.
     void addInstance(const std::string& name, int64_t moduleId, int64_t parentId,
-                     int64_t rowId);
+                     int64_t rowId, int64_t childId);
 
     /// Builds the indexes and closes. Indexes are created last: filling a table
     /// that already carries them costs far more than one build at the end.

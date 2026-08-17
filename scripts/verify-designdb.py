@@ -85,6 +85,46 @@ for tbl in ("symbol", "port"):
 print("ok: direction values are valid")
 print("ok: range lo <= hi")
 
+# child.kind is what `def_module IS NULL` could not say: a gate whose dataflow is
+# already in the parent's edges, versus a black box that has none anywhere.
+bad_kind = con.execute(
+    "SELECT count(*) FROM child WHERE kind NOT IN ('module','primitive','unresolved')"
+).fetchone()[0]
+if bad_kind:
+    sys.exit(f"{bad_kind} child row(s) have a kind outside "
+             "{module, primitive, unresolved}")
+mismatched = con.execute("""
+    SELECT count(*) FROM child
+    WHERE (kind = 'module') != (def_module IS NOT NULL)""").fetchone()[0]
+if mismatched:
+    sys.exit(f"{mismatched} child row(s) disagree between kind and def_module; "
+             "only kind='module' has a module row, and it always has one")
+print("ok: child.kind agrees with def_module")
+
+# The two hierarchy tables must actually be related, in both directions.
+# A `child` nobody expands means the folded row describes an instantiation the
+# tree does not have; a module instance with no `child` means the tree has a node
+# nothing declared. Both were unnoticeable before the column existed.
+unexpanded = con.execute("""
+    SELECT count(*) FROM child c
+    WHERE NOT EXISTS (SELECT 1 FROM instance i WHERE i.child = c.id)""").fetchone()[0]
+if unexpanded:
+    sys.exit(f"{unexpanded} child row(s) are never expanded into an instance")
+unlinked = con.execute("""
+    SELECT count(*) FROM instance
+    WHERE parent IS NOT NULL AND module IS NOT NULL AND child IS NULL""").fetchone()[0]
+if unlinked:
+    sys.exit(f"{unlinked} module instance(s) below the root name no child row; "
+             "the folded and expanded hierarchies have come apart")
+# The root is the one instance nothing declares, and there is exactly one per
+# elaborated top.
+rootless = con.execute(
+    "SELECT count(*) FROM instance WHERE parent IS NULL AND child IS NOT NULL"
+).fetchone()[0]
+if rootless:
+    sys.exit(f"{rootless} root instance(s) claim a child row; nothing declares a top")
+print("ok: every child expands and every module instance names its child")
+
 # Global meta keys -- these are written unconditionally, so a database
 # that lacks them was either not finished or produced by an older version.
 #
@@ -97,7 +137,7 @@ print("ok: range lo <= hi")
 # The required `meta` key set below is part of that version: a database written
 # before those keys existed is not a v5 database, and this check is what stops
 # it being read as one.
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
 if not version or version[0] != SCHEMA_VERSION:
     sys.exit(f"schema_version is {version and version[0]!r}, expected {SCHEMA_VERSION!r}")
@@ -206,6 +246,14 @@ if mode == "constructs":
         JOIN name s ON s.id = e.src JOIN name d ON d.id = e.dst
         WHERE s.text = 'cnt' AND d.text = 'cnt'""")
     check("primitive edges", "SELECT count(*) FROM edge WHERE kind='primitive'", 6)
+    # A gate is a `child` row of its own kind, and the instance-tree node for it
+    # points back at that row. Both were NULL-and-guess before.
+    check("gates recorded as primitive children",
+          "SELECT count(*) FROM child WHERE kind = 'primitive'", 6)
+    check("a gate's tree node names the child row it expands", """
+        SELECT count(*) FROM instance i
+        JOIN child c ON c.id = i.child
+        WHERE c.kind = 'primitive' AND i.module IS NULL""", 6)
     check("the pullup's null-source row", """
         SELECT count(*) FROM edge
         WHERE construct = 'gate:pullup' AND src IS NULL""")
@@ -419,6 +467,36 @@ if mode == "interfaces":
     check("a port tied outside the module keeps its row", """
         SELECT count(*) FROM port p JOIN module m ON m.id = p.module
         WHERE m.name = 'watcher' AND p.conn_kind = 5 AND p.outer IS NULL""")
+    # `assign bus.vld = ready; assign bus.data = payload;` -- two outward writes
+    # on one line, each fed by its own local signal. The write is a hier_ref row
+    # and the read a stmt_read row, so `stmt` is the only thing that says which
+    # read fed which write; module/file/line are identical across all four.
+    # Pairing on it must give exactly two rows, not the 2x2 cross product.
+    chain = con.execute("""
+        SELECT hp.text, rn.text FROM hier_ref h
+        JOIN name hp ON hp.id = h.path
+        JOIN module m ON m.id = h.module
+        JOIN stmt_read r ON r.module = h.module AND r.stmt = h.stmt
+        JOIN name rn ON rn.id = r.name
+        WHERE m.name = 'driver_pair' AND h.write = 1
+        ORDER BY hp.text""").fetchall()
+    if chain != [("bus.data", "payload"), ("bus.vld", "ready")]:
+        sys.exit(f"driver_pair's outward chain is {chain}, expected bus.data<-payload "
+                 "and bus.vld<-ready; the statement ordinal is not separating "
+                 "two outward writes that share a line")
+    print("ok: each outward write pairs with the read that fed it")
+    # And the ordinal is what does it: without it these rows share every other
+    # column, which is the state this example exists to keep fixed.
+    loose = con.execute("""
+        SELECT count(*) FROM hier_ref h
+        JOIN module m ON m.id = h.module
+        JOIN stmt_read r ON r.module = h.module AND r.file IS h.file
+                        AND r.line = h.line
+        WHERE m.name = 'driver_pair' AND h.write = 1""").fetchone()[0]
+    if loose <= len(chain):
+        sys.exit(f"pairing driver_pair on file/line gave {loose} row(s), so this "
+                 "example no longer shows why `stmt` is needed")
+    print(f"ok: the same pairing on file/line alone over-matches ({loose})")
     for bad, what in ((" ", "a space"), ("/*", "a comment"), ("[", "a select")):
         n = con.execute("SELECT count(*) FROM name WHERE instr(text, ?) > 0",
                         (bad,)).fetchone()[0]

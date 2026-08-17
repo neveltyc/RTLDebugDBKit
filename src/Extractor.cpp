@@ -1439,7 +1439,9 @@ public:
 
         // Pass 2: the instance tree, now that every module has a row.
         for (auto inst : compilation.getRoot().topInstances)
-            visitInstance(*inst, 0, "");
+            // The root is written in no module body, so it has no `child` row --
+            // an empty Body is what says so.
+            visitInstance(*inst, 0, "", Body{});
 
         // Last: file rows exist only once something interned them.
         writer.linkSourceFiles(fileOrigins);
@@ -1546,6 +1548,19 @@ private:
     /// `assignment` row cannot exist without one -- and the signals read as
     /// though the design never looked at them. An operand that is itself
     /// outward goes to `hier_ref`, as everywhere else.
+    /// Opens a new statement and returns its ordinal.
+    ///
+    /// Called where a statement begins rather than where a row is written,
+    /// because one statement writes rows from several places -- the assignment,
+    /// the outward write, the reads -- and they have to agree. The walker hands
+    /// the assignment callback a statement before it hands over that statement's
+    /// edges, so a reference surfaced by the edge pass lands on the statement
+    /// just opened, which is the one it belongs to.
+    int64_t beginStmt() {
+        curStmt = ++stmtCount;
+        return curStmt;
+    }
+
     void addStmtReads(const std::vector<Ref>& operands, const std::string& prefix,
                       const std::string& kind, const std::string& construct,
                       const Where& at, EvalContext& eval) {
@@ -1566,6 +1581,7 @@ private:
             if (!r.whole)
                 row.bits = std::make_pair(r.lo, r.hi);
             row.exact = r.exact;
+            row.stmt = curStmt;
             stmtReads.push_back(std::move(row));
         }
     }
@@ -1614,6 +1630,7 @@ private:
         if (r.sym && !r.whole)
             row.bits = std::make_pair(r.lo, r.hi);
         row.exact = r.sym ? r.exact : true;
+        row.stmt = curStmt;
         hierRefs.push_back(std::move(row));
     }
 
@@ -1625,6 +1642,11 @@ private:
         hierRefs.clear();
         stmtReads.clear();
         hierSeen.clear();
+        // Per module, like `proc` beside it: the rows that share a statement all
+        // carry this module's id too, so the ordinal only has to be unique
+        // within one body and stays a small number on a large design.
+        curStmt = 0;
+        stmtCount = 0;
 
         std::vector<EdgeRow> edges;
         // One dedup set for the whole module: procedures and primitives can
@@ -1697,7 +1719,7 @@ private:
             const int64_t defModule = it == groups.end() ? 0 : it->second.id;
             children.push_back(ChildRow{childName,
                                         std::string(child.getDefinition().name),
-                                        defModule});
+                                        defModule, ChildKind::Module});
             std::vector<PortRow> ports;
             emitPorts(child, childName, prefix, ports, body);
             stats.ports += static_cast<int64_t>(ports.size());
@@ -1714,7 +1736,8 @@ private:
             if (primName.empty())
                 primName = "<unnamed>";
             children.push_back(ChildRow{primName,
-                                        std::string(prim.primitiveType.name), 0});
+                                        std::string(prim.primitiveType.name), 0,
+                                        ChildKind::Primitive});
         });
         // Instantiations slang could not resolve are recorded with a null
         // child_module: a consumer can then tell "there is an instance here
@@ -1728,11 +1751,20 @@ private:
             if (name.empty())
                 name = "<unnamed>";
             children.push_back(ChildRow{gen + name,
-                                        std::string(u.definitionName), 0});
+                                        std::string(u.definitionName), 0,
+                                        ChildKind::Unresolved});
             stats.unresolved++;
         });
         stats.children += static_cast<int64_t>(children.size());
-        writer.addChildren(moduleId, children);
+        // Keyed by the name the row carries, so the instance walk can find the
+        // row it expands. The walk names things one segment at a time and these
+        // names hold the whole generate-nested path, so the walk rebuilds the
+        // body-relative name to look it up -- which is the work `instance.child`
+        // exists to spare a consumer.
+        auto& byName = childIdsByModule[moduleId];
+        const std::vector<int64_t> ids = writer.addChildren(moduleId, children);
+        for (size_t i = 0; i < ids.size(); i++)
+            byName.emplace(children[i].name, ids[i]);
 
         writer.addHierRefs(moduleId, hierRefs);
         writer.addStmtReads(moduleId, stmtReads);
@@ -1948,7 +1980,9 @@ private:
             bool inSubroutine) {
             if (!dst.sym || inputPorts.count(dst.sym))
                 return;
+            const int64_t stmtId = beginStmt();
             AssignRow arow;
+            arow.stmt = stmtId;
             const Where at = locate(where.start(), procAt);
             arow.line = at.line;
             if (!relativePath(*dst.sym, prefix, arow.dst)) {
@@ -2022,6 +2056,7 @@ private:
         // assertion. Its reads belong to the statement, not to a target.
         [&](const std::vector<Ref>& operands, const std::string& what,
             SourceRange where) {
+            beginStmt();
             const Where at = locate(where.start(), procAt);
             addStmtReads(operands, prefix, kind, what, at, evalCtx);
         },
@@ -2118,7 +2153,11 @@ private:
 
             const std::string dstName = gen + std::string(sym.name);
 
+            // The declaration is the statement, so it opens one: an initialiser
+            // reading something outward puts a hier_ref row beside this
+            // assignment, and the two are one statement.
             AssignRow arow;
+            arow.stmt = beginStmt();
             arow.dst = dstName;
             arow.kind = "continuous_assign";
             arow.construct = "assign";
@@ -2248,6 +2287,12 @@ private:
                 Ref ref;
                 size_t terminal;
             };
+            // A gate instantiation is the statement here. It writes no
+            // `assignment` row -- a gate is not a statement in that sense -- but
+            // a terminal attached to something outward still produces hier_ref
+            // rows, and those belong to this gate rather than to the gate on the
+            // line above.
+            beginStmt();
             std::vector<Term> reads, writes;
             auto take = [&](size_t i, std::vector<Term>& into, bool skipSelectors) {
                 std::vector<Ref> refs;
@@ -2431,6 +2476,13 @@ private:
         for (auto* conn : child.getPortConnections()) {
             if (!conn)
                 continue;
+            // One connection is one statement's worth of writing, and it is the
+            // unit a hier_ref from `.a(tb.glob)` belongs to. Two ports of one
+            // instance tied to two different outside signals would otherwise be
+            // told apart only by line, which on an instance written one port per
+            // line is exactly what does distinguish them -- and on one written
+            // on a single line, exactly what does not.
+            beginStmt();
             // Where this connection is written. The expression is the only
             // part of it slang keeps a location for; a port left unconnected
             // has none, and falls back to the instantiation.
@@ -2744,29 +2796,61 @@ private:
         }
     }
 
+    /// The module body an instance-tree level was written in: its module row and
+    /// the hierarchical prefix its `child` names are relative to. Carried down
+    /// the walk because a generate block is a level of the tree without being a
+    /// body -- the instances inside it belong to the module that contains the
+    /// generate, and their `child` rows are named from there.
+    struct Body {
+        int64_t moduleId = 0;
+        std::string prefix;
+    };
+
     /// The instance tree: one row per elaborated instance. This is the only
     /// table that scales with the design rather than with the source, so it
     /// carries nothing but identity.
     void visitInstance(const InstanceSymbol& inst, int64_t parentRow,
-                       const std::string& parentPrefix) {
+                       const std::string& parentPrefix, const Body& encl) {
         int64_t moduleId = moduleIdFor(inst);
         int64_t rowId = addLevel(std::string(inst.name), moduleId, parentRow,
-                                 inst, parentPrefix);
-        visitScope(inst.body, rowId, inst.getHierarchicalPath());
+                                 inst, parentPrefix, encl);
+        visitScope(inst.body, rowId, inst.getHierarchicalPath(),
+                   Body{moduleId, inst.getHierarchicalPath()});
     }
 
     /// One row of the instance tree, named relative to its parent.
+    ///
+    /// `encl` is the module body this level was written in, which is what makes
+    /// `instance.child` findable: the `child` row spells the name relative to
+    /// that body (`g[0].u_leaf`), while `name` here is one segment (`u_leaf`).
     int64_t addLevel(std::string fallbackName, int64_t moduleId, int64_t parentRow,
-                     const Symbol& sym, const std::string& parentPrefix) {
+                     const Symbol& sym, const std::string& parentPrefix,
+                     const Body& encl) {
         std::string name;
         if (parentPrefix.empty() || !relativePath(sym, parentPrefix, name))
             name = std::move(fallbackName);
         if (!seenSiblings.insert({parentRow, name}).second)
             stats.duplicatePaths++;
         const int64_t rowId = ++instanceRow;
-        writer.addInstance(name, moduleId, parentRow, rowId);
+        writer.addInstance(name, moduleId, parentRow, rowId, childIdFor(sym, encl));
         stats.instances++;
         return rowId;
+    }
+
+    /// The `child` row this instance expands, or 0 when there is none to name --
+    /// the root, and a generate block, which elaboration invented rather than
+    /// anyone writing it as an instantiation.
+    int64_t childIdFor(const Symbol& sym, const Body& encl) {
+        if (!encl.moduleId)
+            return 0;
+        auto byModule = childIdsByModule.find(encl.moduleId);
+        if (byModule == childIdsByModule.end())
+            return 0;
+        std::string rel;
+        if (encl.prefix.empty() || !relativePath(sym, encl.prefix, rel))
+            return 0;
+        auto it = byModule->second.find(rel);
+        return it == byModule->second.end() ? 0 : it->second;
     }
 
     /// The tree below one scope: child instances, primitives, and a level of
@@ -2778,18 +2862,32 @@ private:
     /// lookup per segment, stalled at the first generate level. It has no
     /// module, so its `module` is NULL.
     void visitScope(const Scope& scope, int64_t parentRow,
-                    const std::string& parentPrefix) {
+                    const std::string& parentPrefix, const Body& encl) {
         for (auto& member : scope.members()) {
             switch (member.kind) {
                 case SymbolKind::Instance:
-                    visitInstance(member.as<InstanceSymbol>(), parentRow, parentPrefix);
+                    visitInstance(member.as<InstanceSymbol>(), parentRow,
+                                  parentPrefix, encl);
                     break;
                 case SymbolKind::PrimitiveInstance: {
                     // A gate is an instantiation like any other. Leaving it out
                     // made a netlist-style module read as instantiating
                     // nothing, and its instance name unrecoverable.
                     auto& prim = member.as<PrimitiveInstanceSymbol>();
-                    addLevel(std::string(prim.name), 0, parentRow, prim, parentPrefix);
+                    addLevel(std::string(prim.name), 0, parentRow, prim,
+                             parentPrefix, encl);
+                    break;
+                }
+                case SymbolKind::UninstantiatedDef: {
+                    // A black box is a real level of the hierarchy: something is
+                    // instantiated here and its definition is simply missing. It
+                    // had no row at all, so a path through it did not resolve and
+                    // the tree said nothing was instantiated -- the same answer a
+                    // module that instantiates nothing gives. `module` is NULL
+                    // because there is no module row to point at, and
+                    // `child.kind` is what says which kind of NULL this is.
+                    auto& u = member.as<UninstantiatedDefSymbol>();
+                    addLevel(std::string(u.name), 0, parentRow, u, parentPrefix, encl);
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
@@ -2797,8 +2895,12 @@ private:
                     if (block.isUninstantiated)
                         break;
                     const int64_t rowId = addLevel(generateSegment(block), 0,
-                                                   parentRow, block, parentPrefix);
-                    visitScope(block, rowId, block.getHierarchicalPath());
+                                                   parentRow, block, parentPrefix,
+                                                   encl);
+                    // The generate level keeps the *enclosing body* rather than
+                    // becoming one: the instantiations inside it are written in
+                    // that body, and their `child` rows are named from it.
+                    visitScope(block, rowId, block.getHierarchicalPath(), encl);
                     break;
                 }
                 case SymbolKind::GenerateBlockArray: {
@@ -2811,15 +2913,18 @@ private:
                         if (entry->kind == SymbolKind::GenerateBlock)
                             segment += generateSegment(entry->as<GenerateBlockSymbol>());
                         const int64_t rowId = addLevel(segment, 0, parentRow,
-                                                       entry->asSymbol(), parentPrefix);
-                        visitScope(*entry, rowId, entry->asSymbol().getHierarchicalPath());
+                                                       entry->asSymbol(), parentPrefix,
+                                                       encl);
+                        visitScope(*entry, rowId,
+                                   entry->asSymbol().getHierarchicalPath(), encl);
                     }
                     break;
                 }
                 case SymbolKind::InstanceArray:
                     // The elements already carry `[i]` in their own names, so
                     // the array is not a level of its own.
-                    visitScope(member.as<InstanceArraySymbol>(), parentRow, parentPrefix);
+                    visitScope(member.as<InstanceArraySymbol>(), parentRow,
+                               parentPrefix, encl);
                     break;
                 default:
                     break;
@@ -2843,6 +2948,21 @@ private:
     /// Not by text: two references can share a spelling and be different
     /// references, which is what a generate loop does to `b[g].sig`.
     std::set<std::pair<const Expression*, bool>> hierSeen;
+    /// The statement being walked, as a per-module ordinal starting at 1; 0 is
+    /// "no statement", which stores as NULL. Bumped by beginStmt() at each
+    /// statement boundary and read by every row emitter, so the parts of one
+    /// statement -- its assignment, the outward targets it writes, the signals
+    /// it reads -- all carry the same number without threading it through the
+    /// walker's callback signatures.
+    int64_t curStmt = 0;
+    int64_t stmtCount = 0;
+    /// module row id -> (body-relative child name -> child row id). Filled while
+    /// emitting each module variant and read while expanding the instance tree,
+    /// which is what lets `instance.child` be written at all: the two walks are
+    /// separate passes over different things -- one over module bodies, one over
+    /// elaborated instances -- and this is the only thing that relates them.
+    std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>>
+        childIdsByModule;
     std::unordered_map<std::string, uint32_t> fileKeyIds;
     // As-written file spelling -> the absolute path its buffer came from.
     std::unordered_map<std::string, std::string> fileOrigins;
