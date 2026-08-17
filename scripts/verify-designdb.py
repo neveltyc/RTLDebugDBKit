@@ -87,24 +87,52 @@ print("ok: range lo <= hi")
 
 # Global meta keys -- these are written unconditionally, so a database
 # that lacks them was either not finished or produced by an older version.
+#
+# schema_version belongs here and not beside meta.top: what `top` should be
+# depends on which example was loaded, but every database this tool writes is
+# schema 4 whatever the design. Checking it only in the mode-specific branch
+# meant a plain `verify-designdb.py design.db` accepted a database claiming
+# schema 999.
+SCHEMA_VERSION = "4"
+version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+if not version or version[0] != SCHEMA_VERSION:
+    sys.exit(f"schema_version is {version and version[0]!r}, expected {SCHEMA_VERSION!r}")
 status = con.execute("SELECT value FROM meta WHERE key='analysis_status'").fetchone()
 if not status or status[0] not in ("complete", "partial", "hierarchy_only"):
     sys.exit(f"analysis_status is {status and status[0]!r}, expected one of "
              "complete/partial/hierarchy_only")
-for key in ("error_count", "warning_count", "unresolved_count", "empty_procedure_count"):
+counts = {}
+for key in ("error_count", "warning_count", "unresolved_count",
+            "empty_procedure_count", "duplicate_path_count"):
     row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     if not row or not row[0].isdigit():
         sys.exit(f"meta.{key} is missing or non-numeric")
-tv = con.execute("SELECT value FROM meta WHERE key='tool_version'").fetchone()
-sv = con.execute("SELECT value FROM meta WHERE key='slang_version'").fetchone()
+    counts[key] = int(row[0])
+for key in ("tool_version", "slang_version", "producer_revision"):
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if not row or not row[0]:
+        sys.exit(f"meta.{key} is missing")
 cd = con.execute("SELECT value FROM meta WHERE key='config_digest'").fetchone()
-if not tv or not tv[0]:
-    sys.exit("meta.tool_version is missing")
-if not sv or not sv[0]:
-    sys.exit("meta.slang_version is missing")
 if not cd or len(cd[0]) != 64:
     sys.exit("meta.config_digest is missing or not a SHA-256")
-print(f"ok: meta seal present (analysis_status={status[0]})")
+
+# The seal has to agree with itself. Presence alone let a database say
+# `complete` while also reporting ten errors and three skipped procedures --
+# a consumer trusting the status word would read the missing dataflow as
+# design fact. warning_count is exempt: plenty of warnings say nothing about
+# whether extraction finished. unresolved_count is exempt too -- a black box
+# is a design that was elaborated as fully as its sources allow.
+INCOMPLETE = ("error_count", "empty_procedure_count", "duplicate_path_count")
+if status[0] == "complete":
+    contradicting = {k: counts[k] for k in INCOMPLETE if counts[k]}
+    if contradicting:
+        sys.exit(f"analysis_status is 'complete' but {contradicting} is non-zero; "
+                 "the status and the counts disagree")
+elif status[0] == "partial":
+    if not any(counts[k] for k in INCOMPLETE):
+        sys.exit("analysis_status is 'partial' but every count that would "
+                 f"explain it is zero: {({k: counts[k] for k in INCOMPLETE})}")
+print(f"ok: meta seal present and self-consistent (analysis_status={status[0]})")
 
 
 def check(what, sql, expect_at_least=1):
@@ -115,11 +143,8 @@ def check(what, sql, expect_at_least=1):
 
 
 if mode:
-    # Mode-specific meta: schema version and elaborated top are tied to the
-    # example, so they stay here rather than in the universal section above.
-    version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if not version or version[0] != "4":
-        sys.exit(f"schema_version is {version and version[0]}, expected 4")
+    # Only `top` is mode-specific: which module elaborates as top is a property
+    # of the example, not of the format. schema_version is checked universally.
     top = con.execute("SELECT value FROM meta WHERE key='top'").fetchone()
     if not top or top[0] != mode:
         sys.exit(f"meta.top is {top and top[0]!r}, expected {mode!r} without --top")

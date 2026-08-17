@@ -465,6 +465,20 @@ int main(int argc, char** argv) {
         }
 
         const std::string tmpPath = opt.output + ".tmp";
+        // Removes the half-written temp database if anything below throws or
+        // returns early. Without it a failed export leaves a stray
+        // `design.db.tmp` beside the good database -- which reads as a second,
+        // broken export rather than as a run that did not finish.
+        struct TempGuard {
+            const std::string& path;
+            bool armed = true;
+            ~TempGuard() {
+                if (armed) {
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                }
+            }
+        } tempGuard{tmpPath};
         designdb::Stats stats;
         {
         designdb::Writer writer(tmpPath);
@@ -514,10 +528,23 @@ int main(int argc, char** argv) {
         // an intermediate state regardless -- this ordering is an extra
         // defence so that a reader of the temp file can tell whether the
         // export ran to completion.
+        //
+        // A duplicated hierarchical path makes `partial` for the same reason a
+        // skipped procedure does: the database is missing something it would
+        // otherwise hold. It is not a dataflow gap but a *naming* one -- two
+        // instances answer to one path, so a path lookup can resolve to the
+        // wrong subtree. Only the terminal warning said so, and `-q` silenced
+        // even that, which left the condition invisible to anyone holding the
+        // file.
+        //
+        // `unresolved` deliberately does not: an unresolved instantiation is a
+        // black box, and a design that instantiates a vendor macro it has no
+        // source for is complete as far as this tool can be. The count is
+        // recorded so a consumer can decide for itself.
         const char* analysisStatus;
         if (fatal || astats.numScopes == 0)
             analysisStatus = "hierarchy_only";
-        else if (numErrors || stats.emptyProcedures)
+        else if (numErrors || stats.emptyProcedures || stats.duplicatePaths)
             analysisStatus = "partial";
         else
             analysisStatus = "complete";
@@ -526,28 +553,67 @@ int main(int argc, char** argv) {
         writer.setMeta("warning_count", std::to_string(numWarnings));
         writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
         writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
+        writer.setMeta("duplicate_path_count", std::to_string(stats.duplicatePaths));
         writer.setMeta("tool_version", RTLDESIGNDB_VERSION);
         writer.setMeta("slang_version", RTLDESIGNDB_SLANG_TAG);
+        // Which build produced this, at commit granularity. `tool_version`
+        // alone cannot answer it: the edge dedup key and the meta seal both
+        // changed while the version string stayed 0.1.0, so two databases
+        // agreeing on tool_version, slang_version and config_digest could
+        // still have been written by exporters that disagree.
+        writer.setMeta("producer_revision", RTLDESIGNDB_PRODUCER_REVISION);
         {
+            // Each item carries its category and its byte length, so no run of
+            // one category can be read as a run of another. Joining the lists
+            // with newlines alone did not survive contact: `+incdir+examples
+            // +define+src` and `+incdir+examples+src` put `src` in different
+            // lists -- one is a macro, the other an include directory, and they
+            // elaborate differently -- yet both flattened to the same bytes and
+            // so to the same digest. The length prefix also means an item
+            // containing a newline or a colon cannot forge a boundary.
             std::string cfg;
-            for (auto& f : opt.files) { cfg += f; cfg += '\n'; }
-            for (auto& i : opt.includeDirs) { cfg += i; cfg += '\n'; }
-            for (auto& d : opt.defines) { cfg += d; cfg += '\n'; }
-            cfg += opt.singleUnit ? "single-unit\n" : "multi-unit\n";
-            for (auto inst : compilation.getRoot().topInstances) {
-                cfg += inst->name;
+            auto put = [&cfg](const char* tag, std::string_view v) {
+                cfg += tag;
+                cfg += ':';
+                cfg += std::to_string(v.size());
+                cfg += ':';
+                cfg += v;
                 cfg += '\n';
-            }
-            cfg += "1ns/1ps\n";
-            cfg += RTLDESIGNDB_VERSION "\n";
-            cfg += RTLDESIGNDB_SLANG_TAG "\n";
+            };
+            for (auto& f : opt.files) put("file", f);
+            for (auto& i : opt.includeDirs) put("incdir", i);
+            for (auto& d : opt.defines) put("define", d);
+            put("mode", opt.singleUnit ? "single-unit" : "multi-unit");
+            for (auto inst : compilation.getRoot().topInstances) put("top", inst->name);
+            put("timescale", "1ns/1ps");
+            put("tool", RTLDESIGNDB_VERSION);
+            put("slang", RTLDESIGNDB_SLANG_TAG);
             writer.setMeta("config_digest", designdb::digest(cfg));
         }
         }
         // Writer destroyed — the database file is closed and complete.
         // Atomic rename replaces the target so a crash mid-export never
         // leaves a partial database under the real name.
-        std::filesystem::rename(tmpPath, opt.output);
+        //
+        // `rename` is specified to behave as POSIX rename(), which replaces an
+        // existing destination; MSVC implements it with MOVEFILE_REPLACE_EXISTING,
+        // so the replace itself is portable. What is *not* portable is replacing
+        // a destination another process holds open: POSIX unlinks it happily,
+        // Windows refuses. That is a real failure a user meets by leaving the
+        // database open in a viewer, so it is reported rather than thrown --
+        // the message has to say which file and why, and a filesystem_error's
+        // what() does not.
+        std::error_code ec;
+        std::filesystem::rename(tmpPath, opt.output, ec);
+        if (ec) {
+            std::fprintf(stderr,
+                         "error: could not replace '%s' with the finished export: %s\n"
+                         "       the previous database is untouched; if it is open in "
+                         "another program, close it and retry\n",
+                         opt.output.c_str(), ec.message().c_str());
+            return 1;
+        }
+        tempGuard.armed = false;
 
         if (!opt.quiet) {
             std::printf("%s: %lld modules, %lld instances, %lld symbols, %lld edges, "

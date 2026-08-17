@@ -85,8 +85,32 @@ add_executable(rtl-designdb
 
 target_include_directories(rtl-designdb PRIVATE src)
 target_link_libraries(rtl-designdb PRIVATE slang::slang designdb_sqlite)
+
+# The commit the exporter was built from. `PROJECT_VERSION` moves once a
+# release; the extraction semantics move far more often than that, so two
+# databases carrying the same tool_version can still disagree about what they
+# hold. This is what tells them apart. `--dirty` because a build from an edited
+# tree is not the commit it names. Empty outside a git checkout -- a release
+# tarball has no history -- and the meta row then says "unknown" rather than
+# claiming a revision that was never there.
+find_package(Git QUIET)
+set(DESIGNDB_PRODUCER_REVISION "unknown")
+if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" describe --always --dirty --tags
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    OUTPUT_VARIABLE DESIGNDB_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(DESIGNDB_GIT_DESCRIBE)
+    set(DESIGNDB_PRODUCER_REVISION "${DESIGNDB_GIT_DESCRIBE}")
+  endif()
+endif()
+message(STATUS "Producer revision : ${DESIGNDB_PRODUCER_REVISION}")
+
 target_compile_definitions(rtl-designdb PRIVATE
   RTLDESIGNDB_VERSION="${PROJECT_VERSION}"
-  RTLDESIGNDB_SLANG_TAG="${DESIGNDB_SLANG_TAG}")
+  RTLDESIGNDB_SLANG_TAG="${DESIGNDB_SLANG_TAG}"
+  RTLDESIGNDB_PRODUCER_REVISION="${DESIGNDB_PRODUCER_REVISION}")
 
 install(TARGETS rtl-designdb RUNTIME DESTINATION bin)

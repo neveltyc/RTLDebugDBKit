@@ -72,6 +72,25 @@ CREATE TABLE file(
     source_file INTEGER REFERENCES source_file(id));
 
 -- Intra-module dataflow, in the module's own namespace.
+--
+-- This is a deduplicated dependency graph, not a statement list, and it is
+-- related to `assignment` many-to-many rather than one-to-one. Both directions
+-- of that are real, so neither can be tightened into a foreign key:
+--
+--   * One edge, many assignments. Two statements writing the same target from
+--     the same source on the same line collapse to one row -- deliberately, so
+--     a connectivity query answers "does a reach y" once rather than once per
+--     statement. `assignment` keeps the statements apart; that is its job.
+--   * One edge, no assignment. A gate contributes edges and no statement at
+--     all, and a subroutine call binds its actuals to its formals -- the
+--     `d -> bump.v` half of `always_ff @(posedge clk) bump(d);` is an edge
+--     with no assignment row behind it, because no assignment was written.
+--
+-- So an `edge.assignment` column could only name one statement out of several,
+-- or NULL for a binding that is genuinely dataflow: it would be less true than
+-- the join it replaced. A consumer that needs the statements joins on
+-- (module, dst, file, line) and expects a set back. A consumer that needs
+-- connectivity reads this table and ignores `assignment` entirely.
 CREATE TABLE edge(
     module   INTEGER NOT NULL REFERENCES module(id),
     -- Null when the right-hand side reads nothing at all: `q <= 8'h0`.
