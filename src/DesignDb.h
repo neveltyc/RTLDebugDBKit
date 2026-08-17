@@ -91,7 +91,24 @@ namespace designdb {
 /// port rows spell it whole (`g_rep[0].u_dec`), so joining the two by name
 /// returned nothing exactly at generate boundaries -- and (module, name) is no
 /// substitute key, since two unnamed gates in one module legally share a name.
-inline constexpr int SchemaVersion = 8;
+///
+/// v9 carried the bit-precision model across the instance boundary. `port`
+/// gained `port_lo`/`port_hi`/`port_exact` -- the bits of the FORMAL a
+/// connection element occupies -- and `map_exact`, edge.map_exact's boundary
+/// twin. Before it, `.q({hi, lo})` exported two rows that both claimed all of
+/// q with outer_exact=1: the per-bit precision v7 built for assignments ended
+/// at every port, and `.q({2{r}})` was worse -- dedup keyed only on the outer
+/// side folded the two copies into one row, deleting the second window
+/// entirely. The window is part of the dedup key now, so a replication is as
+/// many segments as it has copies.
+///
+/// v9 also finished the interface's object model, seven views to nine:
+/// v_load became every recorded read of a signal (dataflow / sensitivity /
+/// wait / statement, discriminated by load_kind -- the flop clock pins of a
+/// netlist database are loads of the clock net, and so are ours), and the
+/// statement layer gained v_statement and v_statement_operand, the half of
+/// the edge/assignment dual projection that had no interface.
+inline constexpr int SchemaVersion = 9;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
@@ -227,6 +244,17 @@ struct PortRow {
     // whole net. Same encoding as EdgeRow: read with outerExact.
     std::optional<std::pair<uint64_t, uint64_t>> outerBits;
     bool outerExact = true;
+    /// The bits of the FORMAL this element occupies -- `.q({hi, lo})` puts hi
+    /// at portBits {4,7} of q. Absent with portExact=1 for the whole formal,
+    /// absent with portExact=0 when the position cannot be stated, and -1
+    /// (stored NULL) where the row has no formal bit domain at all.
+    std::optional<std::pair<uint64_t, uint64_t>> portBits;
+    int portExact = -1;
+    /// Whether this row's outer bits map one-to-one onto its formal window --
+    /// edge.map_exact at the boundary. -1 (stored NULL) when the row has no
+    /// outer end to correspond with: a constant, an unconnected port, an
+    /// external tie, an interface binding.
+    int mapExact = -1;
     PortConn conn = PortConn::Net;
     // For an interface binding: the modport restricting it, when one does.
     std::string modport;
@@ -240,7 +268,7 @@ struct PortRow {
 /// needs an assignment row -- so without this the signal reads as unused.
 struct StmtReadRow {
     std::string name;
-    std::string kind;         // as EdgeRow::kind, plus "assertion"
+    std::string kind;         // as EdgeRow::kind; the assertion's own word is in construct
     std::string construct;    // assign | always_ff | assert | assume | cover
     std::string file;
     uint32_t line = 0;

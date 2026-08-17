@@ -59,7 +59,7 @@ report = {
     "meta": {k: meta(k) for k in (
         "schema_version", "analysis_status", "tool_version", "slang_version",
         "producer_revision", "config_digest", "top", "error_count",
-        "warning_count", "unresolved_count", "empty_procedure_count",
+        "unresolved_count", "empty_procedure_count",
         "duplicate_path_count")},
     "rows": {t: scalar(f'SELECT count(*) FROM "{t}"') for t in TABLES},
 }
@@ -72,7 +72,8 @@ report = {
 # depend on a parameter this module cannot see.
 inexact = {}
 for tbl, col in (("edge", "src_exact"), ("edge", "dst_exact"),
-                 ("port", "outer_exact"), ("assign_operand", "src_exact"),
+                 ("port", "outer_exact"), ("port", "port_exact"),
+                 ("assign_operand", "src_exact"),
                  ("stmt_read", "src_exact"), ("hier_ref", "path_exact")):
     total = scalar(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" IS NOT NULL')
     n = scalar(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" = 0')
@@ -87,6 +88,13 @@ edges_total = scalar("SELECT count(*) FROM edge WHERE src IS NOT NULL")
 coarse = scalar("SELECT count(*) FROM edge WHERE src IS NOT NULL AND map_exact = 0")
 report["coarse_bit_mapping"] = {
     "n": coarse, "of": edges_total, "pct": share(coarse, edges_total)}
+# The same fraction at the instance boundary: net ties whose two ends do not
+# correspond bit for bit. NULL map_exact rows (no outer end) are no one's
+# mapping and stay out of the denominator.
+ports_total = scalar("SELECT count(*) FROM port WHERE map_exact IS NOT NULL")
+pcoarse = scalar("SELECT count(*) FROM port WHERE map_exact = 0")
+report["coarse_port_mapping"] = {
+    "n": pcoarse, "of": ports_total, "pct": share(pcoarse, ports_total)}
 
 # Operands the exporter removed: compile-time constants, and references that
 # leave the module. A row with one operand and three dropped does not read the
@@ -169,6 +177,8 @@ e = report["edges_without_source"]
 print(f"edges w/o source   {e['n']:,} of {e['of']:,} ({e['pct']}%)")
 c = report["coarse_bit_mapping"]
 print(f"no per-bit map     {c['n']:,} of {c['of']:,} sourced edges ({c['pct']}%)")
+pc = report["coarse_port_mapping"]
+print(f"  at boundaries    {pc['n']:,} of {pc['of']:,} net ties ({pc['pct']}%)")
 u = report["undriven_signals"]
 print(f"undriven internal  {u['internal']:,} of {u['of_non_input']:,} non-input signals "
       f"({u['pct_of_non_input']}%)")

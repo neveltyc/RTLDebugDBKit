@@ -609,6 +609,18 @@ bool isPlainReference(const Expression& e) {
             case ExpressionKind::MemberAccess:
                 p = &p->as<MemberAccessExpression>().value();
                 break;
+            case ExpressionKind::Conversion: {
+                // A width-preserving conversion -- a signedness change --
+                // moves no bits, and slang inserts one whenever the spelled
+                // type is not the assignment's. Stopping here made the signed
+                // spelling of a statement range-level while the unsigned
+                // spelling of the same bits was positional.
+                auto& conv = p->as<ConversionExpression>();
+                if (exprWidthOf(conv.operand()) != exprWidthOf(*p))
+                    return false;
+                p = &conv.operand();
+                break;
+            }
             default:
                 return false;
         }
@@ -627,10 +639,22 @@ void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
                   std::vector<Slot>& out, bool skipSelectors = false) {
     const uint64_t width = exprWidthOf(expr);
 
-    if (expr.kind == ExpressionKind::Concatenation && width) {
+    // A concatenation and a simple assignment pattern position their elements
+    // the same way: `'{a, b}` packs a into the high bits of a packed target
+    // exactly as `{a, b}` does, and patterns are the modern idiom for field
+    // packing -- treating only the concat spelling positionally gave the two
+    // spellings of one statement different precision. (A *structured* pattern
+    // maps by member name and stays range-level; an unpacked target has no
+    // width here and degrades on its own.)
+    const bool elementwise = expr.kind == ExpressionKind::Concatenation ||
+                             expr.kind == ExpressionKind::SimpleAssignmentPattern;
+    if (elementwise && width) {
         // Slots are filled from the top: `{a, b}` writes `a` to the high bits.
+        auto ops = expr.kind == ExpressionKind::Concatenation
+                       ? expr.as<ConcatenationExpression>().operands()
+                       : expr.as<SimpleAssignmentPatternExpression>().elements();
         uint64_t cursor = base + width;
-        for (auto* op : expr.as<ConcatenationExpression>().operands()) {
+        for (auto* op : ops) {
             if (!op)
                 continue;
             const uint64_t w = exprWidthOf(*op);
@@ -648,6 +672,32 @@ void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
             collectSlots(*op, ctx, cursor, out, skipSelectors);
         }
         return;
+    }
+
+    // slang wraps a side in an implicit conversion whenever the spelled type
+    // is not the assignment's type, and the wrapper used to end the walk: the
+    // whole subtree fell to the flat default, so `assign wt = {a, b}` with a
+    // narrower target paired `a` with a target its bits never reach -- an
+    // edge marked exact on both ends for a dependency truncation discards.
+    //
+    //   * Width-preserving (a signedness change): transparent. The bits do
+    //     not move.
+    //   * Truncating: transparent too, at the operand's own width -- the
+    //     operand's slots simply extend past the target's, and the overlap
+    //     pairing drops what the truncation drops. A lone plain reference
+    //     also narrows through this: `q = wide` records `wide[3:0] -> q`.
+    //   * Widening: degraded to the flat default deliberately. Zero-extension
+    //     would be positional at the low bits, but sign-extension fans the
+    //     top bit into every extended position, and claiming the low-bits
+    //     mapping while dropping that fan-out would fabricate the *absence*
+    //     of a dependency. Range-level is the honest reading.
+    if (expr.kind == ExpressionKind::Conversion) {
+        auto& conv = expr.as<ConversionExpression>();
+        const uint64_t iw = exprWidthOf(conv.operand());
+        if (width && iw >= width) {
+            collectSlots(conv.operand(), ctx, base, out, skipSelectors);
+            return;
+        }
     }
 
     std::vector<Ref> refs;
@@ -739,6 +789,46 @@ void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
               out.end());
 }
 
+/// A subroutine's free reads -- what a called function samples beyond its
+/// arguments -- reachable from any expression. `active` is the caller-held
+/// recursion guard. A free function rather than a walker method so the net-
+/// initialiser path can use it too: `wire w = masked(a);` used to lose
+/// `masked`'s free reads entirely, uncounted, while the `assign` spelling of
+/// the same statement recorded them.
+void collectCallReadsInto(const Expression& expr,
+                          std::set<const SubroutineSymbol*>& active,
+                          std::vector<Ref>& out) {
+    struct CallFinder : ASTVisitor<CallFinder, VisitFlags::AllGood> {
+        std::set<const SubroutineSymbol*>& active;
+        std::vector<Ref>& out;
+        CallFinder(std::set<const SubroutineSymbol*>& active, std::vector<Ref>& out) :
+            active(active), out(out) {}
+        void handle(const CallExpression& call) {
+            visitDefault(call);
+            auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
+            if (!sub || !*sub)
+                return;
+            if (!active.insert(*sub).second)
+                return;                     // recursive: already on the stack
+            std::vector<Ref> inner;
+            collectStatementRefs((*sub)->getBody(), inner);
+            const std::string scope = (*sub)->getHierarchicalPath();
+            for (auto& r : inner) {
+                std::string path = r.sym->getHierarchicalPath();
+                const bool isLocal = path.size() > scope.size() &&
+                                     path.compare(0, scope.size(), scope) == 0 &&
+                                     path[scope.size()] == '.';
+                if (!isLocal)
+                    out.push_back(r);
+            }
+            active.erase(*sub);
+        }
+    };
+    CallFinder finder(active, out);
+    expr.visit(finder);
+}
+
+
 /// Collects the value symbols an expression reads, with the bit range each
 /// reference touches.
 struct ReadCollector : public ASTVisitor<ReadCollector, VisitFlags::AllGood> {
@@ -814,9 +904,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// merely influences the target's range as a whole.
     using Emit = std::function<void(const Ref& dst, const Ref& src, bool gatingEdge,
                                     bool mapExact, SourceRange where)>;
+    /// `firstTarget` opens a new statement; the remaining targets of one
+    /// concatenated left-hand side share it, so `{a, b} = ...` is ONE
+    /// statement in the stmt ordinal's terms -- as the doc promises -- rather
+    /// than one per target.
     using EmitAssign = std::function<void(const Ref& dst, const std::vector<Ref>& operands,
                                           SourceRange where, int64_t seq, bool blocking,
-                                          int64_t droppedConstants, bool inSubroutine)>;
+                                          int64_t droppedConstants, bool inSubroutine,
+                                          bool firstTarget)>;
     /// A statement that reads without writing anything nameable.
     using EmitRead = std::function<void(const std::vector<Ref>& operands,
                                         const std::string& construct, SourceRange where)>;
@@ -1067,7 +1162,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // target keeps its edges but loses its statement line, seq, and
             // blocking kind. It *reads* cnt the same way, so the operand and the
             // self-edge are recorded exactly as if it were spelled out.
-            emitAssign(dst, {dst}, expr.sourceRange, seq++, true, 0, subDepth > 0);
+            emitAssign(dst, {dst}, expr.sourceRange, seq++, true, 0, subDepth > 0,
+                       /*firstTarget=*/true);
             // Data before gating, as the assignment path does. An operand can
             // reach a target both ways at one statement -- `if (c < lim) c++;`
             // reads `c` in the condition and in the increment -- and the edge
@@ -1154,11 +1250,20 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             for (auto& a : actuals) {
                 if (!a.sym)
                     continue;
-                // An actual binds to its formal whole-to-whole, so the two carry
-                // the same bits -- unless the argument is an expression, in
-                // which case `actuals` holds more than one reference and none of
-                // them fills the formal on its own.
-                const bool oneToOne = actuals.size() == 1;
+                // An actual binds to its formal whole-to-whole -- but only
+                // when the actual IS a reference filling the formal, by the
+                // same rule every positional claim answers to. Counting
+                // references said `bump(a + 4'd1)` was one-to-one because it
+                // holds one reference; a carry crosses bits, and a narrower
+                // actual than its formal has extension bits that are no bit
+                // of it. Same class of wrong the leaf rule exists to prevent.
+                const uint64_t fw =
+                    formal.sym ? bitWidthOf(*formal.sym) : 0;
+                const bool oneToOne =
+                    actuals.size() == 1 && fw != 0 &&
+                    isPlainReference(*args[i]) && actuals[0].exact &&
+                    (actuals[0].whole ? bitWidthOf(*actuals[0].sym) == fw
+                                      : actuals[0].hi - actuals[0].lo + 1 == fw);
                 if (reads)
                     emit(formal, a, false, oneToOne, expr.sourceRange);
                 if (writes)
@@ -1175,34 +1280,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// Only the subroutine's *free* variables are taken; its arguments, locals
     /// and return value are internal and would be noise on every call site.
     void collectCallReads(const Expression& expr, std::vector<Ref>& out) {
-        struct CallFinder : ASTVisitor<CallFinder, VisitFlags::AllGood> {
-            StatementWalker& self;
-            std::vector<Ref>& out;
-            CallFinder(StatementWalker& self, std::vector<Ref>& out) :
-                self(self), out(out) {}
-            void handle(const CallExpression& call) {
-                visitDefault(call);
-                auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
-                if (!sub || !*sub)
-                    return;
-                if (!self.activeSubs.insert(*sub).second)
-                    return;                     // recursive: already on the stack
-                std::vector<Ref> inner;
-                collectStatementRefs((*sub)->getBody(), inner);
-                const std::string scope = (*sub)->getHierarchicalPath();
-                for (auto& r : inner) {
-                    std::string path = r.sym->getHierarchicalPath();
-                    const bool isLocal = path.size() > scope.size() &&
-                                         path.compare(0, scope.size(), scope) == 0 &&
-                                         path[scope.size()] == '.';
-                    if (!isLocal)
-                        out.push_back(r);
-                }
-                self.activeSubs.erase(*sub);
-            }
-        };
-        CallFinder finder(*this, out);
-        expr.visit(finder);
+        collectCallReadsInto(expr, activeSubs, out);
     }
 
     void handle(const AssignmentExpression& expr) {
@@ -1263,19 +1341,21 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         std::vector<Slot> rhsSlots;
         filteredConstants = 0;
         collectSlots(expr.right(), eval, 0, rhsSlots);
-        // A subroutine's own reads and the selectors on the left have no position
-        // in the value: a call is opaque, and an index decides *which* bits are
-        // written rather than supplying any of them. Both span everything.
-        {
-            std::vector<Ref> unpositioned;
-            collectCallReads(expr.right(), unpositioned);
-            // An index or part-select on the left is read, not written:
-            // `q[i] <= d` depends on `i`. Those live inside the selectors that
-            // the target pass skipped, so they are collected separately.
-            collectLeftSelectorRefs(expr.left(), unpositioned);
-            for (auto& r : unpositioned)
-                rhsSlots.push_back(Slot{r, 0, kNoWidth, false});
-        }
+        // A subroutine's own reads and the selectors on the left are never
+        // positional -- a call is opaque, and an index decides *which* bits are
+        // written rather than supplying any of them -- but they do belong to
+        // ONE ELEMENT, and that window is what keeps them off the other
+        // targets. Appending them windowless paired every such read with every
+        // target of a concatenated left-hand side: `{m[i], n} = {x, y}`
+        // fabricated an `i -> n` edge (and its operand row) marked exact, and
+        // a called function's free reads landed on targets its result never
+        // reaches. The v7 cross-product, resurfaced through the side doors.
+        collectAuxSlots(expr.right(), 0, rhsSlots, /*selectors=*/false);
+        // An index or part-select on the left is read, not written:
+        // `q[i] <= d` depends on `i`. Those live inside the selectors that
+        // the target pass skipped, so they are collected separately -- pinned
+        // to their own element's window.
+        collectAuxSlots(expr.left(), 0, rhsSlots, /*selectors=*/true);
         const int64_t droppedConstants = filteredConstants;
 
         // Every non-constant selector evaluation appends a diagnostic and a
@@ -1284,6 +1364,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // assignment measurably bounds it.
         eval.reset();
 
+        bool firstTarget = true;
         for (auto& dstSlot : lhsSlots) {
             if (loopVars.count(dstSlot.ref.sym))
                 continue;
@@ -1308,7 +1389,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 pairs.push_back(std::move(p));
             }
             emitAssign(dstSlot.ref, operands, expr.sourceRange, seq++,
-                       expr.isBlocking(), droppedConstants, subDepth > 0);
+                       expr.isBlocking(), droppedConstants, subDepth > 0,
+                       firstTarget);
+            firstTarget = false;
             for (auto& p : pairs)
                 emit(p.dst, p.src, false, p.mapExact, expr.sourceRange);
             for (auto& src : gating)
@@ -1354,7 +1437,71 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
     }
 
-
+    /// The reads that ride an element without occupying its bits -- a call's
+    /// free reads on the right, a selector's index reads on the left -- each
+    /// pinned to the WINDOW of the element they ride, never positional.
+    ///
+    /// The window is the point. These reads used to be appended spanning
+    /// everything, which paired them with every target of a concatenated
+    /// left-hand side; the index of `m[i]` has no path to the `n` beside it,
+    /// and a function's free variable reaches only the target its result
+    /// lands in. Mirrors collectSlots' walk (elements, width-preserving and
+    /// truncating conversions) so windows agree between the two.
+    void collectAuxSlots(const Expression& expr, uint64_t base,
+                         std::vector<Slot>& out, bool selectors) {
+        const uint64_t width = exprWidthOf(expr);
+        const bool elementwise =
+            expr.kind == ExpressionKind::Concatenation ||
+            expr.kind == ExpressionKind::SimpleAssignmentPattern;
+        if (elementwise && width) {
+            auto ops = expr.kind == ExpressionKind::Concatenation
+                           ? expr.as<ConcatenationExpression>().operands()
+                           : expr.as<SimpleAssignmentPatternExpression>().elements();
+            uint64_t cursor = base + width;
+            bool bad = false;
+            for (auto* op : ops) {
+                if (!op)
+                    continue;
+                const uint64_t w = exprWidthOf(*op);
+                if (!bad && (w == 0 || w > cursor - base))
+                    bad = true;
+                if (bad) {
+                    // Position lost below this point; the remaining elements'
+                    // reads span everything, as the slot walk's own fallback
+                    // does.
+                    std::vector<Ref> reads;
+                    if (selectors)
+                        collectLeftSelectorRefs(*op, reads);
+                    else
+                        collectCallReads(*op, reads);
+                    for (auto& r : reads)
+                        out.push_back(Slot{r, 0, kNoWidth, false});
+                    continue;
+                }
+                cursor -= w;
+                collectAuxSlots(*op, cursor, out, selectors);
+            }
+            return;
+        }
+        if (expr.kind == ExpressionKind::Conversion) {
+            auto& conv = expr.as<ConversionExpression>();
+            if (width && exprWidthOf(conv.operand()) >= width) {
+                collectAuxSlots(conv.operand(), base, out, selectors);
+                return;
+            }
+        }
+        std::vector<Ref> reads;
+        if (selectors)
+            collectLeftSelectorRefs(expr, reads);
+        else
+            collectCallReads(expr, reads);
+        for (auto& r : reads) {
+            if (width)
+                out.push_back(Slot{r, base, base + width - 1, false});
+            else
+                out.push_back(Slot{r, 0, kNoWidth, false});
+        }
+    }
 };
 
 /// The path segment slang gives a generate block, so a prefix built here joins
@@ -2204,10 +2351,14 @@ private:
         // is the reader's job and encoding it here would state it as fact.
         [&](const Ref& dst, const std::vector<Ref>& operands, SourceRange where,
             int64_t stmtSeq, bool blocking, int64_t droppedConstants,
-            bool inSubroutine) {
+            bool inSubroutine, bool firstTarget) {
             if (!dst.sym || inputPorts.count(dst.sym))
                 return;
-            const int64_t stmtId = beginStmt();
+            // One statement, however many targets its left-hand side names:
+            // the second target of `{a, b} = ...` shares the first's ordinal,
+            // so "rows sharing (module, stmt) came from one statement" stays
+            // true for concatenated writes.
+            const int64_t stmtId = firstTarget ? beginStmt() : curStmt;
             AssignRow arow;
             arow.stmt = stmtId;
             const Where at = locate(where.start(), procAt);
@@ -2372,13 +2523,39 @@ private:
                 return;
             const Where at = locate(net.location);
 
-            std::vector<Ref> reads;
+            // Through the same slot machinery as `assign`, because the LRM says
+            // the two ARE the same statement -- and this path used to bypass
+            // it: `wire [7:0] w = {a, b}` claimed `a` drives exactly all of w
+            // while `assign w2 = {a, b}` beside it recorded `a -> w2[7:4]`,
+            // and a called function's free reads were lost outright,
+            // uncounted. The net is the one target, whole and positional.
+            std::vector<Slot> rhs;
             filteredConstants = 0;
-            collectRefs(*init, evalCtx, reads);
+            collectSlots(*init, evalCtx, 0, rhs);
+            {
+                // Free reads of called functions. Flat windows are correct
+                // here, not a shortcut: there is exactly one target, so every
+                // read pairs with it regardless of window.
+                std::vector<Ref> callReads;
+                std::set<const SubroutineSymbol*> active;
+                collectCallReadsInto(*init, active, callReads);
+                for (auto& r : callReads)
+                    rhs.push_back(Slot{r, 0, kNoWidth, false});
+            }
             const int64_t droppedConstants = filteredConstants;
             evalCtx.reset();
 
             const std::string dstName = gen + std::string(sym.name);
+            const uint64_t netWidth = bitWidthOf(net);
+            Slot dstSlot;
+            dstSlot.ref.sym = &net;
+            if (netWidth) {
+                dstSlot.hi = netWidth - 1;
+                dstSlot.positional = true;
+            }
+            else {
+                dstSlot.hi = kNoWidth;
+            }
 
             // The declaration is the statement, so it opens one: an initialiser
             // reading something outward puts a hier_ref row beside this
@@ -2393,22 +2570,35 @@ private:
             arow.proc = -1;    // no procedure: the declaration is the statement
             arow.seq = seq++;
             arow.blocking = -1;
+
+            struct Pair {
+                Ref dst, src;
+                bool mapExact;
+            };
+            std::vector<Pair> pairs;
             std::vector<OperandRow> ops;
-            for (auto& r : reads) {
-                if (!r.sym)
+            for (auto& srcSlot : rhs) {
+                if (!srcSlot.ref.sym)
                     continue;
+                uint64_t lo = 0, hi = 0;
+                if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
+                    continue;
+                Pair p{narrowed(dstSlot, lo, hi), narrowed(srcSlot, lo, hi),
+                       dstSlot.positional && srcSlot.positional};
                 std::string rel;
-                if (!relativePath(*r.sym, prefix, rel)) {
+                if (!relativePath(*p.src.sym, prefix, rel)) {
                     arow.dropped++;
-                    addHierRef(false, r, "continuous_assign", "assign", at, evalCtx);
+                    addHierRef(false, p.src, "continuous_assign", "assign", at,
+                               evalCtx);
                     continue;
                 }
                 OperandRow o;
                 o.name = std::move(rel);
-                if (!r.whole)
-                    o.bits = std::make_pair(r.lo, r.hi);
-                o.exact = r.exact;
+                if (!p.src.whole)
+                    o.bits = std::make_pair(p.src.lo, p.src.hi);
+                o.exact = p.src.exact;
                 ops.push_back(std::move(o));
+                pairs.push_back(std::move(p));
             }
             arow.dropped += droppedConstants;
             writer.addAssignment(moduleId, arow, ops);
@@ -2423,26 +2613,28 @@ private:
             base.line = at.line;
 
             bool anySource = false;
-            for (auto& r : reads) {
-                if (!r.sym)
-                    continue;
-                const auto sk = keyRange(r);
-                if (!seen.emplace(&net, r.sym, fileKey(at.file), at.line,
-                                  uint64_t(0), uint64_t(0),
+            for (auto& p : pairs) {
+                const auto dk = keyRange(p.dst);
+                const auto sk = keyRange(p.src);
+                if (!seen.emplace(&net, p.src.sym, fileKey(at.file), at.line,
+                                  dk.first, dk.second,
                                   sk.first, sk.second,
-                                  false, true, r.exact,
-                                  kindTag("continuous_assign"), true)
+                                  false, p.dst.exact, p.src.exact,
+                                  kindTag("continuous_assign"), p.mapExact)
                          .second) {
                     anySource = true;
                     continue;
                 }
                 EdgeRow row = base;
-                if (!relativePath(*r.sym, prefix, row.src))
-                    continue;   // outward: already in hier_ref, above
-                row.srcType = typeOf(*r.sym);
-                if (!r.whole)
-                    row.srcBits = std::make_pair(r.lo, r.hi);
-                row.srcExact = r.exact;
+                relativePath(*p.src.sym, prefix, row.src);
+                row.srcType = typeOf(*p.src.sym);
+                if (!p.src.whole)
+                    row.srcBits = std::make_pair(p.src.lo, p.src.hi);
+                row.srcExact = p.src.exact;
+                if (!p.dst.whole)
+                    row.dstBits = std::make_pair(p.dst.lo, p.dst.hi);
+                row.dstExact = p.dst.exact;
+                row.mapExact = p.mapExact;
                 anySource = true;
                 out.push_back(std::move(row));
             }
@@ -2848,11 +3040,12 @@ private:
             std::vector<ConnRef> nets;
             collectConnRefs(*expr, evalCtx, nets);
             if (nets.empty()) {
-                // Tied off: the connection is a literal, a parameter, or an
-                // enum member, so there is no net on the outside. The
-                // connection still exists and a reader looking for why a port
-                // never moves wants to see it, so it is recorded with a null
-                // `outer` rather than dropped.
+                // Tied off with not even a constant marker to carry -- a
+                // connection whose width could not be stated. Recorded rather
+                // than dropped, exactly as the markers are: absence would mean
+                // both "nobody connected it" and "the exporter did not get
+                // that far". (A statable constant now arrives as a marker
+                // through the loop below instead, with its window.)
                 PortRow row;
                 row.child = childName;
                 row.port = std::string(port.name);
@@ -2860,6 +3053,7 @@ private:
                 row.direction = dir;
                 row.conn = PortConn::Constant;
                 row.outerWidth = exprWidth;
+                row.portExact = 1;   // the whole formal, trivially
                 row.file = file;
                 row.line = line;
                 out.push_back(std::move(row));
@@ -2867,20 +3061,53 @@ private:
             }
             // Deduplicated on what will be stored: the same net attached twice
             // with different bits (`.z({x[7:4], x[3:0]})`) is two attachments,
-            // not one.
-            std::set<std::tuple<const ValueSymbol*, uint64_t, uint64_t, bool, bool>>
+            // not one -- and attached twice into different *windows*
+            // (`.q({2{r}})`) is two segments, which is why the window is part
+            // of the key: without it the replication's second copy vanished
+            // and the formal's high half read as fed by nothing.
+            std::set<std::tuple<const ValueSymbol*, uint64_t, uint64_t, bool, bool,
+                                bool, uint64_t, uint64_t>>
                 unique;
             for (auto& cn : nets) {
                 const Ref& r = cn.ref;
                 const uint64_t klo = r.whole ? 0 : r.lo;
                 const uint64_t khi = r.whole ? 0 : r.hi;
-                if (!unique.emplace(r.sym, klo, khi, r.whole, cn.expression).second)
+                if (!unique.emplace(r.sym, klo, khi, r.whole, cn.expression,
+                                    cn.windowExact, cn.winLo, cn.winHi)
+                         .second)
                     continue;
                 PortRow row;
                 row.child = childName;
                 row.port = std::string(port.name);
                 row.inner = innerName;
                 row.direction = dir;
+                // Where in the formal this element lands, encoded as ranges
+                // are everywhere: NULL + exact=1 the whole formal, a range +
+                // exact=1 that slice, NULL + exact=0 somewhere unstatable (a
+                // width-changing conversion, an instance-array share).
+                const uint64_t formalWidth =
+                    (!inArray && expr->type) ? expr->type->getBitWidth() : 0;
+                if (!inArray && cn.windowExact && formalWidth) {
+                    if (!(cn.winLo == 0 && cn.winHi + 1 >= formalWidth))
+                        row.portBits = std::make_pair(cn.winLo, cn.winHi);
+                    row.portExact = 1;
+                }
+                else {
+                    row.portExact = 0;
+                }
+                if (!r.sym) {
+                    // A constant element of a structured connection:
+                    // `.q({hi, 3'b000, en})` ties formal bits 1..3 off, and the
+                    // row says so -- without it those bits had no row of any
+                    // kind, indistinguishable from an exporter gap. No outer
+                    // end, so map_exact stays NULL; the window above is real.
+                    row.conn = PortConn::Constant;
+                    row.outerWidth = exprWidth;
+                    row.file = file;
+                    row.line = line;
+                    out.push_back(std::move(row));
+                    continue;
+                }
                 std::string outerRel;
                 if (!relativePath(*r.sym, prefix, outerRel)) {
                     // Tied to a signal outside this module. An output drives
@@ -2905,6 +3132,10 @@ private:
                     // way.
                     row.conn = cn.expression ? PortConn::Expression
                                              : PortConn::External;
+                    // The formal window stays -- `.q({tb.glob, lo})` still puts
+                    // the external tie in q's high half -- but map_exact is
+                    // NULL: this row has no outer end to correspond with, and
+                    // what it is tied to is in hier_ref.
                     row.outerWidth = exprWidth;
                     row.file = file;
                     row.line = line;
@@ -2928,6 +3159,12 @@ private:
                     row.outerExact = r.exact;
                 }
                 row.conn = cn.expression ? PortConn::Expression : PortConn::Net;
+                // Whether this row's outer bits map one-to-one onto its formal
+                // window -- the boundary twin of edge.map_exact, and decided by
+                // the same rule: a lone structural leaf filling its window.
+                // 0 is not doubt, it is range granularity; NULL (elsewhere) is
+                // "no outer end to correspond with".
+                row.mapExact = cn.positional && !inArray ? 1 : 0;
                 row.file = file;
                 row.line = line;
                 out.push_back(std::move(row));
@@ -2936,15 +3173,33 @@ private:
     }
 
     /// One net a connection expression attaches: the base symbol, the bits the
-    /// selector chain picks, and whether it was reached structurally or only
-    /// read inside a wider expression.
+    /// selector chain picks, whether it was reached structurally or only read
+    /// inside a wider expression -- and WHERE in the formal it lands.
+    ///
+    /// The window is the port-boundary twin of the assignment walk's Slot: a
+    /// connection expression is a value aligned to the formal at the LSB, so an
+    /// element of `.q({hi, lo})` occupies a slice of `q` the same way an
+    /// element of `{a, b} = ...` occupies a slice of the target. Without it the
+    /// database knew hi and lo both attach to q and could not say hi is
+    /// q[7:4] -- module-internal edges carried per-bit precision that ended at
+    /// every instance boundary.
     struct ConnRef {
         Ref ref;
         bool expression = false;
+        /// Bits of the formal this element occupies, absolute from the LSB.
+        /// Meaningful only when windowExact; otherwise the position could not
+        /// be stated (an element under a width-changing conversion, an
+        /// instance-array share) and the row stores NULL with exact=0.
+        uint64_t winLo = 0, winHi = 0;
+        bool windowExact = false;
+        /// The element's own bits map one-to-one onto its window, so the pair
+        /// can be followed bit by bit. Same discipline as edge.map_exact: a
+        /// plain reference filling its window exactly, nothing else.
+        bool positional = false;
     };
 
     /// The value symbols a connection expression attaches to, each with its
-    /// bit range.
+    /// bit range and its window in the formal.
     ///
     /// A structural connection -- a name, a select, a concatenation of those --
     /// attaches its nets directly, and the selector *reads* (`readies[sel]`
@@ -2952,8 +3207,57 @@ private:
     /// expression: there is no net behind `.en(state == RUN)`, only signals the
     /// expression samples, so those come back flagged, selector reads included,
     /// for the consumer to treat as operands rather than wires.
+    ///
+    /// `base` is where this subexpression starts in the formal; `degraded`
+    /// poisons positions below a node whose width relationship is not
+    /// one-to-one, so nothing under it claims a window it does not have.
     static void collectConnRefs(const Expression& expr, EvalContext& ctx,
-                                std::vector<ConnRef>& out) {
+                                std::vector<ConnRef>& out, uint64_t base = 0,
+                                bool degraded = false) {
+        const uint64_t width = exprWidthOf(expr);
+        // An element that reads no storage -- a literal, a parameter, an
+        // all-constant expression -- still occupies its window, and dropping
+        // it left formal bits with no row of any kind: `.q({hi, 3'b000, en})`
+        // exported hi and en and said nothing at all about bits 1..3, which is
+        // indistinguishable from an exporter gap. conn_kind=1 exists precisely
+        // so a tie-off is recorded rather than absent; a marker with no symbol
+        // carries that through per element. The row builder recognises the
+        // null symbol and writes the Constant row.
+        auto pushConstant = [&]() {
+            ConnRef cr;
+            if (!degraded && width) {
+                cr.winLo = base;
+                cr.winHi = base + width - 1;
+                cr.windowExact = true;
+            }
+            out.push_back(std::move(cr));
+        };
+        auto push = [&](std::vector<Ref>& refs, bool isExpr) {
+            if (refs.empty()) {
+                pushConstant();
+                return;
+            }
+            const bool windowed = !degraded && width != 0;
+            for (auto& r : refs) {
+                ConnRef cr;
+                cr.ref = r;
+                cr.expression = isExpr;
+                if (windowed) {
+                    cr.winLo = base;
+                    cr.winHi = base + width - 1;
+                    cr.windowExact = true;
+                    // Positional only for a lone structural leaf that fills its
+                    // window: `hi[3:0]` in a concat, a plain `x`. An expression
+                    // combines bits, and a leaf narrower than its window has
+                    // extension bits that are no bit of it.
+                    cr.positional =
+                        !isExpr && refs.size() == 1 && r.exact &&
+                        (r.whole ? bitWidthOf(*r.sym) == width
+                                 : r.hi - r.lo + 1 == width);
+                }
+                out.push_back(std::move(cr));
+            }
+        };
         switch (expr.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue:
@@ -2968,26 +3272,62 @@ private:
                 // Reached only by descending structural nodes, so never an
                 // expression operand: the branch that produces those does not
                 // recurse.
-                for (auto& r : refs)
-                    out.push_back({r, /*expression=*/false});
+                push(refs, /*isExpr=*/false);
                 return;
             }
-            case ExpressionKind::Concatenation:
-                for (auto* op : expr.as<ConcatenationExpression>().operands())
-                    collectConnRefs(*op, ctx, out);
+            case ExpressionKind::Concatenation: {
+                // Filled from the top: `{hi, lo}` puts hi in the high window.
+                // An element of unknown width makes every position below it
+                // unstatable, so the rest of the walk degrades rather than
+                // guesses.
+                auto ops = expr.as<ConcatenationExpression>().operands();
+                uint64_t cursor = base + width;
+                bool bad = degraded || width == 0;
+                for (auto* op : ops) {
+                    if (!op)
+                        continue;
+                    const uint64_t w = exprWidthOf(*op);
+                    if (!bad && (w == 0 || w > cursor - base))
+                        bad = true;
+                    if (!bad)
+                        cursor -= w;
+                    collectConnRefs(*op, ctx, out, bad ? 0 : cursor, bad);
+                }
                 return;
-            case ExpressionKind::Replication:
+            }
+            case ExpressionKind::Replication: {
                 // `{2{two}}` wires `two` into the formal exactly as
-                // `{two, two}` does. Without this case it fell through to the
-                // expression branch and the same netlist got kind 3 from one
-                // spelling and kind 0 from the other -- opposite advice to the
-                // consumer about whether the port aliases the net. The count
-                // is a constant and reads nothing.
-                collectConnRefs(expr.as<ReplicationExpression>().concat(), ctx, out);
+                // `{two, two}` does -- and into two *windows*, which is why the
+                // copies are expanded rather than the concat walked once: each
+                // copy is its own positionally exact segment, and folding them
+                // lost every copy after the first. The count is a constant and
+                // reads nothing.
+                auto& rep = expr.as<ReplicationExpression>();
+                const uint64_t cw = exprWidthOf(rep.concat());
+                if (degraded || width == 0 || cw == 0 || width % cw != 0) {
+                    collectConnRefs(rep.concat(), ctx, out, 0, true);
+                    return;
+                }
+                uint64_t cursor = base + width;
+                for (uint64_t k = 0; k < width / cw; k++) {
+                    cursor -= cw;
+                    collectConnRefs(rep.concat(), ctx, out, cursor, degraded);
+                }
                 return;
-            case ExpressionKind::Conversion:
-                collectConnRefs(expr.as<ConversionExpression>().operand(), ctx, out);
+            }
+            case ExpressionKind::Conversion: {
+                // Width-preserving conversions are transparent. A widening or
+                // truncating one breaks the one-to-one between inside and
+                // outside -- extension bits are no bit of the operand, and a
+                // truncated element may not reach the formal at all -- so the
+                // subtree keeps its refs but loses its windows.
+                auto& conv = expr.as<ConversionExpression>();
+                const uint64_t iw = exprWidthOf(conv.operand());
+                collectConnRefs(conv.operand(), ctx, out,
+                                iw == width ? base : 0,
+                                degraded || iw != width);
                 return;
+            }
             case ExpressionKind::Assignment:
                 // An output or inout connection arrives wrapped in the
                 // assignment `bindLValue` builds around it, with an empty
@@ -2995,7 +3335,8 @@ private:
                 // Without this case `.y(gy)` fell through to the expression
                 // branch and the plainest wire in the design read as an
                 // operand.
-                collectConnRefs(expr.as<AssignmentExpression>().left(), ctx, out);
+                collectConnRefs(expr.as<AssignmentExpression>().left(), ctx, out,
+                                base, degraded);
                 return;
             default: {
                 std::vector<Ref> refs;
@@ -3016,8 +3357,9 @@ private:
                         refs.push_back(r);
                     }
                 }
-                for (auto& r : refs)
-                    out.push_back({r, true});
+                // The window is real -- `{a & b, c}` computes a & b into the
+                // high half -- but nothing inside an expression is positional.
+                push(refs, /*isExpr=*/true);
                 return;
             }
         }

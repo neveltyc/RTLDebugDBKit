@@ -115,6 +115,35 @@ module pick(input logic [7:0] bus, input logic [2:0] i, output logic q);
     assign q = bus[i];
 endmodule
 
+// The bit-precision model crossing the instance boundary. A concatenated
+// connection puts each element in its own slice of the formal -- without the
+// formal-side window, hi and lo both read as attached to all of q, and the
+// per-bit precision edges carry ended at every port.
+module bytesink(input logic [7:0] q);
+endmodule
+module bytesource(output logic [7:0] q);
+    assign q = 8'hC3;
+endmodule
+// A composite formal (`module m(.p({hi, lo}))`) is the fourth window shape and
+// already slices the OUTER side per sub-port. It cannot live here: Verilator
+// rejects complex ports outright, and check-rtl's expect-fail marker waives a
+// whole file rather than one module. slang handles it, and the exporter's
+// windows were verified against it by hand -- see the v9 commit.
+
+// A read's load_kind is its semantics, not which table stored it. A plain
+// event (`@(posedge clk)`) fits proc_event.signal; a selected-bit event can
+// not, and its reads travel through stmt_read -- yet `@(posedge clks[2])` is
+// as much a sensitivity read as the plain spelling, and `wait (clks[0])` and
+// a statement-level `@(posedge clks[1]);` are both waits. The view must say
+// so regardless of the storage split.
+module evkinds(input logic [2:0] clks, input logic d, output logic q);
+    always_ff @(posedge clks[2]) q <= d;
+    initial begin
+        @(posedge clks[1]);
+        wait (clks[0]);
+    end
+endmodule
+
 // One definition, two parameterisations: two module variants, two module_ids.
 // A driver query by module_name alone returns rows from both, which is why the
 // formal interface keys on module_id, taken from the selected tree node --
@@ -198,6 +227,18 @@ module constructs;
     logic [1:0] sc2_d = 2'b00, sc2_q;
     scaled #(.W(1)) u_sc1(.d(trace[0]), .q(sc1_q));
     scaled #(.W(2)) u_sc2(.d(sc2_d), .q(sc2_q));
+
+    // Port windows: an input concat, an output concat, and a replication
+    // (two segments, not one deduplicated row).
+    bytesink   u_bsink(.q({stim[7:4], cnt_o[3:0]}));
+    logic [3:0] bs_a, bs_b;
+    bytesource u_bsrc(.q({bs_a, bs_b}));
+    logic [3:0] rep_r = 4'h0;
+    bytesink   u_brep(.q({2{rep_r}}));
+
+    logic [2:0] ev_clks = 3'b000;
+    logic ev_q;
+    evkinds u_ev(.clks(ev_clks), .d(done), .q(ev_q));
 
 `include "seq.svh"
 

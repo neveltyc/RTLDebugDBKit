@@ -550,7 +550,6 @@ int main(int argc, char** argv) {
             analysisStatus = "complete";
         writer.setMeta("analysis_status", analysisStatus);
         writer.setMeta("error_count", std::to_string(numErrors));
-        writer.setMeta("warning_count", std::to_string(numWarnings));
         writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
         writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
         writer.setMeta("duplicate_path_count", std::to_string(stats.duplicatePaths));

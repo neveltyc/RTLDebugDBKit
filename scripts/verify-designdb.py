@@ -28,9 +28,12 @@ print("row counts:", counts)
 empty = [t for t, n in counts.items() if n == 0]
 if empty:
     sys.exit(f"exported database has no rows in: {', '.join(empty)}")
-digest = con.execute("SELECT digest FROM source_file").fetchone()
-if not digest or len(digest[0]) != 64:
-    sys.exit("source_file.digest is missing or not a SHA-256")
+baddig = con.execute("""
+    SELECT count(*) FROM source_file
+    WHERE digest IS NULL OR length(digest) != 64""").fetchone()[0]
+total_sf = con.execute("SELECT count(*) FROM source_file").fetchone()[0]
+if total_sf == 0 or baddig:
+    sys.exit(f"{baddig} of {total_sf} source_file row(s) lack a SHA-256 digest")
 
 # Structural integrity — catches corruption and generator bugs.
 ic = con.execute("PRAGMA integrity_check").fetchone()[0]
@@ -46,11 +49,11 @@ print("ok: integrity_check and foreign_key_check pass")
 # Value domain: boolean-ish columns must be 0, 1, or NULL.
 for tbl, cols in (
     ("edge", ("control", "src_exact", "dst_exact", "map_exact")),
-    ("port", ("outer_exact",)),
+    ("port", ("outer_exact", "port_exact", "map_exact")),
     ("proc_event", ("wait",)),
     ("assign_operand", ("src_exact",)),
     ("stmt_read", ("src_exact",)),
-    ("hier_ref", ("path_exact",)),
+    ("hier_ref", ("path_exact", "write")),
 ):
     for col in cols:
         bad = con.execute(
@@ -63,7 +66,7 @@ print("ok: boolean columns are 0/1/NULL")
 # Range consistency: lo <= hi when both are non-NULL.
 for tbl, lo, hi in (
     ("edge", "src_lo", "src_hi"), ("edge", "dst_lo", "dst_hi"),
-    ("port", "outer_lo", "outer_hi"),
+    ("port", "outer_lo", "outer_hi"), ("port", "port_lo", "port_hi"),
     ("assignment", "dst_lo", "dst_hi"),
     ("assign_operand", "src_lo", "src_hi"),
     ("stmt_read", "src_lo", "src_hi"),
@@ -125,6 +128,53 @@ if rootless:
     sys.exit(f"{rootless} root instance(s) claim a child row; nothing declares a top")
 print("ok: every child expands and every module instance names its child")
 
+# A tree node and the child row it expands agree on what they are: a module
+# node has a module, and it is the child's def_module. The port/child
+# consistency check below guards the same shape on the other denormalized pair.
+tc = con.execute("""
+    SELECT count(*) FROM instance i JOIN child c ON c.id = i.child
+    WHERE ((c.kind = 'module') != (i.module IS NOT NULL))
+       OR (c.kind = 'module' AND i.module != c.def_module)""").fetchone()[0]
+if tc:
+    sys.exit(f"{tc} instance(s) disagree with their child row about module identity")
+# Among resolved module instantiations, one name in one body is one child row.
+# Not a UNIQUE constraint, deliberately: unnamed gates and partial elaboration
+# legitimately collide, so only the module-kind subset is held to it.
+dupc = con.execute("""
+    SELECT count(*) FROM (
+        SELECT 1 FROM child WHERE kind = 'module'
+        GROUP BY module, name HAVING count(*) > 1)""").fetchone()[0]
+if dupc:
+    sys.exit(f"{dupc} (module, name) pair(s) among module children are duplicated")
+print("ok: the tree, the child rows and their names agree")
+
+# A row with no source has no source end to describe: every column describing
+# one is NULL, exactly as a tied-off port's outer columns are. src_exact=1 on
+# a null source used to say "reads exactly all of nothing", and map_exact=1
+# invited a bit-level tracer to follow a driver that does not exist.
+nulldisc = con.execute("""
+    SELECT count(*) FROM edge
+    WHERE (src IS NULL AND (src_lo IS NOT NULL OR src_hi IS NOT NULL
+                            OR src_exact IS NOT NULL OR map_exact IS NOT NULL))
+       OR (src IS NOT NULL AND (src_exact IS NULL OR map_exact IS NULL))""").fetchone()[0]
+if nulldisc:
+    sys.exit(f"{nulldisc} edge(s) break the null-source discipline: no source, "
+             "no source-describing columns; a source, both flags")
+print("ok: null-source edges describe nothing and sourced edges describe it all")
+
+# port_exact's NULL means "no formal bit domain in this row", and only two
+# kinds have none: an unconnected port and an interface binding. A constant
+# and an external tie occupy their windows.
+pe = con.execute("""
+    SELECT count(*) FROM port
+    WHERE (conn_kind IN (2, 4) AND port_exact IS NOT NULL)
+       OR (conn_kind IN (0, 1, 3, 5) AND port_exact IS NULL)""").fetchone()[0]
+if pe:
+    sys.exit(f"{pe} port row(s) break the port_exact rule: windows for nets, "
+             "constants, expressions and external ties; NULL for unconnected "
+             "and interface")
+print("ok: port_exact agrees with connection_kind")
+
 # The stable query interface: from v8 the seven views are contract, and all
 # three parts of that contract are asserted -- they exist, they carry exactly
 # their documented columns, and each one's row count equals its base table's.
@@ -136,25 +186,26 @@ print("ok: every child expands and every module instance names its child")
 VIEW_COLUMNS = {
     "v_database_info": [
         "schema_version", "tool_version", "slang_version", "producer_revision",
-        "top", "analysis_status", "error_count", "warning_count",
+        "top", "analysis_status", "error_count",
         "unresolved_count", "empty_procedure_count", "duplicate_path_count",
         "config_digest"],
     "v_tree_node": [
         "instance_id", "parent_instance_id", "instance_name", "node_kind",
-        "module_id", "module_name", "module_params", "child_id", "child_kind",
-        "definition_module_id", "definition_name"],
+        "module_id", "module_name", "module_params", "child_id",
+        "definition_name"],
     "v_signal": [
         "module_id", "module_name", "module_params", "signal_name",
-        "symbol_kind", "type_text", "width", "direction", "direction_name",
+        "symbol_kind", "type_text", "width", "direction_name",
         "file_path", "source_path", "source_line", "source_column"],
     "v_port_connection": [
         "parent_module_id", "parent_module_name", "parent_module_params",
         "child_instance_name", "child_id", "child_module_id",
         "child_module_name", "child_module_params", "formal_port_name",
-        "inner_signal_name", "direction", "direction_name",
+        "inner_signal_name", "formal_lo", "formal_hi", "formal_exact",
+        "direction_name",
         "outer_signal_name", "outer_type_text",
-        "outer_width", "outer_lo", "outer_hi", "outer_exact",
-        "connection_kind", "connection_kind_name", "modport_name",
+        "outer_width", "outer_lo", "outer_hi", "outer_exact", "mapping_exact",
+        "connection_kind_name", "modport_name",
         "file_path", "source_path", "source_line"],
     "v_dependency": [
         "module_id", "module_name", "module_params",
@@ -172,8 +223,17 @@ VIEW_COLUMNS = {
         "module_id", "module_name", "module_params",
         "signal_name", "signal_type", "signal_lo", "signal_hi", "signal_exact",
         "load_name", "load_type", "load_lo", "load_hi", "load_exact",
+        "load_kind",
         "dependency_kind", "construct", "is_control", "mapping_exact",
         "file_path", "source_path", "source_line"],
+    "v_statement": [
+        "statement_id", "module_id", "module_name", "module_params",
+        "target_name", "target_lo", "target_hi", "target_exact",
+        "statement_kind", "construct", "proc", "seq", "blocking",
+        "dropped_operands", "stmt", "file_path", "source_path", "source_line"],
+    "v_statement_operand": [
+        "statement_id", "module_id", "module_name", "module_params",
+        "operand_name", "operand_lo", "operand_hi", "operand_exact"],
 }
 have_views = {r[0] for r in con.execute(
     "SELECT name FROM sqlite_master WHERE type='view'")}
@@ -184,7 +244,7 @@ for v, want in VIEW_COLUMNS.items():
     got = [r[1] for r in con.execute(f"PRAGMA table_info({v})")]
     if got != want:
         sys.exit(f"{v} columns are {got}; the contract says {want}")
-print("ok: the seven stable views exist with their contracted columns")
+print("ok: the nine stable views exist with their contracted columns")
 
 for v, base in (
     ("v_tree_node", "SELECT count(*) FROM instance"),
@@ -192,7 +252,11 @@ for v, base in (
     ("v_port_connection", "SELECT count(*) FROM port"),
     ("v_dependency", "SELECT count(*) FROM edge"),
     ("v_driver", "SELECT count(*) FROM edge"),
-    ("v_load", "SELECT count(*) FROM edge WHERE src IS NOT NULL"),
+    ("v_load", """SELECT (SELECT count(*) FROM edge WHERE src IS NOT NULL)
+                 + (SELECT count(*) FROM proc_event WHERE signal IS NOT NULL)
+                 + (SELECT count(*) FROM stmt_read)"""),
+    ("v_statement", "SELECT count(*) FROM assignment"),
+    ("v_statement_operand", "SELECT count(*) FROM assign_operand"),
     ("v_database_info", "SELECT 1"),
 ):
     nv = con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]
@@ -202,16 +266,98 @@ for v, base in (
                  "a view join is fanning out or filtering")
 print("ok: every view's row count equals its base table's")
 
-# port.child_id is the join key between the two hierarchy views, so it has to
-# point at a child of the very module the port row belongs to -- a cross-module
-# id would join a binding onto another module's instantiation and no other
-# check would notice.
+# v_load's union discipline: the discriminator names every row, dataflow rows
+# have a target end with its correspondence columns, and target-less reads
+# carry NULL across the whole load_* group -- symmetric with v_driver's
+# null-driver rows, and with the null-source rule on edge itself.
+badload = con.execute("""
+    SELECT count(*) FROM v_load
+    WHERE load_kind NOT IN ('dataflow', 'sensitivity', 'wait', 'statement')
+       OR (load_kind = 'dataflow'
+           AND (load_name IS NULL OR is_control IS NULL OR mapping_exact IS NULL))
+       OR (load_kind != 'dataflow'
+           AND (load_name IS NOT NULL OR load_type IS NOT NULL
+                OR load_lo IS NOT NULL OR load_hi IS NOT NULL
+                OR load_exact IS NOT NULL OR is_control IS NOT NULL
+                OR mapping_exact IS NOT NULL))""").fetchone()[0]
+if badload:
+    sys.exit(f"{badload} v_load row(s) break the load_kind discipline")
+print("ok: v_load's kinds are named and their NULL rules hold")
+
+# The views expose enum NAMES only -- the raw integers are storage. That makes
+# the CASE mappings contract, so each name's count is pinned to its number's:
+# a swapped label would otherwise pass every NULL check.
+for base_sql, view_sql, pairs in (
+    ("SELECT count(*) FROM port WHERE conn_kind = {v}",
+     "SELECT count(*) FROM v_port_connection WHERE connection_kind_name = '{n}'",
+     ((0, "signal"), (1, "constant"), (2, "unconnected"),
+      (3, "expression_operand"), (4, "interface"), (5, "external_reference"))),
+    ("SELECT count(*) FROM symbol WHERE direction = {v}",
+     "SELECT count(*) FROM v_signal WHERE direction_name = '{n}'",
+     ((0, "input"), (1, "output"), (2, "inout"), (3, "ref"))),
+    ("SELECT count(*) FROM port WHERE direction = {v}",
+     "SELECT count(*) FROM v_port_connection WHERE direction_name = '{n}'",
+     ((0, "input"), (1, "output"), (2, "inout"), (3, "ref"))),
+):
+    for v, n in pairs:
+        nb = con.execute(base_sql.format(v=v)).fetchone()[0]
+        nv = con.execute(view_sql.format(n=n)).fetchone()[0]
+        if nb != nv:
+            sys.exit(f"enum decode drifted: {n!r} names {nv} row(s) where the "
+                     f"base stores {nb} of value {v}")
+print("ok: every enum name's count matches its base value's")
+
+# These hold for any design, not merely the examples: a conn_kind the view
+# cannot name, a tree node it cannot classify, and the retired -1 sentinel
+# would previously pass a plain `verify-designdb.py design.db` untouched.
+unnamed_kind = con.execute("""
+    SELECT count(*) FROM v_port_connection
+    WHERE connection_kind_name IS NULL""").fetchone()[0]
+if unnamed_kind:
+    sys.exit(f"{unnamed_kind} port connection(s) have a kind the view cannot name")
+unk_node = con.execute(
+    "SELECT count(*) FROM v_tree_node WHERE node_kind IS NULL").fetchone()[0]
+if unk_node:
+    sys.exit(f"{unk_node} tree node(s) have no node_kind")
+sentinel = con.execute(
+    "SELECT count(*) FROM assignment WHERE proc = -1").fetchone()[0]
+if sentinel:
+    sys.exit(f"{sentinel} assignment(s) carry proc=-1; no procedure is NULL")
+print("ok: every kind is nameable, every node classified, no -1 sentinel")
+
+# port.child_id is the join key between the two hierarchy views, and port also
+# carries module, child (the name) and def_module of its own -- denormalized
+# for query shape. The two records must agree COMPLETELY: the ids are threaded
+# positionally through the exporter, and a positional slip would pass the
+# foreign-key check, keep every row count intact, and quietly attach a binding
+# to a sibling instance. Checking only the module caught a cross-module slip
+# and nothing else.
 crossed_child = con.execute("""
     SELECT count(*) FROM port p JOIN child c ON c.id = p.child_id
-    WHERE c.module != p.module""").fetchone()[0]
+    WHERE c.module != p.module
+       OR c.name != p.child_name
+       OR c.def_module IS NOT p.def_module
+       OR c.kind != 'module'""").fetchone()[0]
 if crossed_child:
-    sys.exit(f"{crossed_child} port row(s) name a child of a different module")
-print("ok: every port row names a child of its own module")
+    sys.exit(f"{crossed_child} port row(s) disagree with the child row they "
+             "name (module, name, def_module or kind); the positional pairing "
+             "has slipped")
+print("ok: every port row agrees with its child row on all shared identity")
+
+# map_exact's NULL is not a shrug, it is a statement: this row has no outer end
+# to correspond with. So the kinds that have one must say 0 or 1, and the kinds
+# that do not must say NULL -- a value on the wrong side of that line means the
+# writer's discipline broke.
+badmap = con.execute("""
+    SELECT count(*) FROM port
+    WHERE (conn_kind IN (1, 2, 4, 5) AND map_exact IS NOT NULL)
+       OR (conn_kind = 3 AND map_exact IS NOT 0)
+       OR (conn_kind = 0 AND map_exact IS NULL)""").fetchone()[0]
+if badmap:
+    sys.exit(f"{badmap} port row(s) break the map_exact discipline: net ties "
+             "say 0/1, expression operands say 0, everything without an outer "
+             "end says NULL")
+print("ok: port.map_exact agrees with connection_kind")
 
 # Global meta keys -- these are written unconditionally, so a database
 # that lacks them was either not finished or produced by an older version.
@@ -225,7 +371,7 @@ print("ok: every port row names a child of its own module")
 # The required `meta` key set below is part of that version: a database written
 # before those keys existed is not a v5 database, and this check is what stops
 # it being read as one.
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
 if not version or version[0] != SCHEMA_VERSION:
     sys.exit(f"schema_version is {version and version[0]!r}, expected {SCHEMA_VERSION!r}")
@@ -234,13 +380,13 @@ if not status or status[0] not in ("complete", "partial", "hierarchy_only"):
     sys.exit(f"analysis_status is {status and status[0]!r}, expected one of "
              "complete/partial/hierarchy_only")
 counts = {}
-for key in ("error_count", "warning_count", "unresolved_count",
+for key in ("error_count", "unresolved_count",
             "empty_procedure_count", "duplicate_path_count"):
     row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     if not row or not row[0].isdigit():
         sys.exit(f"meta.{key} is missing or non-numeric")
     counts[key] = int(row[0])
-for key in ("tool_version", "slang_version", "producer_revision"):
+for key in ("tool", "tool_version", "slang_version", "producer_revision"):
     row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     if not row or not row[0]:
         sys.exit(f"meta.{key} is missing")
@@ -251,9 +397,10 @@ if not cd or len(cd[0]) != 64:
 # The seal has to agree with itself. Presence alone let a database say
 # `complete` while also reporting ten errors and three skipped procedures --
 # a consumer trusting the status word would read the missing dataflow as
-# design fact. warning_count is exempt: plenty of warnings say nothing about
-# whether extraction finished. unresolved_count is exempt too -- a black box
-# is a design that was elaborated as fully as its sources allow.
+# design fact. unresolved_count is exempt -- a black box is a design that was
+# elaborated as fully as its sources allow. (warning_count is gone entirely: a
+# count whose contents the database cannot show describes the terminal log,
+# not the database, and a number nobody can inspect is not information.)
 INCOMPLETE = ("error_count", "empty_procedure_count", "duplicate_path_count")
 if status[0] == "complete":
     contradicting = {k: counts[k] for k in INCOMPLETE if counts[k]}
@@ -272,7 +419,7 @@ print(f"ok: meta seal present and self-consistent (analysis_status={status[0]})"
 info = con.execute("""
     SELECT schema_version, analysis_status, error_count,
            typeof(error_count) FROM v_database_info""").fetchone()
-if info[0] != SCHEMA_VERSION or info[1] != status[0]:
+if info[0] != int(SCHEMA_VERSION) or info[1] != status[0]:
     sys.exit(f"v_database_info says (schema={info[0]!r}, status={info[1]!r}) "
              f"but meta says ({SCHEMA_VERSION!r}, {status[0]!r})")
 if info[3] != "integer":
@@ -371,12 +518,6 @@ if mode == "constructs":
     check("the net initialiser's assignment has no procedure", """
         SELECT count(*) FROM assignment a JOIN name d ON d.id = a.dst
         WHERE a.proc IS NULL AND d.text IN ('w', 's')""", 2)
-    orphan = con.execute("""
-        SELECT count(*) FROM assignment WHERE proc = -1""").fetchone()[0]
-    if orphan:
-        sys.exit(f"{orphan} assignment(s) carry proc=-1; a statement in no "
-                 "procedure is spelled NULL, like blocking beside it")
-    print("ok: no assignment uses a -1 sentinel for proc")
     check("a gate driving one bit of a net from another", """
         SELECT count(*) FROM edge e
         JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
@@ -394,7 +535,7 @@ if mode == "constructs":
     # instantiation's line for all of them made the ports indistinguishable by
     # position and pointed a driver query at the header.
     spread = con.execute("""
-        SELECT count(DISTINCT p.line) FROM port p JOIN name c ON c.id = p.child
+        SELECT count(DISTINCT p.line) FROM port p JOIN name c ON c.id = p.child_name
         WHERE c.text = 'u_cnt'""").fetchone()[0]
     if spread < 3:
         sys.exit(f"u_cnt's connections share {spread} distinct line(s) across 3 "
@@ -643,31 +784,16 @@ if mode == "constructs":
     check("module nodes expanded from the generate's child rows", """
         SELECT count(*) FROM v_tree_node
         WHERE node_kind = 'module' AND definition_name = 'decode'""", 3)
-    unk = con.execute(
-        "SELECT count(*) FROM v_tree_node WHERE node_kind IS NULL").fetchone()[0]
-    if unk:
-        sys.exit(f"{unk} tree node(s) have no node_kind; an unclassifiable "
-                 "state must fail here, not be relabelled")
-    print("ok: every tree node has a node_kind")
 
     # Connection kinds through the view, name and number agreeing.
-    for kind, kname, what in ((1, "constant", "u_pick2's tied-off bus"),
-                              (2, "unconnected", "u_pick2's open q"),
-                              (3, "expression_operand", "the state == RUN operand")):
+    for kname, what in (("constant", "u_pick2's tied-off bus"),
+                        ("unconnected", "u_pick2's open q"),
+                        ("expression_operand", "the state == RUN operand")):
         n = con.execute("""
             SELECT count(*) FROM v_port_connection
-            WHERE connection_kind = ? AND connection_kind_name = ?""",
-            (kind, kname)).fetchone()[0]
+            WHERE connection_kind_name = ?""", (kname,)).fetchone()[0]
         if not n:
-            sys.exit(f"no v_port_connection row for {what} "
-                     f"(kind {kind} named {kname!r})")
-    unnamed = con.execute("""
-        SELECT count(*) FROM v_port_connection
-        WHERE connection_kind_name IS NULL""").fetchone()[0]
-    if unnamed:
-        sys.exit(f"{unnamed} port connection(s) have a kind the view cannot name")
-    print("ok: v_port_connection names every connection kind, constants and "
-          "unconnected included")
+            sys.exit(f"no v_port_connection row for {what} ({kname!r})")
 
     # The join the composition doctrine rests on: v_tree_node.child_id =
     # v_port_connection.child_id, and it must work exactly where names do not.
@@ -697,6 +823,46 @@ if mode == "constructs":
                  "the example no longer shows why child_id is the key")
     print("ok: the name join still finds nothing there, which is why the key exists")
 
+    # Port windows: the bit-precision model crossing the boundary. An input
+    # concat, an output concat, and a replication -- each element in its own
+    # slice of the formal, positionally exact. Before port_lo/port_hi existed,
+    # all of these read as "attached to all of q, exact", and {2{rep_r}}
+    # deduplicated to one row -- the second copy's window deleted outright.
+    win = con.execute("""
+        SELECT child_instance_name, outer_signal_name, formal_lo, formal_hi,
+               mapping_exact
+        FROM v_port_connection
+        WHERE child_instance_name IN ('u_bsink', 'u_bsrc', 'u_brep')
+        ORDER BY child_instance_name, formal_lo DESC""").fetchall()
+    expect = [
+        ("u_brep", "rep_r", 4, 7, 1), ("u_brep", "rep_r", 0, 3, 1),
+        ("u_bsink", "stim", 4, 7, 1), ("u_bsink", "cnt_o", 0, 3, 1),
+        ("u_bsrc", "bs_a", 4, 7, 1), ("u_bsrc", "bs_b", 0, 3, 1),
+    ]
+    if win != expect:
+        sys.exit(f"port windows are {win}, expected {expect}; the formal-side "
+                 "bit windows are wrong or the replication collapsed again")
+    print("ok: concatenated and replicated connections carry their formal windows")
+    # The concat elements are part-selects, so the outer side is sliced too --
+    # the full cross-boundary pair: stim[7:4] <-> q[7:4], bit for bit.
+    pair = con.execute("""
+        SELECT outer_lo, outer_hi, formal_lo, formal_hi FROM v_port_connection
+        WHERE child_instance_name = 'u_bsink' AND outer_signal_name = 'stim'
+        """).fetchall()
+    if pair != [(4, 7, 4, 7)]:
+        sys.exit(f"u_bsink's stim slice is {pair}, expected outer [4,7] onto "
+                 "formal [4,7]")
+    print("ok: both ends of a sliced connection carry their bits")
+    # The expression operand keeps mapping_exact=0 -- a real tie, range-level.
+    expr0 = con.execute("""
+        SELECT count(*) FROM v_port_connection
+        WHERE connection_kind_name = 'expression_operand'
+          AND mapping_exact = 0""").fetchone()[0]
+    if not expr0:
+        sys.exit("no expression-operand connection with mapping_exact=0; "
+                 "the state == RUN operand must be range-level, not absent")
+    print("ok: an expression operand is range-level, never positional")
+
     # Two parameterisations of one definition are two module variants, and a
     # query by module_name alone mixes them. The formal interface keys on
     # module_id from the selected tree node; this pins both halves -- the
@@ -718,6 +884,72 @@ if mode == "constructs":
         sys.exit(f"per-variant driver queries returned {per_variant}; keying on "
                  "the tree node's module_id must isolate each parameterisation")
     print("ok: module_id from the tree node isolates each parameterisation")
+
+    # ---- v_load as the complete read set ----
+    # The always_ff's triggers are loads of the clock and reset, the way a
+    # clock net's loads include the flop clock pins in a netlist database.
+    sens = con.execute("""
+        SELECT signal_name, construct FROM v_load
+        WHERE module_name = 'counter' AND load_kind = 'sensitivity'
+        ORDER BY signal_name""").fetchall()
+    if sens != [("clk", "posedge"), ("rst_n", "negedge")]:
+        sys.exit(f"counter's sensitivity loads are {sens}; expected clk/posedge "
+                 "and rst_n/negedge as v_load rows")
+    print("ok: a procedure's triggers are loads of the signals it samples")
+    # `@(posedge clk);` suspends rather than triggers, and says so.
+    waits = con.execute("""
+        SELECT count(*) FROM v_load
+        WHERE load_kind = 'wait' AND signal_name = 'clk'""").fetchone()[0]
+    if waits < 2:
+        sys.exit(f"{waits} wait-kind load(s) of clk, expected the two "
+                 "statement-level waits")
+    print("ok: a statement-level wait is a load, distinct from sensitivity")
+    # The question that used to take a five-table union: who reads `done`?
+    # One wait-condition read, one query, with its own word.
+    done = con.execute("""
+        SELECT load_kind, construct FROM v_load
+        WHERE module_name = 'observers' AND signal_name = 'done'""").fetchall()
+    if done != [("wait", "wait")]:
+        sys.exit(f"reads of `done` are {done}; expected exactly the wait "
+                 "condition, classified as a wait")
+    print("ok: 'who reads it' is one v_load query, wait conditions included")
+    # load_kind is semantics, not storage: the selected-bit spellings travel
+    # through stmt_read where the plain ones fit proc_event.signal, and both
+    # must classify identically. Before the CASE, all three of these answered
+    # 'statement' and a load_kind='sensitivity' query missed a clock.
+    ev = con.execute("""
+        SELECT signal_lo, load_kind FROM v_load
+        WHERE module_name = 'evkinds' AND signal_name = 'clks'
+        ORDER BY signal_lo DESC""").fetchall()
+    if ev != [(2, "sensitivity"), (1, "wait"), (0, "wait")]:
+        sys.exit(f"evkinds' reads classify as {ev}; expected clks[2] a "
+                 "sensitivity and clks[1]/clks[0] waits -- the storage split "
+                 "is leaking into load_kind again")
+    print("ok: load_kind says what a read means, not where it was stored")
+
+    # ---- the statement layer ----
+    # One concatenated statement is ONE statement: two v_statement rows (one
+    # per target, each with its own operand set) sharing one stmt ordinal.
+    pack = con.execute("""
+        SELECT count(*), count(DISTINCT stmt) FROM v_statement
+        WHERE module_name = 'packing' AND target_name LIKE 'packed_%'""").fetchone()
+    if pack != (2, 1):
+        sys.exit(f"packing's concat write is {pack} (rows, stmts); expected "
+                 "(2, 1) -- per-target rows, one statement")
+    print("ok: v_statement keeps a concat write one statement with two targets")
+    # The branches pair, through the views this time: same procedure, ordered
+    # seq, non-blocking, distinct statements, and the operand that belongs to
+    # each -- the exact answer the naive edge join cannot give.
+    br = con.execute("""
+        SELECT s.seq, s.blocking, o.operand_name
+        FROM v_statement s
+        JOIN v_statement_operand o ON o.statement_id = s.statement_id
+        WHERE s.module_name = 'branches'
+        ORDER BY s.seq""").fetchall()
+    if br != [(0, 0, "a"), (1, 0, "b")]:
+        sys.exit(f"branches through the statement views reads {br}; expected "
+                 "seq 0 reading a and seq 1 reading b, both non-blocking")
+    print("ok: v_statement_operand gives each statement its own read set")
 
 if mode == "interfaces":
     check("the interface binding (conn_kind=4)",
@@ -805,7 +1037,7 @@ if mode == "interfaces":
     # ---- the stable views over the interface constructs ----
     ifc = con.execute("""
         SELECT count(*) FROM v_port_connection
-        WHERE connection_kind = 4 AND connection_kind_name = 'interface'
+        WHERE connection_kind_name = 'interface'
           AND modport_name = 'src'""").fetchone()[0]
     if ifc < 2:
         sys.exit(f"{ifc} interface binding(s) with modport 'src' in "
@@ -831,6 +1063,28 @@ if mode == "interfaces":
     print("ok: v_driver names the statement driving a target fed from outside")
 
 if mode == "assertions":
+    # The kind vocabulary as slang presents it: module-scope concurrent
+    # assertions arrive wrapped in implicit procedures, so their reads carry
+    # the wrapper's kind -- there is no 'assertion' kind, and the doc says so
+    # rather than promising one nothing emits. The assertion's own word lives
+    # in `construct`.
+    badkind = con.execute("""
+        SELECT count(*) FROM stmt_read
+        WHERE kind NOT IN ('continuous_assign', 'procedural', 'procedure')""").fetchone()[0]
+    if badkind:
+        sys.exit(f"{badkind} stmt_read row(s) carry a kind outside the edge "
+                 "vocabulary; if 'assertion' is being emitted now, put the "
+                 "claim back in the doc")
+    print("ok: stmt_read kinds stay in edge's vocabulary, construct carries the word")
+    # An assertion's reads are loads -- its checker pins -- and reach a
+    # consumer through the same one query as every other read.
+    aread = con.execute("""
+        SELECT count(*) FROM v_load
+        WHERE load_kind = 'statement' AND construct = 'assert'""").fetchone()[0]
+    if aread < 3:
+        sys.exit(f"{aread} assert reads in v_load, expected at least 3; "
+                 "assertion reads must surface as statement-kind loads")
+    print("ok: an assertion's reads are statement-kind loads")
     check("the concurrent assertion's reads", """
         SELECT count(*) FROM stmt_read WHERE construct = 'assert'""", 3)
     check("assume keeps its own word", """

@@ -222,7 +222,13 @@ CREATE TABLE symbol(
 -- hierarchy boundary.
 CREATE TABLE port(
     module       INTEGER NOT NULL REFERENCES module(id),
-    child        INTEGER NOT NULL REFERENCES name(id),
+    -- The child instance's name as the folded model spells it, generate
+    -- prefix included. `_name` by the def_name precedent: an interned name id,
+    -- disambiguated from `child_id` below, which is the actual child-table
+    -- key. (An earlier spelling took the bare word `child`, breaking the
+    -- no-column-takes-a-table's-name rule and forcing the real foreign key
+    -- into the schema's only `_id` suffix.)
+    child_name   INTEGER NOT NULL REFERENCES name(id),
     def_module   INTEGER REFERENCES module(id),
     port         INTEGER NOT NULL REFERENCES name(id),
     -- The signal inside the child that `port` stands for, when the connection
@@ -291,7 +297,21 @@ CREATE TABLE port(
     -- two unnamed gates in one module legally share a name, and a join on it
     -- fans out. The id is assigned by the exporter, so it is collision-proof
     -- where the name is not.
-    child_id     INTEGER NOT NULL REFERENCES child(id));
+    child_id     INTEGER NOT NULL REFERENCES child(id),
+    -- The bits of the FORMAL this row's element occupies: `.q({hi, lo})` is
+    -- two rows, hi at port_lo=4..port_hi=7 of q and lo at 0..3. Without these
+    -- the per-bit precision `edge` carries ended at every instance boundary --
+    -- both nets read as attached to all of q. Encoded as ranges are
+    -- everywhere: NULL + port_exact=1 the whole formal, NULL + port_exact=0
+    -- position unstatable (a width-changing conversion, an instance-array
+    -- element), and port_exact NULL where the row has no formal bit domain.
+    port_lo      INTEGER, port_hi INTEGER, port_exact INTEGER,
+    -- edge.map_exact at the boundary: 1 when this row's outer bits map
+    -- one-to-one onto its formal window, 0 when the tie is real but only
+    -- range-granular (an expression operand, a degraded window), NULL when
+    -- there is no outer end to correspond with (a constant, an unconnected
+    -- port, an external tie, an interface binding). 0 is not doubt.
+    map_exact    INTEGER);
 
 -- Assignments, one row per statement that writes a target.
 --
@@ -451,7 +471,10 @@ CREATE TABLE hier_ref(
 CREATE TABLE stmt_read(
     module    INTEGER NOT NULL REFERENCES module(id),
     name      INTEGER NOT NULL REFERENCES name(id),
-    -- As edge.kind, plus 'assertion' for one that is not inside a procedure.
+    -- edge.kind's vocabulary. (Not 'assertion': slang wraps even a
+    -- module-scope concurrent assertion in an implicit procedure, so the
+    -- reading construct's own word lives in `construct` below and the kind
+    -- stays the wrapper's.)
     kind      TEXT,
     -- The construct that reads: `assign`, `always_ff`, or the assertion's own
     -- word -- `assert`, `assume`, `cover`, `expect`.
@@ -505,6 +528,11 @@ CREATE INDEX child_by_module  ON child(module);
 CREATE INDEX symbol_by_module ON symbol(module);
 CREATE INDEX assign_by_dst    ON assignment(module, dst);
 CREATE INDEX pevent_by_proc   ON proc_event(module, proc);
+-- Two directions, two indexes: pevent_by_proc answers "what is this procedure
+-- sensitive to", this one answers "whose trigger is this signal" -- the event
+-- arm of v_load's documented point query, which otherwise scanned the
+-- module's whole event list through the other index's prefix.
+CREATE INDEX pevent_by_signal ON proc_event(module, signal);
 CREATE INDEX aop_by_assign    ON assign_operand(assignment);
 CREATE INDEX sread_by_name    ON stmt_read(module, name);
 CREATE INDEX href_by_module   ON hier_ref(module);
@@ -526,7 +554,7 @@ CREATE INDEX instance_by_parent ON instance(parent, name);
 CREATE INDEX instance_by_module ON instance(module);
 )SQL";
 
-// The stable query interface: seven views that resolve the intern tables so a
+// The stable query interface: nine views that resolve the intern tables so a
 // consumer never joins `name`, `type`, `file` or `source_file` itself. They are
 // part of the schema-version contract from v8 on -- their existence, their
 // column sets and their row granularity are what a consumer may rely on, and
@@ -543,6 +571,12 @@ CREATE INDEX instance_by_module ON instance(module);
 //     module; walking a fan-in cone or crossing instances is the consumer's
 //     loop, composed from v_dependency + v_port_connection + v_tree_node --
 //     joined on child_id, the one key both hierarchy views expose.
+//   * Few nouns, complete attributes. The views are the object model --
+//     database, tree node, signal, binding, dependency, statement -- not one
+//     view per storage table. v_load is the whole answer to "who reads it"
+//     however the read was stored, the way a netlist database's net.loads
+//     includes the flop clock pins; row counts for union views hold as the
+//     sum of their parts.
 //   * Nothing joins `edge` to `assignment`. The two are independent
 //     projections, and (module, dst, file, line) is not a key between them --
 //     the views must not resurrect the cross product v7 removed.
@@ -561,7 +595,8 @@ constexpr const char* kViews = R"SQL(
 -- required-key enforcement stays in the verifier.
 CREATE VIEW v_database_info AS
 SELECT
-    MAX(CASE WHEN key = 'schema_version'        THEN value END) AS schema_version,
+    CAST(MAX(CASE WHEN key = 'schema_version'
+                  THEN value END) AS INTEGER) AS schema_version,
     MAX(CASE WHEN key = 'tool_version'          THEN value END) AS tool_version,
     MAX(CASE WHEN key = 'slang_version'         THEN value END) AS slang_version,
     MAX(CASE WHEN key = 'producer_revision'     THEN value END) AS producer_revision,
@@ -569,8 +604,6 @@ SELECT
     MAX(CASE WHEN key = 'analysis_status'       THEN value END) AS analysis_status,
     CAST(MAX(CASE WHEN key = 'error_count'
                   THEN value END) AS INTEGER) AS error_count,
-    CAST(MAX(CASE WHEN key = 'warning_count'
-                  THEN value END) AS INTEGER) AS warning_count,
     CAST(MAX(CASE WHEN key = 'unresolved_count'
                   THEN value END) AS INTEGER) AS unresolved_count,
     CAST(MAX(CASE WHEN key = 'empty_procedure_count'
@@ -603,8 +636,6 @@ SELECT
     m.name       AS module_name,
     m.params     AS module_params,
     i.child      AS child_id,
-    c.kind       AS child_kind,
-    c.def_module AS definition_module_id,
     dn.text      AS definition_name
 FROM instance i
 JOIN name n        ON n.id = i.name
@@ -625,7 +656,6 @@ SELECT
     s.kind       AS symbol_kind,
     t.text       AS type_text,
     s.width      AS width,
-    s.direction  AS direction,
     CASE s.direction WHEN 0 THEN 'input' WHEN 1 THEN 'output'
                      WHEN 2 THEN 'inout' WHEN 3 THEN 'ref' END AS direction_name,
     f.path       AS file_path,
@@ -664,7 +694,9 @@ SELECT
     cm.params     AS child_module_params,
     fp.text       AS formal_port_name,
     COALESCE(inn.text, fp.text) AS inner_signal_name,
-    p.direction   AS direction,
+    p.port_lo     AS formal_lo,
+    p.port_hi     AS formal_hi,
+    p.port_exact  AS formal_exact,
     CASE p.direction WHEN 0 THEN 'input' WHEN 1 THEN 'output'
                      WHEN 2 THEN 'inout' WHEN 3 THEN 'ref' END AS direction_name,
     onm.text      AS outer_signal_name,
@@ -673,7 +705,7 @@ SELECT
     p.outer_lo    AS outer_lo,
     p.outer_hi    AS outer_hi,
     p.outer_exact AS outer_exact,
-    p.conn_kind   AS connection_kind,
+    p.map_exact   AS mapping_exact,
     CASE p.conn_kind WHEN 0 THEN 'signal'
                      WHEN 1 THEN 'constant'
                      WHEN 2 THEN 'unconnected'
@@ -686,7 +718,7 @@ SELECT
     p.line        AS source_line
 FROM port p
 JOIN module pm           ON pm.id = p.module
-JOIN name cn             ON cn.id = p.child
+JOIN name cn             ON cn.id = p.child_name
 LEFT JOIN module cm      ON cm.id = p.def_module
 JOIN name fp             ON fp.id = p.port
 LEFT JOIN name inn       ON inn.id = p.inner
@@ -756,9 +788,37 @@ SELECT
     file_path, source_path, source_line
 FROM v_dependency;
 
--- v_dependency read from the source's side: one row per direct load of
--- signal_name. Null-source edges are no signal's load, so they are the one
--- thing filtered out; control edges stay, marked, exactly as in v_driver.
+-- EVERY recorded read of signal_name, one row each -- the storage split
+-- undone. "Who reads it" was always one question; the answer lives in three
+-- tables for storage reasons (a read with no written target has no edge to
+-- ride), and making the consumer know that was exactly the internal knowledge
+-- this interface exists to retire. The netlist analogy decides what belongs
+-- here: a clock net's loads include the flop clock pins, so a sensitivity
+-- read is a load; an assertion's reads are its checker pins, so they are
+-- loads too. load_kind says which shape each row is:
+--
+--   dataflow      an edge: the signal feeds a target this module names.
+--                 load_* name the target; is_control and mapping_exact apply.
+--   sensitivity   a procedure triggers on it (proc_event, wait=0). construct
+--                 is the edge word: posedge / negedge / both.
+--   wait          a procedure suspends on it (proc_event, wait=1).
+--   statement     a statement reads it and writes nothing nameable: an
+--                 assertion, a $display, a writing call's argument.
+--                 construct is that statement's own word.
+--
+-- load_kind is the read's SEMANTICS, not which table stored it. A plain event
+-- (`@(posedge clk)`) lands in proc_event; a selected-bit or expression event
+-- (`@(posedge clks[2])`) cannot name a plain signal there and lands in
+-- stmt_read with construct = sensitivity/wait -- and both spellings of the
+-- same semantics must answer to the same load_kind, or the view leaks the
+-- storage split it exists to hide.
+--
+-- Rows with no written target carry load_* all NULL -- symmetric with
+-- v_driver keeping driver_name NULL for a driving statement with no nameable
+-- source: a real reader with no nameable target. is_control and mapping_exact
+-- are NULL there too; nothing exists to correspond with. What this view still
+-- cannot include: a read made FROM another module through a hierarchical
+-- path -- that is hier_ref text, resolved against the tree by the consumer.
 CREATE VIEW v_load AS
 SELECT
     module_id, module_name, module_params,
@@ -772,10 +832,130 @@ SELECT
     target_lo    AS load_lo,
     target_hi    AS load_hi,
     target_exact AS load_exact,
+    'dataflow'   AS load_kind,
     dependency_kind, construct, is_control, mapping_exact,
     file_path, source_path, source_line
 FROM v_dependency
-WHERE source_name IS NOT NULL;
+WHERE source_name IS NOT NULL
+UNION ALL
+SELECT
+    pe.module    AS module_id,
+    m.name       AS module_name,
+    m.params     AS module_params,
+    n.text       AS signal_name,
+    NULL         AS signal_type,
+    NULL         AS signal_lo,
+    NULL         AS signal_hi,
+    1            AS signal_exact,
+    NULL         AS load_name,
+    NULL         AS load_type,
+    NULL         AS load_lo,
+    NULL         AS load_hi,
+    NULL         AS load_exact,
+    CASE pe.wait WHEN 1 THEN 'wait' ELSE 'sensitivity' END AS load_kind,
+    NULL         AS dependency_kind,
+    pe.edge_kind AS construct,
+    NULL         AS is_control,
+    NULL         AS mapping_exact,
+    f.path       AS file_path,
+    sf.path      AS source_path,
+    pe.line      AS source_line
+FROM proc_event pe
+JOIN module m            ON m.id = pe.module
+-- The inner join on `name` is the NULL filter: an event row whose expression
+-- was not a plain signal has nothing to be a load of, and no name row to
+-- join. Spelling the filter as a WHERE too pushed the planner onto a range
+-- scan where the join gives it an equality seek.
+JOIN name n              ON n.id = pe.signal
+LEFT JOIN file f         ON f.id = pe.file
+LEFT JOIN source_file sf ON sf.id = f.source_file
+UNION ALL
+SELECT
+    r.module     AS module_id,
+    m.name       AS module_name,
+    m.params     AS module_params,
+    n.text       AS signal_name,
+    NULL         AS signal_type,
+    r.src_lo     AS signal_lo,
+    r.src_hi     AS signal_hi,
+    r.src_exact  AS signal_exact,
+    NULL         AS load_name,
+    NULL         AS load_type,
+    NULL         AS load_lo,
+    NULL         AS load_hi,
+    NULL         AS load_exact,
+    CASE WHEN r.construct = 'sensitivity' THEN 'sensitivity'
+         WHEN r.construct = 'wait'        THEN 'wait'
+         ELSE 'statement' END AS load_kind,
+    r.kind       AS dependency_kind,
+    r.construct  AS construct,
+    NULL         AS is_control,
+    NULL         AS mapping_exact,
+    f.path       AS file_path,
+    sf.path      AS source_path,
+    r.line       AS source_line
+FROM stmt_read r
+JOIN module m            ON m.id = r.module
+JOIN name n              ON n.id = r.name
+LEFT JOIN file f         ON f.id = r.file
+LEFT JOIN source_file sf ON sf.id = f.source_file;
+
+-- One row per `assignment`: the statement object, the other half of the
+-- edge/assignment dual projection -- and the one noun this database has that
+-- a netlist database does not, because a netlist has no statements and no
+-- file:line. statement_id is assignment.id, the primary key the schema
+-- already maintains because assign_operand references it; `stmt` beside it
+-- is the per-module ordinal shared with hier_ref and stmt_read, exposed here
+-- because this is the view that makes statement identity queryable at all.
+-- `proc` joins proc_event.proc (same module) to reach the statement's
+-- sensitivity. No target_type: `assignment` stores none, and a view invents
+-- no columns.
+CREATE VIEW v_statement AS
+SELECT
+    a.id        AS statement_id,
+    a.module    AS module_id,
+    m.name      AS module_name,
+    m.params    AS module_params,
+    dn.text     AS target_name,
+    a.dst_lo    AS target_lo,
+    a.dst_hi    AS target_hi,
+    a.dst_exact AS target_exact,
+    a.kind      AS statement_kind,
+    a.construct AS construct,
+    a.proc      AS proc,
+    a.seq       AS seq,
+    a.blocking  AS blocking,
+    a.dropped_operands AS dropped_operands,
+    a.stmt      AS stmt,
+    f.path      AS file_path,
+    sf.path     AS source_path,
+    a.line      AS source_line
+FROM assignment a
+JOIN module m            ON m.id = a.module
+JOIN name dn             ON dn.id = a.dst
+LEFT JOIN file f         ON f.id = a.file
+LEFT JOIN source_file sf ON sf.id = f.source_file;
+
+-- One row per `assign_operand`: a statement's exact read set, the attribute
+-- the naive edge/assignment join gets wrong and this schema keeps repeating
+-- "use assign_operand" about -- now without asking the consumer to intern-join
+-- for it. The module columns ride along (through two primary keys, so nothing
+-- fans out) so the round-one question "which statements read X in M" is one
+-- WHERE clause.
+CREATE VIEW v_statement_operand AS
+SELECT
+    ao.assignment AS statement_id,
+    a.module      AS module_id,
+    m.name        AS module_name,
+    m.params      AS module_params,
+    n.text        AS operand_name,
+    ao.src_lo     AS operand_lo,
+    ao.src_hi     AS operand_hi,
+    ao.src_exact  AS operand_exact
+FROM assign_operand ao
+JOIN assignment a ON a.id = ao.assignment
+JOIN module m     ON m.id = a.module
+JOIN name n       ON n.id = ao.name;
 )SQL";
 
 // Rows per transaction. Committing per row is orders of magnitude slower;
@@ -834,7 +1014,8 @@ Writer::Writer(const std::string& path) {
     prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
     prepare("INSERT INTO child VALUES(?,?,?,?,?,?)", &insChild);
     prepare("INSERT INTO instance VALUES(?,?,?,?,?)", &insInstance);
-    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
+    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            &insPort);
         prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
         prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?)", &insProcEvent);
@@ -1065,11 +1246,27 @@ void Writer::addEdges(int64_t moduleId, const std::vector<EdgeRow>& rows) {
         bindOptId(insEdge, 8, internFile(r.file));
         sqlite3_bind_int64(insEdge, 9, r.line);
         sqlite3_bind_int(insEdge, 10, r.control ? 1 : 0);
-        bindOptRange(insEdge, 11, 12, r.srcBits);
-        sqlite3_bind_int(insEdge, 13, r.srcExact ? 1 : 0);
+        // A row with no source has no source end to describe, so every column
+        // describing one is NULL -- the discipline `port` applies to a tie-off
+        // ("so it does not read as 'the whole of nothing, exactly'"), applied
+        // here at the one chokepoint every emitter goes through. Before this,
+        // `assign q = 1'b0` carried src_exact=1 and map_exact=1: a driver
+        // query reported a per-bit mapping onto a driver that does not exist,
+        // and a bit-level tracer was invited to follow it.
+        if (r.src.empty()) {
+            bindOptRange(insEdge, 11, 12, std::nullopt);
+            sqlite3_bind_null(insEdge, 13);
+        }
+        else {
+            bindOptRange(insEdge, 11, 12, r.srcBits);
+            sqlite3_bind_int(insEdge, 13, r.srcExact ? 1 : 0);
+        }
         bindOptRange(insEdge, 14, 15, r.dstBits);
         sqlite3_bind_int(insEdge, 16, r.dstExact ? 1 : 0);
-        sqlite3_bind_int(insEdge, 17, r.mapExact ? 1 : 0);
+        if (r.src.empty())
+            sqlite3_bind_null(insEdge, 17);
+        else
+            sqlite3_bind_int(insEdge, 17, r.mapExact ? 1 : 0);
         step(insEdge);
         if (++pending >= kBatch) {
             commit();
@@ -1143,6 +1340,15 @@ void Writer::addPorts(int64_t moduleId, int64_t defModuleId, int64_t childId,
         bindOptId(insPort, 15, internFile(r.file));
         sqlite3_bind_int64(insPort, 16, r.line);
         sqlite3_bind_int64(insPort, 17, childId);
+        bindOptRange(insPort, 18, 19, r.portBits);
+        if (r.portExact < 0)
+            sqlite3_bind_null(insPort, 20);
+        else
+            sqlite3_bind_int(insPort, 20, r.portExact);
+        if (r.mapExact < 0)
+            sqlite3_bind_null(insPort, 21);
+        else
+            sqlite3_bind_int(insPort, 21, r.mapExact);
         step(insPort);
         if (++pending >= kBatch) {
             commit();
