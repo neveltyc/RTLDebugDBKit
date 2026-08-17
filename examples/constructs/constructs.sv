@@ -95,6 +95,19 @@ module branches(input logic clk, input logic c, input logic [7:0] a,
     always_ff @(posedge clk) begin if (c) sel <= a; else sel <= b; end
 endmodule
 
+// Concatenated assignment: both sides are positioned, so the halves correspond.
+// Pairing every target with every operand made `swap_lo -> packed_hi` and
+// `swap_hi -> packed_lo` -- not conservative but wrong, and marked exact on both
+// ends like the two real edges. `bits` is the other half of it: the operands of
+// one concatenation land in their own slices of the target rather than each
+// driving all of it.
+module packing(input logic [3:0] swap_hi, input logic [3:0] swap_lo,
+               output logic [3:0] packed_hi, output logic [3:0] packed_lo,
+               output logic [7:0] bits);
+    assign {packed_hi, packed_lo} = {swap_lo, swap_hi};
+    assign bits = {swap_hi, swap_lo};
+endmodule
+
 module constructs;
     `DECLARE_TRACE(trace)                   // declared inside a macro body
 
@@ -141,6 +154,11 @@ module constructs;
 
     logic [7:0] sel;
     branches u_br(.clk(clk), .c(done), .a(stim), .b(cnt_o), .sel(sel));
+
+    logic [3:0] p_hi, p_lo;
+    logic [7:0] p_bits;
+    packing u_pack(.swap_hi(stim[7:4]), .swap_lo(stim[3:0]),
+                   .packed_hi(p_hi), .packed_lo(p_lo), .bits(p_bits));
 
 `include "seq.svh"
 

@@ -545,6 +545,160 @@ void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out
         skipSelectors);
 }
 
+/// A reference together with the bits of the *assignment* it occupies.
+///
+/// Both sides of an assignment are flattened values aligned at the LSB, so a
+/// position in one is comparable with a position in the other. That is what
+/// makes `{a, b} = {x, y}` answerable: `a` sits at bit 1 of the left and `x` at
+/// bit 1 of the right, `b` and `y` at bit 0, and the pairs that do not share a
+/// bit are not dataflow at all.
+///
+/// Pairing every target with every operand instead produced `y -> a` and
+/// `x -> b`, marked exact -- not conservative but wrong, and wrong in the
+/// direction that grows: each false edge is a false fan-out at the next step of
+/// a trace. Concatenated assignment is how a bus is split or a register's fields
+/// are packed, so this was most of the structural RTL in a design.
+struct Slot {
+    Ref ref;
+    /// Bit offset within the assignment's value, LSB = 0, inclusive.
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    /// True when the reference's own bits map one-to-one onto [lo, hi], so a
+    /// bit of the source can be followed to a specific bit of the target.
+    /// False when the reference merely influences the range as a whole: `a + b`
+    /// carries, `f(a)` is opaque, `{2{a}}` puts one source in two places.
+    bool positional = false;
+};
+
+/// Spans everything, so it overlaps whatever it is compared against. Used where
+/// a width is not known -- an unpacked type has no bit width -- and the honest
+/// answer is that no position can be ruled out.
+constexpr uint64_t kNoWidth = ~uint64_t{0};
+
+uint64_t exprWidthOf(const Expression& e) {
+    return e.type ? e.type->getBitWidth() : 0;
+}
+
+/// Whether the expression *is* a reference to storage, rather than a computation
+/// over one.
+///
+/// This is what decides a positional mapping, and counting references is not:
+/// `cnt + 1` holds exactly one reference, filling the whole width, and is not
+/// positional at all -- a carry takes bit 0 of `cnt` to bit 7 of the result. The
+/// question is not how many signals an expression mentions but whether it moves
+/// their bits or combines them.
+///
+/// Selects and member accesses are transparent because they only choose *which*
+/// bits: `hi[3:0]` inside a concatenation still puts one bit per bit. Everything
+/// else answers no, including operators that happen to be bitwise -- `~a` really
+/// is positional, but saying so needs a rule per operator, and being wrong about
+/// one of them costs more than the precision is worth.
+bool isPlainReference(const Expression& e) {
+    const Expression* p = &e;
+    for (;;) {
+        switch (p->kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::ElementSelect:
+                p = &p->as<ElementSelectExpression>().value();
+                break;
+            case ExpressionKind::RangeSelect:
+                p = &p->as<RangeSelectExpression>().value();
+                break;
+            case ExpressionKind::MemberAccess:
+                p = &p->as<MemberAccessExpression>().value();
+                break;
+            default:
+                return false;
+        }
+    }
+}
+
+/// Every reference in `expr`, each tagged with the bits of the assignment it
+/// occupies. `base` is where this subexpression starts.
+///
+/// A concatenation is walked element by element, MSB first as SystemVerilog
+/// writes it, so each element gets its own window. Anything else contributes its
+/// references across its whole window without a per-bit correspondence -- which
+/// is correct rather than approximate for arithmetic, where a low source bit
+/// really can reach a high target bit through a carry.
+void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
+                  std::vector<Slot>& out, bool skipSelectors = false) {
+    const uint64_t width = exprWidthOf(expr);
+
+    if (expr.kind == ExpressionKind::Concatenation && width) {
+        // Slots are filled from the top: `{a, b}` writes `a` to the high bits.
+        uint64_t cursor = base + width;
+        for (auto* op : expr.as<ConcatenationExpression>().operands()) {
+            if (!op)
+                continue;
+            const uint64_t w = exprWidthOf(*op);
+            if (!w) {
+                // An element of unknown width leaves every position below it
+                // uncertain, so the rest of the concatenation is recorded as
+                // spanning the whole assignment rather than guessed at.
+                std::vector<Ref> rest;
+                collectRefs(expr, ctx, rest, skipSelectors);
+                for (auto& r : rest)
+                    out.push_back(Slot{r, 0, kNoWidth, false});
+                return;
+            }
+            cursor -= w;
+            collectSlots(*op, ctx, cursor, out, skipSelectors);
+        }
+        return;
+    }
+
+    std::vector<Ref> refs;
+    collectRefs(expr, ctx, refs, skipSelectors);
+    if (!width) {
+        for (auto& r : refs)
+            out.push_back(Slot{r, 0, kNoWidth, false});
+        return;
+    }
+    // A bit maps to a bit when the window holds one reference to storage, that
+    // reference is statically resolved, and it fills the window exactly. A
+    // computation (`a + b`, `f(x)`) fails the first test even when it mentions a
+    // single signal; a widened operand fails the last, because the bits it does
+    // not supply are extension rather than any bit of it.
+    const bool positional =
+        isPlainReference(expr) && refs.size() == 1 && refs[0].exact &&
+        (refs[0].whole ? bitWidthOf(*refs[0].sym) == width
+                       : refs[0].hi - refs[0].lo + 1 == width);
+    for (auto& r : refs)
+        out.push_back(Slot{r, base, base + width - 1, positional});
+}
+
+/// The bits two slots share, if any.
+bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
+    if (a.hi == kNoWidth || b.hi == kNoWidth) {
+        lo = 0;
+        hi = kNoWidth;
+        return true;
+    }
+    lo = std::max(a.lo, b.lo);
+    hi = std::min(a.hi, b.hi);
+    return lo <= hi;
+}
+
+/// The reference narrowed to the part of it that lands in [lo, hi] of the
+/// assignment. Only meaningful for a positional slot; anything else keeps the
+/// range it came with, because no part of it can be singled out.
+Ref narrowed(const Slot& s, uint64_t lo, uint64_t hi) {
+    Ref r = s.ref;
+    if (!s.positional || s.hi == kNoWidth || hi == kNoWidth || !r.sym)
+        return r;
+    if (lo <= s.lo && hi >= s.hi)
+        return r;                     // the whole slot: nothing to narrow
+    const uint64_t offset = r.whole ? 0 : r.lo;
+    r.lo = offset + (lo - s.lo);
+    r.hi = offset + (hi - s.lo);
+    const uint64_t total = bitWidthOf(*r.sym);
+    r.whole = total == 0 || (r.lo == 0 && r.hi + 1 >= total);
+    return r;
+}
+
 struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::AllGood> {
     std::vector<Ref>& out;
     explicit StatementRefCollector(std::vector<Ref>& out) : out(out) {}
@@ -655,8 +809,11 @@ void collectReads(const Expression& expr, std::vector<const ValueSymbol*>& out) 
 /// stack, unwound on the way back out.
 struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood> {
     /// `src.sym` is null for a driver with no external operand.
+    /// `mapExact` is true when the source's bits map one-to-one onto the
+    /// target's, so a bit-level trace can follow the pair; false when the source
+    /// merely influences the target's range as a whole.
     using Emit = std::function<void(const Ref& dst, const Ref& src, bool gatingEdge,
-                                    SourceRange where)>;
+                                    bool mapExact, SourceRange where)>;
     using EmitAssign = std::function<void(const Ref& dst, const std::vector<Ref>& operands,
                                           SourceRange where, int64_t seq, bool blocking,
                                           int64_t droppedConstants, bool inSubroutine)>;
@@ -920,9 +1077,11 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // while the identical circuit spelled `c <= c + 1` read as data.
             // The data dependency is the stronger fact and the one a consumer
             // filtering `control = 0` is asking for.
-            emit(dst, dst, false, expr.sourceRange);
+            // `cnt++` reads and writes the same bits of the same object, which is
+            // as positional as a mapping gets.
+            emit(dst, dst, false, /*mapExact=*/true, expr.sourceRange);
             for (auto& src : gating)
-                emit(dst, src, true, expr.sourceRange);
+                emit(dst, src, true, /*mapExact=*/false, expr.sourceRange);
         }
         visitDefault(expr);
     }
@@ -995,10 +1154,15 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             for (auto& a : actuals) {
                 if (!a.sym)
                     continue;
+                // An actual binds to its formal whole-to-whole, so the two carry
+                // the same bits -- unless the argument is an expression, in
+                // which case `actuals` holds more than one reference and none of
+                // them fills the formal on its own.
+                const bool oneToOne = actuals.size() == 1;
                 if (reads)
-                    emit(formal, a, false, expr.sourceRange);
+                    emit(formal, a, false, oneToOne, expr.sourceRange);
                 if (writes)
-                    emit(a, formal, false, expr.sourceRange);
+                    emit(a, formal, false, oneToOne, expr.sourceRange);
             }
         }
     }
@@ -1081,14 +1245,37 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             }
         }
 
-        std::vector<Ref> reads;
+        // Where each target sits in the flattened left-hand side. `targets` above
+        // is the same set of references; this adds the position, which is what
+        // decides afterwards whether a given operand reaches a given target.
+        std::vector<Slot> lhsSlots;
+        collectSlots(expr.left(), eval, 0, lhsSlots, /*skipSelectors=*/true);
+        if (lhsSlots.size() != targets.size()) {
+            // The fallback path above resolved a target the slot walk cannot see,
+            // or the two disagree for a reason not understood here. Position is
+            // then not trustworthy, so every target spans the whole assignment
+            // and the pairing falls back to what it always was.
+            lhsSlots.clear();
+            for (auto& t : targets)
+                lhsSlots.push_back(Slot{t, 0, kNoWidth, false});
+        }
+
+        std::vector<Slot> rhsSlots;
         filteredConstants = 0;
-        collectRefs(expr.right(), eval, reads);
-        collectCallReads(expr.right(), reads);
-        // An index or part-select on the left is read, not written: `q[i] <= d`
-        // depends on `i`. Those live inside the selectors that the target pass
-        // skipped, so they are collected separately.
-        collectLeftSelectorRefs(expr.left(), reads);
+        collectSlots(expr.right(), eval, 0, rhsSlots);
+        // A subroutine's own reads and the selectors on the left have no position
+        // in the value: a call is opaque, and an index decides *which* bits are
+        // written rather than supplying any of them. Both span everything.
+        {
+            std::vector<Ref> unpositioned;
+            collectCallReads(expr.right(), unpositioned);
+            // An index or part-select on the left is read, not written:
+            // `q[i] <= d` depends on `i`. Those live inside the selectors that
+            // the target pass skipped, so they are collected separately.
+            collectLeftSelectorRefs(expr.left(), unpositioned);
+            for (auto& r : unpositioned)
+                rhsSlots.push_back(Slot{r, 0, kNoWidth, false});
+        }
         const int64_t droppedConstants = filteredConstants;
 
         // Every non-constant selector evaluation appends a diagnostic and a
@@ -1097,23 +1284,43 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // assignment measurably bounds it.
         eval.reset();
 
-        for (auto& dst : targets) {
-            if (loopVars.count(dst.sym))
+        for (auto& dstSlot : lhsSlots) {
+            if (loopVars.count(dstSlot.ref.sym))
                 continue;
-            emitAssign(dst, reads, expr.sourceRange, seq++, expr.isBlocking(),
-                       droppedConstants, subDepth > 0);
-            for (auto& src : reads)
-                emit(dst, src, false, expr.sourceRange);
+            // Only the operands whose bits actually reach this target, each
+            // narrowed to the part that does. `{a, b} = {x, y}` gives `a` one
+            // operand rather than two, which is the same correction the edges
+            // below get -- `assign_operand` crossed the two sides exactly as
+            // `edge` did.
+            struct Pair {
+                Ref dst, src;
+                bool mapExact;
+            };
+            std::vector<Pair> pairs;
+            std::vector<Ref> operands;
+            for (auto& srcSlot : rhsSlots) {
+                uint64_t lo = 0, hi = 0;
+                if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
+                    continue;
+                Pair p{narrowed(dstSlot, lo, hi), narrowed(srcSlot, lo, hi),
+                       dstSlot.positional && srcSlot.positional};
+                operands.push_back(p.src);
+                pairs.push_back(std::move(p));
+            }
+            emitAssign(dstSlot.ref, operands, expr.sourceRange, seq++,
+                       expr.isBlocking(), droppedConstants, subDepth > 0);
+            for (auto& p : pairs)
+                emit(p.dst, p.src, false, p.mapExact, expr.sourceRange);
             for (auto& src : gating)
-                emit(dst, src, true, expr.sourceRange);
+                emit(dstSlot.ref, src, true, /*mapExact=*/false, expr.sourceRange);
             // A right-hand side that reads nothing at all -- `q <= 8'h0` --
             // still has a driver, and a query for what drives the target has
             // to be able to name the statement. One row with a null source
             // records it; the schema stores edges, so without this the driver
             // simply is not there. A self-read (`cnt <= cnt + 1`) does not land
             // here: its edge is real and already names the statement.
-            if (reads.empty())
-                emit(dst, Ref{}, false, expr.sourceRange);
+            if (pairs.empty())
+                emit(dstSlot.ref, Ref{}, false, /*mapExact=*/true, expr.sourceRange);
         }
 
         visitDefault(expr);
@@ -1253,9 +1460,12 @@ void forEachPrimitive(const Scope& scope, F&& fn) {
 /// `if (a) y = a` collapses the data edge and the condition edge into one;
 /// without dst_exact, `y[i] = a` and `y = {2{a}}` collapse a dynamic
 /// partial write and a precise full write into one.
+/// map_exact joins them for the same reason: two edges between one pair that
+/// differ only in whether the bit correspondence is positional are different
+/// facts, and folding them keeps whichever was emitted first.
 using SeenSet = std::set<std::tuple<const ValueSymbol*, const ValueSymbol*, uint32_t,
                                     uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                    bool, bool, bool, uint8_t>>;
+                                    bool, bool, bool, uint8_t, bool>>;
 
 /// Calls `fn` for every instantiation in `scope` whose module slang could not
 /// resolve, descending generate blocks exactly as `forEachInstance` does.
@@ -1870,7 +2080,7 @@ private:
         std::map<StmtKey, EdgeRow> pendingNull;
 
         StatementWalker walker([&](const Ref& dst, const Ref& src, bool gatingEdge,
-                                   SourceRange where) {
+                                   bool mapExact, SourceRange where) {
             reached = true;
             // Self-feedback is kept, same bits included. Following a *driver*
             // backwards, `cnt <= cnt + 1` adds nothing new -- which is why an
@@ -1900,7 +2110,7 @@ private:
                               sk.first, sk.second,
                               gatingEdge, dst.exact,
                               src.sym ? src.exact : true,
-                              kindTag(kind))
+                              kindTag(kind), mapExact)
                      .second)
                 return;
             EdgeRow row;
@@ -1945,6 +2155,7 @@ private:
                     row.kind = kind;
                     row.construct = construct;
                     row.control = gatingEdge;
+                    row.mapExact = mapExact;
                     row.file = at.file;
                     row.line = at.line;
                     pendingNull.try_emplace({dst.sym, at.file, stmtLine}, row);
@@ -1965,6 +2176,7 @@ private:
             // `construct` made a consumer string-match a suffix to recover one of
             // two orthogonal facts.
             row.control = gatingEdge;
+            row.mapExact = mapExact;
             row.file = at.file;
             row.line = at.line;
             if (src.sym)
@@ -2079,7 +2291,7 @@ private:
             if (!seen.emplace(dstSym, nullptr, fileKey(keyFile), keyLine,
                               dk.first, dk.second, uint64_t(0), uint64_t(0),
                               row.control, row.dstExact, true,
-                              kindTag(row.kind))
+                              kindTag(row.kind), row.mapExact)
                      .second)
                 continue;
             out.push_back(row);
@@ -2204,7 +2416,7 @@ private:
                                   uint64_t(0), uint64_t(0),
                                   sk.first, sk.second,
                                   false, true, r.exact,
-                                  kindTag("continuous_assign"))
+                                  kindTag("continuous_assign"), true)
                          .second) {
                     anySource = true;
                     continue;
@@ -2225,7 +2437,7 @@ private:
                              uint64_t(0), uint64_t(0),
                              uint64_t(0), uint64_t(0),
                              false, true, true,
-                             kindTag("continuous_assign"))
+                             kindTag("continuous_assign"), true)
                     .second) {
                 out.push_back(std::move(base));
             }
@@ -2366,7 +2578,7 @@ private:
                                       dk.first, dk.second,
                                       sk.first, sk.second,
                                       false, dst.exact, src.exact,
-                                      kindTag("primitive"))
+                                      kindTag("primitive"), true)
                              .second) {
                         anyInput = true;   // already recorded, still an input
                         continue;
@@ -2393,7 +2605,7 @@ private:
                                  dk.first, dk.second,
                                  uint64_t(0), uint64_t(0),
                                  false, dst.exact, true,
-                                 kindTag("primitive"))
+                                 kindTag("primitive"), true)
                         .second) {
                     out.push_back(std::move(base));
                 }

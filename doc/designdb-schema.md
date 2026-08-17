@@ -9,9 +9,24 @@ include directories, and optionally a top module.
 **Out:** one SQLite file. No runtime, no library, no simulator — anything that
 speaks SQL can read it.
 
-**Schema version 6.** `meta.schema_version` carries it. A reader that does not
+**Schema version 7.** `meta.schema_version` carries it. A reader that does not
 know the version should refuse the file rather than read it as though the layout
 had held.
+
+Version 7 stopped crossing the two sides of an assignment. Every target used to
+be paired with every operand, so
+
+```systemverilog
+assign {a, b} = {x, y};
+```
+
+exported four edges where the RTL has two — and `y → a` and `x → b`, which are
+not dataflow at all, carried `src_exact = 1` and `dst_exact = 1` exactly like the
+two real ones. Both sides are now walked as positioned slots and paired only
+where their bits meet, which also narrows the target: `q[7:0] = {hi, lo}` records
+`hi → q[7:4]` rather than `hi → q`. `assign_operand` was crossed the same way and
+is fixed with it. The new `edge.map_exact` column says whether the pairing is
+per-bit — see [Bit correspondence](#bit-correspondence).
 
 Version 6 gave names to two relations that were being guessed from file and line.
 
@@ -258,6 +273,7 @@ uses, which is the consumer's judgement to make, not a column here.
 | | `control` | 1 when the operand reached the target through a branch condition rather than the right-hand side. |
 | | `file`, `line` | The statement's own line, not the enclosing procedure's. |
 | | `src_lo`/`src_hi`/`src_exact`, `dst_lo`/`dst_hi`/`dst_exact` | Bit ranges — see [below](#bit-ranges). |
+| | `map_exact` | Whether the source's bits map one-to-one onto the target's. Not a restatement of the two `*_exact` columns — see [Bit correspondence](#bit-correspondence). |
 
 | table | column | meaning |
 |---|---|---|
@@ -308,6 +324,37 @@ for.
 edge says `c` reaches `q` as a condition, not which of the two assignments it
 gates. That is the [deliberate omission](#what-is-deliberately-not-here) below,
 not a gap in this pair of tables.
+
+### Bit correspondence
+
+Three columns on `edge` describe precision, and they answer different questions.
+`src_exact` and `dst_exact` each describe **one end**: whether that end's bit
+range could be narrowed, or is an upper bound. **`map_exact` describes the
+relationship between the ends** — whether a bit of the source can be followed to
+a specific bit of the target.
+
+They are independent. `q = a + b` knows both ranges exactly and still cannot say
+which bit of `a` reaches which bit of `q`, because a carry crosses them:
+`src_exact = 1`, `dst_exact = 1`, `map_exact = 0`.
+
+| what the RTL says | edges | `map_exact` |
+|---|---|---|
+| `{a, b} = {x, y}` | `x → a`, `y → b` | 1 — the halves correspond, and the pairs that do not share a bit are not edges at all |
+| `q[7:0] = {hi, lo}` | `hi → q[7:4]`, `lo → q[3:0]` | 1 — each operand drives its own slice |
+| `q = a + b` | `a → q`, `b → q` | 0 — real dependencies, no per-bit mapping |
+| `q = {2{a}}` | `a → q` | 0 — one source in two places |
+| `q = f(a)` | `a → q` | 0 — opaque |
+
+**`map_exact = 0` does not mean the dependency is doubtful.** The source does
+reach the target; the pairing is simply at range granularity rather than bit
+granularity. A consumer doing bit-level tracing should follow `map_exact = 1`
+edges bit by bit and treat `map_exact = 0` edges as coupling the whole ranges.
+
+A few conservative cases report 0 where a sharper answer exists: a widened
+operand (`q = a` with `a` narrower), a truncated one, and bitwise operators like
+`~a` that really are per-bit. Being wrong in the other direction — claiming a
+correspondence that does not hold — is what this column exists to prevent, so the
+rule is deliberately narrow: only a plain reference filling its window exactly.
 
 ### Statement identity
 
@@ -475,6 +522,10 @@ Read them together with `*_exact`:
 | set | 0 | somewhere **within** those bits — a static outer select with a dynamic inner one (`mem2[1][i]`) narrows the range without pinning it |
 
 Storing both NULL cases the same way made uncertainty read as fact.
+
+`*_exact` describes **one end's own range**. Whether the two ends correspond bit
+for bit is a separate question with a separate column — see
+[Bit correspondence](#bit-correspondence).
 
 ## Provenance
 

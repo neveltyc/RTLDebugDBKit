@@ -45,7 +45,7 @@ print("ok: integrity_check and foreign_key_check pass")
 
 # Value domain: boolean-ish columns must be 0, 1, or NULL.
 for tbl, cols in (
-    ("edge", ("control", "src_exact", "dst_exact")),
+    ("edge", ("control", "src_exact", "dst_exact", "map_exact")),
     ("port", ("outer_exact",)),
     ("proc_event", ("wait",)),
     ("assign_operand", ("src_exact",)),
@@ -137,7 +137,7 @@ print("ok: every child expands and every module instance names its child")
 # The required `meta` key set below is part of that version: a database written
 # before those keys existed is not a v5 database, and this check is what stops
 # it being read as one.
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
 if not version or version[0] != SCHEMA_VERSION:
     sys.exit(f"schema_version is {version and version[0]!r}, expected {SCHEMA_VERSION!r}")
@@ -393,6 +393,61 @@ if mode == "constructs":
         SELECT count(*) FROM assignment a
         JOIN file f ON f.id = a.file JOIN name d ON d.id = a.dst
         WHERE f.path LIKE '%seq.svh' AND d.text = 'u_cnt.dbg'""")
+
+    # `{packed_hi, packed_lo} = {swap_lo, swap_hi}` -- the halves cross, and the
+    # pairs that do not share a bit are not dataflow. Pairing every target with
+    # every operand gave four edges here instead of two, and marked all four
+    # exact on both ends, so the two false ones were indistinguishable from the
+    # two real ones.
+    crossed = con.execute("""
+        SELECT s.text, d.text FROM edge e
+        JOIN module m ON m.id = e.module
+        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
+        WHERE m.name = 'packing' AND d.text LIKE 'packed_%'
+        ORDER BY d.text""").fetchall()
+    if crossed != [("swap_lo", "packed_hi"), ("swap_hi", "packed_lo")]:
+        sys.exit(f"packing's crossed halves are {crossed}, expected exactly "
+                 "swap_lo->packed_hi and swap_hi->packed_lo; the two sides of "
+                 "the assignment are being crossed again")
+    print("ok: a concatenated assignment pairs halves, it does not cross them")
+    # And the target is sliced: an operand drives the bits it occupies, not all
+    # of them. `assign bits = {swap_hi, swap_lo}` is one target and two operands,
+    # so this is the half that a disjointness check alone would not catch.
+    sliced = con.execute("""
+        SELECT s.text, e.dst_lo, e.dst_hi, e.map_exact FROM edge e
+        JOIN module m ON m.id = e.module
+        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
+        WHERE m.name = 'packing' AND d.text = 'bits'
+        ORDER BY e.dst_lo DESC""").fetchall()
+    if sliced != [("swap_hi", 4, 7, 1), ("swap_lo", 0, 3, 1)]:
+        sys.exit(f"packing's sliced target is {sliced}, expected swap_hi->[4,7] "
+                 "and swap_lo->[0,3], both positionally exact")
+    print("ok: each operand of a concatenation drives its own slice of the target")
+    # assign_operand was crossed the same way and is fixed by the same pairing.
+    ops = con.execute("""
+        SELECT d.text, n.text FROM assignment a
+        JOIN module m ON m.id = a.module
+        JOIN name d ON d.id = a.dst
+        JOIN assign_operand ao ON ao.assignment = a.id
+        JOIN name n ON n.id = ao.name
+        WHERE m.name = 'packing' AND d.text LIKE 'packed_%'
+        ORDER BY d.text""").fetchall()
+    if ops != [("packed_hi", "swap_lo"), ("packed_lo", "swap_hi")]:
+        sys.exit(f"packing's assign_operand rows are {ops}, expected one operand "
+                 "each; the statement-level read set is crossed")
+    print("ok: assign_operand is not crossed either")
+    # A carry means no per-bit correspondence, and the database has to say so
+    # rather than claim one. `cnt <= cnt + 1` in `counter` is the case.
+    coarse = con.execute("""
+        SELECT count(*) FROM edge e
+        JOIN module m ON m.id = e.module
+        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
+        WHERE m.name = 'counter' AND d.text = 'cnt' AND s.text = 'cnt'
+          AND e.map_exact = 0""").fetchone()[0]
+    if not coarse:
+        sys.exit("`cnt <= cnt + 1` claims a positional bit mapping; a carry "
+                 "crosses bits, so map_exact must be 0 there")
+    print("ok: an arithmetic dependency is not claimed as a per-bit mapping")
 
     # `if (c) sel <= a; else sel <= b;` -- two statements, three edges (the
     # condition is one), and all five rows carrying the same module, dst, file

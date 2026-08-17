@@ -79,6 +79,15 @@ for tbl, col in (("edge", "src_exact"), ("edge", "dst_exact"),
     inexact[f"{tbl}.{col}"] = {"inexact": n, "of": total, "pct": share(n, total)}
 report["inexact_ranges"] = inexact
 
+# Edges whose two ends do not correspond bit for bit. Not a defect count -- a
+# design full of arithmetic legitimately reports a high share -- but it is the
+# fraction of the graph a bit-level trace cannot follow precisely, which is worth
+# knowing before trusting one.
+edges_total = scalar("SELECT count(*) FROM edge WHERE src IS NOT NULL")
+coarse = scalar("SELECT count(*) FROM edge WHERE src IS NOT NULL AND map_exact = 0")
+report["coarse_bit_mapping"] = {
+    "n": coarse, "of": edges_total, "pct": share(coarse, edges_total)}
+
 # Operands the exporter removed: compile-time constants, and references that
 # leave the module. A row with one operand and three dropped does not read the
 # way a row that genuinely reads one signal does, and only this column tells
@@ -158,6 +167,8 @@ print(f"\ndropped operands   {d['total']:,} across {d['assignments_affected']:,}
       f"of {d['of']:,} assignments ({d['pct']}%)")
 e = report["edges_without_source"]
 print(f"edges w/o source   {e['n']:,} of {e['of']:,} ({e['pct']}%)")
+c = report["coarse_bit_mapping"]
+print(f"no per-bit map     {c['n']:,} of {c['of']:,} sourced edges ({c['pct']}%)")
 u = report["undriven_signals"]
 print(f"undriven internal  {u['internal']:,} of {u['of_non_input']:,} non-input signals "
       f"({u['pct_of_non_input']}%)")

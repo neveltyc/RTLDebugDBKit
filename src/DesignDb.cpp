@@ -151,7 +151,25 @@ CREATE TABLE edge(
     -- exact=0 is somewhere inside it, unknown where. Storing both as NULL made
     -- the second read as the first.
     src_lo    INTEGER, src_hi INTEGER, src_exact INTEGER,
-    dst_lo    INTEGER, dst_hi INTEGER, dst_exact INTEGER);
+    dst_lo    INTEGER, dst_hi INTEGER, dst_exact INTEGER,
+    -- 1 when the source's bits map one-to-one onto the target's, so a bit-level
+    -- trace can follow this edge bit by bit. 0 when the source only influences
+    -- the target's range as a whole.
+    --
+    -- `src_exact` and `dst_exact` each describe *one side*: whether that end's
+    -- range could be narrowed. Neither says anything about the relationship
+    -- between the ends, and both can be 1 while the correspondence is coarse --
+    -- `q = a + b` knows exactly which bits of `a` and of `q` are involved and
+    -- still cannot say which bit of `a` reaches which bit of `q`, because a
+    -- carry crosses them.
+    --
+    -- 0 does not mean the dependency is doubtful; the source does reach the
+    -- target. It means the pairing is at range granularity. That distinction
+    -- exists because it used to be unavailable: `{a, b} = {x, y}` was exported
+    -- as four edges, all four marked exact on both sides, and the two of them
+    -- that are not dataflow at all -- `y -> a`, `x -> b` -- were
+    -- indistinguishable from the two that are.
+    map_exact INTEGER);
 
 -- What a module instantiates. Expanding `instance` against this is what turns
 -- the folded model back into hierarchy, and `instance.child` is the link that
@@ -544,7 +562,7 @@ Writer::Writer(const std::string& path) {
     exec("PRAGMA synchronous=OFF");
     exec(kSchema);
 
-    prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
+    prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
     prepare("INSERT INTO child VALUES(?,?,?,?,?,?)", &insChild);
     prepare("INSERT INTO instance VALUES(?,?,?,?,?)", &insInstance);
     prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insPort);
@@ -782,6 +800,7 @@ void Writer::addEdges(int64_t moduleId, const std::vector<EdgeRow>& rows) {
         sqlite3_bind_int(insEdge, 13, r.srcExact ? 1 : 0);
         bindOptRange(insEdge, 14, 15, r.dstBits);
         sqlite3_bind_int(insEdge, 16, r.dstExact ? 1 : 0);
+        sqlite3_bind_int(insEdge, 17, r.mapExact ? 1 : 0);
         step(insEdge);
         if (++pending >= kBatch) {
             commit();

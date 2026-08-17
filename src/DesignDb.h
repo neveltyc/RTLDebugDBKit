@@ -61,7 +61,19 @@ namespace designdb {
 /// and an unresolved instantiation had no `instance` row at all -- so a path
 /// through a black box did not resolve, and the tree reported the same emptiness
 /// as a module that instantiates nothing.
-inline constexpr int SchemaVersion = 6;
+/// v7 stopped crossing the two sides of an assignment. Every target used to be
+/// paired with every operand, so `{a, b} = {x, y}` exported four edges where the
+/// RTL has two -- and `y -> a` and `x -> b`, which are not dataflow at all,
+/// carried src_exact=1 and dst_exact=1 like the two real ones. Both sides are now
+/// walked as positioned slots and paired only where their bits meet, which also
+/// narrows the target: `q[7:0] = {hi, lo}` records `hi -> q[7:4]` rather than `hi
+/// -> q`. `assign_operand` was crossed the same way and is fixed with it.
+///
+/// `edge.map_exact` is the new column, and it is not a restatement of
+/// src_exact/dst_exact: those describe each end's own range, while this describes
+/// the correspondence between the ends. `q = a + b` knows both ranges exactly and
+/// still cannot say which bit reaches which, because a carry crosses them.
+inline constexpr int SchemaVersion = 7;
 
 /// One intra-module dataflow edge, in the module's own namespace.
 ///
@@ -88,6 +100,12 @@ struct EdgeRow {
     bool dstExact = true;
     // The operand reached the target through a condition, not the RHS.
     bool control = false;
+    /// The source's bits map one-to-one onto the target's, so a bit-level trace
+    /// can follow this edge bit by bit. False when the source only influences the
+    /// target's range as a whole -- `a + b` carries across bits, a call is
+    /// opaque. Distinct from srcExact/dstExact, which each describe one end's own
+    /// range and say nothing about the correspondence between the ends.
+    bool mapExact = false;
 };
 
 /// One assignment: a statement that writes a target.
