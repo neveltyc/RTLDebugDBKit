@@ -2,41 +2,66 @@
 # Copyright (c) 2026 neveltyc
 # released under the BSD 3-Clause License (see LICENSE)
 #
-# Read an exported database back and fail if it is hollow. A build that links
-# proves the slang pin resolves; this proves the exporter still writes rows.
-# CI runs it against examples/ on every platform binary it builds, so it
-# asserts only what those small designs must produce, not exact counts.
+# Read an exported database back and fail if it is hollow or malformed. A
+# build that links proves the slang pin resolves; this proves the exporter
+# still writes rows -- and that the rows keep every contract the schema
+# documents: the subtype bijections, the ownership rules, the provenance
+# matrix behind net_dep, the range discipline, and the twelve stable views
+# with their exact columns and row formulas. CI runs it against examples/ on
+# every platform binary it builds, so the mode branches assert only what
+# those small designs must produce, not exact counts.
 #
-#   verify-designdb.py <design.db>              the hollow check
-#   verify-designdb.py <design.db> constructs   + what examples/constructs/constructs.sv must yield
-#   verify-designdb.py <design.db> interfaces   + what examples/constructs/interfaces.sv must yield
-#   verify-designdb.py <design.db> assertions   + what examples/constructs/assertions.sv must yield
+#   verify-designdb.py <design.db>              the universal checks
+#   verify-designdb.py <design.db> constructs   + examples/constructs/constructs.sv facts
+#   verify-designdb.py <design.db> interfaces   + examples/constructs/interfaces.sv facts
+#   verify-designdb.py <design.db> assertions   + examples/constructs/assertions.sv facts
+#   verify-designdb.py <design.db> hierarchy    + examples/constructs/hierarchy.sv facts
+#   verify-designdb.py <design.db> udp          + examples/constructs/udp.sv facts
+#   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
 import sqlite3
 import sys
 
-if len(sys.argv) not in (2, 3):
-    sys.exit(f"usage: {sys.argv[0]} <design.db> [constructs|interfaces|assertions]")
+MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
+         "unresolved")
+if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
+    sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
+SCHEMA_VERSION = "10"
+
+
+def one(sql, *args):
+    return con.execute(sql, args).fetchone()[0]
+
+
+def check(ok, msg, detail=""):
+    if not ok:
+        sys.exit(f"FAIL: {msg}" + (f" ({detail})" if detail else ""))
+    print(f"ok: {msg}")
+
+
+# ----------------------------------------------------------------- hollow
 counts = {
-    t: con.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
-    for t in ("module", "instance", "symbol", "edge", "port")
+    t: one(f'SELECT count(*) FROM "{t}"')
+    for t in ("module", "tree_node", "inst", "net", "term", "term_map")
 }
 print("row counts:", counts)
 empty = [t for t, n in counts.items() if n == 0]
 if empty:
     sys.exit(f"exported database has no rows in: {', '.join(empty)}")
-baddig = con.execute("""
-    SELECT count(*) FROM source_file
-    WHERE digest IS NULL OR length(digest) != 64""").fetchone()[0]
-total_sf = con.execute("SELECT count(*) FROM source_file").fetchone()[0]
+
+baddig = one("SELECT count(*) FROM source_file "
+             "WHERE digest IS NULL OR length(digest) != 64")
+total_sf = one("SELECT count(*) FROM source_file")
 if total_sf == 0 or baddig:
     sys.exit(f"{baddig} of {total_sf} source_file row(s) lack a SHA-256 digest")
 
-# Structural integrity — catches corruption and generator bugs.
-ic = con.execute("PRAGMA integrity_check").fetchone()[0]
+# Structural integrity -- catches corruption and generator bugs. The writer
+# leaves foreign_keys off for speed, so this is where the REFERENCES clauses
+# are actually enforced.
+ic = one("PRAGMA integrity_check")
 if ic != "ok":
     sys.exit(f"integrity_check failed: {ic}")
 con.execute("PRAGMA foreign_keys = ON")
@@ -46,1059 +71,906 @@ if fk_errs:
              f"first: table={fk_errs[0][0]} rowid={fk_errs[0][1]}")
 print("ok: integrity_check and foreign_key_check pass")
 
-# Value domain: boolean-ish columns must be 0, 1, or NULL.
+# ---------------------------------------------------------- value domains
+# The DDL carries CHECK constraints for the closed enums; re-checking here
+# catches a database written by a producer that dropped them, and covers the
+# open sets (declaration_kind) and the NULL-required combinations CHECK
+# cannot express.
+for tbl, col, values, nullable in (
+    ("module", "definition_kind", ("module", "interface", "program", "checker"), False),
+    ("tree_node", "node_kind", ("root", "instance", "generate", "primitive", "unresolved"), False),
+    ("primitive", "primitive_kind", ("gate", "switch", "udp"), False),
+    ("term", "terminal_kind", ("signal", "interface"), False),
+    ("term", "direction", ("input", "output", "inout", "ref"), True),
+    ("net_conn", "connection_kind",
+     ("signal", "constant", "unconnected", "expression_operand", "interface",
+      "external_reference"), False),
+    ("procedure", "procedure_kind",
+     ("always", "always_ff", "always_comb", "always_latch", "initial", "final",
+      "task", "function"), False),
+    ("stmt", "statement_kind",
+     ("assignment", "assertion", "wait", "call", "system_task", "event_control"), False),
+    ("stmt", "assignment_kind", ("continuous", "blocking", "nonblocking"), True),
+    ("expr_ref", "role",
+     ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
+    ("proc_event", "event_kind", ("sensitivity", "wait"), False),
+    ("proc_event", "edge_kind", ("posedge", "negedge", "both"), True),
+    ("net_dep", "dependency_kind", ("data", "control", "primitive", "procedure"), False),
+    ("hier_ref", "access", ("read", "write", "connect"), False),
+):
+    qs = ",".join("?" for _ in values)
+    null = f'OR "{col}" IS NULL' if not nullable else ""
+    bad = one(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" NOT IN ({qs}) {null}',
+              *values)
+    if bad:
+        sys.exit(f"{tbl}.{col}: {bad} row(s) outside its value domain")
+print("ok: every enum column stays in its domain")
+
 for tbl, cols in (
-    ("edge", ("control", "src_exact", "dst_exact", "map_exact")),
-    ("port", ("outer_exact", "port_exact", "map_exact")),
-    ("proc_event", ("wait",)),
-    ("assign_operand", ("src_exact",)),
-    ("stmt_read", ("src_exact",)),
-    ("hier_ref", ("path_exact", "write")),
+    ("net", ("is_implicit",)),
+    ("term", ("is_const",)),
+    ("term_map", ("term_exact", "net_exact", "mapping_exact")),
+    ("net_conn", ("net_exact", "term_exact", "mapping_exact")),
+    ("assign_target", ("is_exact",)),
+    ("assign_operand", ("is_exact",)),
+    ("expr_ref", ("is_exact",)),
+    ("net_dep", ("source_exact", "target_exact", "mapping_exact")),
+    ("hier_ref", ("is_exact",)),
 ):
     for col in cols:
-        bad = con.execute(
-            f'SELECT count(*) FROM "{tbl}" WHERE "{col}" NOT IN (0, 1) '
-            f'AND "{col}" IS NOT NULL').fetchone()[0]
+        bad = one(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" NOT IN (0,1) '
+                  f'AND "{col}" IS NOT NULL')
         if bad:
-            sys.exit(f"{bad} row(s) in {tbl}.{col} outside {{0, 1, NULL}}")
+            sys.exit(f"{tbl}.{col}: {bad} value(s) outside 0/1/NULL")
 print("ok: boolean columns are 0/1/NULL")
 
-# Range consistency: lo <= hi when both are non-NULL.
-for tbl, lo, hi in (
-    ("edge", "src_lo", "src_hi"), ("edge", "dst_lo", "dst_hi"),
-    ("port", "outer_lo", "outer_hi"), ("port", "port_lo", "port_hi"),
-    ("assignment", "dst_lo", "dst_hi"),
-    ("assign_operand", "src_lo", "src_hi"),
-    ("stmt_read", "src_lo", "src_hi"),
-    ("hier_ref", "path_lo", "path_hi"),
+# ------------------------------------------------------- range discipline
+# A range's lo and hi are both present or both absent, lo <= hi, and a range
+# with real endpoints always says whether it is exact. NULL bits with
+# exact=1 is the whole object; NULL bits with exact=0 is somewhere inside
+# it; both spellings need the exact bit to be readable at all.
+for tbl, lo, hi, exact in (
+    ("term_map", "term_lo", "term_hi", "term_exact"),
+    ("term_map", "net_lo", "net_hi", "net_exact"),
+    ("net_conn", "net_lo", "net_hi", "net_exact"),
+    ("net_conn", "term_lo", "term_hi", "term_exact"),
+    ("assign_target", "lo", "hi", "is_exact"),
+    ("assign_operand", "lo", "hi", "is_exact"),
+    ("expr_ref", "lo", "hi", "is_exact"),
+    ("net_dep", "source_lo", "source_hi", "source_exact"),
+    ("net_dep", "target_lo", "target_hi", "target_exact"),
+    ("hier_ref", "lo", "hi", "is_exact"),
 ):
-    bad = con.execute(
-        f'SELECT count(*) FROM "{tbl}" WHERE "{lo}" IS NOT NULL '
-        f'AND "{hi}" IS NOT NULL AND "{lo}" > "{hi}"').fetchone()[0]
+    bad = one(f'SELECT count(*) FROM "{tbl}" '
+              f'WHERE ("{lo}" IS NULL) != ("{hi}" IS NULL)')
     if bad:
-        sys.exit(f"{bad} row(s) in {tbl} have {lo} > {hi}")
-# direction is an enum, not a boolean: 0=in 1=out 2=inout 3=ref, NULL when
-# the declaration is not a port or the binding is an interface.
-for tbl in ("symbol", "port"):
-    bad = con.execute(
-        f'SELECT count(*) FROM "{tbl}" WHERE direction NOT IN (0, 1, 2, 3) '
-        f'AND direction IS NOT NULL').fetchone()[0]
+        sys.exit(f"{tbl}: {bad} range(s) with only one endpoint ({lo}/{hi})")
+    bad = one(f'SELECT count(*) FROM "{tbl}" WHERE "{lo}" > "{hi}"')
     if bad:
-        sys.exit(f"{bad} row(s) in {tbl}.direction outside {{0, 1, 2, 3, NULL}}")
-print("ok: direction values are valid")
-print("ok: range lo <= hi")
+        sys.exit(f"{tbl}: {bad} range(s) with {lo} > {hi}")
+    bad = one(f'SELECT count(*) FROM "{tbl}" '
+              f'WHERE "{lo}" IS NOT NULL AND "{exact}" IS NULL')
+    if bad:
+        sys.exit(f"{tbl}: {bad} range(s) with endpoints but NULL {exact}")
+print("ok: range lo/hi pair up, lo <= hi, endpoints imply exact")
 
-# child.kind is what `def_module IS NULL` could not say: a gate whose dataflow is
-# already in the parent's edges, versus a black box that has none anywhere.
-bad_kind = con.execute(
-    "SELECT count(*) FROM child WHERE kind NOT IN ('module','primitive','unresolved')"
-).fetchone()[0]
-if bad_kind:
-    sys.exit(f"{bad_kind} child row(s) have a kind outside "
-             "{module, primitive, unresolved}")
-mismatched = con.execute("""
-    SELECT count(*) FROM child
-    WHERE (kind = 'module') != (def_module IS NOT NULL)""").fetchone()[0]
-if mismatched:
-    sys.exit(f"{mismatched} child row(s) disagree between kind and def_module; "
-             "only kind='module' has a module row, and it always has one")
-print("ok: child.kind agrees with def_module")
+# -------------------------------------------------- tree and the subtypes
+check(one("SELECT count(*) FROM tree_node WHERE (parent_node_id IS NULL) != "
+          "(node_kind = 'root')") == 0,
+      "root nodes are exactly the parentless ones")
+check(one("""
+    SELECT count(*) FROM tree_node t
+    WHERE (t.node_kind IN ('root','instance','unresolved'))
+          != EXISTS (SELECT 1 FROM inst i WHERE i.id = t.id)""") == 0,
+      "instance-like nodes have inst rows, others do not")
+check(one("""
+    SELECT count(*) FROM tree_node t
+    WHERE (t.node_kind = 'primitive')
+          != EXISTS (SELECT 1 FROM primitive p WHERE p.id = t.id)""") == 0,
+      "primitive nodes have primitive rows, others do not")
+check(one("""
+    SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
+    WHERE (t.node_kind = 'unresolved') != (i.module_id IS NULL)""") == 0,
+      "unresolved is exactly module_id NULL")
+check(one("""
+    SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
+    WHERE t.node_kind = 'unresolved' AND (i.unresolved_definition IS NULL
+          OR i.parameter_signature IS NOT NULL)""") == 0,
+      "an unresolved inst names its definition and no parameters")
+check(one("SELECT count(*) FROM inst WHERE (parent_inst_id IS NULL) != "
+          "(id IN (SELECT id FROM tree_node WHERE node_kind='root'))") == 0,
+      "the root instances are exactly the parentless inst rows")
 
-# The two hierarchy tables must actually be related, in both directions.
-# A `child` nobody expands means the folded row describes an instantiation the
-# tree does not have; a module instance with no `child` means the tree has a node
-# nothing declared. Both were unnoticeable before the column existed.
-unexpanded = con.execute("""
-    SELECT count(*) FROM child c
-    WHERE NOT EXISTS (SELECT 1 FROM instance i WHERE i.child = c.id)""").fetchone()[0]
-if unexpanded:
-    sys.exit(f"{unexpanded} child row(s) are never expanded into an instance")
-unlinked = con.execute("""
-    SELECT count(*) FROM instance
-    WHERE parent IS NOT NULL AND module IS NOT NULL AND child IS NULL""").fetchone()[0]
-if unlinked:
-    sys.exit(f"{unlinked} module instance(s) below the root name no child row; "
-             "the folded and expanded hierarchies have come apart")
-# The root is the one instance nothing declares, and there is exactly one per
-# elaborated top.
-rootless = con.execute(
-    "SELECT count(*) FROM instance WHERE parent IS NULL AND child IS NOT NULL"
-).fetchone()[0]
-if rootless:
-    sys.exit(f"{rootless} root instance(s) claim a child row; nothing declares a top")
-print("ok: every child expands and every module instance names its child")
+# The hierarchy is encoded twice -- tree_node.parent_node_id and
+# inst.parent_inst_id -- and the two must tell one story: parent_inst is the
+# nearest inst on the tree_node ancestor chain. `nearest` walks up from each
+# node, stopping at the first ancestor that IS an inst.
+NEAREST = """
+    WITH RECURSIVE up(node, cur) AS (
+        SELECT id, parent_node_id FROM tree_node
+        UNION ALL
+        SELECT up.node, t.parent_node_id FROM up
+        JOIN tree_node t ON t.id = up.cur
+        WHERE NOT EXISTS (SELECT 1 FROM inst WHERE inst.id = up.cur)
+    ),
+    nearest(node, anc) AS (
+        SELECT node, cur FROM up
+        WHERE cur IS NULL OR EXISTS (SELECT 1 FROM inst WHERE inst.id = up.cur)
+    )
+"""
+check(one(NEAREST + """
+    SELECT count(*) FROM inst i JOIN nearest n ON n.node = i.id
+    WHERE COALESCE(i.parent_inst_id, 0) != COALESCE(n.anc, 0)""") == 0,
+      "inst.parent_inst_id is the nearest inst ancestor")
+check(one(NEAREST + """
+    SELECT count(*) FROM primitive p JOIN nearest n ON n.node = p.id
+    WHERE COALESCE(p.inst_id, 0) != COALESCE(n.anc, 0)""") == 0,
+      "primitive.inst_id is the owning instance")
 
-# A tree node and the child row it expands agree on what they are: a module
-# node has a module, and it is the child's def_module. The port/child
-# consistency check below guards the same shape on the other denormalized pair.
-tc = con.execute("""
-    SELECT count(*) FROM instance i JOIN child c ON c.id = i.child
-    WHERE ((c.kind = 'module') != (i.module IS NOT NULL))
-       OR (c.kind = 'module' AND i.module != c.def_module)""").fetchone()[0]
-if tc:
-    sys.exit(f"{tc} instance(s) disagree with their child row about module identity")
-# Among resolved module instantiations, one name in one body is one child row.
-# Not a UNIQUE constraint, deliberately: unnamed gates and partial elaboration
-# legitimately collide, so only the module-kind subset is held to it.
-dupc = con.execute("""
-    SELECT count(*) FROM (
-        SELECT 1 FROM child WHERE kind = 'module'
-        GROUP BY module, name HAVING count(*) > 1)""").fetchone()[0]
-if dupc:
-    sys.exit(f"{dupc} (module, name) pair(s) among module children are duplicated")
-print("ok: the tree, the child rows and their names agree")
+# A scope node is the instance itself or a generate level inside it; the
+# owner of a scope is the scope when it is an inst, else its nearest inst.
+SCOPE_OWNER = NEAREST + """
+    , owner(node, inst) AS (
+        SELECT t.id,
+               CASE WHEN EXISTS (SELECT 1 FROM inst WHERE inst.id = t.id)
+                    THEN t.id
+                    ELSE (SELECT anc FROM nearest WHERE nearest.node = t.id) END
+        FROM tree_node t
+    )
+"""
+for tbl in ("net", "procedure", "stmt"):
+    check(one(SCOPE_OWNER + f"""
+        SELECT count(*) FROM "{tbl}" x JOIN owner o ON o.node = x.scope_node_id
+        WHERE o.inst != x.inst_id""") == 0,
+          f"{tbl}.scope_node_id lies inside its own instance")
+check(one("SELECT count(*) FROM tree_node WHERE instr(name, '.') > 0") == 0,
+      "every tree node name is a single path segment")
 
-# A row with no source has no source end to describe: every column describing
-# one is NULL, exactly as a tied-off port's outer columns are. src_exact=1 on
-# a null source used to say "reads exactly all of nothing", and map_exact=1
-# invited a bit-level tracer to follow a driver that does not exist.
-nulldisc = con.execute("""
-    SELECT count(*) FROM edge
-    WHERE (src IS NULL AND (src_lo IS NOT NULL OR src_hi IS NOT NULL
-                            OR src_exact IS NOT NULL OR map_exact IS NOT NULL))
-       OR (src IS NOT NULL AND (src_exact IS NULL OR map_exact IS NULL))""").fetchone()[0]
-if nulldisc:
-    sys.exit(f"{nulldisc} edge(s) break the null-source discipline: no source, "
-             "no source-describing columns; a source, both flags")
-print("ok: null-source edges describe nothing and sourced edges describe it all")
+# ------------------------------------------------------------- ownership
+check(one("""
+    SELECT count(*) FROM term_map m
+    JOIN term t ON t.id = m.term_id JOIN net n ON n.id = m.net_id
+    WHERE t.inst_id != n.inst_id""") == 0,
+      "term_map stays inside one instance")
+check(one("""
+    SELECT count(*) FROM net_conn c
+    JOIN term t ON t.id = c.term_id
+    JOIN net n ON n.id = c.net_id
+    JOIN inst child ON child.id = t.inst_id
+    WHERE n.inst_id != child.parent_inst_id""") == 0,
+      "a connection's net belongs to the terminal's parent instance")
+for tbl in ("assign_target", "assign_operand", "expr_ref"):
+    check(one(f"""
+        SELECT count(*) FROM "{tbl}" x
+        JOIN stmt s ON s.id = x.stmt_id JOIN net n ON n.id = x.net_id
+        WHERE s.inst_id != n.inst_id""") == 0,
+          f"{tbl} references nets of its statement's instance")
+check(one("""
+    SELECT count(*) FROM proc_event e
+    JOIN procedure p ON p.id = e.procedure_id
+    LEFT JOIN net n ON n.id = e.net_id
+    LEFT JOIN stmt s ON s.id = e.stmt_id
+    WHERE (n.id IS NOT NULL AND n.inst_id != p.inst_id)
+       OR (s.id IS NOT NULL AND COALESCE(s.procedure_id, 0) != e.procedure_id)""") == 0,
+      "proc_event stays inside its procedure")
+check(one("""
+    SELECT count(*) FROM proc_event
+    WHERE (event_kind = 'sensitivity') != (stmt_id IS NULL)""") == 0,
+      "sensitivity events belong to the header, waits to a statement")
 
-# port_exact's NULL means "no formal bit domain in this row", and only two
-# kinds have none: an unconnected port and an interface binding. A constant
-# and an external tie occupy their windows.
-pe = con.execute("""
-    SELECT count(*) FROM port
-    WHERE (conn_kind IN (2, 4) AND port_exact IS NOT NULL)
-       OR (conn_kind IN (0, 1, 3, 5) AND port_exact IS NULL)""").fetchone()[0]
-if pe:
-    sys.exit(f"{pe} port row(s) break the port_exact rule: windows for nets, "
-             "constants, expressions and external ties; NULL for unconnected "
-             "and interface")
-print("ok: port_exact agrees with connection_kind")
+# ------------------------------------------------------- statement rules
+check(one("""
+    SELECT count(*) FROM stmt
+    WHERE (statement_kind = 'assignment') != (assignment_kind IS NOT NULL)""") == 0,
+      "assignment_kind is set exactly on assignments")
+# One direction only: a continuous assignment is never inside a procedure,
+# but a procedure-less blocking/nonblocking row is legal -- a function body
+# reached from an `assign` keeps its own `=`, and executes in no procedure.
+check(one("""
+    SELECT count(*) FROM stmt
+    WHERE assignment_kind = 'continuous' AND procedure_id IS NOT NULL""") == 0,
+      "a continuous assignment is never inside a procedure")
+check(one("""
+    SELECT count(*) FROM stmt
+    WHERE procedure_id IS NULL AND sequence IS NOT NULL""") == 0,
+      "sequence never exists outside a procedure")
+check(one("""
+    SELECT count(*) FROM stmt
+    WHERE sequence IS NULL AND procedure_id IS NOT NULL
+      AND statement_kind != 'event_control'""") == 0,
+      "inside a procedure only the header's event_control lacks a sequence")
+check(one("""
+    SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
+    WHERE CASE e.role
+        WHEN 'control'     THEN s.statement_kind != 'assignment'
+        WHEN 'assertion'   THEN s.statement_kind != 'assertion'
+        WHEN 'wait'        THEN s.statement_kind NOT IN ('wait', 'event_control')
+        WHEN 'event'       THEN s.statement_kind != 'event_control'
+        WHEN 'system_task' THEN s.statement_kind != 'system_task'
+        WHEN 'call_argument' THEN s.statement_kind NOT IN
+            ('call', 'assignment', 'system_task')
+        ELSE 1 END""") == 0,
+      "expr_ref roles match their statement kinds")
 
-# The stable query interface: from v8 the seven views are contract, and all
-# three parts of that contract are asserted -- they exist, they carry exactly
-# their documented columns, and each one's row count equals its base table's.
-# The count check earns its keep twice over: SQLite resolves a view's column
-# references only when the view is queried, so counting every view is also
-# what proves the stored SQL still matches the tables underneath; and a count
-# that exceeds the base is a join fanning out, which is the one defect a
-# hand-edited view is most likely to introduce.
+# --------------------------------------------------- net_dep provenance
+# Every dependency names where it came from, per kind, and the copies it
+# carries of the operand/target facts agree with the rows it names. This is
+# the declared redundancy that makes net_dep usable as the driver/load index.
+check(one("""
+    SELECT count(*) FROM net_dep d
+    WHERE CASE d.dependency_kind
+        WHEN 'data' THEN d.stmt_id IS NULL OR d.assign_target_id IS NULL
+             OR d.expr_ref_id IS NOT NULL OR d.primitive_id IS NOT NULL
+             OR (d.source_net_id IS NOT NULL AND d.assign_operand_id IS NULL)
+             OR (d.source_net_id IS NULL AND d.assign_operand_id IS NOT NULL)
+        WHEN 'control' THEN d.stmt_id IS NULL OR d.assign_target_id IS NULL
+             OR d.expr_ref_id IS NULL OR d.assign_operand_id IS NOT NULL
+             OR d.primitive_id IS NOT NULL OR d.mapping_exact != 0
+        WHEN 'primitive' THEN d.primitive_id IS NULL OR d.stmt_id IS NOT NULL
+             OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
+             OR d.expr_ref_id IS NOT NULL
+        WHEN 'procedure' THEN d.primitive_id IS NOT NULL
+             OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
+        ELSE 1 END""") == 0,
+      "net_dep provenance columns match dependency_kind")
+check(one("""
+    SELECT count(*) FROM net_dep d
+    WHERE d.source_net_id IS NULL AND (d.source_lo IS NOT NULL
+       OR d.source_exact IS NOT NULL OR d.mapping_exact IS NOT NULL)""") == 0,
+      "a constant dependency describes no source end")
+check(one("""
+    SELECT count(*) FROM net_dep d JOIN assign_operand o ON o.id = d.assign_operand_id
+    WHERE o.net_id != d.source_net_id OR o.stmt_id != d.stmt_id""") == 0,
+      "net_dep's operand copy agrees with the operand row")
+check(one("""
+    SELECT count(*) FROM net_dep d JOIN assign_target t ON t.id = d.assign_target_id
+    WHERE t.net_id != d.target_net_id OR t.stmt_id != d.stmt_id""") == 0,
+      "net_dep's target copy agrees with the target row")
+check(one("""
+    SELECT count(*) FROM net_dep d JOIN expr_ref e ON e.id = d.expr_ref_id
+    WHERE e.net_id != d.source_net_id
+       OR (d.stmt_id IS NOT NULL AND e.stmt_id != d.stmt_id)
+       OR (d.dependency_kind = 'control' AND e.role != 'control')
+       OR (d.dependency_kind = 'procedure' AND e.role != 'call_argument')""") == 0,
+      "net_dep's expression reference agrees with the expr_ref row")
+check(one("""
+    SELECT count(*) FROM net_dep d
+    JOIN net s ON s.id = d.source_net_id JOIN net t ON t.id = d.target_net_id
+    JOIN stmt st ON st.id = d.stmt_id
+    WHERE d.dependency_kind IN ('data','control')
+      AND (s.inst_id != st.inst_id OR t.inst_id != st.inst_id)""") == 0,
+      "data and control dependencies stay inside one instance")
+check(one("""
+    SELECT count(*) FROM assign_target a
+    WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_target_id = a.id)""") == 0,
+      "every assignment target has a dependency (source may be NULL)")
+
+# ------------------------------------------------------ windows and widths
+# When a mapping claims to be one-to-one, the two sides must be the same
+# width -- a bit-level trace follows it bit by bit, and unequal widths would
+# take it off the end. Width of a side: its range when present, the object's
+# width when the range means "whole".
+check(one("""
+    SELECT count(*) FROM term_map m
+    JOIN term t ON t.id = m.term_id JOIN net n ON n.id = m.net_id
+    WHERE m.mapping_exact = 1
+      AND COALESCE(m.term_hi - m.term_lo + 1, t.width) IS NOT NULL
+      AND COALESCE(m.net_hi - m.net_lo + 1, n.width) IS NOT NULL
+      AND COALESCE(m.term_hi - m.term_lo + 1, t.width)
+          != COALESCE(m.net_hi - m.net_lo + 1, n.width)""") == 0,
+      "an exact term_map maps equal widths")
+check(one("""
+    SELECT count(*) FROM net_conn c
+    JOIN term t ON t.id = c.term_id LEFT JOIN net n ON n.id = c.net_id
+    WHERE c.mapping_exact = 1 AND c.term_exact = 1 AND c.net_exact = 1
+      AND COALESCE(c.term_hi - c.term_lo + 1, t.width) IS NOT NULL
+      AND COALESCE(c.net_hi - c.net_lo + 1, n.width) IS NOT NULL
+      AND COALESCE(c.term_hi - c.term_lo + 1, t.width)
+          != COALESCE(c.net_hi - c.net_lo + 1, n.width)""") == 0,
+      "an exact connection maps equal widths")
+# A one-to-one window is exclusive: two segments both claiming a per-bit
+# mapping cannot share formal bits. Expression operands are exempt by
+# construction -- several reads legitimately feed one element's window, and
+# their mapping_exact is 0.
+for tbl in ("term_map", "net_conn"):
+    check(one(f"""
+        SELECT count(*) FROM "{tbl}" a JOIN "{tbl}" b
+          ON a.term_id = b.term_id AND a.ordinal < b.ordinal
+        WHERE a.mapping_exact = 1 AND b.mapping_exact = 1
+          AND a.term_exact = 1 AND b.term_exact = 1
+          AND a.term_lo IS NOT NULL AND b.term_lo IS NOT NULL
+          AND a.term_lo <= b.term_hi AND b.term_lo <= a.term_hi""") == 0,
+          f"one-to-one {tbl} windows on one terminal do not overlap")
+
+# -------------------------------------------------------------- hier_ref
+check(one("""
+    SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+    WHERE h.resolved_inst_id IS NULL OR n.inst_id != h.resolved_inst_id""") == 0,
+      "a resolved net lies inside its resolved instance")
+check(one("""
+    SELECT count(*) FROM net_conn c JOIN hier_ref h ON h.id = c.hier_ref_id
+    WHERE h.access != 'connect'""") == 0,
+      "a connection's outward tie is access='connect'")
+# A signal connection to a resolved terminal always states its mapping; to
+# an unresolved instance's terminal there is no formal end to correspond
+# with, and NULL is the honest value.
+check(one("""
+    SELECT count(*) FROM net_conn c
+    WHERE CASE c.connection_kind
+        WHEN 'signal' THEN c.net_id IS NULL OR (c.mapping_exact IS NULL
+             AND NOT EXISTS (SELECT 1 FROM term t JOIN tree_node n
+                             ON n.id = t.inst_id
+                             WHERE t.id = c.term_id
+                               AND n.node_kind = 'unresolved'))
+        WHEN 'expression_operand' THEN
+             (c.net_id IS NULL) = (c.hier_ref_id IS NULL)
+             OR (c.net_id IS NOT NULL AND c.mapping_exact != 0)
+        WHEN 'constant' THEN c.net_id IS NOT NULL OR c.mapping_exact IS NOT NULL
+        WHEN 'unconnected' THEN c.net_id IS NOT NULL OR c.mapping_exact IS NOT NULL
+        WHEN 'interface' THEN c.net_id IS NOT NULL
+        WHEN 'external_reference' THEN c.net_id IS NOT NULL OR c.hier_ref_id IS NULL
+        ELSE 1 END""") == 0,
+      "connection columns match connection_kind")
+
+# ------------------------------------------------------------------ meta
+required = ["schema_version", "analysis_status", "error_count",
+            "unresolved_count", "empty_procedure_count", "duplicate_path_count",
+            "tool", "tool_version", "slang_version", "producer_revision",
+            "config_digest"]
+meta = dict(con.execute("SELECT key, value FROM meta"))
+missing = [k for k in required if k not in meta or meta[k] is None]
+if missing:
+    sys.exit(f"meta lacks required key(s): {', '.join(missing)}")
+if meta["schema_version"] != SCHEMA_VERSION:
+    sys.exit(f"schema_version is {meta['schema_version']}, expected {SCHEMA_VERSION}")
+for k in ("error_count", "unresolved_count", "empty_procedure_count",
+          "duplicate_path_count"):
+    if not meta[k].isdigit():
+        sys.exit(f"meta.{k} is not a number: {meta[k]!r}")
+status = meta["analysis_status"]
+if status not in ("complete", "partial", "hierarchy_only"):
+    sys.exit(f"analysis_status is {status!r}")
+if status == "complete" and (int(meta["error_count"]) or
+                             int(meta["empty_procedure_count"]) or
+                             int(meta["duplicate_path_count"])):
+    sys.exit("analysis_status says complete beside non-zero counts")
+print("ok: meta seal present and self-consistent "
+      f"(analysis_status={status})")
+
+info = con.execute("SELECT * FROM v_database_info").fetchone()
+info_cols = [d[0] for d in con.execute("SELECT * FROM v_database_info LIMIT 0").description]
+by = dict(zip(info_cols, info))
+if str(by["schema_version"]) != meta["schema_version"] or \
+   not isinstance(by["schema_version"], int):
+    sys.exit("v_database_info.schema_version disagrees with meta or is not INTEGER")
+for k in ("error_count", "unresolved_count", "empty_procedure_count",
+          "duplicate_path_count"):
+    if by[k] != int(meta[k]) or not isinstance(by[k], int):
+        sys.exit(f"v_database_info.{k} disagrees with meta or is not INTEGER")
+print("ok: v_database_info agrees with meta and casts its counts")
+
+# --------------------------------------------------------- view contract
+# The twelve stable views: existence, exact columns in exact order, and row
+# formulas. v_conn_arc is scaffolding, not contract, and is deliberately
+# absent from this list.
 VIEW_COLUMNS = {
     "v_database_info": [
         "schema_version", "tool_version", "slang_version", "producer_revision",
-        "top", "analysis_status", "error_count",
-        "unresolved_count", "empty_procedure_count", "duplicate_path_count",
-        "config_digest"],
+        "top", "analysis_status", "error_count", "unresolved_count",
+        "empty_procedure_count", "duplicate_path_count", "config_digest"],
     "v_tree_node": [
-        "instance_id", "parent_instance_id", "instance_name", "node_kind",
-        "module_id", "module_name", "module_params", "child_id",
-        "definition_name"],
-    "v_signal": [
-        "module_id", "module_name", "module_params", "signal_name",
-        "symbol_kind", "type_text", "width", "direction_name",
-        "file_path", "source_path", "source_line", "source_column"],
-    "v_port_connection": [
-        "parent_module_id", "parent_module_name", "parent_module_params",
-        "child_instance_name", "child_id", "child_module_id",
-        "child_module_name", "child_module_params", "formal_port_name",
-        "inner_signal_name", "formal_lo", "formal_hi", "formal_exact",
-        "direction_name",
-        "outer_signal_name", "outer_type_text",
-        "outer_width", "outer_lo", "outer_hi", "outer_exact", "mapping_exact",
-        "connection_kind_name", "modport_name",
-        "file_path", "source_path", "source_line"],
-    "v_dependency": [
-        "module_id", "module_name", "module_params",
-        "source_name", "source_type", "source_lo", "source_hi", "source_exact",
-        "target_name", "target_type", "target_lo", "target_hi", "target_exact",
-        "dependency_kind", "construct", "is_control", "mapping_exact",
-        "file_path", "source_path", "source_line"],
+        "node_id", "parent_node_id", "node_name", "node_kind", "ordinal",
+        "instance_id", "parent_instance_id", "module_id", "module_name",
+        "parameter_signature", "definition_name", "file_path", "source_path",
+        "source_line", "source_column"],
+    "v_net": [
+        "net_id", "instance_id", "module_id", "module_name",
+        "parameter_signature", "scope_node_id", "net_name", "declaration_kind",
+        "data_type", "width", "is_implicit", "file_path", "source_path",
+        "source_line", "source_column"],
+    "v_terminal": [
+        "terminal_id", "instance_id", "module_id", "module_name",
+        "terminal_name", "terminal_kind", "direction", "data_type", "width",
+        "ordinal", "is_const", "modport", "file_path", "source_path",
+        "source_line", "source_column"],
+    "v_terminal_map": [
+        "terminal_id", "terminal_instance_id", "terminal_name",
+        "mapping_ordinal", "internal_net_id", "internal_net_name",
+        "terminal_lo", "terminal_hi", "terminal_exact", "net_lo", "net_hi",
+        "net_exact", "mapping_exact"],
+    "v_net_connection": [
+        "connection_id", "net_id", "net_instance_id", "net_name",
+        "terminal_id", "terminal_instance_id", "terminal_name", "direction",
+        "connection_kind", "ordinal", "net_lo", "net_hi", "net_exact",
+        "terminal_lo", "terminal_hi", "terminal_exact", "mapping_exact",
+        "interface_instance_id", "hier_ref_id", "file_path", "source_path",
+        "source_line", "source_column"],
+    "v_net_dependency": [
+        "dependency_id", "source_net_id", "source_instance_id", "source_name",
+        "source_lo", "source_hi", "source_exact", "target_net_id",
+        "target_instance_id", "target_name", "target_lo", "target_hi",
+        "target_exact", "statement_id", "assign_operand_id",
+        "assign_target_id", "expression_reference_id", "primitive_id",
+        "dependency_kind", "mapping_exact", "file_path", "source_path",
+        "source_line", "source_column"],
     "v_driver": [
-        "module_id", "module_name", "module_params",
-        "signal_name", "signal_type", "signal_lo", "signal_hi", "signal_exact",
-        "driver_name", "driver_type", "driver_lo", "driver_hi", "driver_exact",
-        "dependency_kind", "construct", "is_control", "mapping_exact",
-        "file_path", "source_path", "source_line"],
+        "signal_net_id", "signal_instance_id", "signal_name", "signal_lo",
+        "signal_hi", "signal_exact", "driver_net_id", "driver_instance_id",
+        "driver_name", "driver_lo", "driver_hi", "driver_exact",
+        "driver_kind", "dependency_id", "connection_id", "statement_id",
+        "primitive_id", "mapping_exact", "file_path", "source_path",
+        "source_line", "source_column"],
     "v_load": [
-        "module_id", "module_name", "module_params",
-        "signal_name", "signal_type", "signal_lo", "signal_hi", "signal_exact",
-        "load_name", "load_type", "load_lo", "load_hi", "load_exact",
-        "load_kind",
-        "dependency_kind", "construct", "is_control", "mapping_exact",
-        "file_path", "source_path", "source_line"],
+        "signal_net_id", "signal_instance_id", "signal_name", "signal_lo",
+        "signal_hi", "signal_exact", "load_net_id", "load_instance_id",
+        "load_name", "load_lo", "load_hi", "load_exact", "load_kind",
+        "dependency_id", "connection_id", "statement_id", "procedure_id",
+        "mapping_exact", "file_path", "source_path", "source_line",
+        "source_column"],
     "v_statement": [
-        "statement_id", "module_id", "module_name", "module_params",
-        "target_name", "target_lo", "target_hi", "target_exact",
-        "statement_kind", "construct", "proc", "seq", "blocking",
-        "dropped_operands", "stmt", "file_path", "source_path", "source_line"],
+        "statement_id", "instance_id", "module_id", "module_name",
+        "scope_node_id", "procedure_id", "ordinal", "sequence",
+        "statement_kind", "construct", "assignment_kind", "delay",
+        "dropped_operand_count", "file_path", "source_path", "source_line",
+        "source_column"],
+    "v_statement_target": [
+        "target_id", "statement_id", "ordinal", "net_id", "net_name",
+        "target_lo", "target_hi", "target_exact"],
     "v_statement_operand": [
-        "statement_id", "module_id", "module_name", "module_params",
-        "operand_name", "operand_lo", "operand_hi", "operand_exact"],
+        "operand_id", "statement_id", "ordinal", "net_id", "net_name",
+        "operand_lo", "operand_hi", "operand_exact"],
 }
-have_views = {r[0] for r in con.execute(
-    "SELECT name FROM sqlite_master WHERE type='view'")}
-missing_views = sorted(set(VIEW_COLUMNS) - have_views)
-if missing_views:
-    sys.exit(f"missing view(s): {', '.join(missing_views)}")
-for v, want in VIEW_COLUMNS.items():
-    got = [r[1] for r in con.execute(f"PRAGMA table_info({v})")]
+for view, want in VIEW_COLUMNS.items():
+    row = con.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='view' AND name=?",
+        (view,)).fetchone()
+    if not row[0]:
+        sys.exit(f"stable view missing: {view}")
+    got = [d[0] for d in con.execute(f'SELECT * FROM "{view}" LIMIT 0').description]
     if got != want:
-        sys.exit(f"{v} columns are {got}; the contract says {want}")
-print("ok: the nine stable views exist with their contracted columns")
+        sys.exit(f"{view} columns diverge from the contract:\n"
+                 f"  want {want}\n  got  {got}")
+print("ok: the twelve stable views exist with their contracted columns")
 
-for v, base in (
-    ("v_tree_node", "SELECT count(*) FROM instance"),
-    ("v_signal", "SELECT count(*) FROM symbol"),
-    ("v_port_connection", "SELECT count(*) FROM port"),
-    ("v_dependency", "SELECT count(*) FROM edge"),
-    ("v_driver", "SELECT count(*) FROM edge"),
-    ("v_load", """SELECT (SELECT count(*) FROM edge WHERE src IS NOT NULL)
-                 + (SELECT count(*) FROM proc_event WHERE signal IS NOT NULL)
-                 + (SELECT count(*) FROM stmt_read)"""),
-    ("v_statement", "SELECT count(*) FROM assignment"),
-    ("v_statement_operand", "SELECT count(*) FROM assign_operand"),
-    ("v_database_info", "SELECT 1"),
+# Fact views: one view row is one base row.
+for view, base in (
+    ("v_tree_node", "tree_node"), ("v_net", "net"), ("v_terminal", "term"),
+    ("v_terminal_map", "term_map"), ("v_net_connection", "net_conn"),
+    ("v_net_dependency", "net_dep"), ("v_statement", "stmt"),
+    ("v_statement_target", "assign_target"),
+    ("v_statement_operand", "assign_operand"),
 ):
-    nv = con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]
-    nb = con.execute(base).fetchone()[0]
+    nv = one(f'SELECT count(*) FROM "{view}"')
+    nb = one(f'SELECT count(*) FROM "{base}"')
     if nv != nb:
-        sys.exit(f"{v} has {nv} row(s) where its base has {nb}; "
-                 "a view join is fanning out or filtering")
-print("ok: every view's row count equals its base table's")
+        sys.exit(f"{view} has {nv} rows but {base} has {nb}")
+print("ok: every fact view's row count equals its base table's")
 
-# v_load's union discipline: the discriminator names every row, dataflow rows
-# have a target end with its correspondence columns, and target-less reads
-# carry NULL across the whole load_* group -- symmetric with v_driver's
-# null-driver rows, and with the null-source rule on edge itself.
-badload = con.execute("""
+# Composite views: the row count is the sum of the branches, each branch
+# re-derived here from the base tables.
+arcs_in = one("""
+    SELECT count(*) FROM v_conn_arc a
+    WHERE a.direction IN ('input','inout','ref')""")
+arcs_out = one("""
+    SELECT count(*) FROM v_conn_arc a
+    WHERE a.direction IN ('output','inout','ref')
+      AND a.connection_kind = 'signal' AND a.outer_net_id IS NOT NULL""")
+n_driver = one("SELECT count(*) FROM v_driver")
+want = one("SELECT count(*) FROM net_dep") + arcs_in + arcs_out
+if n_driver != want:
+    sys.exit(f"v_driver has {n_driver} rows, branch sum says {want}")
+
+arcs_in_load = one("""
+    SELECT count(*) FROM v_conn_arc a
+    WHERE a.direction IN ('input','inout','ref') AND a.outer_net_id IS NOT NULL""")
+n_load = one("SELECT count(*) FROM v_load")
+want = (one("SELECT count(*) FROM net_dep WHERE source_net_id IS NOT NULL")
+        + arcs_in_load + arcs_out
+        + one("SELECT count(*) FROM proc_event WHERE net_id IS NOT NULL")
+        + one("""SELECT count(*) FROM expr_ref e
+                 WHERE e.role IN ('assertion','wait','event','system_task')
+                    OR NOT EXISTS (SELECT 1 FROM net_dep d
+                                   WHERE d.expr_ref_id = e.id)""")
+        + one("""SELECT count(*) FROM assign_operand o
+                 WHERE NOT EXISTS (SELECT 1 FROM net_dep d
+                                   WHERE d.assign_operand_id = o.id)"""))
+if n_load != want:
+    sys.exit(f"v_load has {n_load} rows, branch sum says {want}")
+print("ok: v_driver and v_load reconcile with their branch formulas")
+
+check(one("""
+    SELECT count(*) FROM v_driver
+    WHERE (driver_kind = 'constant') != (driver_net_id IS NULL)""") == 0,
+      "constant drivers are exactly the source-less rows")
+check(one("""
+    SELECT count(*) FROM v_driver
+    WHERE driver_net_id IS NULL AND (driver_name IS NOT NULL
+       OR driver_lo IS NOT NULL OR driver_exact IS NOT NULL
+       OR mapping_exact IS NOT NULL)""") == 0,
+      "a constant driver describes no driver end")
+check(one("""
     SELECT count(*) FROM v_load
-    WHERE load_kind NOT IN ('dataflow', 'sensitivity', 'wait', 'statement')
-       OR (load_kind = 'dataflow'
-           AND (load_name IS NULL OR is_control IS NULL OR mapping_exact IS NULL))
-       OR (load_kind != 'dataflow'
-           AND (load_name IS NOT NULL OR load_type IS NOT NULL
-                OR load_lo IS NOT NULL OR load_hi IS NOT NULL
-                OR load_exact IS NOT NULL OR is_control IS NOT NULL
-                OR mapping_exact IS NOT NULL))""").fetchone()[0]
-if badload:
-    sys.exit(f"{badload} v_load row(s) break the load_kind discipline")
-print("ok: v_load's kinds are named and their NULL rules hold")
+    WHERE (load_kind IN ('sensitivity','wait','statement'))
+          != (load_net_id IS NULL)""") == 0,
+      "target-less loads are exactly sensitivity/wait/statement")
+check(one("""
+    SELECT count(*) FROM v_driver
+    WHERE driver_kind NOT IN ('data','control','primitive','procedure',
+                              'connection','connection_expression','constant')""") == 0,
+      "driver_kind stays in its vocabulary")
+check(one("""
+    SELECT count(*) FROM v_load
+    WHERE load_kind NOT IN ('dataflow','connection','sensitivity','wait',
+                            'statement')""") == 0,
+      "load_kind stays in its vocabulary")
 
-# The views expose enum NAMES only -- the raw integers are storage. That makes
-# the CASE mappings contract, so each name's count is pinned to its number's:
-# a swapped label would otherwise pass every NULL check.
-for base_sql, view_sql, pairs in (
-    ("SELECT count(*) FROM port WHERE conn_kind = {v}",
-     "SELECT count(*) FROM v_port_connection WHERE connection_kind_name = '{n}'",
-     ((0, "signal"), (1, "constant"), (2, "unconnected"),
-      (3, "expression_operand"), (4, "interface"), (5, "external_reference"))),
-    ("SELECT count(*) FROM symbol WHERE direction = {v}",
-     "SELECT count(*) FROM v_signal WHERE direction_name = '{n}'",
-     ((0, "input"), (1, "output"), (2, "inout"), (3, "ref"))),
-    ("SELECT count(*) FROM port WHERE direction = {v}",
-     "SELECT count(*) FROM v_port_connection WHERE direction_name = '{n}'",
-     ((0, "input"), (1, "output"), (2, "inout"), (3, "ref"))),
-):
-    for v, n in pairs:
-        nb = con.execute(base_sql.format(v=v)).fetchone()[0]
-        nv = con.execute(view_sql.format(n=n)).fetchone()[0]
-        if nb != nv:
-            sys.exit(f"enum decode drifted: {n!r} names {nv} row(s) where the "
-                     f"base stores {nb} of value {v}")
-print("ok: every enum name's count matches its base value's")
-
-# These hold for any design, not merely the examples: a conn_kind the view
-# cannot name, a tree node it cannot classify, and the retired -1 sentinel
-# would previously pass a plain `verify-designdb.py design.db` untouched.
-unnamed_kind = con.execute("""
-    SELECT count(*) FROM v_port_connection
-    WHERE connection_kind_name IS NULL""").fetchone()[0]
-if unnamed_kind:
-    sys.exit(f"{unnamed_kind} port connection(s) have a kind the view cannot name")
-unk_node = con.execute(
-    "SELECT count(*) FROM v_tree_node WHERE node_kind IS NULL").fetchone()[0]
-if unk_node:
-    sys.exit(f"{unk_node} tree node(s) have no node_kind")
-sentinel = con.execute(
-    "SELECT count(*) FROM assignment WHERE proc = -1").fetchone()[0]
-if sentinel:
-    sys.exit(f"{sentinel} assignment(s) carry proc=-1; no procedure is NULL")
-print("ok: every kind is nameable, every node classified, no -1 sentinel")
-
-# port.child_id is the join key between the two hierarchy views, and port also
-# carries module, child (the name) and def_module of its own -- denormalized
-# for query shape. The two records must agree COMPLETELY: the ids are threaded
-# positionally through the exporter, and a positional slip would pass the
-# foreign-key check, keep every row count intact, and quietly attach a binding
-# to a sibling instance. Checking only the module caught a cross-module slip
-# and nothing else.
-crossed_child = con.execute("""
-    SELECT count(*) FROM port p JOIN child c ON c.id = p.child_id
-    WHERE c.module != p.module
-       OR c.name != p.child_name
-       OR c.def_module IS NOT p.def_module
-       OR c.kind != 'module'""").fetchone()[0]
-if crossed_child:
-    sys.exit(f"{crossed_child} port row(s) disagree with the child row they "
-             "name (module, name, def_module or kind); the positional pairing "
-             "has slipped")
-print("ok: every port row agrees with its child row on all shared identity")
-
-# map_exact's NULL is not a shrug, it is a statement: this row has no outer end
-# to correspond with. So the kinds that have one must say 0 or 1, and the kinds
-# that do not must say NULL -- a value on the wrong side of that line means the
-# writer's discipline broke.
-badmap = con.execute("""
-    SELECT count(*) FROM port
-    WHERE (conn_kind IN (1, 2, 4, 5) AND map_exact IS NOT NULL)
-       OR (conn_kind = 3 AND map_exact IS NOT 0)
-       OR (conn_kind = 0 AND map_exact IS NULL)""").fetchone()[0]
-if badmap:
-    sys.exit(f"{badmap} port row(s) break the map_exact discipline: net ties "
-             "say 0/1, expression operands say 0, everything without an outer "
-             "end says NULL")
-print("ok: port.map_exact agrees with connection_kind")
-
-# Global meta keys -- these are written unconditionally, so a database
-# that lacks them was either not finished or produced by an older version.
-#
-# schema_version belongs here and not beside meta.top: what `top` should be
-# depends on which example was loaded, but every database this tool writes is
-# one fixed version whatever the design. Checking it only in the mode-specific
-# branch meant a plain `verify-designdb.py design.db` accepted a database
-# claiming schema 999.
-#
-# The required `meta` key set below is part of that version: a database written
-# before those keys existed is not a v5 database, and this check is what stops
-# it being read as one.
-SCHEMA_VERSION = "9"
-version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-if not version or version[0] != SCHEMA_VERSION:
-    sys.exit(f"schema_version is {version and version[0]!r}, expected {SCHEMA_VERSION!r}")
-status = con.execute("SELECT value FROM meta WHERE key='analysis_status'").fetchone()
-if not status or status[0] not in ("complete", "partial", "hierarchy_only"):
-    sys.exit(f"analysis_status is {status and status[0]!r}, expected one of "
-             "complete/partial/hierarchy_only")
-counts = {}
-for key in ("error_count", "unresolved_count",
-            "empty_procedure_count", "duplicate_path_count"):
-    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    if not row or not row[0].isdigit():
-        sys.exit(f"meta.{key} is missing or non-numeric")
-    counts[key] = int(row[0])
-for key in ("tool", "tool_version", "slang_version", "producer_revision"):
-    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    if not row or not row[0]:
-        sys.exit(f"meta.{key} is missing")
-cd = con.execute("SELECT value FROM meta WHERE key='config_digest'").fetchone()
-if not cd or len(cd[0]) != 64:
-    sys.exit("meta.config_digest is missing or not a SHA-256")
-
-# The seal has to agree with itself. Presence alone let a database say
-# `complete` while also reporting ten errors and three skipped procedures --
-# a consumer trusting the status word would read the missing dataflow as
-# design fact. unresolved_count is exempt -- a black box is a design that was
-# elaborated as fully as its sources allow. (warning_count is gone entirely: a
-# count whose contents the database cannot show describes the terminal log,
-# not the database, and a number nobody can inspect is not information.)
-INCOMPLETE = ("error_count", "empty_procedure_count", "duplicate_path_count")
-if status[0] == "complete":
-    contradicting = {k: counts[k] for k in INCOMPLETE if counts[k]}
-    if contradicting:
-        sys.exit(f"analysis_status is 'complete' but {contradicting} is non-zero; "
-                 "the status and the counts disagree")
-elif status[0] == "partial":
-    if not any(counts[k] for k in INCOMPLETE):
-        sys.exit("analysis_status is 'partial' but every count that would "
-                 f"explain it is zero: {({k: counts[k] for k in INCOMPLETE})}")
-print(f"ok: meta seal present and self-consistent (analysis_status={status[0]})")
-
-# v_database_info must agree with the meta rows it pivots, and its counts must
-# come back as integers -- the CAST in the view is part of the contract, since
-# the key-value table underneath stores TEXT.
-info = con.execute("""
-    SELECT schema_version, analysis_status, error_count,
-           typeof(error_count) FROM v_database_info""").fetchone()
-if info[0] != int(SCHEMA_VERSION) or info[1] != status[0]:
-    sys.exit(f"v_database_info says (schema={info[0]!r}, status={info[1]!r}) "
-             f"but meta says ({SCHEMA_VERSION!r}, {status[0]!r})")
-if info[3] != "integer":
-    sys.exit(f"v_database_info.error_count is {info[3]}, expected integer; "
-             "the view's CAST is missing")
-if info[2] != counts["error_count"]:
-    sys.exit(f"v_database_info.error_count is {info[2]}, "
-             f"meta says {counts['error_count']}")
-print("ok: v_database_info agrees with meta and casts its counts")
-
-
-def check(what, sql, expect_at_least=1):
-    n = con.execute(sql).fetchone()[0]
-    if n < expect_at_least:
-        sys.exit(f"expected {what}, found {n} row(s)")
-    print(f"ok: {what} ({n})")
-
-
+# ------------------------------------------------------ mode-gated checks
 if mode:
-    # Only `top` is mode-specific: which module elaborates as top is a property
-    # of the example, not of the format. schema_version is checked universally.
-    top = con.execute("SELECT value FROM meta WHERE key='top'").fetchone()
-    if not top or top[0] != mode:
-        sys.exit(f"meta.top is {top and top[0]!r}, expected {mode!r} without --top")
-    check("file rows joined to source_file",
-          "SELECT count(*) FROM file WHERE source_file IS NOT NULL")
-    # Every file row, not merely one. The origin of a file is learned from the
-    # first row that mentions it, and a row whose location sits inside a macro
-    # body names no file at all -- which left that file, and only that file,
-    # with no digest to check it against while the count above still passed.
-    unlinked = con.execute(
-        "SELECT count(*) FROM file WHERE source_file IS NULL").fetchone()[0]
-    if unlinked:
-        sys.exit(f"{unlinked} file row(s) have no source_file; a macro-expanded "
-                 "or otherwise fileless location poisoned the origin lookup")
-    print("ok: every file row joined to source_file")
+    check(one("""
+        SELECT count(*) FROM file
+        WHERE source_file_id IS NULL""") == 0,
+          "every file row joined to source_file")
+    top = meta.get("top")
+    want_top = {"constructs": "constructs", "interfaces": "interfaces",
+                "assertions": "assertions", "hierarchy": "hierarchy",
+                "udp": "udps", "unresolved": "unresolved"}[mode]
+    check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
-if mode:
-    # Every statement that writes a target must appear in BOTH tables. `edge`
-    # deduplicates and `assignment` does not, so a key that is too coarse
-    # deletes edges while leaving the assignment behind -- which is exactly
-    # what happened when the key carried a line number without the file, and a
-    # task body in an `include`d header shared a line with a statement in the
-    # module's own file. This invariant catches that whole class without
-    # needing two files to collide on a chosen number.
-    #
-    # An EXISTENCE check, not a pairing. These columns are shared by every
-    # statement on a line, so matching one here says an edge survived for that
-    # statement's target -- not that this edge came from this assignment.
-    # Joining the two tables on them to recover operands returns a cross
-    # product; `assign_operand` is what answers that, keyed on assignment.id.
-    orphaned = con.execute("""
-        SELECT count(*) FROM assignment a
-        WHERE NOT EXISTS (
-            SELECT 1 FROM edge e
-            WHERE e.module = a.module AND e.dst = a.dst
-              AND e.file IS a.file AND e.line = a.line)""").fetchone()[0]
-    if orphaned:
-        sys.exit(f"{orphaned} assignment(s) have no edge at the same "
-                 "module/dst/file/line; the edge dedup key is dropping statements")
-    print("ok: every assignment is matched by an edge at the same place")
-    # A name in the instance tree is one path segment. A generate block glued
-    # onto the child's leaf name made a row the documented per-segment walk
-    # cannot resolve.
-    multi = con.execute("""
-        SELECT count(*) FROM instance i JOIN name n ON n.id = i.name
-        WHERE instr(n.text, '.') > 0""").fetchone()[0]
-    if multi:
-        sys.exit(f"{multi} instance row(s) hold more than one path segment; "
-                 "a generate block is a level of its own")
-    print("ok: every instance name is a single path segment")
+
+def net_id(inst_name, net_name):
+    return one("""
+        SELECT n.id FROM net n JOIN tree_node t ON t.id = n.inst_id
+        WHERE t.name = ? AND n.name = ?""", inst_name, net_name)
+
 
 if mode == "constructs":
-    check("the self-feedback edge (cnt -> cnt)", """
-        SELECT count(*) FROM edge e
-        JOIN name s ON s.id = e.src JOIN name d ON d.id = e.dst
-        WHERE s.text = 'cnt' AND d.text = 'cnt'""")
-    check("primitive edges", "SELECT count(*) FROM edge WHERE kind='primitive'", 6)
-    # A gate is a `child` row of its own kind, and the instance-tree node for it
-    # points back at that row. Both were NULL-and-guess before.
-    check("gates recorded as primitive children",
-          "SELECT count(*) FROM child WHERE kind = 'primitive'", 6)
-    check("a gate's tree node names the child row it expands", """
-        SELECT count(*) FROM instance i
-        JOIN child c ON c.id = i.child
-        WHERE c.kind = 'primitive' AND i.module IS NULL""", 6)
-    check("the pullup's null-source row", """
-        SELECT count(*) FROM edge
-        WHERE construct = 'gate:pullup' AND src IS NULL""")
-    # One net on both terminals of a gate, different bits. Guarding on the
-    # symbol dropped the edge and then called the target undriven, which
-    # severed every stage of a gate-level chain and mislabelled it.
-    # The reason the schema version moved to 3: a statement in no procedure.
-    # Spelled NULL, as `blocking` in the same table already spells "does not
-    # apply" -- a -1 would have to be known about and excluded before joining.
-    check("the net initialiser's assignment has no procedure", """
-        SELECT count(*) FROM assignment a JOIN name d ON d.id = a.dst
-        WHERE a.proc IS NULL AND d.text IN ('w', 's')""", 2)
-    check("a gate driving one bit of a net from another", """
-        SELECT count(*) FROM edge e
-        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
-        WHERE e.construct = 'gate:buf' AND d.text = 'sr' AND s.text = 'sr'
-          AND e.dst_lo = e.src_lo + 1""", 2)
-    nulls = con.execute("""
-        SELECT count(*) FROM edge JOIN name d ON d.id = edge.dst
-        WHERE edge.construct = 'gate:buf' AND d.text = 'sr'
-          AND edge.src IS NULL""").fetchone()[0]
-    if nulls:
-        sys.exit(f"{nulls} gate row(s) on `sr` claim no source; the chain is severed")
-    print("ok: no gate on `sr` claims to drive from nothing")
-    # A connection is written where it is written. `u_cnt` spans one port per
-    # line, so its three rows must carry three different lines -- taking the
-    # instantiation's line for all of them made the ports indistinguishable by
-    # position and pointed a driver query at the header.
-    spread = con.execute("""
-        SELECT count(DISTINCT p.line) FROM port p JOIN name c ON c.id = p.child_name
-        WHERE c.text = 'u_cnt'""").fetchone()[0]
-    if spread < 3:
-        sys.exit(f"u_cnt's connections share {spread} distinct line(s) across 3 "
-                 "ports; they are written one per line and must say so")
-    print(f"ok: each connection on u_cnt names its own line ({spread})")
-    check("the part-select port connection (.idx(stim[3:0]))", """
-        SELECT count(*) FROM port
-        WHERE outer_lo = 0 AND outer_hi = 3 AND outer_exact = 1""")
-    check("an expression-operand connection (conn_kind=3)",
-          "SELECT count(*) FROM port WHERE conn_kind = 3")
-    check("the statement-level wait, at its own line", """
-        SELECT count(*) FROM proc_event pe
-        JOIN module m ON m.id = pe.module
-        WHERE m.name = 'constructs' AND pe.edge_kind = 'posedge'
-          AND pe.line IS NOT NULL""")
-    check("the downward XMR as a dotted edge name", """
-        SELECT count(*) FROM edge e JOIN name s ON s.id = e.src
-        WHERE s.text = 'u_cnt.cnt'""")
-    # A net declared with an initialiser drives it, exactly as `assign` does.
-    check("the net initialiser's drivers", """
-        SELECT count(*) FROM edge e
-        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
-        WHERE d.text = 'w' AND s.text IN ('a', 'b')""", 2)
-    undriven = con.execute("""
-        SELECT count(*) FROM symbol sy JOIN module m ON m.id = sy.module
-        JOIN name n ON n.id = sy.name
-        WHERE m.name = 'netinit' AND n.text IN ('w', 's')
-          AND NOT EXISTS (SELECT 1 FROM edge e
-                          WHERE e.module = sy.module AND e.dst = sy.name)""").fetchone()[0]
-    if undriven:
-        sys.exit(f"{undriven} net(s) declared with an initialiser have no driver")
-    print("ok: no net initialiser leaves its net undriven")
-    # A call binds its actuals, so the chain through the task body is whole.
-    check("the call's actual bound to the formal", """
-        SELECT count(*) FROM edge e
-        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
-        WHERE s.text = 'd' AND d.text = 'bump.v'""")
-    check("the task body's write, the other half of that chain", """
-        SELECT count(*) FROM edge e
-        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
-        WHERE s.text = 'bump.v' AND d.text = 'q'""")
-    # A statement whose whole effect is to read -- a system task's argument, a
-    # wait condition -- writes nothing the module can name, so its reads have
-    # no target to hang from. Without these the signal answers "nobody reads
-    # me" while the source is printing it.
-    check("the system task argument's read", """
-        SELECT count(*) FROM stmt_read r JOIN name n ON n.id = r.name
-        JOIN module m ON m.id = r.module
-        WHERE m.name = 'observers' AND n.text = 'watched'
-          AND r.construct = '$display'""", 2)
-    # A system task's *written* argument is not a read of it.
-    loadedread = con.execute("""
-        SELECT count(*) FROM stmt_read r JOIN name n ON n.id = r.name
-        WHERE n.text = 'loaded'""").fetchone()[0]
-    if loadedread:
-        sys.exit(f"{loadedread} stmt_read row(s) for `loaded`, which $readmemh "
-                 "writes rather than reads")
-    print("ok: a system task's written argument is not recorded as a read")
-    check("the wait condition's read", """
-        SELECT count(*) FROM stmt_read r JOIN name n ON n.id = r.name
-        JOIN module m ON m.id = r.module
-        WHERE m.name = 'observers' AND n.text = 'done' AND r.construct = 'wait'""")
-    # A call that *does* write is attributed through its edges instead, and
-    # must not also be recorded as a bare read.
-    dupe = con.execute("""
-        SELECT count(*) FROM stmt_read r JOIN module m ON m.id = r.module
-        WHERE m.name = 'viacall'""").fetchone()[0]
-    if dupe:
-        sys.exit(f"{dupe} stmt_read row(s) for a call that writes; its reads "
-                 "are already attributed through the edge chain")
-    print("ok: a writing call is not also recorded as a bare read")
-    # An immediate assertion writes nothing, so its reads live in stmt_read.
-    check("the immediate assertion's reads", """
-        SELECT count(*) FROM stmt_read r JOIN module m ON m.id = r.module
-        WHERE m.name = 'checks' AND r.construct = 'assert'""", 2)
-    # The statements in seq.svh belong to a procedure whose header is in
-    # constructs.sv. Their rows must say seq.svh: the file has to travel with
-    # the line it is paired with, or the pair names a line in the wrong file.
-    check("the included wait, attributed to seq.svh", """
-        SELECT count(*) FROM proc_event pe JOIN file f ON f.id = pe.file
-        WHERE f.path LIKE '%seq.svh'""")
-    # An initial block is not sensitive to anything. Its event controls are
-    # waits, and a reader filtering wait=0 must get nothing for it -- without
-    # the column those rows read as a trigger set and the block looks clocked.
-    check("the initial block's events are all waits", """
-        SELECT count(*) FROM proc_event WHERE wait = 1""", 2)
-    sensitive = con.execute("""
-        SELECT count(*) FROM proc_event pe JOIN module m ON m.id = pe.module
-        WHERE m.name = 'constructs' AND pe.wait = 0""").fetchone()[0]
-    if sensitive:
-        sys.exit(f"the initial block reports {sensitive} sensitivity row(s); "
-                 "an initial block triggers on nothing")
-    print("ok: the initial block reports no sensitivity")
-    check("the always_ff's real sensitivity list", """
-        SELECT count(*) FROM proc_event pe JOIN module m ON m.id = pe.module
-        WHERE m.name = 'counter' AND pe.wait = 0""", 2)
-    # A downward XMR resolves inside the module that writes it, so it is an
-    # ordinary assignment under a dotted name rather than a hier_ref -- the
-    # point here is only that the row names the file the statement is in.
-    check("the included XMR, attributed to seq.svh", """
-        SELECT count(*) FROM assignment a
-        JOIN file f ON f.id = a.file JOIN name d ON d.id = a.dst
-        WHERE f.path LIKE '%seq.svh' AND d.text = 'u_cnt.dbg'""")
-
-    # `{packed_hi, packed_lo} = {swap_lo, swap_hi}` -- the halves cross, and the
-    # pairs that do not share a bit are not dataflow. Pairing every target with
-    # every operand gave four edges here instead of two, and marked all four
-    # exact on both ends, so the two false ones were indistinguishable from the
-    # two real ones.
-    crossed = con.execute("""
-        SELECT s.text, d.text FROM edge e
-        JOIN module m ON m.id = e.module
-        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
-        WHERE m.name = 'packing' AND d.text LIKE 'packed_%'
-        ORDER BY d.text""").fetchall()
-    if crossed != [("swap_lo", "packed_hi"), ("swap_hi", "packed_lo")]:
-        sys.exit(f"packing's crossed halves are {crossed}, expected exactly "
-                 "swap_lo->packed_hi and swap_hi->packed_lo; the two sides of "
-                 "the assignment are being crossed again")
-    print("ok: a concatenated assignment pairs halves, it does not cross them")
-    # And the target is sliced: an operand drives the bits it occupies, not all
-    # of them. `assign bits = {swap_hi, swap_lo}` is one target and two operands,
-    # so this is the half that a disjointness check alone would not catch.
-    sliced = con.execute("""
-        SELECT s.text, e.dst_lo, e.dst_hi, e.map_exact FROM edge e
-        JOIN module m ON m.id = e.module
-        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
-        WHERE m.name = 'packing' AND d.text = 'bits'
-        ORDER BY e.dst_lo DESC""").fetchall()
-    if sliced != [("swap_hi", 4, 7, 1), ("swap_lo", 0, 3, 1)]:
-        sys.exit(f"packing's sliced target is {sliced}, expected swap_hi->[4,7] "
-                 "and swap_lo->[0,3], both positionally exact")
-    print("ok: each operand of a concatenation drives its own slice of the target")
-    # assign_operand was crossed the same way and is fixed by the same pairing.
-    ops = con.execute("""
-        SELECT d.text, n.text FROM assignment a
-        JOIN module m ON m.id = a.module
-        JOIN name d ON d.id = a.dst
-        JOIN assign_operand ao ON ao.assignment = a.id
-        JOIN name n ON n.id = ao.name
-        WHERE m.name = 'packing' AND d.text LIKE 'packed_%'
-        ORDER BY d.text""").fetchall()
-    if ops != [("packed_hi", "swap_lo"), ("packed_lo", "swap_hi")]:
-        sys.exit(f"packing's assign_operand rows are {ops}, expected one operand "
-                 "each; the statement-level read set is crossed")
-    print("ok: assign_operand is not crossed either")
-    # A carry means no per-bit correspondence, and the database has to say so
-    # rather than claim one. `cnt <= cnt + 1` in `counter` is the case.
-    coarse = con.execute("""
-        SELECT count(*) FROM edge e
-        JOIN module m ON m.id = e.module
-        JOIN name d ON d.id = e.dst JOIN name s ON s.id = e.src
-        WHERE m.name = 'counter' AND d.text = 'cnt' AND s.text = 'cnt'
-          AND e.map_exact = 0""").fetchone()[0]
-    if not coarse:
-        sys.exit("`cnt <= cnt + 1` claims a positional bit mapping; a carry "
-                 "crosses bits, so map_exact must be 0 there")
-    print("ok: an arithmetic dependency is not claimed as a per-bit mapping")
-
-    # `if (c) sel <= a; else sel <= b;` -- two statements, three edges (the
-    # condition is one), and all five rows carrying the same module, dst, file
-    # and line. This is why those columns are not a join key, and the assertion
-    # is here so the claim in the schema doc stays true rather than becoming
-    # folklore: the naive join must still over-pair, and `assign_operand` must
-    # still be the thing that does not.
-    pairs = con.execute("""
-        SELECT count(*) FROM assignment a
-        JOIN edge e ON e.module = a.module AND e.dst = a.dst
-                   AND e.file IS a.file AND e.line = a.line
-        JOIN module m ON m.id = a.module
-        WHERE m.name = 'branches'""").fetchone()[0]
-    if pairs != 6:
-        sys.exit(f"the branches join produced {pairs} pair(s), expected the 2x3 "
-                 "cross product; the example no longer demonstrates why "
-                 "(module, dst, file, line) cannot recover the relation")
-    print(f"ok: the naive edge/assignment join over-pairs, as documented ({pairs})")
-    ops = con.execute("""
-        SELECT a.seq, n.text FROM assign_operand ao
-        JOIN assignment a ON a.id = ao.assignment
-        JOIN name n ON n.id = ao.name
-        JOIN module m ON m.id = a.module
-        WHERE m.name = 'branches' ORDER BY a.seq, n.text""").fetchall()
-    if ops != [(0, "a"), (1, "b")]:
-        sys.exit(f"branches assign_operand is {ops}, expected [(0,'a'), (1,'b')]; "
-                 "the per-statement read set is the one thing the join cannot give")
-    print("ok: assign_operand separates the two statements exactly")
-
-    # ---- the stable views, asked the questions consumers will ask them ----
-    # Same facts the raw-table checks above pin, but through the interface a
-    # consumer actually uses -- so a view that drifts from its base fails here
-    # even while the base stays correct.
-    vdrv = con.execute("""
-        SELECT driver_name, signal_name, mapping_exact FROM v_driver
-        WHERE module_name = 'packing' AND signal_name LIKE 'packed_%'
-        ORDER BY signal_name""").fetchall()
-    if vdrv != [("swap_lo", "packed_hi", 1), ("swap_hi", "packed_lo", 1)]:
-        sys.exit(f"v_driver reports {vdrv} for packing; expected the crossed "
-                 "halves, each mapping_exact=1")
-    print("ok: v_driver pairs the concatenation's halves without crossing them")
-    arith = con.execute("""
-        SELECT count(*) FROM v_driver
-        WHERE module_name = 'counter' AND signal_name = 'cnt'
-          AND driver_name = 'cnt' AND mapping_exact = 0""").fetchone()[0]
-    if not arith:
-        sys.exit("v_driver claims a per-bit mapping for cnt <= cnt + 1")
-    print("ok: v_driver reports the arithmetic self-feedback as range-level")
-    ctl = con.execute("""
-        SELECT count(*) FROM v_driver
-        WHERE module_name = 'branches' AND signal_name = 'sel'
-          AND driver_name = 'c' AND is_control = 1""").fetchone()[0]
-    if not ctl:
-        sys.exit("v_driver lost the branch condition c -> sel (is_control=1)")
-    print("ok: v_driver keeps the control dependency, marked is_control")
-    dyn = con.execute("""
-        SELECT driver_exact, mapping_exact FROM v_driver
-        WHERE module_name = 'pick' AND signal_name = 'q'
-          AND driver_name = 'bus'""").fetchall()
-    if dyn != [(0, 0)]:
-        sys.exit(f"v_driver reports {dyn} for `q = bus[i]`; a dynamic select "
-                 "must be driver_exact=0 and mapping_exact=0")
-    print("ok: v_driver exposes the dynamic select as an upper bound")
-    nulldrv = con.execute("""
-        SELECT count(*) FROM v_driver
-        WHERE module_name = 'gates' AND signal_name = 'pu'
-          AND driver_name IS NULL""").fetchone()[0]
-    if nulldrv != 1:
-        sys.exit(f"the pullup's null driver has {nulldrv} v_driver row(s); a "
-                 "statement that drives while reading nothing must keep its row")
-    print("ok: v_driver keeps the null-driver row (a real driving statement)")
-
-    # The tree, classified by node_kind rather than by NULL patterns.
-    roots = con.execute("""
-        SELECT count(*) FROM v_tree_node
-        WHERE node_kind = 'root' AND module_name = 'constructs'""").fetchone()[0]
-    if roots != 1:
-        sys.exit(f"{roots} root node(s) named constructs, expected exactly 1")
-    print("ok: v_tree_node has exactly one root, and it is the top")
-    gens = con.execute("""
-        SELECT count(*) FROM v_tree_node
-        WHERE node_kind = 'generate' AND instance_name LIKE 'g_rep[%'""").fetchone()[0]
-    if gens != 2:
-        sys.exit(f"{gens} generate node(s) for g_rep, expected 2")
-    print("ok: v_tree_node reports the generate levels as their own kind")
-    check("v_tree_node's primitive nodes", """
-        SELECT count(*) FROM v_tree_node WHERE node_kind = 'primitive'""", 7)
-    check("module nodes expanded from the generate's child rows", """
-        SELECT count(*) FROM v_tree_node
-        WHERE node_kind = 'module' AND definition_name = 'decode'""", 3)
-
-    # Connection kinds through the view, name and number agreeing.
-    for kname, what in (("constant", "u_pick2's tied-off bus"),
-                        ("unconnected", "u_pick2's open q"),
-                        ("expression_operand", "the state == RUN operand")):
-        n = con.execute("""
-            SELECT count(*) FROM v_port_connection
-            WHERE connection_kind_name = ?""", (kname,)).fetchone()[0]
-        if not n:
-            sys.exit(f"no v_port_connection row for {what} ({kname!r})")
-
-    # The join the composition doctrine rests on: v_tree_node.child_id =
-    # v_port_connection.child_id, and it must work exactly where names do not.
-    # Under the generate, the tree spells `u_dec` and the port rows spell
-    # `g_rep[0].u_dec`, so the name join finds nothing -- the first release of
-    # the views shipped with only the names exposed, and cross-module tracing
-    # died at every generate boundary. Each of the two u_dec instances must
-    # reach its own two bindings, through its own child row.
-    hops = con.execute("""
-        SELECT t.child_id, count(p.formal_port_name)
-        FROM v_tree_node t
-        LEFT JOIN v_port_connection p ON p.child_id = t.child_id
-        WHERE t.node_kind = 'module' AND t.definition_name = 'decode'
-          AND t.instance_name = 'u_dec'
-        GROUP BY t.child_id ORDER BY t.child_id""").fetchall()
-    if len(hops) != 2 or any(n != 2 for _, n in hops):
-        sys.exit(f"the generate instances' boundary hop returned {hops}; "
-                 "each g_rep[*].u_dec must reach its own 2 port rows "
-                 "through child_id")
-    print("ok: v_tree_node joins v_port_connection on child_id across a generate")
-    misjoin = con.execute("""
-        SELECT count(*) FROM v_tree_node t
-        JOIN v_port_connection p ON p.child_instance_name = t.instance_name
-        WHERE t.instance_name = 'u_dec'""").fetchone()[0]
-    if misjoin:
-        sys.exit(f"the name join under the generate returned {misjoin} row(s); "
-                 "the example no longer shows why child_id is the key")
-    print("ok: the name join still finds nothing there, which is why the key exists")
-
-    # Port windows: the bit-precision model crossing the boundary. An input
-    # concat, an output concat, and a replication -- each element in its own
-    # slice of the formal, positionally exact. Before port_lo/port_hi existed,
-    # all of these read as "attached to all of q, exact", and {2{rep_r}}
-    # deduplicated to one row -- the second copy's window deleted outright.
-    win = con.execute("""
-        SELECT child_instance_name, outer_signal_name, formal_lo, formal_hi,
-               mapping_exact
-        FROM v_port_connection
-        WHERE child_instance_name IN ('u_bsink', 'u_bsrc', 'u_brep')
-        ORDER BY child_instance_name, formal_lo DESC""").fetchall()
-    expect = [
-        ("u_brep", "rep_r", 4, 7, 1), ("u_brep", "rep_r", 0, 3, 1),
-        ("u_bsink", "stim", 4, 7, 1), ("u_bsink", "cnt_o", 0, 3, 1),
-        ("u_bsrc", "bs_a", 4, 7, 1), ("u_bsrc", "bs_b", 0, 3, 1),
-    ]
-    if win != expect:
-        sys.exit(f"port windows are {win}, expected {expect}; the formal-side "
-                 "bit windows are wrong or the replication collapsed again")
-    print("ok: concatenated and replicated connections carry their formal windows")
-    # The concat elements are part-selects, so the outer side is sliced too --
-    # the full cross-boundary pair: stim[7:4] <-> q[7:4], bit for bit.
+    # Self-feedback survives, and arithmetic is range-level: cnt <= cnt + 1.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='cnt' AND target_name='cnt'
+          AND source_net_id = target_net_id AND mapping_exact = 0""") >= 1,
+          "the self-feedback dependency (cnt -> cnt), range-level")
+    # Gates: primitive nodes with their rows, and the sr chain bit by bit.
+    check(one("SELECT count(*) FROM primitive WHERE primitive_kind='gate'") >= 6,
+          "gate primitives recorded as primitive nodes")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE dependency_kind='primitive'""") >= 8, "primitive dependencies")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE dependency_kind='primitive' AND source_name='sr' AND
+              target_name='sr' AND source_lo=0 AND source_hi=0 AND
+              target_lo=1 AND target_hi=1 AND mapping_exact=1""") == 1,
+          "a gate driving one bit of a net from another, bit-exact")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE dependency_kind='primitive' AND source_net_id IS NULL""") >= 1,
+          "the pullup's null-source dependency")
+    # Net initialisers are continuous assignments.
+    check(one("""
+        SELECT count(*) FROM v_statement
+        WHERE assignment_kind='continuous' AND procedure_id IS NULL""") >= 2,
+          "net initialisers are procedure-less continuous assignments")
+    check(one("""
+        SELECT count(*) FROM assign_target a JOIN net n ON n.id=a.net_id
+        WHERE n.name='w'""") >= 1, "the net initialiser's target (w)")
+    # The call chain: d -> bump.v at the call, bump.v -> q in the body.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE dependency_kind='procedure' AND source_name='d'
+          AND target_name='bump.v'""") == 1,
+          "the call's actual bound to the formal (d -> bump.v)")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='bump.v' AND target_name='q'
+          AND dependency_kind='data'""") == 1,
+          "the task body's write, the other half of that chain")
+    check(one("""
+        SELECT count(*) FROM net WHERE name='bump.v'""") >= 1,
+          "the subroutine formal is a net row")
+    # System tasks and waits read; their reads are expr_refs by role.
+    check(one("""
+        SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id=e.stmt_id
+        WHERE e.role='system_task' AND s.construct='$display'""") >= 1,
+          "the system task argument's read")
+    check(one("""
+        SELECT count(*) FROM expr_ref WHERE role='wait'""") >= 1,
+          "the wait condition's read")
+    check(one("""
+        SELECT count(*) FROM stmt WHERE statement_kind='event_control'""") >= 2,
+          "statement-level event controls are statements")
+    # The downward XMR resolves to the child's real net -- the fact the
+    # instance-level model exists to state.
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = h.resolved_inst_id
+        WHERE h.path='u_cnt.cnt' AND n.name='cnt' AND t.name='u_cnt'""") >= 1,
+          "the downward XMR resolves to the child's net")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN stmt s ON s.id = h.stmt_id
+        JOIN file f ON f.id = s.file_id
+        WHERE f.path LIKE '%seq.svh'""") >= 1,
+          "the included XMR, attributed to seq.svh")
+    # Port windows: the part-select connection and the replication.
+    check(one("""
+        SELECT count(*) FROM v_net_connection
+        WHERE net_name='stim' AND net_lo=0 AND net_hi=3 AND net_exact=1""") >= 1,
+          "the part-select port connection (.idx(stim[3:0]))")
+    check(one("""
+        SELECT count(*) FROM v_net_connection c1
+        JOIN v_net_connection c2 ON c1.terminal_id = c2.terminal_id
+          AND c1.ordinal < c2.ordinal
+        WHERE c1.net_name='rep_r' AND c2.net_name='rep_r'
+          AND c1.terminal_lo IS NOT NULL AND c2.terminal_lo IS NOT NULL
+          AND c1.mapping_exact=1 AND c2.mapping_exact=1""") >= 1,
+          "a replicated connection keeps one exact segment per copy")
+    check(one("""
+        SELECT count(*) FROM v_net_connection
+        WHERE connection_kind='expression_operand'""") >= 1,
+          "an expression-operand connection")
+    check(one("""
+        SELECT count(*) FROM v_net_connection
+        WHERE connection_kind='constant'""") >= 1, "a constant tie-off")
+    # Generate levels are their own nodes; instances inside them resolve.
+    check(one("""
+        SELECT count(*) FROM tree_node WHERE node_kind='generate'""") >= 2,
+          "generate levels as their own nodes")
+    check(one("""
+        SELECT count(*) FROM tree_node g JOIN tree_node c
+          ON c.parent_node_id = g.id
+        WHERE g.node_kind='generate' AND c.node_kind='instance'""") >= 2,
+          "module instances under generate levels")
+    # Two parameterisations of one module stay two signatures.
+    check(one("""
+        SELECT count(DISTINCT i.parameter_signature) FROM inst i
+        JOIN module m ON m.id = i.module_id WHERE m.name='scaled'""") == 2,
+          "a module's two parameterisations keep distinct signatures")
+    check(one("SELECT count(*) FROM module WHERE name='scaled'") == 1,
+          "one definition row however many parameterisations")
+    # Concatenated assignment: one statement, two targets, no crossing.
     pair = con.execute("""
-        SELECT outer_lo, outer_hi, formal_lo, formal_hi FROM v_port_connection
-        WHERE child_instance_name = 'u_bsink' AND outer_signal_name = 'stim'
-        """).fetchall()
-    if pair != [(4, 7, 4, 7)]:
-        sys.exit(f"u_bsink's stim slice is {pair}, expected outer [4,7] onto "
-                 "formal [4,7]")
-    print("ok: both ends of a sliced connection carry their bits")
-    # The expression operand keeps mapping_exact=0 -- a real tie, range-level.
-    expr0 = con.execute("""
-        SELECT count(*) FROM v_port_connection
-        WHERE connection_kind_name = 'expression_operand'
-          AND mapping_exact = 0""").fetchone()[0]
-    if not expr0:
-        sys.exit("no expression-operand connection with mapping_exact=0; "
-                 "the state == RUN operand must be range-level, not absent")
-    print("ok: an expression operand is range-level, never positional")
-
-    # Two parameterisations of one definition are two module variants, and a
-    # query by module_name alone mixes them. The formal interface keys on
-    # module_id from the selected tree node; this pins both halves -- the
-    # mixing is real, and the id separates it.
-    mixed = con.execute("""
-        SELECT count(DISTINCT module_id) FROM v_driver
-        WHERE module_name = 'scaled' AND signal_name = 'q'""").fetchone()[0]
-    if mixed != 2:
-        sys.exit(f"a module_name query over `scaled` sees {mixed} variant(s), "
-                 "expected 2; the example no longer demonstrates the mixing")
-    print("ok: a module_name driver query really does mix parameterisations (2)")
-    per_variant = con.execute("""
-        SELECT t.instance_name, count(*), count(DISTINCT d.module_params)
-        FROM v_tree_node t
-        JOIN v_driver d ON d.module_id = t.module_id AND d.signal_name = 'q'
-        WHERE t.instance_name IN ('u_sc1', 'u_sc2')
-        GROUP BY t.instance_id ORDER BY t.instance_name""").fetchall()
-    if per_variant != [("u_sc1", 1, 1), ("u_sc2", 1, 1)]:
-        sys.exit(f"per-variant driver queries returned {per_variant}; keying on "
-                 "the tree node's module_id must isolate each parameterisation")
-    print("ok: module_id from the tree node isolates each parameterisation")
-
-    # ---- v_load as the complete read set ----
-    # The always_ff's triggers are loads of the clock and reset, the way a
-    # clock net's loads include the flop clock pins in a netlist database.
-    sens = con.execute("""
-        SELECT signal_name, construct FROM v_load
-        WHERE module_name = 'counter' AND load_kind = 'sensitivity'
-        ORDER BY signal_name""").fetchall()
-    if sens != [("clk", "posedge"), ("rst_n", "negedge")]:
-        sys.exit(f"counter's sensitivity loads are {sens}; expected clk/posedge "
-                 "and rst_n/negedge as v_load rows")
-    print("ok: a procedure's triggers are loads of the signals it samples")
-    # `@(posedge clk);` suspends rather than triggers, and says so.
-    waits = con.execute("""
-        SELECT count(*) FROM v_load
-        WHERE load_kind = 'wait' AND signal_name = 'clk'""").fetchone()[0]
-    if waits < 2:
-        sys.exit(f"{waits} wait-kind load(s) of clk, expected the two "
-                 "statement-level waits")
-    print("ok: a statement-level wait is a load, distinct from sensitivity")
-    # The question that used to take a five-table union: who reads `done`?
-    # One wait-condition read, one query, with its own word.
-    done = con.execute("""
-        SELECT load_kind, construct FROM v_load
-        WHERE module_name = 'observers' AND signal_name = 'done'""").fetchall()
-    if done != [("wait", "wait")]:
-        sys.exit(f"reads of `done` are {done}; expected exactly the wait "
-                 "condition, classified as a wait")
-    print("ok: 'who reads it' is one v_load query, wait conditions included")
-    # load_kind is semantics, not storage: the selected-bit spellings travel
-    # through stmt_read where the plain ones fit proc_event.signal, and both
-    # must classify identically. Before the CASE, all three of these answered
-    # 'statement' and a load_kind='sensitivity' query missed a clock.
-    ev = con.execute("""
-        SELECT signal_lo, load_kind FROM v_load
-        WHERE module_name = 'evkinds' AND signal_name = 'clks'
-        ORDER BY signal_lo DESC""").fetchall()
-    if ev != [(2, "sensitivity"), (1, "wait"), (0, "wait")]:
-        sys.exit(f"evkinds' reads classify as {ev}; expected clks[2] a "
-                 "sensitivity and clks[1]/clks[0] waits -- the storage split "
-                 "is leaking into load_kind again")
-    print("ok: load_kind says what a read means, not where it was stored")
-
-    # ---- the statement layer ----
-    # One concatenated statement is ONE statement: two v_statement rows (one
-    # per target, each with its own operand set) sharing one stmt ordinal.
-    pack = con.execute("""
-        SELECT count(*), count(DISTINCT stmt) FROM v_statement
-        WHERE module_name = 'packing' AND target_name LIKE 'packed_%'""").fetchone()
-    if pack != (2, 1):
-        sys.exit(f"packing's concat write is {pack} (rows, stmts); expected "
-                 "(2, 1) -- per-target rows, one statement")
-    print("ok: v_statement keeps a concat write one statement with two targets")
-    # The branches pair, through the views this time: same procedure, ordered
-    # seq, non-blocking, distinct statements, and the operand that belongs to
-    # each -- the exact answer the naive edge join cannot give.
-    br = con.execute("""
-        SELECT s.seq, s.blocking, o.operand_name
-        FROM v_statement s
-        JOIN v_statement_operand o ON o.statement_id = s.statement_id
-        WHERE s.module_name = 'branches'
-        ORDER BY s.seq""").fetchall()
-    if br != [(0, 0, "a"), (1, 0, "b")]:
-        sys.exit(f"branches through the statement views reads {br}; expected "
-                 "seq 0 reading a and seq 1 reading b, both non-blocking")
-    print("ok: v_statement_operand gives each statement its own read set")
+        SELECT s.id FROM stmt s
+        WHERE (SELECT count(*) FROM assign_target a WHERE a.stmt_id=s.id) = 2
+        LIMIT 1""").fetchone()
+    check(pair is not None, "a concatenated write is one statement, two targets")
+    sid = pair[0]
+    check(one("""
+        SELECT count(*) FROM net_dep d
+        WHERE d.stmt_id=? AND d.dependency_kind='data'""", sid) ==
+          one("""SELECT count(*) FROM assign_operand o WHERE o.stmt_id=?""", sid),
+          "the concatenation pairs halves, it does not cross them")
+    # Dynamic select: an upper bound, not a guess (`assign q = bus[i]`).
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='bus' AND source_exact=0""") >= 1,
+          "a dynamic select's read is an upper bound")
+    # Dropped operands are counted.
+    check(one("""
+        SELECT count(*) FROM stmt WHERE dropped_operand_count > 0""") >= 1,
+          "dropped constant operands are counted")
+    # The crossing: the child counter's clk is driven by the parent's.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='connection' AND signal_name='clk'
+          AND signal_instance_id != driver_instance_id""") >= 1,
+          "v_driver crosses the boundary for the child's clk")
+    check(one("""
+        SELECT count(*) FROM v_driver WHERE driver_kind='constant'""") >= 1,
+          "v_driver keeps the null-driver row")
+    check(one("""
+        SELECT count(*) FROM v_driver WHERE driver_kind='control'""") >= 1,
+          "v_driver keeps the control dependency, marked by kind")
+    check(one("""
+        SELECT count(*) FROM v_load WHERE load_kind='sensitivity'""") >= 2,
+          "sensitivity reads are loads")
+    check(one("""
+        SELECT count(*) FROM v_load WHERE load_kind='wait'""") >= 1,
+          "a wait is a load, distinct from sensitivity")
+    check(one("""
+        SELECT count(*) FROM v_load WHERE load_kind='connection'""") >= 2,
+          "connections are loads of the nets they sample")
+    check(one("""
+        SELECT count(*) FROM v_tree_node WHERE node_kind='root'""") == 1,
+          "v_tree_node has exactly one root")
+    # Delays are normalised statement text, never a number.
+    check(one("""
+        SELECT count(*) FROM stmt WHERE delay='#3'
+          AND assignment_kind='continuous'""") == 1,
+          "a delayed continuous assign keeps its delay text")
+    check(one("""
+        SELECT count(*) FROM stmt WHERE delay='#2'
+          AND assignment_kind='blocking'""") == 1,
+          "an intra-assignment delay belongs to its own statement")
+    # The undeclared left-hand side is a real net, marked implicit.
+    check(one("""
+        SELECT count(*) FROM net WHERE name='dly_w' AND is_implicit=1
+          AND declaration_kind='wire'""") == 1,
+          "an implicit net is a row with is_implicit set")
+    # One pair, two statements, two dependencies -- never folded.
+    check(one("""
+        SELECT count(DISTINCT d.stmt_id) FROM net_dep d
+        JOIN net s ON s.id=d.source_net_id JOIN net t ON t.id=d.target_net_id
+        WHERE s.name='a' AND t.name='r2' AND d.dependency_kind='data'""") == 2,
+          "the same pair from two statements stays two dependencies")
 
 if mode == "interfaces":
-    check("the interface binding (conn_kind=4)",
-          "SELECT count(*) FROM port WHERE conn_kind = 4", 2)
-    check("the binding's declared modport", """
-        SELECT count(*) FROM port p JOIN name n ON n.id = p.modport
-        WHERE p.conn_kind = 4 AND n.text = 'src'""")
-    # `relay` owns no interface instance: it forwards its own port, so the row
-    # must name that port. A NULL outer here breaks the chain in the middle,
-    # and it resolves from neither end.
-    check("the pass-through binding names the forwarding port", """
-        SELECT count(*) FROM port p
-        JOIN module m ON m.id = p.module JOIN name o ON o.id = p.outer
-        WHERE m.name = 'relay' AND p.conn_kind = 4 AND o.text = 'bus'""")
-    unbound = con.execute("""
-        SELECT count(*) FROM port WHERE conn_kind = 4 AND outer IS NULL"""
-    ).fetchone()[0]
-    if unbound:
-        sys.exit(f"{unbound} interface binding(s) have no outer; "
-                 "the alias they exist to record is missing")
-    print("ok: every interface binding names its outer side")
-    check("interface_port symbol rows",
-          "SELECT count(*) FROM symbol WHERE kind = 'interface_port'", 2)
-    check("interface member writes in hier_ref", """
-        SELECT count(*) FROM hier_ref h JOIN name n ON n.id = h.path
-        WHERE h.write = 1 AND n.text LIKE 'bus.%'""", 2)
-    check("interface member reads in hier_ref", """
-        SELECT count(*) FROM hier_ref h JOIN name n ON n.id = h.path
-        WHERE h.write = 0 AND n.text LIKE 'bus.%'""")
-    # `assign seen = bus.vld && bus.data[0]` reads nothing this module can
-    # name, but it plainly drives `seen`. Without a null-source row a driver
-    # query answers "nothing drives it" -- and under v2 every module computing
-    # from interface members is this case.
-    check("a driver row for a target fed only from outside the module", """
-        SELECT count(*) FROM edge e JOIN name d ON d.id = e.dst
-        WHERE d.text = 'seen' AND e.src IS NULL""")
-    # `bus.data` is written three ways in `consumer` -- spaced, commented, and
-    # with two different part-selects. All of them are one signal, so all of
-    # them intern as one name, with the bits in the range columns.
-    check("the differently-spelled references intern as one name", """
-        SELECT count(*) FROM name WHERE text = 'bus.data'""")
-    # A port tied to a signal with no name here still gets a row. Dropping it
-    # made an external tie read exactly like a port nobody connected.
-    check("a port tied outside the module keeps its row", """
-        SELECT count(*) FROM port p JOIN module m ON m.id = p.module
-        WHERE m.name = 'watcher' AND p.conn_kind = 5 AND p.outer IS NULL""")
-    # `assign bus.vld = ready; assign bus.data = payload;` -- two outward writes
-    # on one line, each fed by its own local signal. The write is a hier_ref row
-    # and the read a stmt_read row, so `stmt` is the only thing that says which
-    # read fed which write; module/file/line are identical across all four.
-    # Pairing on it must give exactly two rows, not the 2x2 cross product.
-    chain = con.execute("""
-        SELECT hp.text, rn.text FROM hier_ref h
-        JOIN name hp ON hp.id = h.path
-        JOIN module m ON m.id = h.module
-        JOIN stmt_read r ON r.module = h.module AND r.stmt = h.stmt
-        JOIN name rn ON rn.id = r.name
-        WHERE m.name = 'driver_pair' AND h.write = 1
-        ORDER BY hp.text""").fetchall()
-    if chain != [("bus.data", "payload"), ("bus.vld", "ready")]:
-        sys.exit(f"driver_pair's outward chain is {chain}, expected bus.data<-payload "
-                 "and bus.vld<-ready; the statement ordinal is not separating "
-                 "two outward writes that share a line")
-    print("ok: each outward write pairs with the read that fed it")
-    # And the ordinal is what does it: without it these rows share every other
-    # column, which is the state this example exists to keep fixed.
-    loose = con.execute("""
-        SELECT count(*) FROM hier_ref h
-        JOIN module m ON m.id = h.module
-        JOIN stmt_read r ON r.module = h.module AND r.file IS h.file
-                        AND r.line = h.line
-        WHERE m.name = 'driver_pair' AND h.write = 1""").fetchone()[0]
-    if loose <= len(chain):
-        sys.exit(f"pairing driver_pair on file/line gave {loose} row(s), so this "
-                 "example no longer shows why `stmt` is needed")
-    print(f"ok: the same pairing on file/line alone over-matches ({loose})")
-    for bad, what in ((" ", "a space"), ("/*", "a comment"), ("[", "a select")):
-        n = con.execute("SELECT count(*) FROM name WHERE instr(text, ?) > 0",
-                        (bad,)).fetchone()[0]
-        if n:
-            sys.exit(f"{n} interned name(s) contain {what}; "
-                     "hier_ref paths are not being normalised")
-    print("ok: no interned name carries a space, a comment or a select")
-
-    # ---- the stable views over the interface constructs ----
-    ifc = con.execute("""
-        SELECT count(*) FROM v_port_connection
-        WHERE connection_kind_name = 'interface'
-          AND modport_name = 'src'""").fetchone()[0]
-    if ifc < 2:
-        sys.exit(f"{ifc} interface binding(s) with modport 'src' in "
-                 "v_port_connection, expected at least 2")
-    print(f"ok: v_port_connection reports the interface bindings with their "
-          f"modport ({ifc})")
-    ext = con.execute("""
-        SELECT count(*) FROM v_port_connection
-        WHERE connection_kind_name = 'external_reference'
-          AND outer_signal_name IS NULL""").fetchone()[0]
-    if not ext:
-        sys.exit("the external tie lost its v_port_connection row; a NULL "
-                 "outer with kind 5 is 'tied to something unnameable here', "
-                 "not 'unconnected'")
-    print("ok: v_port_connection keeps the external tie distinct from unconnected")
-    seen = con.execute("""
+    check(one("""
+        SELECT count(*) FROM term WHERE terminal_kind='interface'""") >= 3,
+          "interface terminals")
+    check(one("""
+        SELECT count(*) FROM term
+        WHERE terminal_kind='interface' AND modport IS NOT NULL""") >= 2,
+          "the binding's declared modport")
+    check(one("""
+        SELECT count(*) FROM net_conn
+        WHERE connection_kind='interface' AND interface_inst_id IS NOT NULL""") >= 3,
+          "interface bindings name their interface instance")
+    check(one("""
+        SELECT count(*) FROM net_conn c
+        JOIN inst i ON i.id = c.interface_inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE c.connection_kind='interface' AND m.definition_kind='interface'""")
+          == one("""SELECT count(*) FROM net_conn
+                    WHERE connection_kind='interface'
+                      AND interface_inst_id IS NOT NULL"""),
+          "every named interface binding points at an interface instance")
+    # The pass-through: a grandchild's binding resolves to the same
+    # top-level interface instance the parent was handed.
+    check(one("""
+        SELECT count(DISTINCT c.interface_inst_id) FROM net_conn c
+        JOIN term t ON t.id = c.term_id
+        JOIN inst child ON child.id = t.inst_id
+        JOIN inst parent ON parent.id = child.parent_inst_id
+        WHERE c.connection_kind='interface'
+          AND parent.parent_inst_id IS NOT NULL""") >= 1,
+          "a pass-through binding resolves to the real instance")
+    # Members referenced through the interface resolve to its nets.
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id=h.resolved_net_id
+        WHERE h.access='write' AND n.name='vld'""") >= 1,
+          "an interface member write resolves to the interface's net")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id=h.resolved_net_id
+        WHERE h.access='read' AND n.name IN ('vld','data')""") >= 2,
+          "interface member reads resolve to the interface's nets")
+    # An outward write and the reads that fed it share a statement -- and
+    # driver_pair's two same-line statements stay two statements, each
+    # pairing exactly its own operand rather than both.
+    check(one("""
+        SELECT count(DISTINCT w.stmt_id) FROM hier_ref w
+        JOIN assign_operand o ON o.stmt_id = w.stmt_id
+        WHERE w.access='write'""") >= 2,
+          "each outward write pairs with the read that fed it, per statement")
+    # A target fed only from outside still has a driver row: the statement.
+    check(one("""
         SELECT count(*) FROM v_driver
-        WHERE module_name = 'consumer' AND signal_name = 'seen'
-          AND driver_name IS NULL""").fetchone()[0]
-    if seen != 1:
-        sys.exit(f"{seen} null-driver v_driver row(s) for `seen`; a target fed "
-                 "only from outside the module must keep its driving statement")
-    print("ok: v_driver names the statement driving a target fed from outside")
+        WHERE driver_kind='constant' AND signal_name='seen'
+          AND statement_id IS NOT NULL""") >= 1,
+          "v_driver names the statement driving a target fed from outside")
+    check(one("""
+        SELECT count(*) FROM net_conn
+        WHERE connection_kind='external_reference' AND hier_ref_id IS NOT NULL""") >= 1,
+          "a port tied outside the module keeps its row")
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE instr(path, ' ') > 0 OR instr(path, '/*') > 0""") == 0,
+          "no reference path carries a space or a comment")
 
 if mode == "assertions":
-    # The kind vocabulary as slang presents it: module-scope concurrent
-    # assertions arrive wrapped in implicit procedures, so their reads carry
-    # the wrapper's kind -- there is no 'assertion' kind, and the doc says so
-    # rather than promising one nothing emits. The assertion's own word lives
-    # in `construct`.
-    badkind = con.execute("""
-        SELECT count(*) FROM stmt_read
-        WHERE kind NOT IN ('continuous_assign', 'procedural', 'procedure')""").fetchone()[0]
-    if badkind:
-        sys.exit(f"{badkind} stmt_read row(s) carry a kind outside the edge "
-                 "vocabulary; if 'assertion' is being emitted now, put the "
-                 "claim back in the doc")
-    print("ok: stmt_read kinds stay in edge's vocabulary, construct carries the word")
-    # An assertion's reads are loads -- its checker pins -- and reach a
-    # consumer through the same one query as every other read.
-    aread = con.execute("""
-        SELECT count(*) FROM v_load
-        WHERE load_kind = 'statement' AND construct = 'assert'""").fetchone()[0]
-    if aread < 3:
-        sys.exit(f"{aread} assert reads in v_load, expected at least 3; "
-                 "assertion reads must surface as statement-kind loads")
-    print("ok: an assertion's reads are statement-kind loads")
-    check("the concurrent assertion's reads", """
-        SELECT count(*) FROM stmt_read WHERE construct = 'assert'""", 3)
-    check("assume keeps its own word", """
-        SELECT count(*) FROM stmt_read WHERE construct = 'assume'""", 3)
-    check("cover keeps its own word", """
-        SELECT count(*) FROM stmt_read WHERE construct = 'cover'""", 2)
-    # The bits a property reads are not resolved, so the row must say so
-    # rather than claim the whole signal as fact.
-    claimed = con.execute("""
-        SELECT count(*) FROM stmt_read
-        WHERE src_lo IS NULL AND src_exact = 1""").fetchone()[0]
-    if claimed:
-        sys.exit(f"{claimed} assertion read(s) claim the whole signal exactly; "
-                 "an unresolved range must be inexact")
-    print("ok: unresolved assertion reads are marked inexact")
+    check(one("""
+        SELECT count(*) FROM stmt WHERE statement_kind='assertion'""") >= 3,
+          "assertion statements")
+    for word in ("assert", "assume", "cover"):
+        check(one("""
+            SELECT count(*) FROM stmt
+            WHERE statement_kind='assertion' AND construct=?""", word) >= 1,
+              f"{word} keeps its own word")
+    check(one("""
+        SELECT count(*) FROM expr_ref WHERE role='assertion'""") >= 3,
+          "the concurrent assertion's reads")
+    check(one("""
+        SELECT count(*) FROM expr_ref WHERE role='assertion' AND is_exact=1""") == 0,
+          "unresolved assertion reads are marked inexact")
+    check(one("""
+        SELECT count(*) FROM v_load WHERE load_kind='statement'""") >= 3,
+          "an assertion's reads are statement-kind loads")
+
+if mode == "hierarchy":
+    # Two occurrences of one parameterisation: one signature, two row sets.
+    check(one("""
+        SELECT count(*) FROM inst i JOIN module m ON m.id=i.module_id
+        WHERE m.name='leaf' AND i.parameter_signature='W=4'""") == 2,
+          "the same parameterisation twice is two occurrences")
+    check(one("""
+        SELECT count(DISTINCT n.id) FROM net n JOIN inst i ON i.id=n.inst_id
+        JOIN module m ON m.id=i.module_id
+        WHERE m.name='leaf' AND n.name='q' AND i.parameter_signature='W=4'""") == 2,
+          "each occurrence owns its own nets")
+    # The generate array: one level per element, one instance under each.
+    check(one("""
+        SELECT count(*) FROM tree_node WHERE node_kind='generate'
+          AND name LIKE 'lane%'""") == 4,
+          "a generate array is one level per element")
+    check(one("""
+        SELECT count(*) FROM tree_node c JOIN tree_node g
+          ON g.id = c.parent_node_id
+        WHERE g.node_kind='generate' AND c.node_kind='instance'""") == 4,
+          "each element holds its own instance")
+    check(one("""
+        SELECT count(DISTINCT i.id) FROM inst i JOIN module m ON m.id=i.module_id
+        WHERE m.name='leaf' AND i.parameter_signature='W=1'""") == 4,
+          "the array's parameterisation is per element")
+    # Non-ANSI directions survive; the inout terminal arcs both ways.
+    for tname, tdir in (("a", "input"), ("y", "output"), ("t", "inout")):
+        check(one("""
+            SELECT count(*) FROM term t JOIN inst i ON i.id=t.inst_id
+            JOIN module m ON m.id=i.module_id
+            WHERE m.name='oldstyle' AND t.name=? AND t.direction=?""",
+                  tname, tdir) == 1,
+              f"the non-ANSI {tdir} {tname} keeps its direction")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='connection' AND signal_name='pad'""") >= 1,
+          "the inout arcs outward")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='connection' AND driver_name='pad'""") >= 1,
+          "the inout arcs inward")
+
+if mode == "udp":
+    check(one("""
+        SELECT count(*) FROM primitive WHERE primitive_kind='udp'
+          AND definition_name='latch_p'""") == 1,
+          "the UDP is a primitive of its own kind")
+    check(one("""
+        SELECT count(*) FROM primitive WHERE primitive_kind='switch'
+          AND definition_name='tranif1'""") == 1,
+          "the switch is a primitive of its own kind")
+    check(one("""
+        SELECT count(*) FROM primitive WHERE primitive_kind='gate'""") >= 1,
+          "the buffer stays a gate")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency d
+        JOIN primitive p ON p.id = d.primitive_id
+        WHERE p.primitive_kind='udp' AND d.target_name='q'
+          AND d.source_name IN ('d','en')""") == 2,
+          "the UDP couples its inputs to its output")
+    # A tran conducts both ways: each end drives the other.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency d
+        JOIN primitive p ON p.id = d.primitive_id
+        WHERE p.primitive_kind='switch'
+          AND ((d.source_name='a' AND d.target_name='b')
+            OR (d.source_name='b' AND d.target_name='a'))""") == 2,
+          "the switch couples both directions")
+
+if mode == "unresolved":
+    check(status == "partial",
+          "a missing definition leaves the export partial")
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
+        WHERE t.node_kind='unresolved' AND i.unresolved_definition='ghost'""") == 1,
+          "the black box names the definition it wanted")
+    # Terminals for what the parent connected, direction unknown.
+    check(one("""
+        SELECT count(*) FROM term t JOIN tree_node n ON n.id = t.inst_id
+        WHERE n.node_kind='unresolved' AND t.direction IS NULL""") == 4,
+          "the black box has a terminal per connection")
+    check(one("""
+        SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
+        JOIN tree_node n ON n.id = t.inst_id
+        WHERE n.node_kind='unresolved' AND c.connection_kind='signal'""") >= 3,
+          "the connections that reach the black box are recorded")
+    check(one("""
+        SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
+        JOIN tree_node n ON n.id = t.inst_id
+        WHERE n.node_kind='unresolved' AND c.connection_kind='unconnected'""") == 1,
+          "its unconnected pin is recorded as unconnected")
+    # The trace stops AT the box: mid still has its consumer.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='mid' AND target_name='gnt'""") == 1,
+          "the design around the hole keeps its dataflow")
 
 print("OK")

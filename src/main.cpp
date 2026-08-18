@@ -615,19 +615,12 @@ int main(int argc, char** argv) {
         tempGuard.armed = false;
 
         if (!opt.quiet) {
-            std::printf("%s: %lld modules, %lld instances, %lld symbols, %lld edges, "
-                        "%lld assignments, %lld children, %lld ports\n",
+            std::printf("%s: %lld modules, %lld instances, %lld nets, %lld terminals, "
+                        "%lld connections, %lld statements, %lld dependencies\n",
                         opt.output.c_str(), (long long)stats.modules,
-                        (long long)stats.instances, (long long)stats.symbols, (long long)stats.edges,
-                        (long long)stats.assignments, (long long)stats.children,
-                        (long long)stats.ports);
-            if (stats.stmtReads) {
-                std::fprintf(stderr,
-                             "note: %lld read(s) belong to a statement that writes "
-                             "nothing this module can name (an assertion, or a "
-                             "write to a signal outside it); see stmt_read\n",
-                             (long long)stats.stmtReads);
-            }
+                        (long long)stats.instances, (long long)stats.nets,
+                        (long long)stats.terms, (long long)stats.conns,
+                        (long long)stats.stmts, (long long)stats.deps);
             if (stats.emptyProcedures) {
                 std::fprintf(stderr,
                              "warning: %lld procedure(s) drive a signal but yielded no "
@@ -638,7 +631,7 @@ int main(int argc, char** argv) {
             if (stats.unresolved) {
                 std::fprintf(stderr,
                              "note: %lld instantiation(s) name a module that could not "
-                             "be resolved; recorded with a null child_module\n",
+                             "be resolved; recorded as unresolved tree nodes\n",
                              (long long)stats.unresolved);
             }
             if (stats.external) {

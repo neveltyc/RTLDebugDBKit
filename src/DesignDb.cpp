@@ -15,27 +15,41 @@ namespace designdb {
 
 namespace {
 
-// The schema is *folded*: rows hang off `module`, not off `instance`. Thirty-two
-// copies of the same core therefore share one set of edges, and the database
-// tracks the amount of unique RTL rather than the elaborated instance count.
-// Column naming follows three rules, so a name can be guessed rather than
-// looked up:
+// The schema is *instance-level*: rows hang off `inst`, the elaborated
+// occurrence, not off a folded module variant. Thirty-two copies of one core
+// are thirty-two sets of rows, and in exchange every net, terminal and
+// statement is one row with one id -- "who drives bit 3 of THIS instance's
+// q" is an indexed lookup, and a fan-in cone is a recursive CTE over
+// `net_dep` rather than an application-side walk that re-folds the hierarchy
+// at every boundary. The fold was v9's trade; this is the other side of it,
+// taken deliberately (see doc/designdb-schema.md for the accounting).
 //
-//   * A bit range is prefixed with the column it describes. `edge` names its
-//     ends `src` and `dst`, so their ranges are `src_lo`/`src_hi` and
-//     `dst_lo`/`dst_hi`, and `assign_operand` uses `src_*` for the same idea.
-//     An earlier spelling invented `sb_`/`db_`, which matched nothing else in
-//     the row and read as "database" in a database.
-//   * A foreign key is named for the table it points at; a text name ends in
-//     `_name`. `child.def_module` is a module id, `child.def_name` is the text.
-//   * No column takes a table's name. `proc_event` records an edge kind, not
-//     an `edge`, and the two would have collided in every join that used both.
+// Naming rules, so a column can be guessed rather than looked up:
+//
+//   * Tables are singular_snake_case. `_id` appears exactly where a column
+//     holds another table's primary key (`inst.module_id` -> module.id), and
+//     nowhere else -- an attribute is never dressed as a key.
+//   * A bit range is prefixed with the end it describes (`source_lo`,
+//     `target_hi`, `term_exact`); a single-range table spells its own range
+//     bare (`lo`/`hi`/`is_exact`). `mapping_exact` always describes the
+//     correspondence BETWEEN two ends, never either end's own range.
+//   * Kinds and directions are their words (`'input'`, `'constant'`,
+//     `'always_ff'`), never integer codes. Three values never deserved the
+//     decode table every consumer had to carry; CHECK constraints hold the
+//     closed sets.
+//   * `ordinal` is position in a declaration or extraction list; `sequence`
+//     is execution order inside a procedure. Neither is an identity.
+//
+// Ranges keep the v7 encoding everywhere: LSB-relative offsets into the
+// flattened object, NOT declared indices. `logic [15:8] off` has bit 15 at
+// offset 7. NULL bits with exact=1 is the whole object; NULL bits with
+// exact=0 is somewhere inside it, unknown where; a present range with
+// exact=0 is an upper bound rather than the bits actually touched.
 //
 // The REFERENCES clauses document the joins; they are not enforced at runtime,
-// since `PRAGMA foreign_keys` is left at its default of off. A consumer should
-// read them as the shape of the schema rather than as a guarantee already
-// checked -- the export is written once and read many times, and paying for a
-// lookup per inserted row to re-verify ids this process just issued is the
+// since `PRAGMA foreign_keys` is left at its default of off. The verifier runs
+// `foreign_key_check` on every export -- the ids are all issued by one process
+// in one pass, and paying a lookup per inserted row to re-verify them is the
 // wrong side of that trade.
 constexpr const char* kSchema = R"SQL(
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
@@ -45,549 +59,478 @@ CREATE TABLE source_file(
     path    TEXT UNIQUE,
     digest  TEXT);
 
--- A module together with the parameter values it elaborated with. The
--- parameters are part of the identity: a different parameterisation resolves
--- different generate branches and different widths, so it is a different
--- netlist and must not share rows.
-CREATE TABLE module(
-    id      INTEGER PRIMARY KEY,
-    name    TEXT NOT NULL,
-    params  TEXT NOT NULL,
-    UNIQUE(name, params));
-
--- Repeated strings, interned. Types especially: a packed struct or enum prints
--- as its entire member list, which is far larger than the row referencing it.
-CREATE TABLE type(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
--- Identifiers: signals, ports, instance names. Short, and repeated far more
--- than they are distinct.
-CREATE TABLE name(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
 -- `path` is the spelling the rows carry -- as written in the filelist or on
 -- the command line -- while `source_file.path` is absolute. The two genuinely
--- differ, so `source_file` joins them: without it a consumer checking digests
--- had to match spellings by basename, which breaks on the first design with
--- two files of one name.
+-- differ, so `source_file_id` joins them: without it a consumer checking
+-- digests had to match spellings by basename, which breaks on the first
+-- design with two files of one name.
 CREATE TABLE file(
-    id          INTEGER PRIMARY KEY,
-    path        TEXT UNIQUE,
-    source_file INTEGER REFERENCES source_file(id));
+    id             INTEGER PRIMARY KEY,
+    path           TEXT UNIQUE,
+    source_file_id INTEGER REFERENCES source_file(id));
 
--- Intra-module dataflow, in the module's own namespace.
---
--- `edge` and `assignment` are two independent projections of the same
--- statements, and there is deliberately no key that recovers one from the
--- other. **(module, dst, file, line) is not a join key.** An earlier version of
--- this comment said it was, which was wrong in a way that returns rows rather
--- than failing:
---
---     always_ff @(posedge clk) begin if (c) q <= a; else q <= b; end
---
--- is two assignments and three edges (a->q, b->q, and c->q with control=1), and
--- every one of those five rows carries the same module, dst, file and line.
--- Joining on them pairs each assignment with all three edges, so a consumer
--- asking what the first statement reads is told `a`, `b` and `c`. The line is
--- shared by construction -- a statement is written where it is written -- so
--- this is the ordinary case, not a corner one.
---
--- Nor can the relation be tightened into a foreign key, in either direction:
---
---   * One edge, many assignments. Two statements writing the same target from
---     the same source on the same line collapse to one row -- deliberately, so
---     a connectivity query answers "does a reach q" once rather than once per
---     statement.
---   * One edge, no assignment. A gate contributes edges and no statement at
---     all, and a subroutine call binds its actuals to its formals -- the
---     `d -> bump.v` half of `always_ff @(posedge clk) bump(d);` is an edge
---     with no assignment row behind it, because no assignment was written.
---
--- So each projection answers its own questions and neither substitutes for the
--- other:
---
---   * What does *this statement* read?  `assign_operand`, keyed on
---     `assignment.id`. It is exact: for the block above it gives `a` to the
---     first assignment and `b` to the second, which is the answer the join
---     above gets wrong.
---   * Does a reach q at all, through anything?  This table.
---
--- What no table answers is which branch condition gates which statement: the
--- `c -> q` edge records that `c` reaches `q` as a condition, not which of the
--- two assignments it guards. That is the deliberate omission `assignment`
--- documents below, not an accident of this one.
-CREATE TABLE edge(
-    module   INTEGER NOT NULL REFERENCES module(id),
-    -- Null when the right-hand side reads nothing at all: `q <= 8'h0`.
-    -- The row still names the statement, which is what a driver query reports.
-    src      INTEGER REFERENCES name(id),
-    dst      INTEGER NOT NULL REFERENCES name(id),
-    src_type INTEGER REFERENCES type(id),
-    dst_type INTEGER REFERENCES type(id),
-    -- continuous_assign | procedural | primitive | procedure. `primitive` is
-    -- a gate, switch or UDP instance, whose `construct` names it (`gate:and`,
-    -- `udp:my_latch`); it has no procedure and so no `proc_event` row.
-    kind      TEXT,
-    construct TEXT,
-    file      INTEGER REFERENCES file(id),
-    line     INTEGER,
-    -- 1 when the operand reached the target through a branch condition rather
-    -- than through the right-hand side. Its own column rather than a suffix on
-    -- `construct`, which made a consumer string-match to recover it.
-    --
-    -- There is deliberately no `clocked` column. Whether the enclosing
-    -- procedure is edge-triggered is a property of that procedure and lives in
-    -- `proc_event`; stamping it onto every target claimed each one is held by a
-    -- flop, which is false for a block-local temporary written with `=`.
-    control  INTEGER,
-    -- Bit ranges, NULL when the reference covers the whole object. Read them
-    -- with `src_exact`/`dst_exact`: NULL with exact=1 is the whole object, NULL
-    -- with exact=0 is somewhere inside it and we cannot say where.
-    --
-    -- These are LSB-relative offsets into the flattened object, NOT the
-    -- declared indices. `logic [15:8] off` has bit 15 as offset 7, and
-    -- `logic [0:7] up` has bit 0 as offset 7. A consumer that maps them
-    -- straight onto declared indices mislabels every signal not declared
-    -- [N-1:0]; the declared range is recoverable from `dst_type`/`src_type`.
-    -- `*_exact` is 0 when a dynamic selector meant the range could not be
-    -- narrowed, so the range is an upper bound rather than the bits actually
-    -- touched. NULL bits with exact=1 is the whole object; NULL bits with
-    -- exact=0 is somewhere inside it, unknown where. Storing both as NULL made
-    -- the second read as the first.
-    src_lo    INTEGER, src_hi INTEGER, src_exact INTEGER,
-    dst_lo    INTEGER, dst_hi INTEGER, dst_exact INTEGER,
-    -- 1 when the source's bits map one-to-one onto the target's, so a bit-level
-    -- trace can follow this edge bit by bit. 0 when the source only influences
-    -- the target's range as a whole.
-    --
-    -- `src_exact` and `dst_exact` each describe *one side*: whether that end's
-    -- range could be narrowed. Neither says anything about the relationship
-    -- between the ends, and both can be 1 while the correspondence is coarse --
-    -- `q = a + b` knows exactly which bits of `a` and of `q` are involved and
-    -- still cannot say which bit of `a` reaches which bit of `q`, because a
-    -- carry crosses them.
-    --
-    -- 0 does not mean the dependency is doubtful; the source does reach the
-    -- target. It means the pairing is at range granularity. That distinction
-    -- exists because it used to be unavailable: `{a, b} = {x, y}` was exported
-    -- as four edges, all four marked exact on both sides, and the two of them
-    -- that are not dataflow at all -- `y -> a`, `x -> b` -- were
-    -- indistinguishable from the two that are.
-    map_exact INTEGER);
+-- Repeated type text, interned -- the one intern table v10 keeps. A packed
+-- struct or enum prints as its entire member list, far larger than the row
+-- referencing it, and the instance-level model repeats each declaration once
+-- per occurrence. Names are not interned: they are short, and the join every
+-- query paid the old `name` table was the storage tail wagging the schema.
+CREATE TABLE data_type(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
 
--- What a module instantiates. Expanding `instance` against this is what turns
--- the folded model back into hierarchy, and `instance.child` is the link that
--- makes the expansion an id lookup rather than a name-parsing exercise.
-CREATE TABLE child(
-    id         INTEGER PRIMARY KEY,
-    module     INTEGER NOT NULL REFERENCES module(id),
-    name       INTEGER NOT NULL REFERENCES name(id),
-    def_name   INTEGER REFERENCES name(id),      -- what it instantiates, as text
-    def_module INTEGER REFERENCES module(id),    -- and as a module row
-    -- What sort of thing this is, because `def_module IS NULL` does not say.
-    -- Three states shared that one spelling and a consumer could not tell them
-    -- apart, though a trace stopping at each means something different:
-    --
-    --   module      an ordinary instance; `def_module` names its rows.
-    --   primitive   a gate, switch or UDP. It has no module row and never will;
-    --               its dataflow is already in the parent's `primitive` edges,
-    --               so a trace does not stop here, it continues in the parent.
-    --   unresolved  a definition slang could not find. There is no dataflow
-    --               anywhere for it -- this is a black box, and a trace really
-    --               does stop. Counted in `meta.unresolved_count`; this is
-    --               where the individual rows are.
-    kind       TEXT);
+-- A source definition: what was written, not what it elaborated into. The
+-- parameter values a body elaborated with are per-occurrence facts and live
+-- on `inst.parameter_signature` -- v9 folded them into module identity, v10
+-- puts identity where the source has it. (name, file_id, line) is the
+-- definition's own identity; two libraries may define one name.
+CREATE TABLE module(
+    id              INTEGER PRIMARY KEY,
+    name            TEXT NOT NULL,
+    definition_kind TEXT NOT NULL
+        CHECK(definition_kind IN ('module','interface','program','checker')),
+    file_id         INTEGER REFERENCES file(id),
+    line            INTEGER,
+    column          INTEGER,
+    UNIQUE(name, file_id, line));
 
--- Every declaration in a module. The rest of the schema is edge-derived, so a
--- signal appears there only if it takes part in dataflow; this is what makes
--- "what is in this scope", "which outputs are never driven" and "which signals
--- are dead" answerable at all.
+-- The hierarchy tree, one node per level, one path segment per node --
+-- resolving `a.b[0].c` is one indexed lookup per segment, which is why the
+-- paths themselves are never stored. This is the supertype: a module
+-- instance is a `tree_node` plus an `inst` row under the same id, a gate is
+-- a `tree_node` plus a `primitive` row, a generate block is a bare
+-- `tree_node`. node_kind says which, and the verifier holds the bijection.
 --
--- One row per actual signal. slang carries a Port symbol *and* the underlying
--- net or variable for every port, so the port contributes its direction to the
--- signal's row rather than a row of its own.
-CREATE TABLE symbol(
-    module    INTEGER NOT NULL REFERENCES module(id),
-    name      INTEGER NOT NULL REFERENCES name(id),
-    -- variable | net | port | parameter | interface_port. An interface port
-    -- has no net behind it, so it gets a row of its own; `type` holds the
-    -- interface name, with `.modport` appended when the port declares one.
-    kind      TEXT,
-    type      INTEGER REFERENCES type(id),
-    width     INTEGER,                    -- bits, NULL when not integral
-    direction INTEGER,                    -- 0=in 1=out 2=inout 3=ref, NULL if not a port
-    file      INTEGER REFERENCES file(id),
-    line      INTEGER,
-    col       INTEGER);
+--   root        the top instance; it has an `inst` row and no parent.
+--   instance    a resolved module/interface/program instance -> `inst`.
+--   generate    a generate block or one element of a generate array. A
+--               naming level, not an object; nothing subtypes it.
+--   primitive   a gate, switch or UDP -> `primitive`.
+--   unresolved  an instance whose definition slang could not find -> `inst`
+--               with module_id NULL. A trace really does stop here.
+CREATE TABLE tree_node(
+    id             INTEGER PRIMARY KEY,
+    parent_node_id INTEGER REFERENCES tree_node(id),
+    name           TEXT NOT NULL,
+    node_kind      TEXT NOT NULL
+        CHECK(node_kind IN ('root','instance','generate','primitive','unresolved')),
+    ordinal        INTEGER NOT NULL);
 
--- Port connections, recorded against the PARENT module that writes them.
--- `outer` is a net in the parent's namespace and `port` a formal inside the
--- child, so following this table in either direction is how a trace crosses a
--- hierarchy boundary.
-CREATE TABLE port(
-    module       INTEGER NOT NULL REFERENCES module(id),
-    -- The child instance's name as the folded model spells it, generate
-    -- prefix included. `_name` by the def_name precedent: an interned name id,
-    -- disambiguated from `child_id` below, which is the actual child-table
-    -- key. (An earlier spelling took the bare word `child`, breaking the
-    -- no-column-takes-a-table's-name rule and forcing the real foreign key
-    -- into the schema's only `_id` suffix.)
-    child_name   INTEGER NOT NULL REFERENCES name(id),
-    def_module   INTEGER REFERENCES module(id),
-    port         INTEGER NOT NULL REFERENCES name(id),
-    -- The signal inside the child that `port` stands for, when the connection
-    -- names the formal something else: `module m(.ext_one(inner))` is
-    -- `ext_one` here and `inner` in every row the child's own module owns, so
-    -- without this a consumer holding the internal name had no way back to the
-    -- binding. NULL in the ordinary case where the two are one name.
-    --
-    -- Paired with `outer` deliberately: `outer` is the net on the parent's
-    -- side of the boundary, `inner` the signal on the child's, and `port` the
-    -- name the connection is written with.
-    inner        INTEGER REFERENCES name(id),
-    -- 0=in 1=out 2=inout 3=ref. Three values do not deserve 1.1 MB of text.
-    direction    INTEGER,
-    outer        INTEGER REFERENCES name(id),
-    outer_type   INTEGER REFERENCES type(id),
-    -- Width of the connection *expression*, which a concatenation or a slice
-    -- makes different from the width of any one net, so it is not derivable
-    -- from `outer`. Comparing it against the formal's width in `symbol` is how
-    -- a width-mismatched connection is found.
-    outer_width  INTEGER,
-    -- The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches
-    -- bits 0..3 of stim, and without these columns it attached all of stim --
-    -- a trace crossing the boundary then fanned out to everything else the
-    -- bus feeds. Encoded exactly as `edge` encodes its ranges: LSB-relative
-    -- offsets into the flattened object; NULL with exact=1 is the whole net,
-    -- NULL with exact=0 is somewhere inside it (a dynamic select, or an
-    -- element of an instance array, which shares the whole array's connection
-    -- expression the same way outer_width does).
-    outer_lo     INTEGER, outer_hi INTEGER, outer_exact INTEGER,
-    -- 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an
-    -- expression, 4=an interface binding. 3 is not a net: `.en(state == RUN)`
-    -- samples `state` but does not alias it to `en`, and recording it as 0
-    -- made every reader of `en` count as a reader of `state`. An unconnected
-    -- port is recorded rather than omitted: absence would otherwise mean both
-    -- "nobody connected it" and "the exporter did not get that far".
-    --
-    -- For 4, `port` is the child's interface port, `outer` the interface
-    -- instance (or the parent's own interface port, passed through) in the
-    -- parent's namespace, `outer_type` the interface definition, and
-    -- `direction` is NULL -- an interface port has none. This row is the alias
-    -- that makes `child.bus.*` resolvable: the signals live in the interface
-    -- instance named by `outer`, and without the row they can be reached from
-    -- neither side.
-    --
-    -- 5 = attached to a signal with no name in this module -- `.a(tb.glob)`.
-    -- `outer` is NULL because there is nothing here to name; what it is tied
-    -- to is in `hier_ref` at the same file and line. The row is written all
-    -- the same, so "connected to something I cannot name here" stays distinct
-    -- from "nobody connected it", which is the whole point of recording an
-    -- unconnected port in the first place.
-    conn_kind    INTEGER,
-    -- The modport restricting an interface binding, when one does. NULL
-    -- otherwise, and for every non-interface row.
-    modport      INTEGER REFERENCES name(id),
-    file         INTEGER REFERENCES file(id),
-    line         INTEGER,
-    -- The `child` row this binding belongs to -- the stable key that relates a
-    -- port row to the hierarchy, and through instance.child to the expanded
-    -- tree. It exists because the *name* here is not that key: `child` above
-    -- is the instance name as the folded model spells it, generate prefix
-    -- included (`g_rep[0].u_dec`), while the instance tree spells the same
-    -- level one segment at a time (`g_rep[0]`, then `u_dec`) -- so a consumer
-    -- holding a tree node had to rebuild the folded spelling before it could
-    -- find the node's port rows. Nor is (module, name) something to join on:
-    -- two unnamed gates in one module legally share a name, and a join on it
-    -- fans out. The id is assigned by the exporter, so it is collision-proof
-    -- where the name is not.
-    child_id     INTEGER NOT NULL REFERENCES child(id),
-    -- The bits of the FORMAL this row's element occupies: `.q({hi, lo})` is
-    -- two rows, hi at port_lo=4..port_hi=7 of q and lo at 0..3. Without these
-    -- the per-bit precision `edge` carries ended at every instance boundary --
-    -- both nets read as attached to all of q. Encoded as ranges are
-    -- everywhere: NULL + port_exact=1 the whole formal, NULL + port_exact=0
-    -- position unstatable (a width-changing conversion, an instance-array
-    -- element), and port_exact NULL where the row has no formal bit domain.
-    port_lo      INTEGER, port_hi INTEGER, port_exact INTEGER,
-    -- edge.map_exact at the boundary: 1 when this row's outer bits map
-    -- one-to-one onto its formal window, 0 when the tie is real but only
-    -- range-granular (an expression operand, a degraded window), NULL when
-    -- there is no outer end to correspond with (a constant, an unconnected
-    -- port, an external tie, an interface binding). 0 is not doubt.
-    map_exact    INTEGER);
+-- One module instance occurrence. `id` IS the tree_node id -- one id space
+-- for the whole hierarchy, so `net.inst_id` and `tree_node.parent_node_id`
+-- never disagree about what an instance is.
+--
+-- `parent_inst_id` is the nearest enclosing module instance, skipping
+-- generate levels -- the ancestry `tree_node` already encodes, denormalised
+-- one hop because every ownership check walks it. The verifier holds the two
+-- encodings equal.
+--
+-- `parameter_signature` is the elaborated parameter values, normalised, in
+-- declaration order, localparams included (it over-splits, never
+-- under-splits). Instances of one module with one signature share a body and
+-- carry identical rows -- the sharing v9 stored once, v10 stamps out.
+CREATE TABLE inst(
+    id                    INTEGER PRIMARY KEY REFERENCES tree_node(id),
+    module_id             INTEGER REFERENCES module(id),
+    parent_inst_id        INTEGER REFERENCES inst(id),
+    parameter_signature   TEXT,
+    unresolved_definition TEXT,
+    file_id               INTEGER REFERENCES file(id),
+    line                  INTEGER,
+    column                INTEGER);
 
--- Assignments, one row per statement that writes a target.
+-- One gate, switch or UDP instance. `id` IS the tree_node id. Not a module
+-- instance (it has no body, no ports, no parameters) and not a statement
+-- (nothing was assigned); its dataflow is `net_dep` rows with
+-- primitive_id set. Expression operators (`&`, `+`, `?:`) are not
+-- primitives -- they stay inside their statement's own rows.
+CREATE TABLE primitive(
+    id              INTEGER PRIMARY KEY REFERENCES tree_node(id),
+    inst_id         INTEGER NOT NULL REFERENCES inst(id),
+    primitive_kind  TEXT NOT NULL CHECK(primitive_kind IN ('gate','switch','udp')),
+    definition_name TEXT NOT NULL,
+    file_id         INTEGER REFERENCES file(id),
+    line            INTEGER,
+    column          INTEGER);
+
+-- One connectable object in one instance: a net or a variable -- anything
+-- that can be driven, read or wired. Parameters, type parameters and
+-- interface ports are NOT here: they are not connectable, and v9 mixing them
+-- into `symbol` made every "signals of this scope" query filter them out.
 --
--- `edge` flattens a procedure into "these signals drive that one"; this keeps
--- the statements apart, so a target with four assignments reads as four
--- statements with their own lines, operands and bit ranges rather than as one
--- merged set.
+-- Subroutine formals and locals ARE here (name is the scope-relative dotted
+-- path, `bump.v`): a call binds actuals to formals and `net_dep` ends are
+-- ids, so a formal without a row would be a dependency with a dangling end.
+-- Their scope_node_id is the nearest tree_node, since a subroutine is not a
+-- hierarchy level.
 --
--- It deliberately stops there. An earlier draft also stored the branch
--- conditions reaching each assignment, on the theory that a consumer could
--- evaluate them against a waveform and name the assignment in effect at a given
--- time. That does not hold up: the conditions would have to be evaluated as
--- SystemVerilog expressions, which a waveform tool cannot do; the sampling
--- instant is an edge of a clock this schema deliberately does not identify;
--- guard operands are often not in the dump at all; X during reset makes a chain
--- neither true nor false; and for blocking assignments "which one was in
--- effect" has no single answer because all of them ran. Encoding that judgement
--- as data would have produced confident wrong answers about which line of RTL
--- fired. The line numbers are here; the reasoning belongs to the reader.
-CREATE TABLE assignment(
+-- declaration_kind is the net type's own word (`wire`, `wand`, `trireg`,
+-- ...) or `variable`. is_implicit=1 marks a net slang created for an
+-- undeclared identifier under the active `default_nettype`; its
+-- declaration_kind is that nettype, and its location is the first use.
+CREATE TABLE net(
+    id               INTEGER PRIMARY KEY,
+    inst_id          INTEGER NOT NULL REFERENCES inst(id),
+    scope_node_id    INTEGER NOT NULL REFERENCES tree_node(id),
+    name             TEXT NOT NULL,
+    declaration_kind TEXT NOT NULL,
+    data_type_id     INTEGER REFERENCES data_type(id),
+    width            INTEGER,
+    is_implicit      INTEGER NOT NULL CHECK(is_implicit IN (0,1)),
+    file_id          INTEGER REFERENCES file(id),
+    line             INTEGER,
+    column           INTEGER);
+
+-- One terminal: a port on an instance's boundary. The root instance's
+-- terminals are the design's top-level ports; a child's are the pins its
+-- parent connects. One noun for both, because they are the same object seen
+-- from the two sides v9 conflated in one `port` row.
+--
+-- direction is NULL for an interface terminal (it has none) and for a
+-- terminal of an unresolved instance (nobody knows). is_const marks
+-- `const ref`; NULL where constness does not apply. An unresolved instance
+-- still gets terminal rows -- one per connection its parent wrote, named as
+-- the connection names them -- so `net_conn` has something to bind and
+-- "connected to a black box" stays distinct from "connected to nothing".
+CREATE TABLE term(
+    id            INTEGER PRIMARY KEY,
+    inst_id       INTEGER NOT NULL REFERENCES inst(id),
+    name          TEXT NOT NULL,
+    terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('signal','interface')),
+    direction     TEXT CHECK(direction IN ('input','output','inout','ref')),
+    data_type_id  INTEGER REFERENCES data_type(id),
+    width         INTEGER,
+    ordinal       INTEGER NOT NULL,
+    is_const      INTEGER CHECK(is_const IN (0,1)),
+    modport       TEXT,
+    file_id       INTEGER REFERENCES file(id),
+    line          INTEGER,
+    column        INTEGER);
+
+-- The INSIDE of a terminal: which nets of its own instance it stands for,
+-- one row per segment. An ANSI port is one whole-to-whole row; a non-ANSI
+-- `.p({hi, lo})` formal is one row per element, each with its window of the
+-- terminal (`term_lo`/`term_hi`) and of the net. Both nets belong to the
+-- terminal's own instance -- the outside is `net_conn`'s business, and
+-- keeping the two relations apart is what v9's one-table version kept
+-- getting wrong.
+CREATE TABLE term_map(
+    term_id       INTEGER NOT NULL REFERENCES term(id),
+    ordinal       INTEGER NOT NULL,
+    net_id        INTEGER NOT NULL REFERENCES net(id),
+    term_lo       INTEGER,
+    term_hi       INTEGER,
+    term_exact    INTEGER NOT NULL CHECK(term_exact IN (0,1)),
+    net_lo        INTEGER,
+    net_hi        INTEGER,
+    net_exact     INTEGER NOT NULL CHECK(net_exact IN (0,1)),
+    mapping_exact INTEGER NOT NULL CHECK(mapping_exact IN (0,1)),
+    PRIMARY KEY(term_id, ordinal));
+
+-- The OUTSIDE of a terminal: what the parent connected to it, one row per
+-- atomic segment -- each concatenation element and each replication copy is
+-- its own row with its own window of the formal, so `.q({2{r}})` is two
+-- rows whose windows tile q. connection_kind decides which columns apply:
+--
+--   signal              net_id names a net of the PARENT instance.
+--   constant            a tie-off; no net, but the window is kept so the
+--                       formal's bits tile rather than leaving a gap that
+--                       reads as an exporter bug.
+--   unconnected         nobody connected it. Recorded, not omitted: absence
+--                       would also mean "the exporter did not get this far".
+--   expression_operand  the actual is an expression; this row is one net it
+--                       reads. `.en(state == RUN)` samples state but does
+--                       not alias it to en -- mapping_exact is 0 by
+--                       construction.
+--   interface           interface_inst_id names the bound interface
+--                       instance. No dataflow arc pretends to cross here.
+--   external_reference  tied to something with no name in the parent
+--                       (`.a(tb.glob)`); hier_ref_id says what.
+--
+-- Range discipline: columns describing an end that does not exist are NULL
+-- -- a constant has no net end, an interface binding has no bit domain --
+-- so a tie-off never reads as "the whole of nothing, exactly".
+CREATE TABLE net_conn(
+    id                INTEGER PRIMARY KEY,
+    net_id            INTEGER REFERENCES net(id),
+    term_id           INTEGER NOT NULL REFERENCES term(id),
+    ordinal           INTEGER NOT NULL,
+    connection_kind   TEXT NOT NULL
+        CHECK(connection_kind IN ('signal','constant','unconnected',
+                                  'expression_operand','interface','external_reference')),
+    net_lo            INTEGER,
+    net_hi            INTEGER,
+    net_exact         INTEGER CHECK(net_exact IN (0,1)),
+    term_lo           INTEGER,
+    term_hi           INTEGER,
+    term_exact        INTEGER CHECK(term_exact IN (0,1)),
+    mapping_exact     INTEGER CHECK(mapping_exact IN (0,1)),
+    interface_inst_id INTEGER REFERENCES inst(id),
+    hier_ref_id       INTEGER REFERENCES hier_ref(id),
+    file_id           INTEGER REFERENCES file(id),
+    line              INTEGER,
+    column            INTEGER,
+    UNIQUE(term_id, ordinal));
+
+-- One procedure: an always/initial/final block, or a task/function body.
+-- v9 named these with a bare per-module integer that was not a key in any
+-- table; this is the object that integer was gesturing at.
+CREATE TABLE procedure(
+    id             INTEGER PRIMARY KEY,
+    inst_id        INTEGER NOT NULL REFERENCES inst(id),
+    scope_node_id  INTEGER NOT NULL REFERENCES tree_node(id),
+    name           TEXT,
+    procedure_kind TEXT NOT NULL
+        CHECK(procedure_kind IN ('always','always_ff','always_comb','always_latch',
+                                 'initial','final','task','function')),
+    ordinal        INTEGER NOT NULL,
+    file_id        INTEGER REFERENCES file(id),
+    line           INTEGER,
+    column         INTEGER);
+
+-- One statement, or one statement-level construct. The statement is the
+-- object; its targets, operands and other reads are child rows -- v9's
+-- `assignment` was one row per TARGET, so `{a,b} = {x,y}` was two rows
+-- claiming one statement and a statement writing only outward was no row at
+-- all. Here it is one row regardless.
+--
+-- sequence is execution order within the procedure, NULL exactly when
+-- procedure_id is NULL (a continuous assign has no execution order).
+-- assignment_kind is NULL for non-assignments. delay is the delay control's
+-- normalised source text (`#3`, `#(rise, fall)`), not a number this tool
+-- pretended to evaluate; NULL when there is none.
+--
+-- What is deliberately NOT here, unchanged from v9: no branch-condition
+-- text, no clocked flag, no source text. `force` records as a blocking
+-- assignment; `release` leaves no row.
+CREATE TABLE stmt(
+    id                    INTEGER PRIMARY KEY,
+    inst_id               INTEGER NOT NULL REFERENCES inst(id),
+    scope_node_id         INTEGER NOT NULL REFERENCES tree_node(id),
+    procedure_id          INTEGER REFERENCES procedure(id),
+    ordinal               INTEGER NOT NULL,
+    sequence              INTEGER,
+    statement_kind        TEXT NOT NULL
+        CHECK(statement_kind IN ('assignment','assertion','wait','call',
+                                 'system_task','event_control')),
+    construct             TEXT,
+    assignment_kind       TEXT
+        CHECK(assignment_kind IN ('continuous','blocking','nonblocking')),
+    delay                 TEXT,
+    dropped_operand_count INTEGER NOT NULL,
+    file_id               INTEGER REFERENCES file(id),
+    line                  INTEGER,
+    column                INTEGER);
+
+-- One target reference of an assignment (LHS), in written order. A target
+-- whose net lies outside the instance is not here -- it is a `hier_ref`
+-- with access='write' on the same stmt_id.
+CREATE TABLE assign_target(
     id       INTEGER PRIMARY KEY,
-    module   INTEGER NOT NULL REFERENCES module(id),
-    dst       INTEGER NOT NULL REFERENCES name(id),
-    dst_lo    INTEGER, dst_hi INTEGER, dst_exact INTEGER,
-    -- continuous_assign | procedural. Never `primitive`: a gate is not a
-    -- statement, so it contributes edges and no assignment row.
-    kind      TEXT,
-    construct TEXT,
-    file     INTEGER REFERENCES file(id),
-    line     INTEGER,
-    -- Which procedure in the module, and the order within it. Both are needed:
-    -- `seq` restarts per procedure, so two assignments to one target from
-    -- different `always` blocks can carry the same seq and would otherwise read
-    -- as one ordered sequence.
-    --
-    -- `proc` is NULL when the statement is in no procedure: a net declared with
-    -- an initialiser (`wire w = a & b;`) is a continuous assignment written at
-    -- the declaration, so it has a `seq` among its peers and no procedure to
-    -- belong to.
-    proc     INTEGER,
-    seq      INTEGER,
-    -- 1 for `=`, 0 for `<=`, NULL for a continuous assign. Not decoration: two
-    -- assignments to one target in one block resolve by different rules --
-    -- non-blocking samples at entry and the last one wins, blocking runs in
-    -- order and each intermediate value is visible to the statements after it.
-    -- Without this a consumer holding `seq` cannot tell which rule applies.
-    blocking  INTEGER,
-    -- Operands not recorded: compile-time constants, and references outside
-    -- this module. A row with one operand and three dropped is not the same as
-    -- a row that reads one signal, and without this they look identical.
-    dropped_operands INTEGER,
-    -- Which statement in the module wrote this, as an ordinal the exporter
-    -- assigns. See `hier_ref.stmt` for what it is for -- it is the same number,
-    -- and it is what relates a row here to the outward writes and reads of the
-    -- same statement.
-    stmt     INTEGER);
+    stmt_id  INTEGER NOT NULL REFERENCES stmt(id),
+    ordinal  INTEGER NOT NULL,
+    net_id   INTEGER NOT NULL REFERENCES net(id),
+    lo       INTEGER,
+    hi       INTEGER,
+    is_exact INTEGER NOT NULL CHECK(is_exact IN (0,1)),
+    UNIQUE(stmt_id, ordinal));
 
--- The edge events a procedure triggers on. Every one of them, because an event
--- list has no order: `@(posedge clk or negedge rst_n)` and
--- `@(negedge rst_n or posedge clk)` are the same block written two ways, and
--- both spellings are common. Recording "the first" would have been recording
--- how the author happened to arrange the list.
---
--- Which of these is a clock and which a reset is not decided here. That needs
--- constraints this tool does not read, and a divided or gated clock cannot be
--- related to its source without them. A consumer that knows gets both events
--- and can say; one that does not is not handed a guess.
---
--- Keyed on the procedure rather than the assignment: every assignment in a
--- block shares its sensitivity list. Level-sensitive lists are not recorded --
--- for `always @(*)` or `always @(a or b)` the sensitivity is the read set,
--- which `assign_operand` already carries.
---
--- Statement-level event controls are rows too: `@(posedge clk);` inside an
--- initial block or a task is a wait rather than sensitivity, but the signal
--- is sampled either way, and without a row the read had no trace at all.
---
--- `wait` is what tells the two apart, and it has to be a column. An earlier
--- version said file/line would do it -- a sensitivity row carrying the
--- procedure's location, a wait its statement's -- which is not something a
--- consumer can evaluate: no table stores a procedure's own location, so there
--- is nothing to compare against, and a wait written on the same line as the
--- header produces two rows that are byte-identical. Without the column an
--- `initial` block containing `@(posedge clk);` reads as a procedure triggered
--- by `clk`, which is a wrong trigger set rather than a missing one.
-CREATE TABLE proc_event(
-    module INTEGER NOT NULL REFERENCES module(id),
-    proc   INTEGER NOT NULL,
-    signal INTEGER REFERENCES name(id),   -- NULL when not a plain reference
-    edge_kind TEXT,                       -- posedge | negedge | both
-    -- 0 = the procedure's sensitivity list, so it triggers the block.
-    -- 1 = a wait reached during execution; it suspends the block instead, and
-    -- says nothing about what triggers it. An `initial` block has only these.
-    wait   INTEGER NOT NULL,
-    file   INTEGER REFERENCES file(id),
-    line   INTEGER);
-
+-- One operand reference of an assignment's RHS. Operands belong to the
+-- STATEMENT, not to a target: which operand feeds which target is
+-- `net_dep`'s answer, and pairing them here is exactly the cross product
+-- v7 removed. A read occurring twice is two rows.
 CREATE TABLE assign_operand(
-    assignment INTEGER NOT NULL REFERENCES assignment(id),
-    name       INTEGER NOT NULL REFERENCES name(id),
-    src_lo     INTEGER, src_hi INTEGER, src_exact INTEGER);
+    id       INTEGER PRIMARY KEY,
+    stmt_id  INTEGER NOT NULL REFERENCES stmt(id),
+    ordinal  INTEGER NOT NULL,
+    net_id   INTEGER NOT NULL REFERENCES net(id),
+    lo       INTEGER,
+    hi       INTEGER,
+    is_exact INTEGER NOT NULL CHECK(is_exact IN (0,1)),
+    UNIQUE(stmt_id, ordinal));
 
--- References that leave the module, exactly as written: `bus.vld` through an
--- interface port, `tb.u_dut.state` as an XMR, `pkg::cfg` from a package.
+-- One statement read that is not an assignment operand, classified by role:
 --
--- Their target cannot go into edge or port rows: those name signals in the
--- module's own namespace, shared by every instance of it, and an absolute
--- path would bake one instance's hierarchy into all of them. The *text* has
--- no such problem -- every instance carries the same spelling -- so the text
--- is what is stored, and resolving it against the hierarchy belongs to the
--- consumer. Bare names that leave the module (a subroutine's package-level
--- free variable) are counted but not recorded: a name with no path in it
--- resolves against imports this table cannot see.
+--   control        a branch condition the statement's targets sit under
+--   assertion      read by an assert/assume/cover/expect
+--   wait           a wait statement's condition
+--   event          a sensitivity/event expression that is not a plain net
+--                  (those are proc_event rows -- one read, one table, never
+--                  both, or v_load counts it twice)
+--   call_argument  an actual at a call site
+--   system_task    read by $display and friends
+CREATE TABLE expr_ref(
+    id       INTEGER PRIMARY KEY,
+    stmt_id  INTEGER NOT NULL REFERENCES stmt(id),
+    ordinal  INTEGER NOT NULL,
+    net_id   INTEGER NOT NULL REFERENCES net(id),
+    role     TEXT NOT NULL
+        CHECK(role IN ('control','assertion','wait','event',
+                       'call_argument','system_task')),
+    lo       INTEGER,
+    hi       INTEGER,
+    is_exact INTEGER NOT NULL CHECK(is_exact IN (0,1)),
+    UNIQUE(stmt_id, ordinal));
+
+-- One edge event a procedure triggers on or waits on. All of them, because
+-- an event list has no order and recording "the first" records how the
+-- author arranged the list. Which is the clock is deliberately not decided
+-- here, exactly as in v9.
 --
--- `write`=1 when the module writes the path. `kind`/`construct` are edge's
--- vocabulary, plus kind='port' with the direction in `construct` for a port
--- connection tied to an external signal. Bits as everywhere else.
+-- event_kind='sensitivity' rows belong to the procedure header (stmt_id
+-- NULL); event_kind='wait' rows are statement-level controls reached during
+-- execution (stmt_id set). net_id is NULL when the event expression is not
+-- a plain net -- the reads of such an expression are expr_ref rows with
+-- role='event', never both.
+CREATE TABLE proc_event(
+    id           INTEGER PRIMARY KEY,
+    procedure_id INTEGER NOT NULL REFERENCES procedure(id),
+    stmt_id      INTEGER REFERENCES stmt(id),
+    net_id       INTEGER REFERENCES net(id),
+    event_kind   TEXT NOT NULL CHECK(event_kind IN ('sensitivity','wait')),
+    edge_kind    TEXT CHECK(edge_kind IN ('posedge','negedge','both')),
+    file_id      INTEGER REFERENCES file(id),
+    line         INTEGER,
+    column       INTEGER);
+
+-- One net-to-net dependency occurrence -- the adjacency list v_driver and
+-- v_load index, and the provenance record v9's deduplicated `edge` erased.
+-- NOT deduplicated: the same source reaching the same target from two
+-- statements is two rows, each naming its statement. `{a,b} = {x,y}` is
+-- x->a and y->b, each naming its operand and target rows -- never the
+-- four-way cross product.
+--
+-- dependency_kind, and what must be set for each (verifier-enforced):
+--
+--   data       an assignment moves it: stmt_id, assign_operand_id,
+--              assign_target_id. source_net_id NULL is a constant driver
+--              (`q <= 8'h0`) -- the row still names the statement, which is
+--              what a driver query reports; every source_* column is NULL.
+--   control    it reaches the target through a branch condition: stmt_id,
+--              expr_ref_id (role='control'), assign_target_id.
+--              mapping_exact is 0 -- a condition gates, it does not map.
+--   primitive  a gate/switch/UDP couples them: primitive_id, per LRM
+--              (input, output) pairing.
+--   procedure  a call binds them: actual to formal by argument direction,
+--              and function return to the call site's targets. stmt_id is
+--              the calling statement; the actual's read is expr_ref_id
+--              (role='call_argument') or assign_operand_id, the written
+--              side assign_target_id, whichever exist. mapping_exact 0 --
+--              a call is opaque.
+--
+-- source_net_id/target_net_id repeat what the operand/target rows already
+-- know. Deliberate, verified redundancy: this table is the driver/load
+-- index, and the verifier holds the copies equal.
+CREATE TABLE net_dep(
+    id                INTEGER PRIMARY KEY,
+    source_net_id     INTEGER REFERENCES net(id),
+    target_net_id     INTEGER NOT NULL REFERENCES net(id),
+    stmt_id           INTEGER REFERENCES stmt(id),
+    assign_operand_id INTEGER REFERENCES assign_operand(id),
+    assign_target_id  INTEGER REFERENCES assign_target(id),
+    expr_ref_id       INTEGER REFERENCES expr_ref(id),
+    primitive_id      INTEGER REFERENCES primitive(id),
+    dependency_kind   TEXT NOT NULL
+        CHECK(dependency_kind IN ('data','control','primitive','procedure')),
+    source_lo         INTEGER,
+    source_hi         INTEGER,
+    source_exact      INTEGER CHECK(source_exact IN (0,1)),
+    target_lo         INTEGER,
+    target_hi         INTEGER,
+    target_exact      INTEGER NOT NULL CHECK(target_exact IN (0,1)),
+    mapping_exact     INTEGER CHECK(mapping_exact IN (0,1)));
+
+-- One reference that leaves the instance: an XMR, an interface member, a
+-- package item. The path is stored as written (normalised), AND -- new in
+-- v10, because an occurrence knows its place in the hierarchy where a
+-- folded row could not -- resolved to the target instance and net when
+-- slang could resolve it and the target is in this export. NULL
+-- resolved_* is "not resolved here", never a fabricated object.
+--
+-- access: read | write | connect (a port connection tied outward; its
+-- net_conn row points back here).
 CREATE TABLE hier_ref(
-    module INTEGER NOT NULL REFERENCES module(id),
-    path   INTEGER NOT NULL REFERENCES name(id),
-    write  INTEGER,
-    kind      TEXT,
-    construct TEXT,
-    file   INTEGER REFERENCES file(id),
-    line   INTEGER,
-    path_lo INTEGER, path_hi INTEGER, path_exact INTEGER,
-    -- Which statement produced this, as an ordinal the exporter assigns while
-    -- walking the module. Rows sharing (module, stmt) came from one statement;
-    -- the number means nothing outside its module and is not an id in a table.
-    --
-    -- It exists because a statement whose target is outward has no `assignment`
-    -- row to hang its parts from: the write lands here, the reads it made land
-    -- in `stmt_read`, and any further outward operand lands here too. Before
-    -- this, those parts shared only module, file and line, so
-    --
-    --     assign top.a = x; assign top.b = y;
-    --
-    -- exported two writes and two reads that a consumer could only pair four
-    -- ways -- `top.a` from `x` *and* from `y`, `top.b` likewise -- when the RTL
-    -- says exactly one of those four. `edge` has the same shape of problem and
-    -- deliberately does not solve it, because a deduplicated dependency graph
-    -- has no statement to point at; these tables are not deduplicated and do.
-    stmt   INTEGER);
-
--- A statement that reads signals without writing anything this module can
--- name. Two shapes reach it: an assertion, which writes nothing at all, and an
--- assignment whose target lies outside the module (`assign bus.vld = |payload;`).
---
--- Their reads had nowhere else to go. `edge` requires a `dst`, and
--- `assign_operand` hangs off an `assignment` row that cannot exist without a
--- module-relative target -- so `payload` and every signal an assertion checks
--- read as though nothing in the design used them, which for assertion-heavy
--- RTL is most of what the file says.
---
--- The write side of the second shape is in `hier_ref` at the same file and
--- line; this is the read side of the same statement.
-CREATE TABLE stmt_read(
-    module    INTEGER NOT NULL REFERENCES module(id),
-    name      INTEGER NOT NULL REFERENCES name(id),
-    -- edge.kind's vocabulary. (Not 'assertion': slang wraps even a
-    -- module-scope concurrent assertion in an implicit procedure, so the
-    -- reading construct's own word lives in `construct` below and the kind
-    -- stays the wrapper's.)
-    kind      TEXT,
-    -- The construct that reads: `assign`, `always_ff`, or the assertion's own
-    -- word -- `assert`, `assume`, `cover`, `expect`.
-    construct TEXT,
-    file      INTEGER REFERENCES file(id),
-    line      INTEGER,
-    -- Bits of the thing read, spelled `src_*` as everywhere else that records
-    -- a read.
-    src_lo    INTEGER, src_hi INTEGER, src_exact INTEGER,
-    -- The statement these reads belong to, as `hier_ref.stmt`. Joining on it is
-    -- what pairs a read with the outward write it fed, rather than with every
-    -- outward write on the line.
-    stmt      INTEGER);
-
--- The instance tree. This is the one table that scales with the design rather
--- than with the source, which is why it carries nothing but identity.
-CREATE TABLE instance(
-    id      INTEGER PRIMARY KEY,
-    -- One path segment, never more. A generate block is a level of its own,
-    -- so `g_lane[3].u_dp` is two rows rather than one name containing a dot:
-    -- resolving a path is then one indexed lookup per segment, which is the
-    -- whole reason the paths themselves are not stored.
-    name    INTEGER NOT NULL REFERENCES name(id),
-    -- NULL for a generate block, which is a naming level rather than an
-    -- instantiation and has no module to point at. Also NULL for a primitive
-    -- and for an unresolved instantiation, neither of which has a module row --
-    -- `child.kind`, reached through `child` below, is what separates those
-    -- three; `module IS NULL` alone does not.
-    module  INTEGER REFERENCES module(id),
-    parent  INTEGER REFERENCES instance(id),
-    -- The instantiation in the parent's module body that this row expands.
-    --
-    -- The two hierarchy tables were otherwise related by nothing: `child` is
-    -- folded and spells a generate-nested name whole (`g[0].u_leaf`), while
-    -- `instance` is expanded and one segment per row (`g[0]` then `u_leaf`), so
-    -- matching them meant re-parsing the text and walking segments -- work the
-    -- database could do once and did not. One `child` row expands to as many
-    -- `instance` rows as there are instances of the enclosing module, which is
-    -- the ordinary one-to-many this column now states.
-    --
-    -- NULL only where there is genuinely no instantiation to point at: the root,
-    -- and a generate block, which is a level the elaboration invented rather
-    -- than something written as an instance.
-    child   INTEGER REFERENCES child(id));
+    id               INTEGER PRIMARY KEY,
+    inst_id          INTEGER NOT NULL REFERENCES inst(id),
+    stmt_id          INTEGER REFERENCES stmt(id),
+    path             TEXT NOT NULL,
+    access           TEXT NOT NULL CHECK(access IN ('read','write','connect')),
+    resolved_inst_id INTEGER REFERENCES inst(id),
+    resolved_net_id  INTEGER REFERENCES net(id),
+    lo               INTEGER,
+    hi               INTEGER,
+    is_exact         INTEGER NOT NULL CHECK(is_exact IN (0,1)),
+    file_id          INTEGER REFERENCES file(id),
+    line             INTEGER,
+    column           INTEGER);
 )SQL";
 
+// UNIQUE constraints already index (stmt_id, ordinal) on the three statement
+// child tables and (term_id, ordinal) on net_conn; term_map's primary key
+// covers (term_id, ordinal). What is added here is the other direction of
+// each relation and the point queries the views document: driver = by
+// target, load = by source, provenance = by each reference id.
 constexpr const char* kIndexes = R"SQL(
-CREATE INDEX edge_by_dst      ON edge(module, dst);
-CREATE INDEX edge_by_src      ON edge(module, src);
-CREATE INDEX child_by_module  ON child(module);
-CREATE INDEX symbol_by_module ON symbol(module);
-CREATE INDEX assign_by_dst    ON assignment(module, dst);
-CREATE INDEX pevent_by_proc   ON proc_event(module, proc);
--- Two directions, two indexes: pevent_by_proc answers "what is this procedure
--- sensitive to", this one answers "whose trigger is this signal" -- the event
--- arm of v_load's documented point query, which otherwise scanned the
--- module's whole event list through the other index's prefix.
-CREATE INDEX pevent_by_signal ON proc_event(module, signal);
-CREATE INDEX aop_by_assign    ON assign_operand(assignment);
-CREATE INDEX sread_by_name    ON stmt_read(module, name);
-CREATE INDEX href_by_module   ON hier_ref(module);
-CREATE INDEX symbol_by_name   ON symbol(name);
--- Both directions: outward from a net in the parent, and inward from a formal
--- in the child. A driver query needs the first, a load query the second.
-CREATE INDEX port_by_outer    ON port(module, outer);
-CREATE INDEX port_by_formal   ON port(def_module, port);
--- The boundary-crossing hop of a trace: a tree node's child_id to its port
--- rows. Not a view index (SQLite has none) -- it is the access path of the
--- port.child_id foreign key, which the documented v_tree_node-to-
--- v_port_connection join takes on every instance boundary.
-CREATE INDEX port_by_child    ON port(child_id);
--- The descent index: resolving a hierarchical path means one lookup per
--- segment against this. Not unique -- a design that only partially elaborates
--- can produce two siblings with the same name, and refusing the second would
--- abort an export that is otherwise perfectly usable. The count is reported.
-CREATE INDEX instance_by_parent ON instance(parent, name);
-CREATE INDEX instance_by_module ON instance(module);
+CREATE INDEX tree_node_by_parent    ON tree_node(parent_node_id, ordinal);
+CREATE INDEX inst_by_parent         ON inst(parent_inst_id);
+CREATE INDEX inst_by_module         ON inst(module_id);
+CREATE INDEX primitive_by_inst      ON primitive(inst_id);
+CREATE INDEX net_by_inst            ON net(inst_id, name);
+CREATE INDEX net_by_scope           ON net(scope_node_id, name);
+CREATE INDEX term_by_inst           ON term(inst_id, ordinal);
+CREATE INDEX term_by_inst_name      ON term(inst_id, name);
+CREATE INDEX term_map_by_net        ON term_map(net_id);
+CREATE INDEX net_conn_by_net        ON net_conn(net_id);
+CREATE INDEX procedure_by_inst      ON procedure(inst_id, ordinal);
+CREATE INDEX stmt_by_inst           ON stmt(inst_id, ordinal);
+CREATE INDEX stmt_by_procedure      ON stmt(procedure_id, sequence);
+CREATE INDEX assign_target_by_net   ON assign_target(net_id);
+CREATE INDEX assign_operand_by_net  ON assign_operand(net_id);
+CREATE INDEX expr_ref_by_net        ON expr_ref(net_id);
+CREATE INDEX proc_event_by_procedure ON proc_event(procedure_id);
+CREATE INDEX proc_event_by_net      ON proc_event(net_id);
+CREATE INDEX net_dep_by_source      ON net_dep(source_net_id);
+CREATE INDEX net_dep_by_target      ON net_dep(target_net_id);
+CREATE INDEX net_dep_by_stmt        ON net_dep(stmt_id);
+CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id);
+CREATE INDEX net_dep_by_target_ref  ON net_dep(assign_target_id);
+CREATE INDEX net_dep_by_expr_ref    ON net_dep(expr_ref_id);
+CREATE INDEX net_dep_by_primitive   ON net_dep(primitive_id);
+CREATE INDEX hier_ref_by_inst       ON hier_ref(inst_id);
+CREATE INDEX hier_ref_by_stmt       ON hier_ref(stmt_id);
+CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id);
 )SQL";
 
-// The stable query interface: nine views that resolve the intern tables so a
-// consumer never joins `name`, `type`, `file` or `source_file` itself. They are
-// part of the schema-version contract from v8 on -- their existence, their
-// column sets and their row granularity are what a consumer may rely on, and
-// verify-designdb.py asserts all three.
+// The stable query interface: twelve views, the v10 consumption contract.
+// Their existence, column sets, column semantics, NULL rules and row
+// granularity are what a consumer may rely on; changing any of those bumps
+// the schema version, changing only how one is computed does not.
+// verify-designdb.py asserts all of it on every export.
 //
-// Ground rules, so the views stay what they claim to be:
+// Ground rules, revised from v8 for the instance-level model:
 //
-//   * One view row is one base-table row. Every join here is against a primary
-//     key, so no LEFT JOIN can fan out, and the verifier checks
-//     count(view) == count(base) to keep it that way.
-//   * Explicit column lists, never SELECT * -- a column added to a base table
-//     must not silently change a view's contract.
-//   * No transitive closure. v_driver and v_load are one step inside one
-//     module; walking a fan-in cone or crossing instances is the consumer's
-//     loop, composed from v_dependency + v_port_connection + v_tree_node --
-//     joined on child_id, the one key both hierarchy views expose.
-//   * Few nouns, complete attributes. The views are the object model --
-//     database, tree node, signal, binding, dependency, statement -- not one
-//     view per storage table. v_load is the whole answer to "who reads it"
-//     however the read was stored, the way a netlist database's net.loads
-//     includes the flop clock pins; row counts for union views hold as the
-//     sum of their parts.
-//   * Nothing joins `edge` to `assignment`. The two are independent
-//     projections, and (module, dst, file, line) is not a key between them --
-//     the views must not resurrect the cross product v7 removed.
+//   * A FACT view's row is one base-table row -- v_tree_node, v_net,
+//     v_terminal, v_terminal_map, v_net_connection, v_net_dependency,
+//     v_statement, v_statement_target, v_statement_operand -- and the
+//     verifier checks count(view) == count(base). Every internal join is
+//     against a primary key, so nothing fans out.
+//   * v_driver and v_load are COMPOSITE: UNION ALL branches discriminated by
+//     driver_kind/load_kind, each branch's row count reconcilable against
+//     its base tables by a formula the verifier evaluates. They are the one
+//     place the hierarchy crossing is composed (net_conn against term_map);
+//     v9 left that composition to the consumer, and every consumer wrote it
+//     differently or wrongly.
+//   * v_conn_arc is scaffolding for that composition, NOT part of the
+//     contract: consumers must not query it, and it may change or vanish
+//     without a version bump. It exists because the same composition feeds
+//     four branches and inlining it four times would guarantee drift.
+//   * Explicit column lists, never SELECT *. No transitive closure -- a
+//     fan-in cone is the consumer's recursive query over net_dep, one step
+//     per row here.
 //   * Plain CREATE VIEW, not IF NOT EXISTS: the writer only ever creates a
-//     fresh database, so a name collision is a bug to fail on, not to accept.
+//     fresh database, so a name collision is a bug to fail on.
 //
 // SQLite resolves a view's column references when the view is *queried*, not
-// when it is created -- a view naming a dropped column is created without
-// complaint and fails on first use. The verifier's row-count checks query
-// every view, which is what makes a stale view a caught error rather than a
-// consumer's surprise.
+// when it is created -- the verifier's row-count checks query every view,
+// which is what makes a stale view a caught error rather than a consumer's
+// surprise.
 constexpr const char* kViews = R"SQL(
 -- The meta table pivoted to one fixed row, so "which schema, which status" is
 -- one SELECT with no key-value handling. Counts are CAST so a consumer gets
@@ -613,349 +556,538 @@ SELECT
     MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest
 FROM meta;
 
--- One row per `instance`: the expanded tree, with names resolved and the node's
--- nature spelled out. node_kind is the classification a consumer had to derive
--- from NULL combinations before: root and generate are structural (nothing was
--- written as an instance), the other three are child.kind -- and a trace stops
--- differently at each, which is why the word matters. An inconsistent row
--- yields NULL rather than 'unknown': naming it would hide exactly the state
--- the verifier exists to reject.
---
--- No source location -- instance and child do not carry one, and a view must
--- not invent columns it cannot fill. No precomputed path either: the chain of
--- instance_name up parent_instance_id IS the path, one segment per row.
+-- One row per tree_node. The subtype columns are NULL by node_kind, and that
+-- is the contract: root/instance/unresolved have instance_id (and module_id
+-- unless unresolved); primitive and generate have instance_id NULL. For a
+-- primitive, parent_instance_id is the instance whose body wrote it and
+-- definition_name is the gate/UDP name; for an unresolved node,
+-- definition_name is the unresolvable spelling. Location is the
+-- instantiation site; the root and generate levels have none.
 CREATE VIEW v_tree_node AS
 SELECT
-    i.id         AS instance_id,
-    i.parent     AS parent_instance_id,
-    n.text       AS instance_name,
-    CASE WHEN i.parent IS NULL THEN 'root'
-         WHEN i.child IS NULL AND i.module IS NULL THEN 'generate'
-         ELSE c.kind END AS node_kind,
-    i.module     AS module_id,
-    m.name       AS module_name,
-    m.params     AS module_params,
-    i.child      AS child_id,
-    dn.text      AS definition_name
-FROM instance i
-JOIN name n        ON n.id = i.name
-LEFT JOIN module m ON m.id = i.module
-LEFT JOIN child c  ON c.id = i.child
-LEFT JOIN name dn  ON dn.id = c.def_name;
+    n.id             AS node_id,
+    n.parent_node_id AS parent_node_id,
+    n.name           AS node_name,
+    n.node_kind      AS node_kind,
+    n.ordinal        AS ordinal,
+    i.id             AS instance_id,
+    COALESCE(i.parent_inst_id, p.inst_id) AS parent_instance_id,
+    i.module_id      AS module_id,
+    m.name           AS module_name,
+    i.parameter_signature AS parameter_signature,
+    COALESCE(p.definition_name, i.unresolved_definition) AS definition_name,
+    f.path           AS file_path,
+    sf.path          AS source_path,
+    COALESCE(i.line, p.line)         AS source_line,
+    COALESCE(i."column", p."column") AS source_column
+FROM tree_node n
+LEFT JOIN inst i         ON i.id = n.id
+LEFT JOIN primitive p    ON p.id = n.id
+LEFT JOIN module m       ON m.id = i.module_id
+LEFT JOIN file f         ON f.id = COALESCE(i.file_id, p.file_id)
+LEFT JOIN source_file sf ON sf.id = f.source_file_id;
 
--- One row per `symbol`: a declaration in a module variant, with its type text
--- and both spellings of its file -- file_path as written in the filelist,
--- source_path absolute on disk. They genuinely differ and each is the right
--- answer to a different question, so neither substitutes for the other.
-CREATE VIEW v_signal AS
+-- One row per net: a connectable object of one concrete instance. No
+-- direction column -- direction belongs to terminals, and a net's port-ness
+-- is one v_terminal_map join away. file_path is the spelling as written in
+-- the filelist, source_path the absolute path it resolved to; they answer
+-- different questions and neither substitutes for the other.
+CREATE VIEW v_net AS
 SELECT
-    s.module     AS module_id,
-    m.name       AS module_name,
-    m.params     AS module_params,
-    n.text       AS signal_name,
-    s.kind       AS symbol_kind,
-    t.text       AS type_text,
-    s.width      AS width,
-    CASE s.direction WHEN 0 THEN 'input' WHEN 1 THEN 'output'
-                     WHEN 2 THEN 'inout' WHEN 3 THEN 'ref' END AS direction_name,
-    f.path       AS file_path,
-    sf.path      AS source_path,
-    s.line       AS source_line,
-    s.col        AS source_column
-FROM symbol s
-JOIN module m            ON m.id = s.module
-JOIN name n              ON n.id = s.name
-LEFT JOIN type t         ON t.id = s.type
-LEFT JOIN file f         ON f.id = s.file
-LEFT JOIN source_file sf ON sf.id = f.source_file;
+    nt.id               AS net_id,
+    nt.inst_id          AS instance_id,
+    i.module_id         AS module_id,
+    m.name              AS module_name,
+    i.parameter_signature AS parameter_signature,
+    nt.scope_node_id    AS scope_node_id,
+    nt.name             AS net_name,
+    nt.declaration_kind AS declaration_kind,
+    dt.text             AS data_type,
+    nt.width            AS width,
+    nt.is_implicit      AS is_implicit,
+    f.path              AS file_path,
+    sf.path             AS source_path,
+    nt.line             AS source_line,
+    nt."column"         AS source_column
+FROM net nt
+JOIN inst i              ON i.id = nt.inst_id
+LEFT JOIN module m       ON m.id = i.module_id
+LEFT JOIN data_type dt   ON dt.id = nt.data_type_id
+LEFT JOIN file f         ON f.id = nt.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id;
 
--- One row per `port`: a binding in the FOLDED model, shared by every instance
--- of the parent -- which is why there is no instance_id here to ask for.
--- child_id is the join key to the hierarchy: v_tree_node.child_id equals it,
--- and that pair is the ONLY documented way to relate the two views. The names
--- do not relate them -- child_instance_name is the folded spelling with the
--- generate prefix (`g_rep[0].u_dec`) while v_tree_node.instance_name is one
--- segment (`u_dec`), so a name join returns nothing exactly where the id is
--- needed most.
--- inner_signal_name is already coalesced: NULL inner means "the formal's own
--- name", and every consumer repeating that COALESCE was the reason to do it
--- once here. connection_kind decides what NULL means elsewhere in the row
--- (constant, unconnected and external ties all have no outer name), so read
--- it rather than testing outer_signal_name IS NULL.
-CREATE VIEW v_port_connection AS
+-- One row per terminal. direction NULL is an interface terminal or a
+-- terminal of an unresolved instance -- terminal_kind and the owning
+-- instance's node_kind say which.
+CREATE VIEW v_terminal AS
 SELECT
-    p.module      AS parent_module_id,
-    pm.name       AS parent_module_name,
-    pm.params     AS parent_module_params,
-    cn.text       AS child_instance_name,
-    p.child_id    AS child_id,
-    p.def_module  AS child_module_id,
-    cm.name       AS child_module_name,
-    cm.params     AS child_module_params,
-    fp.text       AS formal_port_name,
-    COALESCE(inn.text, fp.text) AS inner_signal_name,
-    p.port_lo     AS formal_lo,
-    p.port_hi     AS formal_hi,
-    p.port_exact  AS formal_exact,
-    CASE p.direction WHEN 0 THEN 'input' WHEN 1 THEN 'output'
-                     WHEN 2 THEN 'inout' WHEN 3 THEN 'ref' END AS direction_name,
-    onm.text      AS outer_signal_name,
-    ot.text       AS outer_type_text,
-    p.outer_width AS outer_width,
-    p.outer_lo    AS outer_lo,
-    p.outer_hi    AS outer_hi,
-    p.outer_exact AS outer_exact,
-    p.map_exact   AS mapping_exact,
-    CASE p.conn_kind WHEN 0 THEN 'signal'
-                     WHEN 1 THEN 'constant'
-                     WHEN 2 THEN 'unconnected'
-                     WHEN 3 THEN 'expression_operand'
-                     WHEN 4 THEN 'interface'
-                     WHEN 5 THEN 'external_reference' END AS connection_kind_name,
-    mp.text       AS modport_name,
-    f.path        AS file_path,
-    sf.path       AS source_path,
-    p.line        AS source_line
-FROM port p
-JOIN module pm           ON pm.id = p.module
-JOIN name cn             ON cn.id = p.child_name
-LEFT JOIN module cm      ON cm.id = p.def_module
-JOIN name fp             ON fp.id = p.port
-LEFT JOIN name inn       ON inn.id = p.inner
-LEFT JOIN name onm       ON onm.id = p.outer
-LEFT JOIN type ot        ON ot.id = p.outer_type
-LEFT JOIN name mp        ON mp.id = p.modport
-LEFT JOIN file f         ON f.id = p.file
-LEFT JOIN source_file sf ON sf.id = f.source_file;
+    t.id            AS terminal_id,
+    t.inst_id       AS instance_id,
+    i.module_id     AS module_id,
+    m.name          AS module_name,
+    t.name          AS terminal_name,
+    t.terminal_kind AS terminal_kind,
+    t.direction     AS direction,
+    dt.text         AS data_type,
+    t.width         AS width,
+    t.ordinal       AS ordinal,
+    t.is_const      AS is_const,
+    t.modport       AS modport,
+    f.path          AS file_path,
+    sf.path         AS source_path,
+    t.line          AS source_line,
+    t."column"      AS source_column
+FROM term t
+JOIN inst i              ON i.id = t.inst_id
+LEFT JOIN module m       ON m.id = i.module_id
+LEFT JOIN data_type dt   ON dt.id = t.data_type_id
+LEFT JOIN file f         ON f.id = t.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id;
 
--- One row per `edge`: the direction-neutral base v_driver and v_load rename.
--- source_name NULL is a real record -- a statement that drives the target
--- while reading nothing nameable (`assign q = 1'b0;`) -- and is preserved, not
--- filtered. Bit ranges keep edge's semantics unchanged: LSB-relative offsets
--- into the flattened object, NULL+exact=1 the whole object, NULL+exact=0
--- somewhere unknown inside it; and mapping_exact=0 means the dependency is
--- real but only traceable at range granularity, not that it is doubtful.
-CREATE VIEW v_dependency AS
+-- One row per term_map segment: the inside of a terminal.
+CREATE VIEW v_terminal_map AS
 SELECT
-    e.module    AS module_id,
-    m.name      AS module_name,
-    m.params    AS module_params,
-    sn.text     AS source_name,
-    st.text     AS source_type,
-    e.src_lo    AS source_lo,
-    e.src_hi    AS source_hi,
-    e.src_exact AS source_exact,
-    dn.text     AS target_name,
-    dt.text     AS target_type,
-    e.dst_lo    AS target_lo,
-    e.dst_hi    AS target_hi,
-    e.dst_exact AS target_exact,
-    e.kind      AS dependency_kind,
-    e.construct AS construct,
-    e.control   AS is_control,
-    e.map_exact AS mapping_exact,
-    f.path      AS file_path,
-    sf.path     AS source_path,
-    e.line      AS source_line
-FROM edge e
-JOIN module m            ON m.id = e.module
-LEFT JOIN name sn        ON sn.id = e.src
-LEFT JOIN type st        ON st.id = e.src_type
-JOIN name dn             ON dn.id = e.dst
-LEFT JOIN type dt        ON dt.id = e.dst_type
-LEFT JOIN file f         ON f.id = e.file
-LEFT JOIN source_file sf ON sf.id = f.source_file;
+    mp.term_id       AS terminal_id,
+    t.inst_id        AS terminal_instance_id,
+    t.name           AS terminal_name,
+    mp.ordinal       AS mapping_ordinal,
+    mp.net_id        AS internal_net_id,
+    n.name           AS internal_net_name,
+    mp.term_lo       AS terminal_lo,
+    mp.term_hi       AS terminal_hi,
+    mp.term_exact    AS terminal_exact,
+    mp.net_lo        AS net_lo,
+    mp.net_hi        AS net_hi,
+    mp.net_exact     AS net_exact,
+    mp.mapping_exact AS mapping_exact
+FROM term_map mp
+JOIN term t ON t.id = mp.term_id
+JOIN net n  ON n.id = mp.net_id;
 
--- v_dependency read from the target's side: one row per direct driving
--- relation of signal_name. driver_name NULL stays -- the statement drives the
--- signal even though no source can be named -- and control edges stay, marked
--- is_control=1, for the consumer to keep or drop. One step, in-module: the
--- root driver across hierarchy is a walk the consumer composes.
+-- One row per net_conn segment: the outside of a terminal, exactly as
+-- written in the parent. Deliberately NOT composed with term_map -- this
+-- view is the fact, v_driver/v_load are the composition.
+CREATE VIEW v_net_connection AS
+SELECT
+    c.id                AS connection_id,
+    c.net_id            AS net_id,
+    pn.inst_id          AS net_instance_id,
+    pn.name             AS net_name,
+    c.term_id           AS terminal_id,
+    t.inst_id           AS terminal_instance_id,
+    t.name              AS terminal_name,
+    t.direction         AS direction,
+    c.connection_kind   AS connection_kind,
+    c.ordinal           AS ordinal,
+    c.net_lo            AS net_lo,
+    c.net_hi            AS net_hi,
+    c.net_exact         AS net_exact,
+    c.term_lo           AS terminal_lo,
+    c.term_hi           AS terminal_hi,
+    c.term_exact        AS terminal_exact,
+    c.mapping_exact     AS mapping_exact,
+    c.interface_inst_id AS interface_instance_id,
+    c.hier_ref_id       AS hier_ref_id,
+    f.path              AS file_path,
+    sf.path             AS source_path,
+    c.line              AS source_line,
+    c."column"          AS source_column
+FROM net_conn c
+JOIN term t              ON t.id = c.term_id
+LEFT JOIN net pn         ON pn.id = c.net_id
+LEFT JOIN file f         ON f.id = c.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+
+-- One row per net_dep: a statement- or primitive-level dependency
+-- occurrence, not deduplicated across statements. Location is the
+-- statement's, or the primitive's for a primitive arc.
+CREATE VIEW v_net_dependency AS
+SELECT
+    d.id              AS dependency_id,
+    d.source_net_id   AS source_net_id,
+    sn.inst_id        AS source_instance_id,
+    sn.name           AS source_name,
+    d.source_lo       AS source_lo,
+    d.source_hi       AS source_hi,
+    d.source_exact    AS source_exact,
+    d.target_net_id   AS target_net_id,
+    tn.inst_id        AS target_instance_id,
+    tn.name           AS target_name,
+    d.target_lo       AS target_lo,
+    d.target_hi       AS target_hi,
+    d.target_exact    AS target_exact,
+    d.stmt_id         AS statement_id,
+    d.assign_operand_id AS assign_operand_id,
+    d.assign_target_id  AS assign_target_id,
+    d.expr_ref_id     AS expression_reference_id,
+    d.primitive_id    AS primitive_id,
+    d.dependency_kind AS dependency_kind,
+    d.mapping_exact   AS mapping_exact,
+    f.path            AS file_path,
+    sf.path           AS source_path,
+    COALESCE(s.line, p.line)         AS source_line,
+    COALESCE(s."column", p."column") AS source_column
+FROM net_dep d
+JOIN net tn              ON tn.id = d.target_net_id
+LEFT JOIN net sn         ON sn.id = d.source_net_id
+LEFT JOIN stmt s         ON s.id = d.stmt_id
+LEFT JOIN primitive p    ON p.id = d.primitive_id
+LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
+LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+
+-- NOT part of the stable contract. The composition v_driver and v_load
+-- project: one row per overlapping (net_conn segment, term_map segment)
+-- pair -- a terminal's outside met with its inside. Windows are intersected
+-- on the terminal; a side's net range is narrowed through the overlap when
+-- every link of that side's chain is exact, passed through untouched when
+-- the other side does not narrow it, and degraded to exact=0 otherwise --
+-- the range is then an upper bound, which is what exact=0 means everywhere.
+CREATE VIEW v_conn_arc AS
+WITH seg AS (
+    SELECT
+        c.id            AS connection_id,
+        c.connection_kind AS connection_kind,
+        c.net_id        AS outer_net_id,
+        c.net_lo        AS c_net_lo,
+        c.net_hi        AS c_net_hi,
+        c.net_exact     AS c_net_exact,
+        c.term_lo       AS c_lo,
+        c.term_hi       AS c_hi,
+        c.term_exact    AS c_term_exact,
+        c.mapping_exact AS c_map,
+        c.file_id       AS file_id,
+        c.line          AS line,
+        c."column"      AS col,
+        t.id            AS term_id,
+        t.inst_id       AS term_inst_id,
+        t.direction     AS direction,
+        mp.net_id       AS inner_net_id,
+        mp.term_lo      AS m_lo,
+        mp.term_hi      AS m_hi,
+        mp.term_exact   AS m_term_exact,
+        mp.net_lo       AS m_net_lo,
+        mp.net_hi       AS m_net_hi,
+        mp.net_exact    AS m_net_exact,
+        mp.mapping_exact AS m_map
+    FROM net_conn c
+    JOIN term t      ON t.id = c.term_id
+    JOIN term_map mp ON mp.term_id = c.term_id
+    WHERE c.connection_kind IN ('signal', 'expression_operand', 'constant')
+      AND (c.term_lo IS NULL OR mp.term_hi IS NULL OR c.term_lo <= mp.term_hi)
+      AND (mp.term_lo IS NULL OR c.term_hi IS NULL OR mp.term_lo <= c.term_hi)
+),
+arc AS (
+    SELECT seg.*,
+        CASE WHEN c_lo IS NULL THEN m_lo
+             WHEN m_lo IS NULL THEN c_lo
+             ELSE MAX(c_lo, m_lo) END AS ilo,
+        CASE WHEN c_hi IS NULL THEN m_hi
+             WHEN m_hi IS NULL THEN c_hi
+             ELSE MIN(c_hi, m_hi) END AS ihi,
+        (COALESCE(c_map, 0) = 1 AND COALESCE(c_term_exact, 0) = 1
+             AND m_term_exact = 1) AS outer_chain,
+        (m_map = 1 AND COALESCE(c_term_exact, 0) = 1
+             AND m_term_exact = 1) AS inner_chain,
+        (m_lo IS NOT NULL OR m_hi IS NOT NULL) AS m_narrows,
+        (c_lo IS NOT NULL OR c_hi IS NOT NULL) AS c_narrows
+    FROM seg
+)
+SELECT
+    connection_id, connection_kind, term_id, term_inst_id, direction,
+    outer_net_id, inner_net_id,
+    CASE WHEN outer_net_id IS NULL THEN NULL
+         WHEN outer_chain AND c_net_exact = 1 AND ilo IS NOT NULL
+              THEN COALESCE(c_net_lo, 0) + ilo - COALESCE(c_lo, 0)
+         ELSE c_net_lo END AS outer_lo,
+    CASE WHEN outer_net_id IS NULL THEN NULL
+         WHEN outer_chain AND c_net_exact = 1 AND ihi IS NOT NULL
+              THEN COALESCE(c_net_lo, 0) + ihi - COALESCE(c_lo, 0)
+         ELSE c_net_hi END AS outer_hi,
+    CASE WHEN outer_net_id IS NULL THEN NULL
+         WHEN outer_chain OR NOT m_narrows THEN c_net_exact
+         ELSE 0 END AS outer_exact,
+    CASE WHEN inner_chain AND m_net_exact = 1 AND ilo IS NOT NULL
+              THEN COALESCE(m_net_lo, 0) + ilo - COALESCE(m_lo, 0)
+         ELSE m_net_lo END AS inner_lo,
+    CASE WHEN inner_chain AND m_net_exact = 1 AND ihi IS NOT NULL
+              THEN COALESCE(m_net_lo, 0) + ihi - COALESCE(m_lo, 0)
+         ELSE m_net_hi END AS inner_hi,
+    CASE WHEN inner_chain OR NOT c_narrows THEN m_net_exact
+         ELSE 0 END AS inner_exact,
+    CASE WHEN outer_net_id IS NULL THEN NULL
+         WHEN connection_kind = 'expression_operand' THEN 0
+         ELSE (c_map AND m_map) END AS mapping_exact,
+    file_id, line, col
+FROM arc;
+
+-- Every direct driving arc of signal_net, one row each. Branches, told
+-- apart by driver_kind:
+--
+--   data / control / primitive / procedure   a net_dep row, kind carried
+--                       through; a data row with no source is 'constant'.
+--   connection          the hierarchy crossing: for input/inout/ref, the
+--                       parent-side net drives the child's internal net;
+--                       for output/inout/ref, the internal net drives the
+--                       parent's. inout and ref arc both ways, one row
+--                       each. Interface bindings do not arc.
+--   connection_expression  the actual is an expression; each net it reads
+--                       drives the internal net at range granularity.
+--   constant            a tie-off or a constant RHS: driver_net_id NULL,
+--                       and every driver_* column NULL with it.
+--
+-- An unconnected terminal contributes no row.
 CREATE VIEW v_driver AS
 SELECT
-    module_id, module_name, module_params,
-    target_name  AS signal_name,
-    target_type  AS signal_type,
-    target_lo    AS signal_lo,
-    target_hi    AS signal_hi,
-    target_exact AS signal_exact,
-    source_name  AS driver_name,
-    source_type  AS driver_type,
-    source_lo    AS driver_lo,
-    source_hi    AS driver_hi,
-    source_exact AS driver_exact,
-    dependency_kind, construct, is_control, mapping_exact,
-    file_path, source_path, source_line
-FROM v_dependency;
+    d.target_net_id  AS signal_net_id,
+    tn.inst_id       AS signal_instance_id,
+    tn.name          AS signal_name,
+    d.target_lo      AS signal_lo,
+    d.target_hi      AS signal_hi,
+    d.target_exact   AS signal_exact,
+    d.source_net_id  AS driver_net_id,
+    sn.inst_id       AS driver_instance_id,
+    sn.name          AS driver_name,
+    d.source_lo      AS driver_lo,
+    d.source_hi      AS driver_hi,
+    d.source_exact   AS driver_exact,
+    CASE WHEN d.source_net_id IS NULL THEN 'constant'
+         ELSE d.dependency_kind END AS driver_kind,
+    d.id             AS dependency_id,
+    NULL             AS connection_id,
+    d.stmt_id        AS statement_id,
+    d.primitive_id   AS primitive_id,
+    d.mapping_exact  AS mapping_exact,
+    f.path           AS file_path,
+    sf.path          AS source_path,
+    COALESCE(s.line, p.line)         AS source_line,
+    COALESCE(s."column", p."column") AS source_column
+FROM net_dep d
+JOIN net tn              ON tn.id = d.target_net_id
+LEFT JOIN net sn         ON sn.id = d.source_net_id
+LEFT JOIN stmt s         ON s.id = d.stmt_id
+LEFT JOIN primitive p    ON p.id = d.primitive_id
+LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+UNION ALL
+SELECT
+    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_lo, a.inner_hi, a.inner_exact,
+    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_lo, a.outer_hi, a.outer_exact,
+    CASE a.connection_kind
+         WHEN 'signal'             THEN 'connection'
+         WHEN 'expression_operand' THEN 'connection_expression'
+         ELSE 'constant' END,
+    NULL, a.connection_id, NULL, NULL,
+    a.mapping_exact,
+    f.path, sf.path, a.line, a.col
+FROM v_conn_arc a
+JOIN net innet           ON innet.id = a.inner_net_id
+LEFT JOIN net outnet     ON outnet.id = a.outer_net_id
+LEFT JOIN file f         ON f.id = a.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE a.direction IN ('input', 'inout', 'ref')
+UNION ALL
+SELECT
+    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_lo, a.outer_hi, a.outer_exact,
+    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_lo, a.inner_hi, a.inner_exact,
+    'connection',
+    NULL, a.connection_id, NULL, NULL,
+    a.mapping_exact,
+    f.path, sf.path, a.line, a.col
+FROM v_conn_arc a
+JOIN net innet           ON innet.id = a.inner_net_id
+JOIN net outnet          ON outnet.id = a.outer_net_id
+LEFT JOIN file f         ON f.id = a.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE a.direction IN ('output', 'inout', 'ref')
+  AND a.connection_kind = 'signal';
 
--- EVERY recorded read of signal_name, one row each -- the storage split
--- undone. "Who reads it" was always one question; the answer lives in three
--- tables for storage reasons (a read with no written target has no edge to
--- ride), and making the consumer know that was exactly the internal knowledge
--- this interface exists to retire. The netlist analogy decides what belongs
--- here: a clock net's loads include the flop clock pins, so a sensitivity
--- read is a load; an assertion's reads are its checker pins, so they are
--- loads too. load_kind says which shape each row is:
+-- Every recorded read of signal_net, one row each -- v9's generalised load
+-- semantics carried to the instance level, plus the crossing. load_kind:
 --
---   dataflow      an edge: the signal feeds a target this module names.
---                 load_* name the target; is_control and mapping_exact apply.
---   sensitivity   a procedure triggers on it (proc_event, wait=0). construct
---                 is the edge word: posedge / negedge / both.
---   wait          a procedure suspends on it (proc_event, wait=1).
---   statement     a statement reads it and writes nothing nameable: an
---                 assertion, a $display, a writing call's argument.
---                 construct is that statement's own word.
+--   dataflow      a net_dep row: the signal feeds a target (data, control,
+--                 primitive or procedure -- join net_dep on dependency_id
+--                 for which).
+--   connection    the crossing reads it: a parent net feeding an
+--                 input/inout/ref terminal, or an internal net feeding an
+--                 output/inout/ref one. load_net is the far side.
+--   sensitivity   a procedure triggers on it (proc_event, or an expr_ref
+--                 with role='event' when the expression was not plain).
+--   wait          a procedure suspends on it (proc_event, or role='wait').
+--   statement     a statement reads it and writes nothing this instance
+--                 names: an assertion, a $display, a call argument or
+--                 branch condition whose statement has no local target.
+--                 load_* are all NULL -- a real reader, no nameable target.
 --
--- load_kind is the read's SEMANTICS, not which table stored it. A plain event
--- (`@(posedge clk)`) lands in proc_event; a selected-bit or expression event
--- (`@(posedge clks[2])`) cannot name a plain signal there and lands in
--- stmt_read with construct = sensitivity/wait -- and both spellings of the
--- same semantics must answer to the same load_kind, or the view leaks the
--- storage split it exists to hide.
---
--- Rows with no written target carry load_* all NULL -- symmetric with
--- v_driver keeping driver_name NULL for a driving statement with no nameable
--- source: a real reader with no nameable target. is_control and mapping_exact
--- are NULL there too; nothing exists to correspond with. What this view still
--- cannot include: a read made FROM another module through a hierarchical
--- path -- that is hier_ref text, resolved against the tree by the consumer.
+-- One read, one row: an expr_ref or assign_operand that a net_dep row
+-- already carries into 'dataflow' is not repeated as 'statement' -- the
+-- NOT EXISTS guards are that rule, and the verifier re-derives the counts.
 CREATE VIEW v_load AS
 SELECT
-    module_id, module_name, module_params,
-    source_name  AS signal_name,
-    source_type  AS signal_type,
-    source_lo    AS signal_lo,
-    source_hi    AS signal_hi,
-    source_exact AS signal_exact,
-    target_name  AS load_name,
-    target_type  AS load_type,
-    target_lo    AS load_lo,
-    target_hi    AS load_hi,
-    target_exact AS load_exact,
-    'dataflow'   AS load_kind,
-    dependency_kind, construct, is_control, mapping_exact,
-    file_path, source_path, source_line
-FROM v_dependency
-WHERE source_name IS NOT NULL
+    d.source_net_id AS signal_net_id,
+    sn.inst_id      AS signal_instance_id,
+    sn.name         AS signal_name,
+    d.source_lo     AS signal_lo,
+    d.source_hi     AS signal_hi,
+    d.source_exact  AS signal_exact,
+    d.target_net_id AS load_net_id,
+    tn.inst_id      AS load_instance_id,
+    tn.name         AS load_name,
+    d.target_lo     AS load_lo,
+    d.target_hi     AS load_hi,
+    d.target_exact  AS load_exact,
+    'dataflow'      AS load_kind,
+    d.id            AS dependency_id,
+    NULL            AS connection_id,
+    d.stmt_id       AS statement_id,
+    s.procedure_id  AS procedure_id,
+    d.mapping_exact AS mapping_exact,
+    f.path          AS file_path,
+    sf.path         AS source_path,
+    COALESCE(s.line, p.line)         AS source_line,
+    COALESCE(s."column", p."column") AS source_column
+FROM net_dep d
+JOIN net sn              ON sn.id = d.source_net_id
+JOIN net tn              ON tn.id = d.target_net_id
+LEFT JOIN stmt s         ON s.id = d.stmt_id
+LEFT JOIN primitive p    ON p.id = d.primitive_id
+LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
 UNION ALL
 SELECT
-    pe.module    AS module_id,
-    m.name       AS module_name,
-    m.params     AS module_params,
-    n.text       AS signal_name,
-    NULL         AS signal_type,
-    NULL         AS signal_lo,
-    NULL         AS signal_hi,
-    1            AS signal_exact,
-    NULL         AS load_name,
-    NULL         AS load_type,
-    NULL         AS load_lo,
-    NULL         AS load_hi,
-    NULL         AS load_exact,
-    CASE pe.wait WHEN 1 THEN 'wait' ELSE 'sensitivity' END AS load_kind,
-    NULL         AS dependency_kind,
-    pe.edge_kind AS construct,
-    NULL         AS is_control,
-    NULL         AS mapping_exact,
-    f.path       AS file_path,
-    sf.path      AS source_path,
-    pe.line      AS source_line
+    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_lo, a.outer_hi, a.outer_exact,
+    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_lo, a.inner_hi, a.inner_exact,
+    'connection',
+    NULL, a.connection_id, NULL, NULL,
+    a.mapping_exact,
+    f.path, sf.path, a.line, a.col
+FROM v_conn_arc a
+JOIN net outnet          ON outnet.id = a.outer_net_id
+JOIN net innet           ON innet.id = a.inner_net_id
+LEFT JOIN file f         ON f.id = a.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE a.direction IN ('input', 'inout', 'ref')
+UNION ALL
+SELECT
+    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_lo, a.inner_hi, a.inner_exact,
+    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_lo, a.outer_hi, a.outer_exact,
+    'connection',
+    NULL, a.connection_id, NULL, NULL,
+    a.mapping_exact,
+    f.path, sf.path, a.line, a.col
+FROM v_conn_arc a
+JOIN net innet           ON innet.id = a.inner_net_id
+JOIN net outnet          ON outnet.id = a.outer_net_id
+LEFT JOIN file f         ON f.id = a.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE a.direction IN ('output', 'inout', 'ref')
+  AND a.connection_kind = 'signal'
+UNION ALL
+SELECT
+    pe.net_id, n.inst_id, n.name,
+    NULL, NULL, 1,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    pe.event_kind,
+    NULL, NULL, pe.stmt_id, pe.procedure_id, NULL,
+    f.path, sf.path, pe.line, pe."column"
 FROM proc_event pe
-JOIN module m            ON m.id = pe.module
--- The inner join on `name` is the NULL filter: an event row whose expression
--- was not a plain signal has nothing to be a load of, and no name row to
--- join. Spelling the filter as a WHERE too pushed the planner onto a range
--- scan where the join gives it an equality seek.
-JOIN name n              ON n.id = pe.signal
-LEFT JOIN file f         ON f.id = pe.file
-LEFT JOIN source_file sf ON sf.id = f.source_file
+JOIN net n               ON n.id = pe.net_id
+LEFT JOIN file f         ON f.id = pe.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
 UNION ALL
 SELECT
-    r.module     AS module_id,
-    m.name       AS module_name,
-    m.params     AS module_params,
-    n.text       AS signal_name,
-    NULL         AS signal_type,
-    r.src_lo     AS signal_lo,
-    r.src_hi     AS signal_hi,
-    r.src_exact  AS signal_exact,
-    NULL         AS load_name,
-    NULL         AS load_type,
-    NULL         AS load_lo,
-    NULL         AS load_hi,
-    NULL         AS load_exact,
-    CASE WHEN r.construct = 'sensitivity' THEN 'sensitivity'
-         WHEN r.construct = 'wait'        THEN 'wait'
-         ELSE 'statement' END AS load_kind,
-    r.kind       AS dependency_kind,
-    r.construct  AS construct,
-    NULL         AS is_control,
-    NULL         AS mapping_exact,
-    f.path       AS file_path,
-    sf.path      AS source_path,
-    r.line       AS source_line
-FROM stmt_read r
-JOIN module m            ON m.id = r.module
-JOIN name n              ON n.id = r.name
-LEFT JOIN file f         ON f.id = r.file
-LEFT JOIN source_file sf ON sf.id = f.source_file;
+    e.net_id, n.inst_id, n.name,
+    e.lo, e.hi, e.is_exact,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    CASE e.role WHEN 'wait' THEN 'wait'
+                WHEN 'event' THEN 'sensitivity'
+                ELSE 'statement' END,
+    NULL, NULL, e.stmt_id, s.procedure_id, NULL,
+    f.path, sf.path, s.line, s."column"
+FROM expr_ref e
+JOIN net n               ON n.id = e.net_id
+JOIN stmt s              ON s.id = e.stmt_id
+LEFT JOIN file f         ON f.id = s.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE e.role IN ('assertion', 'wait', 'event', 'system_task')
+   OR NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.expr_ref_id = e.id)
+UNION ALL
+SELECT
+    o.net_id, n.inst_id, n.name,
+    o.lo, o.hi, o.is_exact,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    'statement',
+    NULL, NULL, o.stmt_id, s.procedure_id, NULL,
+    f.path, sf.path, s.line, s."column"
+FROM assign_operand o
+JOIN net n               ON n.id = o.net_id
+JOIN stmt s              ON s.id = o.stmt_id
+LEFT JOIN file f         ON f.id = s.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_operand_id = o.id);
 
--- One row per `assignment`: the statement object, the other half of the
--- edge/assignment dual projection -- and the one noun this database has that
--- a netlist database does not, because a netlist has no statements and no
--- file:line. statement_id is assignment.id, the primary key the schema
--- already maintains because assign_operand references it; `stmt` beside it
--- is the per-module ordinal shared with hier_ref and stmt_read, exposed here
--- because this is the view that makes statement identity queryable at all.
--- `proc` joins proc_event.proc (same module) to reach the statement's
--- sensitivity. No target_type: `assignment` stores none, and a view invents
--- no columns.
+-- One row per stmt: the statement object. Targets and operands are
+-- v_statement_target / v_statement_operand rows keyed on statement_id --
+-- one statement is ONE row here no matter how many targets it writes.
 CREATE VIEW v_statement AS
 SELECT
-    a.id        AS statement_id,
-    a.module    AS module_id,
-    m.name      AS module_name,
-    m.params    AS module_params,
-    dn.text     AS target_name,
-    a.dst_lo    AS target_lo,
-    a.dst_hi    AS target_hi,
-    a.dst_exact AS target_exact,
-    a.kind      AS statement_kind,
-    a.construct AS construct,
-    a.proc      AS proc,
-    a.seq       AS seq,
-    a.blocking  AS blocking,
-    a.dropped_operands AS dropped_operands,
-    a.stmt      AS stmt,
-    f.path      AS file_path,
-    sf.path     AS source_path,
-    a.line      AS source_line
-FROM assignment a
-JOIN module m            ON m.id = a.module
-JOIN name dn             ON dn.id = a.dst
-LEFT JOIN file f         ON f.id = a.file
-LEFT JOIN source_file sf ON sf.id = f.source_file;
+    s.id              AS statement_id,
+    s.inst_id         AS instance_id,
+    i.module_id       AS module_id,
+    m.name            AS module_name,
+    s.scope_node_id   AS scope_node_id,
+    s.procedure_id    AS procedure_id,
+    s.ordinal         AS ordinal,
+    s.sequence        AS sequence,
+    s.statement_kind  AS statement_kind,
+    s.construct       AS construct,
+    s.assignment_kind AS assignment_kind,
+    s.delay           AS delay,
+    s.dropped_operand_count AS dropped_operand_count,
+    f.path            AS file_path,
+    sf.path           AS source_path,
+    s.line            AS source_line,
+    s."column"        AS source_column
+FROM stmt s
+JOIN inst i              ON i.id = s.inst_id
+LEFT JOIN module m       ON m.id = i.module_id
+LEFT JOIN file f         ON f.id = s.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id;
 
--- One row per `assign_operand`: a statement's exact read set, the attribute
--- the naive edge/assignment join gets wrong and this schema keeps repeating
--- "use assign_operand" about -- now without asking the consumer to intern-join
--- for it. The module columns ride along (through two primary keys, so nothing
--- fans out) so the round-one question "which statements read X in M" is one
--- WHERE clause.
+-- One row per assign_target.
+CREATE VIEW v_statement_target AS
+SELECT
+    a.id       AS target_id,
+    a.stmt_id  AS statement_id,
+    a.ordinal  AS ordinal,
+    a.net_id   AS net_id,
+    n.name     AS net_name,
+    a.lo       AS target_lo,
+    a.hi       AS target_hi,
+    a.is_exact AS target_exact
+FROM assign_target a
+JOIN net n ON n.id = a.net_id;
+
+-- One row per assign_operand.
 CREATE VIEW v_statement_operand AS
 SELECT
-    ao.assignment AS statement_id,
-    a.module      AS module_id,
-    m.name        AS module_name,
-    m.params      AS module_params,
-    n.text        AS operand_name,
-    ao.src_lo     AS operand_lo,
-    ao.src_hi     AS operand_hi,
-    ao.src_exact  AS operand_exact
-FROM assign_operand ao
-JOIN assignment a ON a.id = ao.assignment
-JOIN module m     ON m.id = a.module
-JOIN name n       ON n.id = ao.name;
+    o.id       AS operand_id,
+    o.stmt_id  AS statement_id,
+    o.ordinal  AS ordinal,
+    o.net_id   AS net_id,
+    n.name     AS net_name,
+    o.lo       AS operand_lo,
+    o.hi       AS operand_hi,
+    o.is_exact AS operand_exact
+FROM assign_operand o
+JOIN net n ON n.id = o.net_id;
 )SQL";
 
 // Rows per transaction. Committing per row is orders of magnitude slower;
@@ -977,16 +1109,65 @@ void bindOptId(sqlite3_stmt* s, int i, int64_t id) {
         sqlite3_bind_null(s, i);
 }
 
-void bindOptRange(sqlite3_stmt* s, int lo, int hi,
-                  const std::optional<std::pair<uint64_t, uint64_t>>& r) {
+/// -1 spells NULL for the tri-state 0/1 columns (a side that does not exist).
+void bindTri(sqlite3_stmt* s, int i, int v) {
+    if (v < 0)
+        sqlite3_bind_null(s, i);
+    else
+        sqlite3_bind_int(s, i, v ? 1 : 0);
+}
+
+/// A location is three columns bound together: no file, no line, no column.
+/// Rows that genuinely have no source (the root instance) carry NULLs, not
+/// a 0 a consumer would have to know to exclude.
+void bindLoc(sqlite3_stmt* s, int i, int64_t fileId, uint32_t line,
+             uint32_t column) {
+    if (fileId) {
+        sqlite3_bind_int64(s, i, fileId);
+        sqlite3_bind_int64(s, i + 1, line);
+        sqlite3_bind_int64(s, i + 2, column);
+    }
+    else {
+        sqlite3_bind_null(s, i);
+        sqlite3_bind_null(s, i + 1);
+        sqlite3_bind_null(s, i + 2);
+    }
+}
+
+/// lo, hi and exact bound as one range with the bool-exact discipline.
+void bindRange(sqlite3_stmt* s, int lo,
+               const std::optional<std::pair<uint64_t, uint64_t>>& r,
+               bool exact) {
     if (!r) {
         sqlite3_bind_null(s, lo);
-        sqlite3_bind_null(s, hi);
+        sqlite3_bind_null(s, lo + 1);
     }
     else {
         sqlite3_bind_int64(s, lo, static_cast<int64_t>(r->first));
-        sqlite3_bind_int64(s, hi, static_cast<int64_t>(r->second));
+        sqlite3_bind_int64(s, lo + 1, static_cast<int64_t>(r->second));
     }
+    sqlite3_bind_int(s, lo + 2, exact ? 1 : 0);
+}
+
+/// The tri-state variant: exact < 0 means the whole end does not exist, so
+/// all three columns are NULL regardless of what the range says.
+void bindRangeTri(sqlite3_stmt* s, int lo,
+                  const std::optional<std::pair<uint64_t, uint64_t>>& r,
+                  int exact) {
+    if (exact < 0) {
+        sqlite3_bind_null(s, lo);
+        sqlite3_bind_null(s, lo + 1);
+        sqlite3_bind_null(s, lo + 2);
+        return;
+    }
+    bindRange(s, lo, r, exact != 0);
+}
+
+void bindOptWidth(sqlite3_stmt* s, int i, int64_t width) {
+    if (width >= 0)
+        sqlite3_bind_int64(s, i, width);
+    else
+        sqlite3_bind_null(s, i);
 }
 
 } // namespace
@@ -1003,38 +1184,39 @@ Writer::Writer(const std::string& path) {
         throw std::runtime_error("cannot create " + path + ": " + msg);
     }
     try {
+        // The database is a build artifact: if the process dies it is rebuilt
+        // from source, so paying for durability buys nothing and costs a large
+        // fraction of the write time.
+        exec("PRAGMA journal_mode=OFF");
+        exec("PRAGMA synchronous=OFF");
+        exec(kSchema);
 
-    // The database is a build artifact: if the process dies it is rebuilt from
-    // source, so paying for durability buys nothing and costs a large fraction
-    // of the write time.
-    exec("PRAGMA journal_mode=OFF");
-    exec("PRAGMA synchronous=OFF");
-    exec(kSchema);
-
-    prepare("INSERT INTO edge VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insEdge);
-    prepare("INSERT INTO child VALUES(?,?,?,?,?,?)", &insChild);
-    prepare("INSERT INTO instance VALUES(?,?,?,?,?)", &insInstance);
-    prepare("INSERT INTO port VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            &insPort);
-        prepare("INSERT INTO symbol VALUES(?,?,?,?,?,?,?,?,?)", &insSymbol);
-        prepare("INSERT INTO assignment VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &insAssign);
-        prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?)", &insProcEvent);
-        prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?)", &insAssignOp);
-        prepare("INSERT INTO stmt_read VALUES(?,?,?,?,?,?,?,?,?,?)", &insStmtRead);
-        prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?,?)", &insHierRef);
+        prepare("INSERT INTO module VALUES(?,?,?,?,?,?)", &ins[InsModule]);
+        prepare("INSERT INTO tree_node VALUES(?,?,?,?,?)", &ins[InsTreeNode]);
+        prepare("INSERT INTO inst VALUES(?,?,?,?,?,?,?,?)", &ins[InsInst]);
+        prepare("INSERT INTO primitive VALUES(?,?,?,?,?,?,?)", &ins[InsPrimitive]);
+        prepare("INSERT INTO net VALUES(?,?,?,?,?,?,?,?,?,?,?)", &ins[InsNet]);
+        prepare("INSERT INTO term VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsTerm]);
+        prepare("INSERT INTO term_map VALUES(?,?,?,?,?,?,?,?,?,?)", &ins[InsTermMap]);
+        prepare("INSERT INTO net_conn VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsNetConn]);
+        prepare("INSERT INTO procedure VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcedure]);
+        prepare("INSERT INTO stmt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsStmt]);
+        prepare("INSERT INTO assign_target VALUES(?,?,?,?,?,?,?)",
+                &ins[InsAssignTarget]);
+        prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?,?,?)",
+                &ins[InsAssignOperand]);
+        prepare("INSERT INTO expr_ref VALUES(?,?,?,?,?,?,?,?)", &ins[InsExprRef]);
+        prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcEvent]);
+        prepare("INSERT INTO net_dep VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsNetDep]);
+        prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsHierRef]);
         begin();
     }
     catch (...) {
-        sqlite3_finalize(insEdge);
-        sqlite3_finalize(insChild);
-        sqlite3_finalize(insInstance);
-        sqlite3_finalize(insPort);
-        sqlite3_finalize(insSymbol);
-        sqlite3_finalize(insAssign);
-        sqlite3_finalize(insProcEvent);
-        sqlite3_finalize(insAssignOp);
-        sqlite3_finalize(insStmtRead);
-        sqlite3_finalize(insHierRef);
+        for (auto* s : ins)
+            sqlite3_finalize(s);
         sqlite3_close(db);
         db = nullptr;
         throw;
@@ -1043,16 +1225,8 @@ Writer::Writer(const std::string& path) {
 
 Writer::~Writer() {
     if (db) {
-        sqlite3_finalize(insEdge);
-        sqlite3_finalize(insChild);
-        sqlite3_finalize(insInstance);
-        sqlite3_finalize(insPort);
-        sqlite3_finalize(insSymbol);
-        sqlite3_finalize(insAssign);
-        sqlite3_finalize(insProcEvent);
-        sqlite3_finalize(insAssignOp);
-        sqlite3_finalize(insStmtRead);
-        sqlite3_finalize(insHierRef);
+        for (auto* s : ins)
+            sqlite3_finalize(s);
         sqlite3_close(db);
     }
 }
@@ -1097,6 +1271,13 @@ void Writer::commit() {
     pending = 0;
 }
 
+void Writer::bumped() {
+    if (++pending >= kBatch) {
+        commit();
+        begin();
+    }
+}
+
 void Writer::setMeta(std::string_view key, std::string_view value) {
     sqlite3_stmt* s = nullptr;
     prepare("INSERT OR REPLACE INTO meta VALUES(?,?)", &s);
@@ -1130,7 +1311,7 @@ void Writer::linkSourceFiles(
     // -- a synthesized buffer, which is not a file and was never hashed --
     // yields NULL, which is what "no origin" already means in this column.
     sqlite3_stmt* s = nullptr;
-    prepare("UPDATE file SET source_file="
+    prepare("UPDATE file SET source_file_id="
             "(SELECT id FROM source_file WHERE path = ?1) WHERE path = ?2", &s);
     for (auto& [asWritten, full] : origins) {
         sqlite3_reset(s);
@@ -1145,39 +1326,6 @@ void Writer::linkSourceFiles(
     sqlite3_finalize(s);
 }
 
-int64_t Writer::internModule(const std::string& name, const std::string& params) {
-    sqlite3_stmt* s = nullptr;
-    prepare("SELECT id FROM module WHERE name=? AND params=?", &s);
-    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, params.c_str(), -1, SQLITE_TRANSIENT);
-    int64_t id = 0;
-    int rc = sqlite3_step(s);
-    if (rc == SQLITE_ROW)
-        id = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
-        throw std::runtime_error(std::string("sqlite: looking up module ") + name + ": " +
-                                 sqlite3_errmsg(db));
-    }
-    if (id)
-        return id;
-
-    prepare("INSERT INTO module(name,params) VALUES(?,?)", &s);
-    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, params.c_str(), -1, SQLITE_TRANSIENT);
-    rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    // Checked for the same reason internInto states: last_insert_rowid() after a
-    // failed insert returns the id of whatever went in before it, so a single
-    // failure here would silently point every row referencing this module --
-    // its edges, symbols, ports and children -- at a different module.
-    if (rc != SQLITE_DONE) {
-        throw std::runtime_error(std::string("sqlite: interning module ") + name + ": " +
-                                 sqlite3_errmsg(db));
-    }
-    return sqlite3_last_insert_rowid(db);
-}
-
 namespace {
 int64_t internInto(sqlite3* db, std::unordered_map<std::string, int64_t>& cache,
                    const char* table, const char* column, const std::string& text) {
@@ -1186,12 +1334,11 @@ int64_t internInto(sqlite3* db, std::unordered_map<std::string, int64_t>& cache,
     if (auto it = cache.find(text); it != cache.end())
         return it->second;
     std::string sql = std::string("INSERT INTO ") + table + "(" + column + ") VALUES(?)";
-    // (single-column insert)
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
         throw std::runtime_error(std::string("sqlite: ") + sqlite3_errmsg(db));
     // Bound with an explicit length: the -1 form stops at the first NUL, so a
-    // name carrying one would be stored truncated and alias another entry.
+    // string carrying one would be stored truncated and alias another entry.
     sqlite3_bind_text(s, 1, text.data(), static_cast<int>(text.size()),
                       SQLITE_TRANSIENT);
     int rc = sqlite3_step(s);
@@ -1208,307 +1355,275 @@ int64_t internInto(sqlite3* db, std::unordered_map<std::string, int64_t>& cache,
 }
 } // namespace
 
-int64_t Writer::internType(const std::string& text) {
-    return internInto(db, typeIds, "type", "text", text);
+int64_t Writer::internDataType(const std::string& text) {
+    return internInto(db, dataTypeIds, "data_type", "text", text);
 }
 
 int64_t Writer::internFile(const std::string& path) {
     return internInto(db, fileIds, "file", "path", path);
 }
 
-int64_t Writer::internName(const std::string& text) {
-    return internInto(db, nameIds, "name", "text", text);
+void Writer::addModule(const ModuleRow& r) {
+    auto* s = ins[InsModule];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_text(s, 2, r.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, r.definitionKind.c_str(), -1, SQLITE_TRANSIENT);
+    bindLoc(s, 4, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
 }
 
-namespace {
-/// 0=in 1=out 2=inout 3=ref, matching the schema comment. Anything else is
-/// 4=unknown rather than being folded into `ref`, so a direction this tool does
-/// not model yet is visible instead of being quietly mislabelled.
-int directionCode(const std::string& d) {
-    if (d == "in") return 0;
-    if (d == "out") return 1;
-    if (d == "inout") return 2;
-    if (d == "ref") return 3;
-    return 4;
+void Writer::addTreeNode(const TreeNodeRow& r) {
+    auto* s = ins[InsTreeNode];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    bindOptId(s, 2, r.parentNodeId);
+    sqlite3_bind_text(s, 3, r.name.data(), static_cast<int>(r.name.size()),
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 4, r.nodeKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 5, r.ordinal);
+    step(s);
+    bumped();
 }
-} // namespace
 
-void Writer::addEdges(int64_t moduleId, const std::vector<EdgeRow>& rows) {
-    for (auto& r : rows) {
-        sqlite3_reset(insEdge);
-        sqlite3_bind_int64(insEdge, 1, moduleId);
-        bindOptId(insEdge, 2, internName(r.src));
-        sqlite3_bind_int64(insEdge, 3, internName(r.dst));
-        bindOptId(insEdge, 4, internType(r.srcType));
-        bindOptId(insEdge, 5, internType(r.dstType));
-        bindOptText(insEdge, 6, r.kind);
-        bindOptText(insEdge, 7, r.construct);
-        bindOptId(insEdge, 8, internFile(r.file));
-        sqlite3_bind_int64(insEdge, 9, r.line);
-        sqlite3_bind_int(insEdge, 10, r.control ? 1 : 0);
-        // A row with no source has no source end to describe, so every column
-        // describing one is NULL -- the discipline `port` applies to a tie-off
-        // ("so it does not read as 'the whole of nothing, exactly'"), applied
-        // here at the one chokepoint every emitter goes through. Before this,
-        // `assign q = 1'b0` carried src_exact=1 and map_exact=1: a driver
-        // query reported a per-bit mapping onto a driver that does not exist,
-        // and a bit-level tracer was invited to follow it.
-        if (r.src.empty()) {
-            bindOptRange(insEdge, 11, 12, std::nullopt);
-            sqlite3_bind_null(insEdge, 13);
-        }
-        else {
-            bindOptRange(insEdge, 11, 12, r.srcBits);
-            sqlite3_bind_int(insEdge, 13, r.srcExact ? 1 : 0);
-        }
-        bindOptRange(insEdge, 14, 15, r.dstBits);
-        sqlite3_bind_int(insEdge, 16, r.dstExact ? 1 : 0);
-        if (r.src.empty())
-            sqlite3_bind_null(insEdge, 17);
-        else
-            sqlite3_bind_int(insEdge, 17, r.mapExact ? 1 : 0);
-        step(insEdge);
-        if (++pending >= kBatch) {
-            commit();
-            begin();
-        }
+void Writer::addInst(const InstRow& r) {
+    auto* s = ins[InsInst];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    bindOptId(s, 2, r.moduleId);
+    bindOptId(s, 3, r.parentInstId);
+    bindOptText(s, 4, r.parameterSignature);
+    bindOptText(s, 5, r.unresolvedDefinition);
+    bindLoc(s, 6, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addPrimitive(const PrimitiveRow& r) {
+    auto* s = ins[InsPrimitive];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    sqlite3_bind_text(s, 3, r.primitiveKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 4, r.definitionName.c_str(), -1, SQLITE_TRANSIENT);
+    bindLoc(s, 5, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addNet(const NetRow& r) {
+    auto* s = ins[InsNet];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    sqlite3_bind_int64(s, 3, r.scopeNodeId);
+    sqlite3_bind_text(s, 4, r.name.data(), static_cast<int>(r.name.size()),
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 5, r.declarationKind.c_str(), -1, SQLITE_TRANSIENT);
+    bindOptId(s, 6, r.dataTypeId);
+    bindOptWidth(s, 7, r.width);
+    sqlite3_bind_int(s, 8, r.isImplicit ? 1 : 0);
+    bindLoc(s, 9, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addTerm(const TermRow& r) {
+    auto* s = ins[InsTerm];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    sqlite3_bind_text(s, 3, r.name.data(), static_cast<int>(r.name.size()),
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 4, r.terminalKind.c_str(), -1, SQLITE_TRANSIENT);
+    bindOptText(s, 5, r.direction);
+    bindOptId(s, 6, r.dataTypeId);
+    bindOptWidth(s, 7, r.width);
+    sqlite3_bind_int64(s, 8, r.ordinal);
+    bindTri(s, 9, r.isConst);
+    bindOptText(s, 10, r.modport);
+    bindLoc(s, 11, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addTermMap(const TermMapRow& r) {
+    auto* s = ins[InsTermMap];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.termId);
+    sqlite3_bind_int64(s, 2, r.ordinal);
+    sqlite3_bind_int64(s, 3, r.netId);
+    bindRange(s, 4, r.termBits, r.termExact);
+    bindRange(s, 7, r.netBits, r.netExact);
+    sqlite3_bind_int(s, 10, r.mappingExact ? 1 : 0);
+    step(s);
+    bumped();
+}
+
+void Writer::addNetConn(const NetConnRow& r) {
+    auto* s = ins[InsNetConn];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    bindOptId(s, 2, r.netId);
+    sqlite3_bind_int64(s, 3, r.termId);
+    sqlite3_bind_int64(s, 4, r.ordinal);
+    sqlite3_bind_text(s, 5, r.connectionKind.c_str(), -1, SQLITE_TRANSIENT);
+    // A row with no net end has no net range and nothing to correspond with
+    // -- the NULL discipline enforced at the one chokepoint every emitter
+    // goes through, so a tie-off can never read as "the whole of nothing,
+    // exactly".
+    if (r.netId == 0) {
+        bindRangeTri(s, 6, std::nullopt, -1);
+        bindRangeTri(s, 9, r.termBits, r.termExact);
+        sqlite3_bind_null(s, 12);
     }
-}
-
-std::vector<int64_t> Writer::addChildren(int64_t moduleId,
-                                         const std::vector<ChildRow>& rows) {
-    std::vector<int64_t> ids;
-    ids.reserve(rows.size());
-    for (auto& r : rows) {
-        sqlite3_reset(insChild);
-        sqlite3_bind_null(insChild, 1);                    // autoincrement id
-        sqlite3_bind_int64(insChild, 2, moduleId);
-        sqlite3_bind_int64(insChild, 3, internName(r.name));
-        bindOptId(insChild, 4, internName(r.defName));
-        if (r.defModule)
-            sqlite3_bind_int64(insChild, 5, r.defModule);
-        else
-            sqlite3_bind_null(insChild, 5);
-        sqlite3_bind_text(insChild, 6,
-                          r.kind == ChildKind::Primitive    ? "primitive"
-                          : r.kind == ChildKind::Unresolved ? "unresolved"
-                                                            : "module",
-                          -1, SQLITE_STATIC);
-        step(insChild);
-        ids.push_back(sqlite3_last_insert_rowid(db));
-        if (++pending >= kBatch) {
-            commit();
-            begin();
-        }
+    else {
+        bindRangeTri(s, 6, r.netBits, r.netExact);
+        bindRangeTri(s, 9, r.termBits, r.termExact);
+        bindTri(s, 12, r.mappingExact);
     }
-    return ids;
+    bindOptId(s, 13, r.interfaceInstId);
+    bindOptId(s, 14, r.hierRefId);
+    bindLoc(s, 15, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
 }
 
-void Writer::addPorts(int64_t moduleId, int64_t defModuleId, int64_t childId,
-                      const std::vector<PortRow>& rows) {
-    for (auto& r : rows) {
-        sqlite3_reset(insPort);
-        sqlite3_bind_int64(insPort, 1, moduleId);
-        sqlite3_bind_int64(insPort, 2, internName(r.child));
-        bindOptId(insPort, 3, defModuleId);
-        sqlite3_bind_int64(insPort, 4, internName(r.port));
-        // An interface port has no direction at all; NULL says so, where a
-        // made-up code would read as a direction this tool failed to model.
-        if (r.direction.empty())
-            sqlite3_bind_null(insPort, 6);
-        else
-            sqlite3_bind_int(insPort, 6, directionCode(r.direction));
-        bindOptId(insPort, 5, internName(r.inner));
-        bindOptId(insPort, 7, internName(r.outer));
-        bindOptId(insPort, 8, internType(r.outerType));
-        if (r.outerWidth >= 0)
-            sqlite3_bind_int64(insPort, 9, r.outerWidth);
-        else
-            sqlite3_bind_null(insPort, 9);
-        // A row with no outer net has no bits to describe; all three stay NULL
-        // so a tie-off does not read as "the whole of nothing, exactly".
-        if (r.outer.empty()) {
-            bindOptRange(insPort, 10, 11, std::nullopt);
-            sqlite3_bind_null(insPort, 12);
-        }
-        else {
-            bindOptRange(insPort, 10, 11, r.outerBits);
-            sqlite3_bind_int(insPort, 12, r.outerExact ? 1 : 0);
-        }
-        sqlite3_bind_int(insPort, 13, static_cast<int>(r.conn));
-        bindOptId(insPort, 14, internName(r.modport));
-        bindOptId(insPort, 15, internFile(r.file));
-        sqlite3_bind_int64(insPort, 16, r.line);
-        sqlite3_bind_int64(insPort, 17, childId);
-        bindOptRange(insPort, 18, 19, r.portBits);
-        if (r.portExact < 0)
-            sqlite3_bind_null(insPort, 20);
-        else
-            sqlite3_bind_int(insPort, 20, r.portExact);
-        if (r.mapExact < 0)
-            sqlite3_bind_null(insPort, 21);
-        else
-            sqlite3_bind_int(insPort, 21, r.mapExact);
-        step(insPort);
-        if (++pending >= kBatch) {
-            commit();
-            begin();
-        }
-    }
+void Writer::addProcedure(const ProcedureRow& r) {
+    auto* s = ins[InsProcedure];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    sqlite3_bind_int64(s, 3, r.scopeNodeId);
+    bindOptText(s, 4, r.name);
+    sqlite3_bind_text(s, 5, r.procedureKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 6, r.ordinal);
+    bindLoc(s, 7, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
 }
 
-void Writer::addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows) {
-    for (auto& r : rows) {
-        sqlite3_reset(insSymbol);
-        sqlite3_bind_int64(insSymbol, 1, moduleId);
-        sqlite3_bind_int64(insSymbol, 2, internName(r.name));
-        bindOptText(insSymbol, 3, r.kind);
-        bindOptId(insSymbol, 4, internType(r.type));
-        if (r.width >= 0)
-            sqlite3_bind_int64(insSymbol, 5, r.width);
-        else
-            sqlite3_bind_null(insSymbol, 5);
-        if (r.direction.empty())
-            sqlite3_bind_null(insSymbol, 6);
-        else
-            sqlite3_bind_int(insSymbol, 6, directionCode(r.direction));
-        bindOptId(insSymbol, 7, internFile(r.file));
-        sqlite3_bind_int64(insSymbol, 8, r.line);
-        sqlite3_bind_int64(insSymbol, 9, r.col);
-        step(insSymbol);
-        if (++pending >= kBatch) {
-            commit();
-            begin();
-        }
-    }
-}
-
-void Writer::addStmtReads(int64_t moduleId, const std::vector<StmtReadRow>& rows) {
-    for (auto& r : rows) {
-        sqlite3_reset(insStmtRead);
-        sqlite3_bind_int64(insStmtRead, 1, moduleId);
-        sqlite3_bind_int64(insStmtRead, 2, internName(r.name));
-        bindOptText(insStmtRead, 3, r.kind);
-        bindOptText(insStmtRead, 4, r.construct);
-        bindOptId(insStmtRead, 5, internFile(r.file));
-        sqlite3_bind_int64(insStmtRead, 6, r.line);
-        bindOptRange(insStmtRead, 7, 8, r.bits);
-        sqlite3_bind_int(insStmtRead, 9, r.exact ? 1 : 0);
-        // Ordinals start at 1, so 0 spells "not attributed to a statement" and
-        // stores as NULL -- the stored number is the ordinal itself, unshifted.
-        bindOptId(insStmtRead, 10, r.stmt);
-        step(insStmtRead);
-        if (++pending >= kBatch) {
-            commit();
-            begin();
-        }
-    }
-}
-
-int64_t Writer::addAssignment(int64_t moduleId, const AssignRow& row,
-                              const std::vector<OperandRow>& operands) {
-    sqlite3_reset(insAssign);
-    sqlite3_bind_null(insAssign, 1);                       // autoincrement id
-    sqlite3_bind_int64(insAssign, 2, moduleId);
-    sqlite3_bind_int64(insAssign, 3, internName(row.dst));
-    bindOptRange(insAssign, 4, 5, row.dstBits);
-    sqlite3_bind_int(insAssign, 6, row.dstExact ? 1 : 0);
-    bindOptText(insAssign, 7, row.kind);
-    bindOptText(insAssign, 8, row.construct);
-    bindOptId(insAssign, 9, internFile(row.file));
-    sqlite3_bind_int64(insAssign, 10, row.line);
-    // NULL when the statement is not inside a procedure at all -- a net
-    // declared with an initialiser. Spelled the way `blocking` two columns
-    // along already spells "does not apply", rather than as a -1 a consumer
-    // would have to know to exclude before joining on it.
-    if (row.proc < 0)
-        sqlite3_bind_null(insAssign, 11);
+void Writer::addStmt(const StmtRow& r) {
+    auto* s = ins[InsStmt];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    sqlite3_bind_int64(s, 3, r.scopeNodeId);
+    bindOptId(s, 4, r.procedureId);
+    sqlite3_bind_int64(s, 5, r.ordinal);
+    // NULL exactly when the statement is in no procedure: a continuous
+    // assign has no execution order among statements that all run always.
+    if (r.procedureId == 0 || r.sequence < 0)
+        sqlite3_bind_null(s, 6);
     else
-        sqlite3_bind_int64(insAssign, 11, row.proc);
-    sqlite3_bind_int64(insAssign, 12, row.seq);
-    if (row.blocking < 0)
-        sqlite3_bind_null(insAssign, 13);
-    else
-        sqlite3_bind_int(insAssign, 13, row.blocking);
-    sqlite3_bind_int64(insAssign, 14, row.dropped);
-    bindOptId(insAssign, 15, row.stmt);
-    step(insAssign);
-    const int64_t id = sqlite3_last_insert_rowid(db);
-
-    for (auto& op : operands) {
-        sqlite3_reset(insAssignOp);
-        sqlite3_bind_int64(insAssignOp, 1, id);
-        sqlite3_bind_int64(insAssignOp, 2, internName(op.name));
-        bindOptRange(insAssignOp, 3, 4, op.bits);
-        sqlite3_bind_int(insAssignOp, 5, op.exact ? 1 : 0);
-        step(insAssignOp);
-    }
-
-    pending += 1 + static_cast<int64_t>(operands.size());
-    if (pending >= kBatch) {
-        commit();
-        begin();
-    }
-    return id;
+        sqlite3_bind_int64(s, 6, r.sequence);
+    sqlite3_bind_text(s, 7, r.statementKind.c_str(), -1, SQLITE_TRANSIENT);
+    bindOptText(s, 8, r.construct);
+    bindOptText(s, 9, r.assignmentKind);
+    bindOptText(s, 10, r.delay);
+    sqlite3_bind_int64(s, 11, r.droppedOperandCount);
+    bindLoc(s, 12, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
 }
 
-void Writer::addProcEvents(int64_t moduleId, int64_t proc,
-                           const std::vector<ProcEventRow>& events) {
-    for (auto& e : events) {
-        sqlite3_reset(insProcEvent);
-        sqlite3_bind_int64(insProcEvent, 1, moduleId);
-        sqlite3_bind_int64(insProcEvent, 2, proc);
-        bindOptId(insProcEvent, 3, internName(e.signal));
-        bindOptText(insProcEvent, 4, e.edge);
-        sqlite3_bind_int(insProcEvent, 5, e.wait ? 1 : 0);
-        bindOptId(insProcEvent, 6, internFile(e.file));
-        sqlite3_bind_int64(insProcEvent, 7, e.line);
-        step(insProcEvent);
-        pending++;
-    }
-    if (pending >= kBatch) {
-        commit();
-        begin();
-    }
+void Writer::addAssignTarget(const AssignTargetRow& r) {
+    auto* s = ins[InsAssignTarget];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.stmtId);
+    sqlite3_bind_int64(s, 3, r.ordinal);
+    sqlite3_bind_int64(s, 4, r.netId);
+    bindRange(s, 5, r.bits, r.exact);
+    step(s);
+    bumped();
 }
 
-void Writer::addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows) {
-    for (auto& r : rows) {
-        sqlite3_reset(insHierRef);
-        sqlite3_bind_int64(insHierRef, 1, moduleId);
-        sqlite3_bind_int64(insHierRef, 2, internName(r.path));
-        sqlite3_bind_int(insHierRef, 3, r.write ? 1 : 0);
-        bindOptText(insHierRef, 4, r.kind);
-        bindOptText(insHierRef, 5, r.construct);
-        bindOptId(insHierRef, 6, internFile(r.file));
-        sqlite3_bind_int64(insHierRef, 7, r.line);
-        bindOptRange(insHierRef, 8, 9, r.bits);
-        sqlite3_bind_int(insHierRef, 10, r.exact ? 1 : 0);
-        bindOptId(insHierRef, 11, r.stmt);
-        step(insHierRef);
-        if (++pending >= kBatch) {
-            commit();
-            begin();
-        }
-    }
+void Writer::addAssignOperand(const AssignOperandRow& r) {
+    auto* s = ins[InsAssignOperand];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.stmtId);
+    sqlite3_bind_int64(s, 3, r.ordinal);
+    sqlite3_bind_int64(s, 4, r.netId);
+    bindRange(s, 5, r.bits, r.exact);
+    step(s);
+    bumped();
 }
 
-void Writer::addInstance(const std::string& name, int64_t moduleId, int64_t parentId,
-                         int64_t rowId, int64_t childId) {
-    sqlite3_reset(insInstance);
-    sqlite3_bind_int64(insInstance, 1, rowId);
-    sqlite3_bind_int64(insInstance, 2, internName(name));
-    bindOptId(insInstance, 3, moduleId);   // NULL for a generate block
-    if (parentId)
-        sqlite3_bind_int64(insInstance, 4, parentId);
-    else
-        sqlite3_bind_null(insInstance, 4);
-    bindOptId(insInstance, 5, childId);    // NULL for the root and generate levels
-    step(insInstance);
-    if (++pending >= kBatch) {
-        commit();
-        begin();
+void Writer::addExprRef(const ExprRefRow& r) {
+    auto* s = ins[InsExprRef];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.stmtId);
+    sqlite3_bind_int64(s, 3, r.ordinal);
+    sqlite3_bind_int64(s, 4, r.netId);
+    sqlite3_bind_text(s, 5, r.role.c_str(), -1, SQLITE_TRANSIENT);
+    bindRange(s, 6, r.bits, r.exact);
+    step(s);
+    bumped();
+}
+
+void Writer::addProcEvent(const ProcEventRow& r) {
+    auto* s = ins[InsProcEvent];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.procedureId);
+    bindOptId(s, 3, r.stmtId);
+    bindOptId(s, 4, r.netId);
+    sqlite3_bind_text(s, 5, r.eventKind.c_str(), -1, SQLITE_TRANSIENT);
+    bindOptText(s, 6, r.edgeKind);
+    bindLoc(s, 7, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addNetDep(const NetDepRow& r) {
+    auto* s = ins[InsNetDep];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    bindOptId(s, 2, r.sourceNetId);
+    sqlite3_bind_int64(s, 3, r.targetNetId);
+    bindOptId(s, 4, r.stmtId);
+    bindOptId(s, 5, r.assignOperandId);
+    bindOptId(s, 6, r.assignTargetId);
+    bindOptId(s, 7, r.exprRefId);
+    bindOptId(s, 8, r.primitiveId);
+    sqlite3_bind_text(s, 9, r.dependencyKind.c_str(), -1, SQLITE_TRANSIENT);
+    // A row with no source has no source end to describe, so every column
+    // describing one is NULL -- enforced here rather than in every emitter.
+    // Before this discipline, `assign q = 1'b0` carried src_exact=1 and
+    // map_exact=1: a per-bit mapping onto a driver that does not exist.
+    if (r.sourceNetId == 0) {
+        bindRangeTri(s, 10, std::nullopt, -1);
+        bindRange(s, 13, r.targetBits, r.targetExact);
+        sqlite3_bind_null(s, 16);
     }
+    else {
+        bindRangeTri(s, 10, r.sourceBits, r.sourceExact);
+        bindRange(s, 13, r.targetBits, r.targetExact);
+        bindTri(s, 16, r.mappingExact);
+    }
+    step(s);
+    bumped();
+}
+
+void Writer::addHierRef(const HierRefRow& r) {
+    auto* s = ins[InsHierRef];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    bindOptId(s, 3, r.stmtId);
+    sqlite3_bind_text(s, 4, r.path.data(), static_cast<int>(r.path.size()),
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 5, r.access.c_str(), -1, SQLITE_TRANSIENT);
+    bindOptId(s, 6, r.resolvedInstId);
+    bindOptId(s, 7, r.resolvedNetId);
+    bindRange(s, 8, r.bits, r.exact);
+    bindLoc(s, 11, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
 }
 
 void Writer::finish() {
