@@ -242,7 +242,8 @@ CREATE TABLE term_map(
 --   interface           interface_inst_id names the bound interface
 --                       instance. No dataflow arc pretends to cross here.
 --   external_reference  tied to something with no name in the parent
---                       (`.a(tb.glob)`); hier_ref_id says what.
+--                       (`.p(u.g[7:4])`); hier_ref_id says what, and the
+--                       arc crosses once that reference resolves.
 --
 -- Range discipline: columns describing an end that does not exist are NULL
 -- -- a constant has no net end, an interface binding has no bit domain --
@@ -399,43 +400,58 @@ CREATE TABLE proc_event(
 --
 -- dependency_kind, and what must be set for each (verifier-enforced):
 --
---   data       an assignment moves it: stmt_id, assign_operand_id,
---              assign_target_id. source_net_id NULL is a constant driver
---              (`q <= 8'h0`) -- the row still names the statement, which is
---              what a driver query reports; every source_* column is NULL.
+--   data       an assignment moves it: stmt_id, and per end either the
+--              local reference (assign_operand_id / assign_target_id) or
+--              the resolved hierarchical one (source_hier_ref_id /
+--              target_hier_ref_id). source_net_id NULL with no source
+--              reference of either kind is a constant driver (`q <= 8'h0`)
+--              -- the row still names the statement, which is what a driver
+--              query reports; every source_* column is NULL with it.
 --   control    it reaches the target through a branch condition: stmt_id,
---              expr_ref_id (role='control'), assign_target_id.
+--              the condition's expr_ref_id (role='control') or
+--              source_hier_ref_id, and the target's reference as above.
 --              mapping_exact is 0 -- a condition gates, it does not map.
 --   primitive  a gate/switch/UDP couples them: primitive_id, per LRM
 --              (input, output) pairing.
 --   procedure  a call binds them: actual to formal by argument direction,
---              and function return to the call site's targets. stmt_id is
---              the calling statement; the actual's read is expr_ref_id
---              (role='call_argument') or assign_operand_id, the written
---              side assign_target_id, whichever exist. mapping_exact 0 --
---              a call is opaque.
+--              and formal back to a written actual. stmt_id is the calling
+--              statement (NULL for a call in a control expression); the
+--              actual's read is expr_ref_id (role='call_argument') or
+--              source_hier_ref_id.
 --
--- source_net_id/target_net_id repeat what the operand/target rows already
+-- A dependency whose end lies in ANOTHER instance -- `assign q = u.x;`,
+-- a write through an interface port -- carries the resolved net id like
+-- any other end, and names the hier_ref row it resolved through instead of
+-- an operand/target row. The pairing is made where the statement was
+-- walked, one row per (source element, target element) that share bits --
+-- never by joining hier_ref to operands on stmt_id afterwards, which would
+-- resurrect the cross product v7 removed. An unresolved reference produces
+-- no dependency: the hier_ref text is the honest record, and a guessed
+-- edge would be a wrong one.
+--
+-- source_net_id/target_net_id repeat what the referenced rows already
 -- know. Deliberate, verified redundancy: this table is the driver/load
 -- index, and the verifier holds the copies equal.
 CREATE TABLE net_dep(
-    id                INTEGER PRIMARY KEY,
-    source_net_id     INTEGER REFERENCES net(id),
-    target_net_id     INTEGER NOT NULL REFERENCES net(id),
-    stmt_id           INTEGER REFERENCES stmt(id),
-    assign_operand_id INTEGER REFERENCES assign_operand(id),
-    assign_target_id  INTEGER REFERENCES assign_target(id),
-    expr_ref_id       INTEGER REFERENCES expr_ref(id),
-    primitive_id      INTEGER REFERENCES primitive(id),
-    dependency_kind   TEXT NOT NULL
+    id                 INTEGER PRIMARY KEY,
+    source_net_id      INTEGER REFERENCES net(id),
+    target_net_id      INTEGER NOT NULL REFERENCES net(id),
+    stmt_id            INTEGER REFERENCES stmt(id),
+    assign_operand_id  INTEGER REFERENCES assign_operand(id),
+    assign_target_id   INTEGER REFERENCES assign_target(id),
+    expr_ref_id        INTEGER REFERENCES expr_ref(id),
+    primitive_id       INTEGER REFERENCES primitive(id),
+    source_hier_ref_id INTEGER REFERENCES hier_ref(id),
+    target_hier_ref_id INTEGER REFERENCES hier_ref(id),
+    dependency_kind    TEXT NOT NULL
         CHECK(dependency_kind IN ('data','control','primitive','procedure')),
-    source_lo         INTEGER,
-    source_hi         INTEGER,
-    source_exact      INTEGER CHECK(source_exact IN (0,1)),
-    target_lo         INTEGER,
-    target_hi         INTEGER,
-    target_exact      INTEGER NOT NULL CHECK(target_exact IN (0,1)),
-    mapping_exact     INTEGER CHECK(mapping_exact IN (0,1)));
+    source_lo          INTEGER,
+    source_hi          INTEGER,
+    source_exact       INTEGER CHECK(source_exact IN (0,1)),
+    target_lo          INTEGER,
+    target_hi          INTEGER,
+    target_exact       INTEGER NOT NULL CHECK(target_exact IN (0,1)),
+    mapping_exact      INTEGER CHECK(mapping_exact IN (0,1)));
 
 -- One reference that leaves the instance: an XMR, an interface member, a
 -- package item. The path is stored as written (normalised), AND -- new in
@@ -478,6 +494,11 @@ CREATE INDEX term_by_inst           ON term(inst_id, ordinal);
 CREATE INDEX term_by_inst_name      ON term(inst_id, name);
 CREATE INDEX term_map_by_net        ON term_map(net_id);
 CREATE INDEX net_conn_by_net        ON net_conn(net_id);
+-- The reverse of hier_ref's advertised back-pointer. Without it, "what does
+-- this net drive across the boundary" is an indexed seek for a locally
+-- named connection and a full net_conn scan for an outward tie -- the one
+-- path the resolved-reference arcs actually take.
+CREATE INDEX net_conn_by_href       ON net_conn(hier_ref_id);
 CREATE INDEX procedure_by_inst      ON procedure(inst_id, ordinal);
 CREATE INDEX stmt_by_inst           ON stmt(inst_id, ordinal);
 CREATE INDEX stmt_by_procedure      ON stmt(procedure_id, sequence);
@@ -493,6 +514,8 @@ CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id);
 CREATE INDEX net_dep_by_target_ref  ON net_dep(assign_target_id);
 CREATE INDEX net_dep_by_expr_ref    ON net_dep(expr_ref_id);
 CREATE INDEX net_dep_by_primitive   ON net_dep(primitive_id);
+CREATE INDEX net_dep_by_source_href ON net_dep(source_hier_ref_id);
+CREATE INDEX net_dep_by_target_href ON net_dep(target_hier_ref_id);
 CREATE INDEX hier_ref_by_inst       ON hier_ref(inst_id);
 CREATE INDEX hier_ref_by_stmt       ON hier_ref(stmt_id);
 CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id);
@@ -721,6 +744,8 @@ SELECT
     d.assign_target_id  AS assign_target_id,
     d.expr_ref_id     AS expression_reference_id,
     d.primitive_id    AS primitive_id,
+    d.source_hier_ref_id AS source_hier_ref_id,
+    d.target_hier_ref_id AS target_hier_ref_id,
     d.dependency_kind AS dependency_kind,
     d.mapping_exact   AS mapping_exact,
     f.path            AS file_path,
@@ -747,10 +772,20 @@ WITH seg AS (
     SELECT
         c.id            AS connection_id,
         c.connection_kind AS connection_kind,
-        c.net_id        AS outer_net_id,
-        c.net_lo        AS c_net_lo,
-        c.net_hi        AS c_net_hi,
-        c.net_exact     AS c_net_exact,
+        -- An external tie participates once its reference resolved: the far
+        -- net is the outer end, exactly as a parent-local net would be. An
+        -- unresolved one stays out -- no fabricated arcs.
+        -- All four columns switch on the same test, so the id, the window
+        -- and the exactness always describe the same end. COALESCE per
+        -- column would mix them the moment a row carried both a local net
+        -- and a reference.
+        COALESCE(c.net_id, hr.resolved_net_id) AS outer_net_id,
+        CASE WHEN c.net_id IS NOT NULL THEN c.net_lo
+             ELSE hr.lo END                    AS c_net_lo,
+        CASE WHEN c.net_id IS NOT NULL THEN c.net_hi
+             ELSE hr.hi END                    AS c_net_hi,
+        CASE WHEN c.net_id IS NOT NULL THEN c.net_exact
+             ELSE hr.is_exact END              AS c_net_exact,
         c.term_lo       AS c_lo,
         c.term_hi       AS c_hi,
         c.term_exact    AS c_term_exact,
@@ -772,7 +807,13 @@ WITH seg AS (
     FROM net_conn c
     JOIN term t      ON t.id = c.term_id
     JOIN term_map mp ON mp.term_id = c.term_id
-    WHERE c.connection_kind IN ('signal', 'expression_operand', 'constant')
+    LEFT JOIN hier_ref hr ON hr.id = c.hier_ref_id
+    WHERE c.connection_kind IN ('signal', 'expression_operand', 'constant',
+                                'external_reference')
+      AND (c.connection_kind != 'external_reference'
+           OR hr.resolved_net_id IS NOT NULL)
+      AND (c.connection_kind != 'expression_operand'
+           OR c.net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
       AND (c.term_lo IS NULL OR mp.term_hi IS NULL OR c.term_lo <= mp.term_hi)
       AND (mp.term_lo IS NULL OR c.term_hi IS NULL OR mp.term_lo <= c.term_hi)
 ),
@@ -815,7 +856,8 @@ SELECT
     CASE WHEN inner_chain OR NOT c_narrows THEN m_net_exact
          ELSE 0 END AS inner_exact,
     CASE WHEN outer_net_id IS NULL THEN NULL
-         WHEN connection_kind = 'expression_operand' THEN 0
+         WHEN connection_kind IN ('expression_operand', 'external_reference')
+              THEN 0
          ELSE (c_map AND m_map) END AS mapping_exact,
     file_id, line, col
 FROM arc;
@@ -829,11 +871,24 @@ FROM arc;
 --                       parent-side net drives the child's internal net;
 --                       for output/inout/ref, the internal net drives the
 --                       parent's. inout and ref arc both ways, one row
---                       each. Interface bindings do not arc.
+--                       each. An external tie whose reference resolved
+--                       crosses the same way, its far net as the outer
+--                       end. Interface bindings do not arc.
 --   connection_expression  the actual is an expression; each net it reads
 --                       drives the internal net at range granularity.
 --   constant            a tie-off or a constant RHS: driver_net_id NULL,
 --                       and every driver_* column NULL with it.
+--   terminal            the design boundary: a root input/inout/ref
+--                       terminal drives the net it stands for. No driver
+--                       net exists -- the world outside is the driver --
+--                       and terminal_id names the pin, so "undriven" and
+--                       "reaches the boundary" stay distinct answers.
+--                       Every driver_* column is NULL, mapping_exact with
+--                       them: there is no end to describe or correspond
+--                       with, and the whole point of the null-source
+--                       discipline is that a range beside a driver that
+--                       does not exist is a claim about nothing. The
+--                       terminal's own window is in v_terminal_map.
 --
 -- An unconnected terminal contributes no row.
 CREATE VIEW v_driver AS
@@ -856,6 +911,7 @@ SELECT
     NULL             AS connection_id,
     d.stmt_id        AS statement_id,
     d.primitive_id   AS primitive_id,
+    NULL             AS terminal_id,
     d.mapping_exact  AS mapping_exact,
     f.path           AS file_path,
     sf.path          AS source_path,
@@ -875,10 +931,10 @@ SELECT
     a.outer_net_id, outnet.inst_id, outnet.name,
     a.outer_lo, a.outer_hi, a.outer_exact,
     CASE a.connection_kind
-         WHEN 'signal'             THEN 'connection'
          WHEN 'expression_operand' THEN 'connection_expression'
-         ELSE 'constant' END,
-    NULL, a.connection_id, NULL, NULL,
+         WHEN 'constant'           THEN 'constant'
+         ELSE 'connection' END,
+    NULL, a.connection_id, NULL, NULL, NULL,
     a.mapping_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
@@ -894,7 +950,7 @@ SELECT
     a.inner_net_id, innet.inst_id, innet.name,
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
-    NULL, a.connection_id, NULL, NULL,
+    NULL, a.connection_id, NULL, NULL, NULL,
     a.mapping_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
@@ -903,7 +959,23 @@ JOIN net outnet          ON outnet.id = a.outer_net_id
 LEFT JOIN file f         ON f.id = a.file_id
 LEFT JOIN source_file sf ON sf.id = f.source_file_id
 WHERE a.direction IN ('output', 'inout', 'ref')
-  AND a.connection_kind = 'signal';
+  AND a.connection_kind IN ('signal', 'external_reference')
+UNION ALL
+SELECT
+    m.net_id, n.inst_id, n.name,
+    m.net_lo, m.net_hi, m.net_exact,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    'terminal',
+    NULL, NULL, NULL, NULL, t.id,
+    NULL,
+    f.path, sf.path, t.line, t."column"
+FROM term_map m
+JOIN term t              ON t.id = m.term_id
+JOIN tree_node r         ON r.id = t.inst_id AND r.node_kind = 'root'
+JOIN net n               ON n.id = m.net_id
+LEFT JOIN file f         ON f.id = t.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE t.direction IN ('input', 'inout', 'ref');
 
 -- Every recorded read of signal_net, one row each -- v9's generalised load
 -- semantics carried to the instance level, plus the crossing. load_kind:
@@ -912,8 +984,9 @@ WHERE a.direction IN ('output', 'inout', 'ref')
 --                 primitive or procedure -- join net_dep on dependency_id
 --                 for which).
 --   connection    the crossing reads it: a parent net feeding an
---                 input/inout/ref terminal, or an internal net feeding an
---                 output/inout/ref one. load_net is the far side.
+--                 input/inout/ref terminal, an internal net feeding an
+--                 output/inout/ref one, or a resolved external tie either
+--                 way. load_net is the far side.
 --   sensitivity   a procedure triggers on it (proc_event, or an expr_ref
 --                 with role='event' when the expression was not plain).
 --   wait          a procedure suspends on it (proc_event, or role='wait').
@@ -921,6 +994,10 @@ WHERE a.direction IN ('output', 'inout', 'ref')
 --                 names: an assertion, a $display, a call argument or
 --                 branch condition whose statement has no local target.
 --                 load_* are all NULL -- a real reader, no nameable target.
+--   terminal      the design boundary: a root output/inout/ref terminal
+--                 reads the net it stands for. load_* are NULL and
+--                 terminal_id names the pin, so "unused" and "reaches the
+--                 boundary" stay distinct answers.
 --
 -- One read, one row: an expr_ref or assign_operand that a net_dep row
 -- already carries into 'dataflow' is not repeated as 'statement' -- the
@@ -944,6 +1021,7 @@ SELECT
     NULL            AS connection_id,
     d.stmt_id       AS statement_id,
     s.procedure_id  AS procedure_id,
+    NULL            AS terminal_id,
     d.mapping_exact AS mapping_exact,
     f.path          AS file_path,
     sf.path         AS source_path,
@@ -963,7 +1041,7 @@ SELECT
     a.inner_net_id, innet.inst_id, innet.name,
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
-    NULL, a.connection_id, NULL, NULL,
+    NULL, a.connection_id, NULL, NULL, NULL,
     a.mapping_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
@@ -979,7 +1057,7 @@ SELECT
     a.outer_net_id, outnet.inst_id, outnet.name,
     a.outer_lo, a.outer_hi, a.outer_exact,
     'connection',
-    NULL, a.connection_id, NULL, NULL,
+    NULL, a.connection_id, NULL, NULL, NULL,
     a.mapping_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
@@ -988,14 +1066,14 @@ JOIN net outnet          ON outnet.id = a.outer_net_id
 LEFT JOIN file f         ON f.id = a.file_id
 LEFT JOIN source_file sf ON sf.id = f.source_file_id
 WHERE a.direction IN ('output', 'inout', 'ref')
-  AND a.connection_kind = 'signal'
+  AND a.connection_kind IN ('signal', 'external_reference')
 UNION ALL
 SELECT
     pe.net_id, n.inst_id, n.name,
     NULL, NULL, 1,
     NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
-    NULL, NULL, pe.stmt_id, pe.procedure_id, NULL,
+    NULL, NULL, pe.stmt_id, pe.procedure_id, NULL, NULL,
     f.path, sf.path, pe.line, pe."column"
 FROM proc_event pe
 JOIN net n               ON n.id = pe.net_id
@@ -1009,7 +1087,7 @@ SELECT
     CASE e.role WHEN 'wait' THEN 'wait'
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
-    NULL, NULL, e.stmt_id, s.procedure_id, NULL,
+    NULL, NULL, e.stmt_id, s.procedure_id, NULL, NULL,
     f.path, sf.path, s.line, s."column"
 FROM expr_ref e
 JOIN net n               ON n.id = e.net_id
@@ -1024,14 +1102,29 @@ SELECT
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
-    NULL, NULL, o.stmt_id, s.procedure_id, NULL,
+    NULL, NULL, o.stmt_id, s.procedure_id, NULL, NULL,
     f.path, sf.path, s.line, s."column"
 FROM assign_operand o
 JOIN net n               ON n.id = o.net_id
 JOIN stmt s              ON s.id = o.stmt_id
 LEFT JOIN file f         ON f.id = s.file_id
 LEFT JOIN source_file sf ON sf.id = f.source_file_id
-WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_operand_id = o.id);
+WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_operand_id = o.id)
+UNION ALL
+SELECT
+    m.net_id, n.inst_id, n.name,
+    m.net_lo, m.net_hi, m.net_exact,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    'terminal',
+    NULL, NULL, NULL, NULL, t.id, NULL,
+    f.path, sf.path, t.line, t."column"
+FROM term_map m
+JOIN term t              ON t.id = m.term_id
+JOIN tree_node r         ON r.id = t.inst_id AND r.node_kind = 'root'
+JOIN net n               ON n.id = m.net_id
+LEFT JOIN file f         ON f.id = t.file_id
+LEFT JOIN source_file sf ON sf.id = f.source_file_id
+WHERE t.direction IN ('output', 'inout', 'ref');
 
 -- One row per stmt: the statement object. Targets and operands are
 -- v_statement_target / v_statement_operand rows keyed on statement_id --
@@ -1208,7 +1301,7 @@ Writer::Writer(const std::string& path) {
                 &ins[InsAssignOperand]);
         prepare("INSERT INTO expr_ref VALUES(?,?,?,?,?,?,?,?)", &ins[InsExprRef]);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcEvent]);
-        prepare("INSERT INTO net_dep VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        prepare("INSERT INTO net_dep VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetDep]);
         prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsHierRef]);
@@ -1590,20 +1683,22 @@ void Writer::addNetDep(const NetDepRow& r) {
     bindOptId(s, 6, r.assignTargetId);
     bindOptId(s, 7, r.exprRefId);
     bindOptId(s, 8, r.primitiveId);
-    sqlite3_bind_text(s, 9, r.dependencyKind.c_str(), -1, SQLITE_TRANSIENT);
+    bindOptId(s, 9, r.sourceHierRefId);
+    bindOptId(s, 10, r.targetHierRefId);
+    sqlite3_bind_text(s, 11, r.dependencyKind.c_str(), -1, SQLITE_TRANSIENT);
     // A row with no source has no source end to describe, so every column
     // describing one is NULL -- enforced here rather than in every emitter.
     // Before this discipline, `assign q = 1'b0` carried src_exact=1 and
     // map_exact=1: a per-bit mapping onto a driver that does not exist.
     if (r.sourceNetId == 0) {
-        bindRangeTri(s, 10, std::nullopt, -1);
-        bindRange(s, 13, r.targetBits, r.targetExact);
-        sqlite3_bind_null(s, 16);
+        bindRangeTri(s, 12, std::nullopt, -1);
+        bindRange(s, 15, r.targetBits, r.targetExact);
+        sqlite3_bind_null(s, 18);
     }
     else {
-        bindRangeTri(s, 10, r.sourceBits, r.sourceExact);
-        bindRange(s, 13, r.targetBits, r.targetExact);
-        bindTri(s, 16, r.mappingExact);
+        bindRangeTri(s, 12, r.sourceBits, r.sourceExact);
+        bindRange(s, 15, r.targetBits, r.targetExact);
+        bindTri(s, 18, r.mappingExact);
     }
     step(s);
     bumped();

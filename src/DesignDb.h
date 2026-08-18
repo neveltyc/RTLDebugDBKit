@@ -335,7 +335,9 @@ struct ProcEventRow {
     uint32_t column = 0;
 };
 
-/// One net-to-net dependency occurrence, with its provenance.
+/// One net-to-net dependency occurrence, with its provenance. An end that
+/// resolved through a hierarchical reference carries the resolved net id
+/// and names the hier_ref row instead of an operand/target row.
 struct NetDepRow {
     int64_t id = 0;
     int64_t sourceNetId = 0;      // 0 = a constant drives the target
@@ -345,6 +347,8 @@ struct NetDepRow {
     int64_t assignTargetId = 0;
     int64_t exprRefId = 0;
     int64_t primitiveId = 0;
+    int64_t sourceHierRefId = 0;
+    int64_t targetHierRefId = 0;
     std::string dependencyKind;   // data | control | primitive | procedure
     std::optional<std::pair<uint64_t, uint64_t>> sourceBits;
     int sourceExact = -1;         // -1 = no source end, stored NULL

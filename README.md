@@ -79,9 +79,9 @@ Release build, macOS arm64, against public designs, schema v10:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 225 | 746 | 4,888 | 0.03 s | 1.13 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.04 s | 1.43 MB |
-| VeeRwolf (`veerwolf_core`) | 86 | 1,920 | 17,808 | 11,080 | 36,605 | 0.32 s | 11.2 MB |
+| picorv32 | 1 | 1 | 225 | 746 | 4,888 | 0.03 s | 1.23 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.04 s | 1.54 MB |
+| VeeRwolf (`veerwolf_core`) | 86 | 1,920 | 17,808 | 11,088 | 36,621 | 0.35 s | 11.9 MB |
 
 The instance-level expansion is the column to watch: VeeRwolf's 1,920
 occurrences stamp out from 164 parameterised bodies (10× replication), and
@@ -132,10 +132,11 @@ CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
 src/                    main.cpp (CLI + filelist parsing), Extractor, DesignDb
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
-examples/constructs/    self-feedback, primitives, UDPs, waits, delays, XMRs,
-                        interfaces, assertions, generate arrays, non-ANSI
-                        ports, a deliberate black box -- exported and
-                        asserted by CI
+examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
+                        cross-instance references, per-call-site tasks,
+                        level-sensitive events, interfaces, assertions,
+                        generate arrays, non-ANSI ports, a deliberate black
+                        box -- exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
                         designdb-coverage.py (what an export had to approximate),

@@ -315,11 +315,19 @@ void collectEdgeEvents(const TimingControl* t,
     switch (t->kind) {
         case TimingControlKind::SignalEvent: {
             auto& se = t->as<SignalEventControl>();
-            if (se.edge == EdgeKind::None)
-                return;                 // level-sensitive: that is the read set
-            out.emplace_back(&se.expr, se.edge == EdgeKind::PosEdge   ? "posedge"
-                                       : se.edge == EdgeKind::NegEdge ? "negedge"
-                                                                      : "both");
+            // An explicitly written event is recorded whether or not it
+            // names an edge: `always @(b)` samples b, and a signal that
+            // appears ONLY in a sensitivity list was otherwise invisible to
+            // every load query. edge_kind stays NULL for the plain form.
+            // Implicit lists (`@*`, always_comb) are deliberately NOT
+            // expanded here: their sensitivity IS the read set, which the
+            // dataflow rows already carry, and duplicating it would list
+            // every combinational read twice.
+            out.emplace_back(&se.expr,
+                             se.edge == EdgeKind::PosEdge   ? "posedge"
+                             : se.edge == EdgeKind::NegEdge ? "negedge"
+                             : se.edge == EdgeKind::BothEdges ? "both"
+                                                              : "");
             // `@(posedge clk iff en)` samples `en` too; it qualifies the
             // event rather than being one.
             if (iffs && se.iffCondition)
@@ -429,6 +437,22 @@ struct Slot {
 };
 
 constexpr uint64_t kNoWidth = ~uint64_t{0};
+
+/// How many subroutine bodies one module may instantiate across all its
+/// procedures.
+///
+/// Per-call-site expansion is what makes a call's gating and delay its own,
+/// but the cycle guard bounds only recursion, not fan-out: a call DAG
+/// branching twice per level costs 2^depth, and 21 such levels turned an
+/// 88-line file into 3.1 M statements and 1.2 GB. This bounds that.
+///
+/// The number is set from measurement, not taste: of the designs exported
+/// here, the heaviest user of calls is picorv32 with 13 call statements,
+/// and tinyriscv and VeeRwolf have none. Four thousand is two orders of
+/// magnitude above that, so real RTL -- and any testbench short of a
+/// deliberately exponential one -- never reaches it. What it stops is
+/// counted and reported, never silently dropped.
+constexpr int64_t kCallExpansionBudget = 4000;
 
 uint64_t exprWidthOf(const Expression& e) {
     return e.type ? e.type->getBitWidth() : 0;
@@ -554,6 +578,43 @@ struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::All
     explicit StatementRefCollector(std::vector<Ref>& out) : out(out) {}
     void handle(const NamedValueExpression& e) { addRef(e); }
     void handle(const HierarchicalValueExpression& e) { addRef(e); }
+    /// An assignment's target is written, not read. Visiting it as an
+    /// ordinary value made a subroutine's *writes* come back as reads of
+    /// the call site: `task touch(); freewr = freerd; endtask` reported
+    /// freewr as read at the call, though nothing in the design reads it,
+    /// and the same database showed it with a single driver -- two rows
+    /// contradicting each other. The selectors on the left ARE reads
+    /// (`m[i] = x` reads i), so they are still visited.
+    void handle(const AssignmentExpression& e) {
+        collectLeftSelectorReads(e.left());
+        e.right().visit(*this);
+    }
+    void collectLeftSelectorReads(const Expression& lhs) {
+        switch (lhs.kind) {
+            case ExpressionKind::ElementSelect: {
+                auto& sel = lhs.as<ElementSelectExpression>();
+                sel.selector().visit(*this);
+                collectLeftSelectorReads(sel.value());
+                return;
+            }
+            case ExpressionKind::RangeSelect: {
+                auto& sel = lhs.as<RangeSelectExpression>();
+                sel.left().visit(*this);
+                sel.right().visit(*this);
+                collectLeftSelectorReads(sel.value());
+                return;
+            }
+            case ExpressionKind::MemberAccess:
+                collectLeftSelectorReads(lhs.as<MemberAccessExpression>().value());
+                return;
+            case ExpressionKind::Concatenation:
+                for (auto* op : lhs.as<ConcatenationExpression>().operands())
+                    collectLeftSelectorReads(*op);
+                return;
+            default:
+                return;
+        }
+    }
     void addRef(const ValueExpressionBase& e) {
         Ref r;
         r.sym = &e.symbol;
@@ -893,6 +954,25 @@ struct TplHierRef {
     std::string netName;     // scope-relative net name at the target instance
 };
 
+/// One dependency with at least one end outside the instance, paired where
+/// the statement was walked -- per (source element, target element), never
+/// by joining afterwards -- and materialised once the occurrence's
+/// references resolve. An end is a local net index or a hierRefs index,
+/// never both.
+struct TplCrossDep {
+    std::string kind;        // data | control | procedure
+    int32_t stmt = -1;
+    int32_t srcNet = -1;
+    int32_t srcHref = -1;
+    int32_t tgtNet = -1;
+    int32_t tgtHref = -1;
+    int32_t operandRef = -1;
+    int32_t targetRef = -1;
+    int32_t exprRef = -1;
+    TplRange srcR, tgtR;
+    int mappingExact = -1;
+};
+
 struct TplConn {
     std::string kind;        // net_conn.connection_kind
     int32_t parentNet = -1;  // index into the PARENT template's nets
@@ -936,6 +1016,7 @@ struct Template {
     std::vector<TplPrim> prims;
     std::vector<TplDep> deps;
     std::vector<TplHierRef> hierRefs;
+    std::vector<TplCrossDep> crossDeps;
     std::vector<TplChild> children;
     std::unordered_map<std::string, int32_t> termIndex;  // name -> terms index
     std::unordered_map<std::string, int32_t> netIndex;   // name -> nets index
@@ -950,8 +1031,17 @@ struct Template {
 // stack in one call, because the template needs the pairing (net_dep names
 // the operand and target rows) rather than a stream of independent edges.
 
+/// One operand paired with the part of the target its bits actually reach.
+///
+/// Both ends are narrowed to the overlap, not just the source. Keeping the
+/// target whole while narrowing the source is what made
+/// `assign swap = {c[3:0], c[7:4]}` export two dependencies each claiming
+/// all eight bits of swap with mapping_exact=1 -- a four-bit source cannot
+/// map one-to-one onto an eight-bit target, so the row was not merely
+/// coarse but impossible, and it said the bytes were not swapped.
 struct PairedSrc {
     Ref src;
+    Ref tgt;
     bool mapExact = false;
 };
 
@@ -993,9 +1083,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     std::vector<Ref> gating;
     int64_t seq = 0;
     std::set<const SubroutineSymbol*> activeSubs;
-    std::set<const SubroutineSymbol*> walkedSubs;
     std::set<const ValueSymbol*> loopVars;
     int subDepth = 0;
+    /// Remaining subroutine-body instantiations for the whole template, and
+    /// the count of call sites whose body was skipped once it ran out. Both
+    /// owned by the caller: the budget spans every procedure of one module,
+    /// since the blowup compounds across them.
+    int64_t* budget = nullptr;
+    int64_t* truncated = nullptr;
     /// Whether call bindings currently have a statement to attach to; cleared
     /// while visiting control expressions, whose calls belong to no statement
     /// this schema records.
@@ -1034,6 +1129,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// the actual-to-formal bindings hang -- but only its *reads* are
     /// recorded here; a written argument's assignment is walked inside the
     /// call expression as usual.
+    ///
+    /// Only what the call site itself names is read here. A user
+    /// subroutine's own reads are recorded by walking its body, which v10
+    /// does once per call site -- summarising them here as well reported
+    /// every one of them twice, as a `dataflow` load from the body and a
+    /// `statement` load from the call, against a schema that promises one
+    /// read is one row. A system task has no body to walk, so its free
+    /// reads still have to be gathered.
     void handle(const ExpressionStatement& stmt) {
         if (stmt.expr.kind != ExpressionKind::Call) {
             visitDefault(stmt);
@@ -1042,7 +1145,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         auto& call = stmt.expr.as<CallExpression>();
         std::vector<Ref> reads;
         collectRefs(stmt.expr, eval, reads);
-        {
+        if (call.isSystemCall()) {
             std::set<const SubroutineSymbol*> active;
             collectCallReadsInto(stmt.expr, active, reads);
         }
@@ -1107,28 +1210,57 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         visitDefault(stmt);
     }
 
+    /// Visits the condition expressions of a branch with `bindable` off --
+    /// a call written INSIDE a condition belongs to no statement this
+    /// schema records -- and leaves it on for the branch bodies, whose
+    /// calls are ordinary statements of their own.
+    ///
+    /// Clearing it across the whole subtree instead cost every gated call
+    /// its statement binding: `if (g) put(b);` produced a `procedure`
+    /// dependency with stmt_id and expr_ref_id NULL, while the same call
+    /// written ungated kept both. That is exactly the shape the per-call-
+    /// site walk exists to record, and every call site in the motivating
+    /// case is gated.
+    template<typename F>
+    void visitGuarded(F&& visitConditions) {
+        const bool saved = bindable;
+        bindable = false;
+        visitConditions();
+        bindable = saved;
+    }
+
     void handle(const ConditionalStatement& stmt) {
         const size_t mark = gating.size();
-        for (auto& cond : stmt.conditions)
-            collectRefs(*cond.expr, eval, gating);
-        const bool savedBindable = bindable;
-        bindable = false;      // a call in the condition belongs to no statement
-        visitDefault(stmt);
-        bindable = savedBindable;
+        visitGuarded([&] {
+            for (auto& cond : stmt.conditions) {
+                collectRefs(*cond.expr, eval, gating);
+                cond.expr->visit(*this);
+            }
+        });
+        stmt.ifTrue.visit(*this);
+        if (stmt.ifFalse)
+            stmt.ifFalse->visit(*this);
         gating.resize(mark);
     }
 
     void handle(const CaseStatement& stmt) {
         const size_t mark = gating.size();
-        collectRefs(stmt.expr, eval, gating);
+        visitGuarded([&] {
+            collectRefs(stmt.expr, eval, gating);
+            stmt.expr.visit(*this);
+            for (auto& item : stmt.items) {
+                for (auto* label : item.expressions) {
+                    collectRefs(*label, eval, gating);
+                    label->visit(*this);
+                }
+            }
+        });
         for (auto& item : stmt.items) {
-            for (auto* label : item.expressions)
-                collectRefs(*label, eval, gating);
+            if (item.stmt)
+                item.stmt->visit(*this);
         }
-        const bool savedBindable = bindable;
-        bindable = false;
-        visitDefault(stmt);
-        bindable = savedBindable;
+        if (stmt.defaultCase)
+            stmt.defaultCase->visit(*this);
         gating.resize(mark);
     }
 
@@ -1180,7 +1312,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 continue;
             // Reads and writes the same bits of the same object -- as
             // positional as a mapping gets.
-            emitTarget(dst, {PairedSrc{dst, true}}, gating, expr.sourceRange,
+            emitTarget(dst, {PairedSrc{dst, dst, true}}, gating, expr.sourceRange,
                        seq++, true, 0, subDepth > 0, /*firstTarget=*/true,
                        pendingDelay);
         }
@@ -1192,19 +1324,36 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         auto sub = std::get_if<const SubroutineSymbol*>(&expr.subroutine);
         if (!sub || !*sub)
             return;
-        // Every call, before the once-per-subroutine guard: the body is the
-        // same wherever it is called from, but the actuals are not.
         bindArguments(expr, **sub);
         if (!activeSubs.insert(*sub).second)
+            return;                       // recursion guard
+        // Per CALL SITE, deliberately. Walking the body once per subroutine
+        // read cleaner but lost call-site semantics: in
+        // `if (g1) put(d1); if (g2) put(d2);` the body's `q <= v` inherited
+        // g1's gating only, so g2 -> q never existed and the driver cone
+        // depended on which call was walked first. The body's statements
+        // are the effect of THIS call -- its gating stack, its delay -- so
+        // each call instantiates them, exactly as the occurrence model
+        // stamps each instance.
+        //
+        // The cost is body rows per call site, and it compounds: the cycle
+        // guard above stops recursion but not fan-out, so a call DAG where
+        // each level calls the next twice costs 2^depth. Measured at 21
+        // such levels: 3.1 M statements and 1.2 GB from an 88-line file.
+        // The budget bounds that. It is deliberately generous -- ordinary
+        // RTL never approaches it -- and what it skips is counted rather
+        // than silently dropped, so a truncated export says so.
+        if (budget && *budget <= 0) {
+            if (truncated)
+                (*truncated)++;
+            activeSubs.erase(*sub);
             return;
-        // Once per subroutine: the body's own statements are the
-        // subroutine's, not the call site's, and walking them per call
-        // duplicated every one of them.
-        if (walkedSubs.insert(*sub).second) {
-            subDepth++;
-            (*sub)->getBody().visit(*this);
-            subDepth--;
         }
+        if (budget)
+            (*budget)--;
+        subDepth++;
+        (*sub)->getBody().visit(*this);
+        subDepth--;
         activeSubs.erase(*sub);
     }
 
@@ -1249,6 +1398,17 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     }
 
     void handle(const AssignmentExpression& expr) {
+        // The copy-back slang synthesises for an `output`/`inout` actual:
+        // `bump(i0, o0)` carries an assignment to o0 whose right side is an
+        // empty placeholder. It is not a statement anyone wrote, and it has
+        // no operands -- so recording it produced a source-less dependency,
+        // which v_driver reports as a CONSTANT tie-off on a signal the task
+        // plainly drives. The real record is the `procedure` dependency
+        // from the formal, which bindArguments already makes.
+        if (expr.right().kind == ExpressionKind::EmptyArgument) {
+            visitDefault(expr);
+            return;
+        }
         std::vector<Ref> targets;
         collectRefs(expr.left(), eval, targets, /*skipSelectors=*/true);
         if (targets.empty()) {
@@ -1313,6 +1473,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
                     continue;
                 pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
+                                          narrowed(dstSlot, lo, hi),
                                           dstSlot.positional && srcSlot.positional});
             }
             emitTarget(dstSlot.ref, pairs, gating, expr.sourceRange, stmtSeq,
@@ -1591,15 +1752,25 @@ private:
         std::unordered_map<const Symbol*, int32_t> netOf;
         std::unordered_map<const Symbol*, int32_t> scopeOf;
         std::unordered_map<const SubroutineSymbol*, int32_t> procOf;
-        std::set<std::pair<const Expression*, bool>> hierSeen;
+        /// (reference expression, is-write) -> hierRefs index. Keyed by node
+        /// so a generate loop's four elaborations of one spelling stay four
+        /// rows, and mapped rather than a bare set so a second sighting can
+        /// pair a dependency with the row the first one made.
+        std::map<std::pair<const Expression*, bool>, int32_t> hierSeen;
         int32_t curStmt = -1;      // where call bindings attach
         int32_t curProc = -1;      // procedure of statements being created
         int32_t curScope = 0;
         int64_t targetOrdinal = 0; // per-stmt ordinals
         int64_t operandOrdinal = 0;
         int64_t exprOrdinal = 0;
-        std::vector<int32_t> curControlRefs;  // control expr_refs of curStmt
+        std::vector<int32_t> curControlRefs;   // control expr_refs of curStmt
+        std::vector<int32_t> curControlHrefs;  // outward conditions, as hierRefs
         std::vector<Ref> curControlSrcs;
+        /// Subroutine-body instantiations left for this module, and the
+        /// call sites skipped once they ran out. See handle(CallExpression)
+        /// for why per-call-site expansion needs a ceiling at all.
+        int64_t callBudget = kCallExpansionBudget;
+        int64_t truncatedCalls = 0;
     };
 
     /// The net index for a symbol of this body, creating the row on first
@@ -1738,7 +1909,13 @@ private:
         b.targetOrdinal = 0;
         b.operandOrdinal = 0;
         b.exprOrdinal = 0;
+        // All three condition vectors, always together: they are indexed in
+        // lockstep by the target loop, so clearing two of them leaves the
+        // third holding an earlier statement's entries and every later
+        // lookup reads the wrong slot -- a control edge attributed to the
+        // wrong signal, or dropped, with nothing in the row to show for it.
         b.curControlRefs.clear();
+        b.curControlHrefs.clear();
         b.curControlSrcs.clear();
         return idx;
     }
@@ -1761,14 +1938,16 @@ private:
     int32_t addHierRef(Build& b, bool isWrite, const Ref& r,
                        const TplLoc& at, EvalContext& eval,
                        const char* access = nullptr) {
-        if (!b.hierSeen.emplace(r.origin, isWrite).second)
-            return -1;
+        auto key = std::make_pair(r.origin, isWrite);
+        if (auto it = b.hierSeen.find(key); it != b.hierSeen.end())
+            return it->second;
         std::string text = canonicalPath(r.origin, eval);
         if (text.empty())
             text = normalizedText(r.origin, sourceManager);
         if (text.empty() || (text.find('.') == std::string::npos &&
                              text.find("::") == std::string::npos)) {
             stats.external++;
+            b.hierSeen.emplace(key, -1);
             return -1;
         }
         stats.external++;
@@ -1783,6 +1962,7 @@ private:
         if (row.resolve != TplHierRef::None)
             b.t->hasResolvableRefs = true;
         b.t->hierRefs.push_back(std::move(row));
+        b.hierSeen.emplace(key, idx);
         return idx;
     }
 
@@ -1954,6 +2134,7 @@ private:
         buildNetInitialisers(b, body);
         buildPrimitives(b, body);
         buildChildren(b, body);
+        stats.truncatedCalls += b.truncatedCalls;
         t.built = true;
     }
 
@@ -2161,6 +2342,8 @@ private:
             },
             evalCtx);
         walker.sensitivityTiming = sens.timingControl;
+        walker.budget = &b.callBudget;
+        walker.truncated = &b.truncatedCalls;
         if (isContinuous) {
             walker.pendingDelay = delayText(
                 sym.as<ContinuousAssignSymbol>().getDelay());
@@ -2251,18 +2434,22 @@ private:
                                       : (blocking ? "blocking" : "nonblocking"),
                            seq, delay, dropped, at);
             // The control reads gate every target of the statement; recorded
-            // once, reused by each target's control dependencies.
+            // once, reused by each target's control dependencies. An outward
+            // condition is a hier_ref; its dependency onto each target is
+            // paired here and materialised when the reference resolves.
             for (auto& g : gating) {
                 if (!g.sym)
                     continue;
                 const int32_t netIdx = netFor(b, *g.sym);
                 if (netIdx < 0) {
-                    addHierRef(b, false, g, at, evalCtx);
                     b.curControlRefs.push_back(-1);
+                    b.curControlHrefs.push_back(
+                        addHierRef(b, false, g, at, evalCtx));
                 }
                 else {
                     b.curControlRefs.push_back(
                         addExprRef(b, stmt, g, "control", netIdx));
+                    b.curControlHrefs.push_back(-1);
                 }
                 b.curControlSrcs.push_back(g);
             }
@@ -2272,9 +2459,10 @@ private:
 
         // The target row, or the outward write.
         int32_t targetIdx = -1;
+        int32_t tgtHref = -1;
         int32_t dstNet = netFor(b, *dst.sym);
         if (dstNet < 0) {
-            addHierRef(b, true, dst, at, evalCtx);
+            tgtHref = addHierRef(b, true, dst, at, evalCtx);
         }
         else {
             TplStmtRef tr;
@@ -2285,25 +2473,36 @@ private:
             targetIdx = int32_t(b.t->targets.size());
             b.t->targets.push_back(std::move(tr));
         }
+        const bool haveTarget = targetIdx >= 0 || tgtHref >= 0;
 
-        // Operands and data dependencies, paired -- never crossed.
-        bool anyLocalSource = false;
+        // Operands and data dependencies, paired -- never crossed. An end
+        // outside the instance keeps the pairing: the dependency is queued
+        // against the hier_ref and becomes a real cross-instance row once
+        // the reference resolves. Unresolvable stays a hier_ref alone --
+        // the honest record, never a fabricated edge.
+        bool anySource = false;
         for (auto& p : pairs) {
             if (!p.src.sym)
                 continue;
             const int32_t srcNet = netFor(b, *p.src.sym);
-            if (srcNet < 0) {
-                addHierRef(b, false, p.src, at, evalCtx);
-                continue;
+            int32_t operandIdx = -1;
+            int32_t srcHref = -1;
+            if (srcNet >= 0) {
+                TplStmtRef orow;
+                orow.stmt = stmt;
+                orow.ordinal = b.operandOrdinal++;
+                orow.net = srcNet;
+                orow.r = rangeOf(p.src);
+                operandIdx = int32_t(b.t->operands.size());
+                b.t->operands.push_back(std::move(orow));
             }
-            TplStmtRef orow;
-            orow.stmt = stmt;
-            orow.ordinal = b.operandOrdinal++;
-            orow.net = srcNet;
-            orow.r = rangeOf(p.src);
-            const int32_t operandIdx = int32_t(b.t->operands.size());
-            b.t->operands.push_back(std::move(orow));
-            if (targetIdx >= 0) {
+            else {
+                srcHref = addHierRef(b, false, p.src, at, evalCtx);
+            }
+            if (!haveTarget)
+                continue;
+            anySource = anySource || srcNet >= 0 || srcHref >= 0;
+            if (srcNet >= 0 && targetIdx >= 0) {
                 TplDep d;
                 d.srcNet = srcNet;
                 d.tgtNet = dstNet;
@@ -2312,15 +2511,35 @@ private:
                 d.targetRef = targetIdx;
                 d.kind = "data";
                 d.srcR = rangeOf(p.src);
-                d.tgtR = rangeOf(dst);
+                // The bits of the target THIS operand reaches, not the
+                // whole target: the `assign_target` row above still spans
+                // everything the statement writes.
+                d.tgtR = rangeOf(p.tgt);
                 d.mappingExact = p.mapExact ? 1 : 0;
                 b.t->deps.push_back(std::move(d));
-                anyLocalSource = true;
+            }
+            else if (srcNet >= 0 || srcHref >= 0) {
+                TplCrossDep d;
+                d.kind = "data";
+                d.stmt = stmt;
+                d.srcNet = srcNet;
+                d.srcHref = srcHref;
+                d.tgtNet = dstNet;
+                d.tgtHref = tgtHref;
+                d.operandRef = operandIdx;
+                d.targetRef = targetIdx;
+                d.srcR = rangeOf(p.src);
+                d.tgtR = rangeOf(p.tgt);
+                d.mappingExact = p.mapExact ? 1 : 0;
+                b.t->crossDeps.push_back(std::move(d));
             }
         }
-        // `q <= 8'h0`, or a statement whose every operand lives outside the
-        // instance: the target is driven, and the null-source row says so.
-        if (targetIdx >= 0 && !anyLocalSource) {
+        // `q <= 8'h0`: nothing at all reaches the target, and the
+        // null-source row records the driving statement. A target whose
+        // sources are all OUTWARD is not that -- its drivers are the
+        // cross-instance rows above, and claiming a constant here was a
+        // wrong fact, not a conservative one.
+        if (targetIdx >= 0 && !anySource) {
             TplDep d;
             d.srcNet = -1;
             d.tgtNet = dstNet;
@@ -2331,48 +2550,95 @@ private:
             b.t->deps.push_back(std::move(d));
         }
         // Control dependencies: each recorded condition read reaches this
-        // target through its branch.
-        if (targetIdx >= 0) {
-            for (size_t i = 0; i < b.curControlRefs.size(); i++) {
-                if (b.curControlRefs[i] < 0)
-                    continue;
+        // target through its branch, whichever side of the boundary either
+        // end lives on.
+        if (haveTarget) {
+            for (size_t i = 0; i < b.curControlSrcs.size(); i++) {
                 auto& src = b.curControlSrcs[i];
-                const int32_t srcNet = netFor(b, *src.sym);
-                if (srcNet < 0)
+                const int32_t ctrlRef = b.curControlRefs[i];
+                const int32_t ctrlHref = b.curControlHrefs[i];
+                if (ctrlRef < 0 && ctrlHref < 0)
                     continue;
-                TplDep d;
-                d.srcNet = srcNet;
-                d.tgtNet = dstNet;
-                d.stmt = stmt;
-                d.exprRef = b.curControlRefs[i];
-                d.targetRef = targetIdx;
-                d.kind = "control";
-                d.srcR = rangeOf(src);
-                d.tgtR = rangeOf(dst);
-                d.mappingExact = 0;
-                b.t->deps.push_back(std::move(d));
+                if (ctrlRef >= 0 && targetIdx >= 0) {
+                    const int32_t srcNet = netFor(b, *src.sym);
+                    if (srcNet < 0)
+                        continue;
+                    TplDep d;
+                    d.srcNet = srcNet;
+                    d.tgtNet = dstNet;
+                    d.stmt = stmt;
+                    d.exprRef = ctrlRef;
+                    d.targetRef = targetIdx;
+                    d.kind = "control";
+                    d.srcR = rangeOf(src);
+                    d.tgtR = rangeOf(dst);
+                    d.mappingExact = 0;
+                    b.t->deps.push_back(std::move(d));
+                }
+                else {
+                    TplCrossDep d;
+                    d.kind = "control";
+                    d.stmt = stmt;
+                    d.srcNet = ctrlRef >= 0 ? netFor(b, *src.sym) : -1;
+                    d.srcHref = ctrlHref;
+                    d.tgtNet = dstNet;
+                    d.tgtHref = tgtHref;
+                    d.exprRef = ctrlRef;
+                    d.targetRef = targetIdx;
+                    d.srcR = rangeOf(src);
+                    d.tgtR = rangeOf(dst);
+                    d.mappingExact = 0;
+                    b.t->crossDeps.push_back(std::move(d));
+                }
             }
         }
     }
 
     /// One call binding: the actual and the formal coupled by argument
-    /// direction. The formal is a subroutine-scope net (`bump.v`); the body's
-    /// own statements belong to the calling procedure, exactly as the v9
-    /// walk attributed them.
+    /// direction. The formal is a subroutine-scope net (`bump.v`); the
+    /// body's own statements belong to the calling procedure, and are
+    /// walked once per call site so each carries its caller's gating.
     void emitCallBinding(Build& b, const Ref& formal, const Ref& actual,
                          bool reads, bool writes, bool oneToOne, bool bindable,
                          const TplLoc& at, EvalContext& evalCtx) {
         if (!formal.sym || !actual.sym)
             return;
         const int32_t formalNet = netFor(b, *formal.sym);
-        const int32_t actualNet = netFor(b, *actual.sym);
-        if (actualNet < 0) {
-            addHierRef(b, writes, actual, at, evalCtx);
-            return;
-        }
         if (formalNet < 0)
             return;
         const int32_t stmt = bindable ? b.curStmt : -1;
+        const int32_t actualNet = netFor(b, *actual.sym);
+        if (actualNet < 0) {
+            // An outward actual still binds: the dependency pairs here and
+            // materialises when the reference resolves.
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            const int32_t href = addHierRef(b, writes, actual, at, evalCtx);
+            b.curStmt = saved;
+            if (href < 0)
+                return;
+            if (reads) {
+                TplCrossDep d;
+                d.kind = "procedure";
+                d.stmt = stmt;
+                d.srcHref = href;
+                d.tgtNet = formalNet;
+                d.srcR = rangeOf(actual);
+                d.mappingExact = oneToOne ? 1 : 0;
+                b.t->crossDeps.push_back(std::move(d));
+            }
+            if (writes) {
+                TplCrossDep d;
+                d.kind = "procedure";
+                d.stmt = stmt;
+                d.srcNet = formalNet;
+                d.tgtHref = href;
+                d.tgtR = rangeOf(actual);
+                d.mappingExact = oneToOne ? 1 : 0;
+                b.t->crossDeps.push_back(std::move(d));
+            }
+            return;
+        }
         if (reads) {
             int32_t exprIdx = -1;
             if (stmt >= 0)
@@ -2440,6 +2706,7 @@ private:
                 if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
                     continue;
                 pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
+                                          narrowed(dstSlot, lo, hi),
                                           dstSlot.positional && srcSlot.positional});
             }
             b.curScope = 0;
@@ -3092,7 +3359,16 @@ private:
         int64_t instNode = 0;         // the occurrence the reference is in
         const Template* t = nullptr;
         size_t refIdx = 0;
+        Bases base;
         std::vector<int64_t> ifaceBind; // term index -> bound iface inst id
+    };
+
+    /// One queued cross-instance dependency of one occurrence, written once
+    /// the occurrence's references resolve.
+    struct CrossJob {
+        const Template* t = nullptr;
+        size_t idx = 0;
+        Bases base;
     };
 
     void stampOccurrence(const InstanceSymbol& instSym, const std::string& key,
@@ -3343,19 +3619,21 @@ private:
 
         // Hierarchical reference rows are written in the final pass, once
         // every subtree they may land in exists; ids are fixed now because
-        // net_conn rows below may reference them.
-        if (!t.hierRefs.empty()) {
-            for (size_t i = 0; i < t.hierRefs.size(); i++) {
-                ReplayJob job;
-                job.rowId = base.hierRef + int64_t(i) + 1;
-                job.instNode = instId;
-                job.t = &t;
-                job.refIdx = i;
-                job.ifaceBind = ifaceBind;
-                replayJobs.push_back(std::move(job));
-            }
-            hierStmtBase.emplace(instId, base);
+        // net_conn rows below may reference them. The queued cross-instance
+        // dependencies follow in the same pass, since their endpoints are
+        // those references' resolutions.
+        for (size_t i = 0; i < t.hierRefs.size(); i++) {
+            ReplayJob job;
+            job.rowId = base.hierRef + int64_t(i) + 1;
+            job.instNode = instId;
+            job.t = &t;
+            job.refIdx = i;
+            job.base = base;
+            job.ifaceBind = ifaceBind;
+            replayJobs.push_back(std::move(job));
         }
+        for (size_t i = 0; i < t.crossDeps.size(); i++)
+            crossJobs.push_back(CrossJob{&t, i, base});
         stats.hierRefs += int64_t(t.hierRefs.size());
 
         // For hierarchical-reference replay: which template (and net base)
@@ -3550,19 +3828,19 @@ private:
     }
 
     /// Writes every hier_ref row, resolving the ones whose replay lands on a
-    /// stamped object. The tree walk is by name against childByName; the net
-    /// by name against the target group's template index -- both spellings
-    /// the stamping itself produced.
+    /// stamped object -- then materialises the queued cross-instance
+    /// dependencies whose endpoints those resolutions are. The tree walk is
+    /// by name against childByName; the net by name against the target
+    /// group's template index -- both spellings the stamping itself
+    /// produced.
     void resolveHierRefs() {
+        std::unordered_map<int64_t, int64_t> resolvedNet;  // hier_ref id -> net id
         for (auto& job : replayJobs) {
             const TplHierRef& ref = job.t->hierRefs[job.refIdx];
             HierRefRow row;
             row.id = job.rowId;
             row.instId = job.instNode;
-            auto baseIt = hierStmtBase.find(job.instNode);
-            row.stmtId = ref.stmt < 0 || baseIt == hierStmtBase.end()
-                             ? 0
-                             : baseIt->second.stmt + ref.stmt + 1;
+            row.stmtId = ref.stmt < 0 ? 0 : job.base.stmt + ref.stmt + 1;
             row.path = ref.path;
             row.access = ref.access;
             row.bits = ref.r.bits;
@@ -3596,13 +3874,67 @@ private:
                     if (tplIt != nodeTemplate.end()) {
                         auto& tt = *tplIt->second.first;
                         auto nIt = tt.netIndex.find(ref.netName);
-                        if (nIt != tt.netIndex.end())
+                        if (nIt != tt.netIndex.end()) {
                             row.resolvedNetId =
                                 tplIt->second.second + nIt->second + 1;
+                            resolvedNet.emplace(row.id, row.resolvedNetId);
+                        }
                     }
                 }
             }
             writer.addHierRef(row);
+        }
+
+        // The cross-instance dependencies. An endpoint is a local net (base
+        // plus index) or a reference's resolution; a dependency any of whose
+        // referenced ends did not resolve is not written -- the hier_ref
+        // rows above are the honest record, and a fabricated edge would be
+        // a wrong one.
+        for (auto& job : crossJobs) {
+            const TplCrossDep& d = job.t->crossDeps[job.idx];
+            NetDepRow row;
+            row.id = 0;   // assigned below once the row is known writable
+            if (d.srcNet >= 0) {
+                row.sourceNetId = job.base.net + d.srcNet + 1;
+            }
+            else if (d.srcHref >= 0) {
+                row.sourceHierRefId = job.base.hierRef + d.srcHref + 1;
+                auto it = resolvedNet.find(row.sourceHierRefId);
+                if (it == resolvedNet.end())
+                    continue;
+                row.sourceNetId = it->second;
+            }
+            else {
+                continue;
+            }
+            if (d.tgtNet >= 0) {
+                row.targetNetId = job.base.net + d.tgtNet + 1;
+            }
+            else if (d.tgtHref >= 0) {
+                row.targetHierRefId = job.base.hierRef + d.tgtHref + 1;
+                auto it = resolvedNet.find(row.targetHierRefId);
+                if (it == resolvedNet.end())
+                    continue;
+                row.targetNetId = it->second;
+            }
+            else {
+                continue;
+            }
+            row.id = ++depCounter;
+            row.stmtId = d.stmt < 0 ? 0 : job.base.stmt + d.stmt + 1;
+            row.assignOperandId =
+                d.operandRef < 0 ? 0 : job.base.operand + d.operandRef + 1;
+            row.assignTargetId =
+                d.targetRef < 0 ? 0 : job.base.target + d.targetRef + 1;
+            row.exprRefId = d.exprRef < 0 ? 0 : job.base.exprRef + d.exprRef + 1;
+            row.dependencyKind = d.kind;
+            row.sourceBits = d.srcR.bits;
+            row.sourceExact = d.srcR.exact ? 1 : 0;
+            row.targetBits = d.tgtR.bits;
+            row.targetExact = d.tgtR.exact;
+            row.mappingExact = d.mappingExact;
+            writer.addNetDep(row);
+            stats.deps++;
         }
     }
 
@@ -3649,7 +3981,7 @@ private:
 
     std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>> childByName;
     std::vector<ReplayJob> replayJobs;
-    std::unordered_map<int64_t, Bases> hierStmtBase;
+    std::vector<CrossJob> crossJobs;
     /// node id -> (template, net id base) for net-name resolution at replay.
     std::unordered_map<int64_t, std::pair<const Template*, int64_t>> nodeTemplate;
 

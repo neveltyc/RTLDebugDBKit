@@ -18,11 +18,12 @@
 #   verify-designdb.py <design.db> hierarchy    + examples/constructs/hierarchy.sv facts
 #   verify-designdb.py <design.db> udp          + examples/constructs/udp.sv facts
 #   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
+#   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved")
+         "unresolved", "xmr")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
@@ -296,23 +297,51 @@ check(one("""
 # Every dependency names where it came from, per kind, and the copies it
 # carries of the operand/target facts agree with the rows it names. This is
 # the declared redundancy that makes net_dep usable as the driver/load index.
+# Per kind, and per END: a data/control end is either the local reference
+# row or the resolved hierarchical one, exactly one of the two.
 check(one("""
     SELECT count(*) FROM net_dep d
     WHERE CASE d.dependency_kind
-        WHEN 'data' THEN d.stmt_id IS NULL OR d.assign_target_id IS NULL
+        WHEN 'data' THEN d.stmt_id IS NULL
              OR d.expr_ref_id IS NOT NULL OR d.primitive_id IS NOT NULL
-             OR (d.source_net_id IS NOT NULL AND d.assign_operand_id IS NULL)
-             OR (d.source_net_id IS NULL AND d.assign_operand_id IS NOT NULL)
-        WHEN 'control' THEN d.stmt_id IS NULL OR d.assign_target_id IS NULL
-             OR d.expr_ref_id IS NULL OR d.assign_operand_id IS NOT NULL
-             OR d.primitive_id IS NOT NULL OR d.mapping_exact != 0
+             OR (d.assign_target_id IS NULL) = (d.target_hier_ref_id IS NULL)
+             OR (d.source_net_id IS NULL AND (d.assign_operand_id IS NOT NULL
+                  OR d.source_hier_ref_id IS NOT NULL))
+             OR (d.source_net_id IS NOT NULL AND
+                 (d.assign_operand_id IS NULL) = (d.source_hier_ref_id IS NULL))
+        WHEN 'control' THEN d.stmt_id IS NULL
+             -- A condition always has a source: without this, a control row
+             -- with source_net_id NULL passed every check and surfaced in
+             -- v_driver as a CONSTANT tie-off on a gated signal.
+             OR d.source_net_id IS NULL
+             OR d.assign_operand_id IS NOT NULL OR d.primitive_id IS NOT NULL
+             OR (d.expr_ref_id IS NULL) = (d.source_hier_ref_id IS NULL)
+             OR (d.assign_target_id IS NULL) = (d.target_hier_ref_id IS NULL)
+             -- NULL-safe: `NULL != 0` is NULL, so the plain comparison read
+             -- as "0 or NULL" and let an unset mapping through.
+             OR d.mapping_exact IS NOT 0
         WHEN 'primitive' THEN d.primitive_id IS NULL OR d.stmt_id IS NOT NULL
              OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
-             OR d.expr_ref_id IS NOT NULL
+             OR d.expr_ref_id IS NOT NULL OR d.source_hier_ref_id IS NOT NULL
+             OR d.target_hier_ref_id IS NOT NULL
         WHEN 'procedure' THEN d.primitive_id IS NOT NULL
              OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
+             OR d.source_net_id IS NULL
+             -- The reading side names where the actual came from, exactly
+             -- as the doc promises: an argument reference or a resolved
+             -- outward one. The write-back direction (formal -> actual) has
+             -- neither, and is told apart by the formal being the source.
+             OR (d.expr_ref_id IS NOT NULL AND d.source_hier_ref_id IS NOT NULL)
         ELSE 1 END""") == 0,
       "net_dep provenance columns match dependency_kind")
+check(one("""
+    SELECT count(*) FROM net_dep d JOIN hier_ref h ON h.id = d.source_hier_ref_id
+    WHERE h.resolved_net_id IS NULL OR h.resolved_net_id != d.source_net_id""") == 0,
+      "a hierarchical source copies its reference's resolution")
+check(one("""
+    SELECT count(*) FROM net_dep d JOIN hier_ref h ON h.id = d.target_hier_ref_id
+    WHERE h.resolved_net_id IS NULL OR h.resolved_net_id != d.target_net_id""") == 0,
+      "a hierarchical target copies its reference's resolution")
 check(one("""
     SELECT count(*) FROM net_dep d
     WHERE d.source_net_id IS NULL AND (d.source_lo IS NOT NULL
@@ -333,17 +362,23 @@ check(one("""
        OR (d.dependency_kind = 'control' AND e.role != 'control')
        OR (d.dependency_kind = 'procedure' AND e.role != 'call_argument')""") == 0,
       "net_dep's expression reference agrees with the expr_ref row")
+# Locality holds exactly where no end went through a hierarchical
+# reference; a resolved cross-instance dependency is the point of v10's
+# occurrence model, not a violation of it.
 check(one("""
     SELECT count(*) FROM net_dep d
     JOIN net s ON s.id = d.source_net_id JOIN net t ON t.id = d.target_net_id
     JOIN stmt st ON st.id = d.stmt_id
     WHERE d.dependency_kind IN ('data','control')
+      AND d.source_hier_ref_id IS NULL AND d.target_hier_ref_id IS NULL
       AND (s.inst_id != st.inst_id OR t.inst_id != st.inst_id)""") == 0,
-      "data and control dependencies stay inside one instance")
+      "purely local dependencies stay inside one instance")
 check(one("""
     SELECT count(*) FROM assign_target a
-    WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_target_id = a.id)""") == 0,
-      "every assignment target has a dependency (source may be NULL)")
+    WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_target_id = a.id)
+      AND NOT EXISTS (SELECT 1 FROM hier_ref h
+                      WHERE h.stmt_id = a.stmt_id AND h.access = 'read')""") == 0,
+      "every assignment target has a dependency or an unresolved outward read")
 
 # ------------------------------------------------------ windows and widths
 # When a mapping claims to be one-to-one, the two sides must be the same
@@ -359,6 +394,20 @@ check(one("""
       AND COALESCE(m.term_hi - m.term_lo + 1, t.width)
           != COALESCE(m.net_hi - m.net_lo + 1, n.width)""") == 0,
       "an exact term_map maps equal widths")
+# The same rule on dependencies, and it is the one that matters most: a
+# one-to-one claim between ends of different widths is not coarse, it is
+# impossible. `assign swap = {c[3:0], c[7:4]}` used to export two rows each
+# claiming all eight bits of swap from a four-bit source -- provably false,
+# and every column in it well formed.
+check(one("""
+    SELECT count(*) FROM net_dep d
+    JOIN net s ON s.id = d.source_net_id JOIN net t ON t.id = d.target_net_id
+    WHERE d.mapping_exact = 1 AND d.source_exact = 1 AND d.target_exact = 1
+      AND COALESCE(d.source_hi - d.source_lo + 1, s.width) IS NOT NULL
+      AND COALESCE(d.target_hi - d.target_lo + 1, t.width) IS NOT NULL
+      AND COALESCE(d.source_hi - d.source_lo + 1, s.width)
+          != COALESCE(d.target_hi - d.target_lo + 1, t.width)""") == 0,
+      "a one-to-one dependency maps equal widths")
 check(one("""
     SELECT count(*) FROM net_conn c
     JOIN term t ON t.id = c.term_id LEFT JOIN net n ON n.id = c.net_id
@@ -491,6 +540,7 @@ VIEW_COLUMNS = {
         "target_instance_id", "target_name", "target_lo", "target_hi",
         "target_exact", "statement_id", "assign_operand_id",
         "assign_target_id", "expression_reference_id", "primitive_id",
+        "source_hier_ref_id", "target_hier_ref_id",
         "dependency_kind", "mapping_exact", "file_path", "source_path",
         "source_line", "source_column"],
     "v_driver": [
@@ -498,15 +548,15 @@ VIEW_COLUMNS = {
         "signal_hi", "signal_exact", "driver_net_id", "driver_instance_id",
         "driver_name", "driver_lo", "driver_hi", "driver_exact",
         "driver_kind", "dependency_id", "connection_id", "statement_id",
-        "primitive_id", "mapping_exact", "file_path", "source_path",
-        "source_line", "source_column"],
+        "primitive_id", "terminal_id", "mapping_exact", "file_path",
+        "source_path", "source_line", "source_column"],
     "v_load": [
         "signal_net_id", "signal_instance_id", "signal_name", "signal_lo",
         "signal_hi", "signal_exact", "load_net_id", "load_instance_id",
         "load_name", "load_lo", "load_hi", "load_exact", "load_kind",
         "dependency_id", "connection_id", "statement_id", "procedure_id",
-        "mapping_exact", "file_path", "source_path", "source_line",
-        "source_column"],
+        "terminal_id", "mapping_exact", "file_path", "source_path",
+        "source_line", "source_column"],
     "v_statement": [
         "statement_id", "instance_id", "module_id", "module_name",
         "scope_node_id", "procedure_id", "ordinal", "sequence",
@@ -554,9 +604,18 @@ arcs_in = one("""
 arcs_out = one("""
     SELECT count(*) FROM v_conn_arc a
     WHERE a.direction IN ('output','inout','ref')
-      AND a.connection_kind = 'signal' AND a.outer_net_id IS NOT NULL""")
+      AND a.connection_kind IN ('signal', 'external_reference')
+      AND a.outer_net_id IS NOT NULL""")
+term_in = one("""
+    SELECT count(*) FROM term_map m JOIN term t ON t.id = m.term_id
+    JOIN tree_node r ON r.id = t.inst_id AND r.node_kind = 'root'
+    WHERE t.direction IN ('input','inout','ref')""")
+term_out = one("""
+    SELECT count(*) FROM term_map m JOIN term t ON t.id = m.term_id
+    JOIN tree_node r ON r.id = t.inst_id AND r.node_kind = 'root'
+    WHERE t.direction IN ('output','inout','ref')""")
 n_driver = one("SELECT count(*) FROM v_driver")
-want = one("SELECT count(*) FROM net_dep") + arcs_in + arcs_out
+want = one("SELECT count(*) FROM net_dep") + arcs_in + arcs_out + term_in
 if n_driver != want:
     sys.exit(f"v_driver has {n_driver} rows, branch sum says {want}")
 
@@ -565,7 +624,7 @@ arcs_in_load = one("""
     WHERE a.direction IN ('input','inout','ref') AND a.outer_net_id IS NOT NULL""")
 n_load = one("SELECT count(*) FROM v_load")
 want = (one("SELECT count(*) FROM net_dep WHERE source_net_id IS NOT NULL")
-        + arcs_in_load + arcs_out
+        + arcs_in_load + arcs_out + term_out
         + one("SELECT count(*) FROM proc_event WHERE net_id IS NOT NULL")
         + one("""SELECT count(*) FROM expr_ref e
                  WHERE e.role IN ('assertion','wait','event','system_task')
@@ -580,28 +639,46 @@ print("ok: v_driver and v_load reconcile with their branch formulas")
 
 check(one("""
     SELECT count(*) FROM v_driver
-    WHERE (driver_kind = 'constant') != (driver_net_id IS NULL)""") == 0,
-      "constant drivers are exactly the source-less rows")
+    WHERE (driver_net_id IS NULL) != (driver_kind IN ('constant','terminal'))""") == 0,
+      "driver-less rows are exactly constants and terminals")
 check(one("""
     SELECT count(*) FROM v_driver
-    WHERE driver_net_id IS NULL AND (driver_name IS NOT NULL
-       OR driver_lo IS NOT NULL OR driver_exact IS NOT NULL
-       OR mapping_exact IS NOT NULL)""") == 0,
-      "a constant driver describes no driver end")
+    WHERE driver_kind IN ('constant', 'terminal') AND (driver_name IS NOT NULL
+       OR driver_lo IS NOT NULL OR driver_hi IS NOT NULL
+       OR driver_exact IS NOT NULL OR mapping_exact IS NOT NULL)""") == 0,
+      "a driver-less row describes no driver end")
+# The same discipline on the load side, which had no such check at all --
+# so the terminal branch drifted into carrying ranges for an end that does
+# not exist, exactly the shape the null-source rule exists to forbid.
 check(one("""
     SELECT count(*) FROM v_load
-    WHERE (load_kind IN ('sensitivity','wait','statement'))
+    WHERE load_net_id IS NULL AND (load_name IS NOT NULL
+       OR load_lo IS NOT NULL OR load_hi IS NOT NULL
+       OR load_exact IS NOT NULL OR mapping_exact IS NOT NULL)""") == 0,
+      "a target-less load describes no load end")
+check(one("""
+    SELECT count(*) FROM v_driver
+    WHERE (driver_kind = 'terminal') != (terminal_id IS NOT NULL)""") == 0,
+      "terminal drivers are exactly the rows naming a terminal")
+check(one("""
+    SELECT count(*) FROM v_load
+    WHERE (load_kind IN ('sensitivity','wait','statement','terminal'))
           != (load_net_id IS NULL)""") == 0,
-      "target-less loads are exactly sensitivity/wait/statement")
+      "target-less loads are exactly sensitivity/wait/statement/terminal")
+check(one("""
+    SELECT count(*) FROM v_load
+    WHERE (load_kind = 'terminal') != (terminal_id IS NOT NULL)""") == 0,
+      "terminal loads are exactly the rows naming a terminal")
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind NOT IN ('data','control','primitive','procedure',
-                              'connection','connection_expression','constant')""") == 0,
+                              'connection','connection_expression','constant',
+                              'terminal')""") == 0,
       "driver_kind stays in its vocabulary")
 check(one("""
     SELECT count(*) FROM v_load
     WHERE load_kind NOT IN ('dataflow','connection','sensitivity','wait',
-                            'statement')""") == 0,
+                            'statement','terminal')""") == 0,
       "load_kind stays in its vocabulary")
 
 # ------------------------------------------------------ mode-gated checks
@@ -613,7 +690,7 @@ if mode:
     top = meta.get("top")
     want_top = {"constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
-                "udp": "udps", "unresolved": "unresolved"}[mode]
+                "udp": "udps", "unresolved": "unresolved", "xmr": "xmr"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -842,12 +919,32 @@ if mode == "interfaces":
         JOIN assign_operand o ON o.stmt_id = w.stmt_id
         WHERE w.access='write'""") >= 2,
           "each outward write pairs with the read that fed it, per statement")
-    # A target fed only from outside still has a driver row: the statement.
+    # A target fed only from outside is driven by what actually feeds it,
+    # across the boundary -- not by a fabricated constant. `assign seen =
+    # bus.vld && bus.data[0]` reaches the interface instance's own nets.
     check(one("""
         SELECT count(*) FROM v_driver
-        WHERE driver_kind='constant' AND signal_name='seen'
-          AND statement_id IS NOT NULL""") >= 1,
-          "v_driver names the statement driving a target fed from outside")
+        WHERE signal_name='seen' AND driver_kind='data'
+          AND driver_instance_id != signal_instance_id
+          AND driver_name IN ('vld','data')""") == 2,
+          "a target fed from outside is driven across the boundary")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='seen' AND driver_kind='constant'""") == 0,
+          "and is not reported as constant-driven")
+    # The interface's own nets have real drivers and loads, which is what
+    # the resolved references buy: a modport write reaches the net.
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN tree_node n ON n.id = d.signal_instance_id
+        WHERE d.signal_name='vld' AND d.driver_kind='data'
+          AND d.driver_instance_id != d.signal_instance_id""") >= 1,
+          "an interface member is driven from the module that writes it")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='data' AND load_kind='dataflow'
+          AND load_instance_id != signal_instance_id""") >= 1,
+          "an interface member is read by the module that samples it")
     check(one("""
         SELECT count(*) FROM net_conn
         WHERE connection_kind='external_reference' AND hier_ref_id IS NOT NULL""") >= 1,
@@ -972,5 +1069,129 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dependency
         WHERE source_name='mid' AND target_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "xmr":
+    # A downward read is a real dependency naming the reference it went
+    # through -- not a hier_ref row beside a fabricated constant driver.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency d
+        JOIN hier_ref h ON h.id = d.source_hier_ref_id
+        WHERE d.source_name='x' AND d.target_name='q'
+          AND d.source_instance_id != d.target_instance_id
+          AND h.path='u.x' AND h.access='read'""") == 1,
+          "a downward read crosses as a dependency naming its reference")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='q' AND driver_kind='constant'""") == 0,
+          "and the target is not reported as constant-driven")
+    # A downward write likewise, from the writing instance's operand.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency d
+        JOIN hier_ref h ON h.id = d.target_hier_ref_id
+        WHERE d.source_name='a' AND d.target_name='x'
+          AND h.path='u.x' AND h.access='write'""") == 1,
+          "a downward write crosses as a dependency naming its reference")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='x' AND driver_name='a' AND driver_kind='data'""") == 1,
+          "the far instance's net has the real driver")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='x' AND load_name='q' AND load_kind='dataflow'""") == 1,
+          "and the far instance's net has the real load")
+    # Bits survive the crossing.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='wide' AND target_name='slice_o'
+          AND source_lo=0 AND source_hi=3""") == 1,
+          "a part-select of a downward reference keeps its bits")
+    # A control dependency whose target is outward.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='g1' AND target_name='wide'
+          AND dependency_kind='control'""") == 1,
+          "a condition gating an outward write is a control dependency")
+    # Two outward-gated statements in ONE procedure: each target takes its
+    # own condition. The per-statement condition vectors are indexed in
+    # lockstep, so a stale entry shows up exactly here -- as gate1's signal
+    # on gate2's target, or as a missing edge.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='en' AND target_name='gated'
+          AND dependency_kind='control'""") == 1,
+          "the first outward condition gates its own statement")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='rst' AND target_name='gated'
+          AND dependency_kind='control'""") == 1,
+          "and the second gates its own, not the first's")
+    check(one("""
+        SELECT count(DISTINCT statement_id) FROM v_net_dependency
+        WHERE source_name IN ('en','rst') AND target_name='gated'
+          AND dependency_kind='control'""") == 2,
+          "each outward condition lands on a distinct statement")
+    # Two call sites, two conditions: each caller's gating reaches the
+    # task body's write.
+    for g in ("g1", "g2"):
+        check(one("""
+            SELECT count(*) FROM v_net_dependency
+            WHERE source_name=? AND target_name='hits'
+              AND dependency_kind='control'""", g) >= 1,
+              f"the task body's write inherits {g} from its own call site")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE target_name='put.v' AND dependency_kind='procedure'""") == 2,
+          "each call site binds its own actual to the formal")
+    # Both call sites here are gated. A binding that loses its statement
+    # under a branch is the shape that made per-call-site walking useless.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE target_name='put.v' AND dependency_kind='procedure'
+          AND statement_id IS NOT NULL
+          AND expression_reference_id IS NOT NULL""") == 2,
+          "a gated call keeps its statement and its argument reference")
+    check(one("""
+        SELECT count(DISTINCT statement_id) FROM v_net_dependency
+        WHERE source_name='put.v' AND target_name='hits'""") == 2,
+          "the body's write is an occurrence per call site")
+    # A signal that only appears in a sensitivity list is still a load.
+    check(one("""
+        SELECT count(*) FROM proc_event pe JOIN net n ON n.id = pe.net_id
+        WHERE n.name='sens_only' AND pe.edge_kind IS NULL
+          AND pe.event_kind='sensitivity'""") == 1,
+          "a level-sensitive event is recorded with no edge")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='sens_only' AND load_kind='sensitivity'""") == 1,
+          "and it reads as a sensitivity load")
+    # A port tied to a name this instance does not have, resolved: it
+    # crosses as a real arc instead of stopping at the hier_ref row, and
+    # the constant beside it still tiles the rest of the formal.
+    check(one("""
+        SELECT count(*) FROM net_conn
+        WHERE connection_kind='external_reference'
+          AND hier_ref_id IS NOT NULL""") == 1,
+          "a port tied outward keeps its connection row")
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_tree_node t ON t.node_id = d.signal_instance_id
+        WHERE t.node_name='u_sink' AND d.signal_name='p'
+          AND d.driver_kind='connection' AND d.driver_name='g'""") == 1,
+          "and the resolved tie drives the formal across the boundary")
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_tree_node t ON t.node_id = d.signal_instance_id
+        WHERE t.node_name='u_sink' AND d.signal_name='p'
+          AND d.driver_kind='constant'""") == 1,
+          "the constant tiling the rest of that formal is still recorded")
+    # The design boundary is visible in both directions.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='a' AND driver_kind='terminal'""") == 1,
+          "a top-level input drives its net as a terminal")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='q' AND load_kind='terminal'""") == 1,
+          "a top-level output reads its net as a terminal")
 
 print("OK")

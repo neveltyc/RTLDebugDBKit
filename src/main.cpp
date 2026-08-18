@@ -544,7 +544,8 @@ int main(int argc, char** argv) {
         const char* analysisStatus;
         if (fatal || astats.numScopes == 0)
             analysisStatus = "hierarchy_only";
-        else if (numErrors || stats.emptyProcedures || stats.duplicatePaths)
+        else if (numErrors || stats.emptyProcedures || stats.duplicatePaths ||
+                 stats.truncatedCalls)
             analysisStatus = "partial";
         else
             analysisStatus = "complete";
@@ -640,6 +641,14 @@ int main(int argc, char** argv) {
                              "module (hierarchical, interface or package items); "
                              "those written as a path are recorded in hier_ref\n",
                              (long long)stats.external);
+            }
+            if (stats.truncatedCalls) {
+                std::fprintf(stderr,
+                             "warning: %lld call site(s) exceeded the "
+                             "subroutine expansion budget; their bodies were "
+                             "not walked, so dataflow through them is "
+                             "incomplete\n",
+                             (long long)stats.truncatedCalls);
             }
             if (stats.duplicatePaths) {
                 std::fprintf(stderr,

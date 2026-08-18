@@ -57,6 +57,11 @@ struct Stats {
     /// Tree nodes whose (parent, name) was already taken. Non-zero means the
     /// design did not fully elaborate; a path lookup may be ambiguous.
     int64_t duplicatePaths = 0;
+    /// Call sites whose subroutine body was not instantiated because the
+    /// module hit its expansion budget. Non-zero means the dataflow through
+    /// those calls is incomplete -- reported rather than left to look like
+    /// a subroutine that reads and writes nothing.
+    int64_t truncatedCalls = 0;
 };
 
 /// Extracts `compilation` into `writer`. `analysis` must already have run.

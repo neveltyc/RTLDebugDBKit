@@ -36,9 +36,12 @@ scaled with the design. v10 unfolds:
   primitive it came from. The statement layer behind it (`procedure`,
   `stmt`, `assign_target`, `assign_operand`, `expr_ref`, `proc_event`) has
   real keys — v9's bare `proc`/`stmt` integers are gone.
-* **References that leave an instance resolve.** `hier_ref` still stores
-  the path as written; where slang resolved it and the target is in the
-  export, `resolved_inst_id`/`resolved_net_id` name the actual rows.
+* **References that leave an instance resolve, and carry dataflow.**
+  `hier_ref` still stores the path as written; where slang resolved it and
+  the target is in the export, `resolved_inst_id`/`resolved_net_id` name
+  the actual rows — and the dependency that used the reference is a real
+  `net_dep` row across the boundary, naming that reference on the end it
+  crossed.
 * **The intern tables are gone, except `data_type`.** Names are TEXT on
   their object rows; kinds and directions are words, never 0/1/2/3 codes;
   `_id` appears exactly where a column holds another table's key.
@@ -209,7 +212,10 @@ whose windows tile `q`. `connection_kind`:
   the binding has no per-occurrence object (an interface array element).
   No dataflow arc pretends to cross an interface binding.
 * `external_reference` — tied to something with no name in the parent
-  (`.a(tb.glob)`); `hier_ref_id` says what, with `access='connect'`.
+  (`.p(u.g[7:4])`); `hier_ref_id` says what, with `access='connect'`. It
+  crosses like any other connection once that reference resolves; an
+  upward tie (`.a(tb.glob)`) does not resolve, so it stays a recorded
+  connection with no arc.
 
 Width degradation: when the connection expression's width and the declared
 terminal width disagree (an output narrower than the net it drives arrives
@@ -224,10 +230,33 @@ against: their terminal side is NULL and `mapping_exact` NULL.
 
 **`procedure`** — one row per always/always_ff/always_comb/always_latch/
 initial/final block, `ordinal` in declaration order. Task and function
-bodies do not get procedure rows: their statements are walked from the call
-site and belong to the calling procedure, exactly as v9 attributed them — a
-`=` inside a function reached from an `assign` is still `blocking`, and
-executes in no procedure (`procedure_id` NULL).
+bodies do not get procedure rows: their statements belong to the calling
+procedure — a `=` inside a function reached from an `assign` is still
+`blocking`, and executes in no procedure (`procedure_id` NULL).
+
+A body is walked **once per call site**, not once per subroutine. The
+statements are the effect of *that* call, so they carry its gating stack
+and its delay:
+
+```systemverilog
+always_ff @(posedge clk) begin
+    if (g1) put(d1);
+    if (g2) put(d2);
+end
+```
+
+records the body's write twice, once under `g1` and once under `g2`.
+Walking the body once instead was cheaper and wrong: the write inherited
+only the first call site's condition, so `g2` never reached the target and
+the answer depended on which call the walk happened to reach first.
+
+Recursion is bounded by an active-call guard, so a self-calling task is
+expanded once, not forever. Fan-out is bounded by a per-module budget: the
+guard stops cycles but not a call DAG that branches, which costs 2^depth,
+so a module that exceeds the budget stops instantiating bodies, counts the
+call sites it skipped, and reports `analysis_status='partial'`. Measured
+RTL does not come close — the heaviest caller among the designs exported
+here has thirteen call statements.
 
 **`stmt`** — one row per statement or statement-level construct; `{a,b} =
 {x,y}` is ONE row however many targets it writes. `statement_kind` is
@@ -258,11 +287,20 @@ that is not a plain net), `call_argument`, `system_task`. One read lands in
 exactly one of `assign_operand`, `expr_ref` or `proc_event` — the verifier
 holds the view formulas that make double counting visible.
 
-**`proc_event`** — one row per edge event a procedure triggers on
+**`proc_event`** — one row per event a procedure triggers on
 (`event_kind='sensitivity'`, `stmt_id` NULL) or waits on (`'wait'`, the
-statement set). All of them, since an event list has no order. `net_id` is
-NULL when the expression is not a plain net; the reads then live as
-`expr_ref` rows. Which event is the clock is deliberately not decided here.
+statement set). All of them, since an event list has no order. `edge_kind`
+is `posedge`/`negedge`/`both`, or NULL for a level-sensitive event written
+explicitly (`always @(b)`) — the event is a fact whether or not it names an
+edge, and a signal appearing *only* in a sensitivity list is otherwise
+invisible to every load query. `net_id` is NULL when the expression is not
+a plain net; the reads then live as `expr_ref` rows with role `event`.
+
+An *implicit* list (`always @*`, `always_comb`, `always_latch`) gets no
+event rows: its sensitivity IS the read set, which the dataflow rows
+already carry, and duplicating it would report every combinational read
+twice — once as `dataflow` and once as `sensitivity`. Which event is the
+clock is deliberately not decided here.
 
 ### Dataflow
 
@@ -276,13 +314,26 @@ never the four-way cross product. `dependency_kind`, and what must be set
 
 | kind | means | names |
 |---|---|---|
-| `data` | an assignment moves it | `stmt_id`, `assign_target_id`, and `assign_operand_id` when a source exists. `source_net_id` NULL is a constant driver (`q <= 8'h0`) — the row still names the statement, which is what a driver query reports; every source column is NULL with it. |
-| `control` | it reaches the target through a branch condition | `stmt_id`, `expr_ref_id` (role `control`), `assign_target_id`; `mapping_exact` 0 — a condition gates, it does not map |
+| `data` | an assignment moves it | `stmt_id`, and per end either the local reference (`assign_target_id` / `assign_operand_id`) or the resolved hierarchical one (`target_hier_ref_id` / `source_hier_ref_id`) — exactly one of the two per end. `source_net_id` NULL *with no source reference of either kind* is a constant driver (`q <= 8'h0`); the row still names the statement, which is what a driver query reports, and every source column is NULL with it. |
+| `control` | it reaches the target through a branch condition | `stmt_id`, the condition as `expr_ref_id` (role `control`) or `source_hier_ref_id`, the target as `assign_target_id` or `target_hier_ref_id`; `mapping_exact` 0 — a condition gates, it does not map |
 | `primitive` | a gate/switch/UDP couples them | `primitive_id`, per LRM (input, output) pairing; scalar-to-scalar couplings are per-bit |
-| `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) on the reading side |
+| `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) or `source_hier_ref_id` on the reading side |
 
-`source_net_id`/`target_net_id` repeat what the operand and target rows
-already know. That is deliberate, *verified* redundancy — this table is the
+**Dataflow that crosses by name.** `assign q = u.x;` and a modport write
+are dataflow like any other, and they are recorded like any other: the
+dependency carries the resolved net at both ends and names the `hier_ref`
+row the reference went through instead of a local operand/target row. The
+pairing is made where the statement was walked — one row per (source
+element, target element) that share bits — never by joining `hier_ref` to
+operands on `stmt_id` afterwards, which would resurrect the cross product
+v7 removed. A reference that did not resolve produces no dependency at all:
+the `hier_ref` text is the honest record, and a guessed edge would be a
+wrong one. (In v10's first cut these produced only `hier_ref` rows, so a
+target fed entirely from outside reported `constant` — a confident wrong
+answer, which is exactly what this schema exists not to give.)
+
+`source_net_id`/`target_net_id` repeat what the referenced rows already
+know. That is deliberate, *verified* redundancy — this table is the
 driver/load index, and the verifier holds the copies equal — not two
 independent sources of truth.
 
@@ -346,8 +397,12 @@ of it on every export. Ground rules:
   count(view) == count(base) is checked. Every internal join is against a
   primary key; nothing fans out.
 * `v_driver` and `v_load` are COMPOSITE: UNION ALL branches discriminated
-  by `driver_kind`/`load_kind`, each branch's row count reconcilable
-  against the base tables by a formula the verifier evaluates.
+  by `driver_kind`/`load_kind`, each branch's row count reconcilable by a
+  formula the verifier evaluates. The dependency, event, statement and
+  terminal branches reconcile against base tables; the two crossing
+  branches reconcile against `v_conn_arc`, which is the composition
+  itself — so a fault inside that composition would inflate both sides
+  equally and pass. That is the one seam these formulas do not check.
 * `v_conn_arc` exists in the file but is NOT contract: it is the scaffolding
   the two composite views share, may change or vanish without a version
   bump, and consumers must not query it.
@@ -396,30 +451,42 @@ the fact, `v_driver`/`v_load` are the composition.
 source_net_id, source_instance_id, source_name, source_lo, source_hi,
 source_exact, target_net_id, target_instance_id, target_name, target_lo,
 target_hi, target_exact, statement_id, assign_operand_id, assign_target_id,
-expression_reference_id, primitive_id, dependency_kind, mapping_exact,
-file_path, source_path, source_line, source_column`. Location is the
-statement's, or the primitive's for a primitive arc. Not deduplicated.
+expression_reference_id, primitive_id, source_hier_ref_id,
+target_hier_ref_id, dependency_kind, mapping_exact, file_path, source_path,
+source_line, source_column`. Location is the statement's, or the
+primitive's for a primitive arc. A row whose `source_instance_id` and
+`target_instance_id` differ crossed by name; the `*_hier_ref_id` column on
+that end names the reference it went through. Not deduplicated.
 
 **`v_driver`** — every direct driving arc of `signal_net`, one row each:
 `signal_net_id, signal_instance_id, signal_name, signal_lo, signal_hi,
 signal_exact, driver_net_id, driver_instance_id, driver_name, driver_lo,
 driver_hi, driver_exact, driver_kind, dependency_id, connection_id,
-statement_id, primitive_id, mapping_exact, file_path, source_path,
-source_line, source_column`. `driver_kind`:
+statement_id, primitive_id, terminal_id, mapping_exact, file_path,
+source_path, source_line, source_column`. `driver_kind`:
 
 * `data | control | primitive | procedure` — a `net_dep` row, kind carried
   through.
 * `connection` — the crossing: for an input/inout/ref terminal the
   parent-side net drives the child's internal net; for output/inout/ref the
   internal net drives the parent's. `inout` and `ref` arc both ways, one
-  row each. The two windows are intersected on the terminal; a side's range
-  is narrowed through the overlap when every link of its chain is exact,
-  and degraded to `exact=0` otherwise. Interface bindings do not arc.
+  row each. An external tie (`.p(u.g[7:4])`) whose reference resolved
+  crosses the same way, its far net as the outer end; one that did not
+  resolve contributes no arc. The two windows are
+  intersected on the terminal; a side's range is narrowed through the
+  overlap when every link of its chain is exact, and degraded to `exact=0`
+  otherwise. Interface bindings do not arc.
 * `connection_expression` — the actual is an expression; each net it reads
   drives the internal net at range granularity.
 * `constant` — a tie-off or constant right-hand side: `driver_net_id` NULL
   and every driver column NULL with it. The statement or connection is
   still named — that is what a driver query reports.
+* `terminal` — the design boundary. A root instance's input/inout/ref
+  terminal drives the net it stands for: `driver_net_id` is NULL (the
+  world outside the export is the driver) and `terminal_id` names the pin.
+  Without it, a top-level input's net reported no driver at all, and a
+  consumer could not tell "nothing drives this" from "this is where the
+  design ends" — two answers that mean opposite things.
 
 An unconnected terminal contributes no row.
 
@@ -427,14 +494,17 @@ An unconnected terminal contributes no row.
 `signal_net_id, signal_instance_id, signal_name, signal_lo, signal_hi,
 signal_exact, load_net_id, load_instance_id, load_name, load_lo, load_hi,
 load_exact, load_kind, dependency_id, connection_id, statement_id,
-procedure_id, mapping_exact, file_path, source_path, source_line,
-source_column`. `load_kind`: `dataflow` (a dependency reads it), `connection`
-(the crossing reads it; `load_net` is the far side), `sensitivity`, `wait`,
-`statement` (an assertion, a `$display`, a read whose statement has no local
-target; `load_*` all NULL — a real reader, no nameable target). One read,
-one row: a reference already carried into `dataflow` by a dependency is not
-repeated as `statement`. The netlist analogy decides membership: a clock
-net's loads include the flop clock pins, so sensitivity is a load.
+procedure_id, terminal_id, mapping_exact, file_path, source_path,
+source_line, source_column`. `load_kind`: `dataflow` (a dependency reads
+it), `connection` (the crossing reads it; `load_net` is the far side),
+`sensitivity`, `wait`, `statement` (an assertion, a `$display`, a read
+whose statement has no local target), `terminal` (a root output/inout/ref
+terminal reads the net it stands for — the boundary counterpart of
+v_driver's `terminal`). The last four have `load_*` NULL: a real reader
+with no nameable target. One read, one row: a reference already carried
+into `dataflow` by a dependency is not repeated as `statement`. The netlist
+analogy decides membership: a clock net's loads include the flop clock
+pins, so sensitivity is a load.
 
 **`v_statement`** — one row per statement: `statement_id, instance_id,
 module_id, module_name, scope_node_id, procedure_id, ordinal, sequence,
@@ -514,7 +584,29 @@ Unchanged from v9, and still deliberate:
   Verilator rejects the construct, so it is verified by hand.
 * Task and function bodies have no `procedure` rows; their statements
   belong to the procedure that reached them, and a subroutine no procedure
-  walks contributes nothing.
+  walks contributes nothing. A body called from N sites is N sets of rows,
+  bounded by a per-module expansion budget — a pathological call DAG that
+  exceeds it reports the skipped sites rather than exhausting memory, and
+  `meta` says the export is `partial`.
+* A subroutine's formals are one net per subroutine, not one per call site.
+  Each call's gating and delay are its own, but the formal is shared, so
+  the transitive cone through a task called twice admits combinations no
+  single call makes (`g1` with the second call's argument). Per-call-site
+  formals would fix it and are not in v10.
+* A resolved external tie crosses at range granularity: `net_conn` does
+  not record a `mapping_exact` for it, so the arc reports 0 even where
+  both windows are exact. Recording it would let those ties be traced bit
+  by bit; it is not in v10.
+* A function call contributes both a summary arc (each argument to the
+  call's target) and the detail arcs through its formals, so a fan-out
+  count over both double-counts that read. The detail path also stops at
+  the function's return net, which has no arc onward to the target.
+* A `hier_ref` row is one per (reference expression, direction), so a
+  reference surfaced by two statements — a shared branch condition, or a
+  task body walked once per call site — carries the *first* statement's
+  `stmt_id`. Every dependency through it still names its own statement in
+  `net_dep.stmt_id`; the two can disagree, and `net_dep` is the one to
+  trust for "which statement did this".
 * A macro-assembled reference spans two buffers and cannot be recovered as
   one span; it is counted (`meta` external tally), not stored.
 * Statements slang marks bad take their enclosing block out of the walk;

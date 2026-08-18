@@ -126,25 +126,30 @@ report["hier_ref_resolution"] = {
     "to_net": resolved, "to_instance_only": inst_only, "of": hrefs,
     "pct_to_net": share(resolved, hrefs)}
 
-# Nets with no driver of any kind -- no dependency targets them and no
-# crossing feeds them. The root's input nets are held apart: the testbench
-# drives those by definition, while internal nets nothing drives are what a
-# systematic extraction miss looks like.
+# Nets with no driver of any kind -- no dependency targets them, no
+# crossing feeds them, and they are not a design input. The boundary nets
+# are held apart: the world outside drives those by definition, while
+# internal nets nothing drives are what a systematic extraction miss looks
+# like.
+#
+# Phrased as set membership, not as a correlated NOT EXISTS. v_driver is a
+# seven-branch union, and a correlated subquery re-runs it once per net --
+# 90 seconds on a design where scanning it once takes 20 milliseconds.
 root_inputs = scalar("""
     SELECT count(DISTINCT m.net_id) FROM term_map m
     JOIN term t ON t.id = m.term_id
     JOIN tree_node n ON n.id = t.inst_id
     WHERE n.node_kind = 'root' AND t.direction IN ('input', 'inout')""")
 undriven = scalar("""
-    SELECT count(*) FROM net
-    WHERE NOT EXISTS (SELECT 1 FROM v_driver d WHERE d.signal_net_id = net.id)""")
+    SELECT count(*) FROM net WHERE id NOT IN
+        (SELECT signal_net_id FROM v_driver WHERE signal_net_id IS NOT NULL)""")
 undriven_internal = scalar("""
-    SELECT count(*) FROM net
-    WHERE NOT EXISTS (SELECT 1 FROM v_driver d WHERE d.signal_net_id = net.id)
-      AND NOT EXISTS (SELECT 1 FROM term_map m JOIN term t ON t.id = m.term_id
-                      JOIN tree_node n ON n.id = t.inst_id
-                      WHERE m.net_id = net.id AND n.node_kind = 'root'
-                        AND t.direction IN ('input', 'inout'))""")
+    SELECT count(*) FROM net WHERE id NOT IN
+        (SELECT signal_net_id FROM v_driver WHERE signal_net_id IS NOT NULL)
+      AND id NOT IN
+        (SELECT m.net_id FROM term_map m JOIN term t ON t.id = m.term_id
+         JOIN tree_node n ON n.id = t.inst_id
+         WHERE n.node_kind = 'root' AND t.direction IN ('input', 'inout'))""")
 nets = report["rows"]["net"]
 report["undriven_nets"] = {
     "internal": undriven_internal,
