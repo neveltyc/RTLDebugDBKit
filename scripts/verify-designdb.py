@@ -1057,6 +1057,25 @@ if mode == "udp":
             OR (d.source_name='b' AND d.target_name='a'))""") == 2,
           "the switch couples both directions")
 
+    # Anonymous gates get a segment of their own, so a parent's children
+    # stay distinguishable and no gate borrows the instance's name.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE p.name='u_anon' AND t.node_kind='primitive'
+          AND t.name = p.name""") == 0,
+          "an anonymous gate never takes its parent's name")
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE p.name='u_anon' AND t.node_kind='primitive'""") == 4,
+          "each anonymous gate is its own node")
+    check(one("""
+        SELECT count(*) FROM (SELECT parent_node_id, name, count(*) c
+                              FROM tree_node GROUP BY parent_node_id, name
+                              HAVING c > 1)""") == 0,
+          "and no two siblings share a name")
+
 if mode == "unresolved":
     check(status == "partial",
           "a missing definition leaves the export partial")

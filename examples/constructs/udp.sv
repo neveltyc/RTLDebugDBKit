@@ -15,8 +15,22 @@ primitive latch_p(output reg q, input d, input en);
 endprimitive
 
 module udps(input logic d, input logic en, output wire q, output wire z,
-            inout wire a, inout wire b);
+            inout wire a, inout wire b, output wire w);
     latch_p u_l (q, d, en);
     tranif1 u_t (a, b, en);
     buf     u_b (z, q);
+    anon_gates u_anon (.a(d), .b(en), .y(w));
+endmodule
+
+// Gates written without an instance name -- legal, and how cell models are
+// usually written. Such a symbol has no name of its own, so its
+// hierarchical path ends at its parent: taking the last segment named every
+// one of these after the enclosing instance, and resolving that segment
+// returned all four gates plus the instance itself.
+module anon_gates(input logic a, input logic b, output wire y);
+    wire t1, t2, t3;
+    buf (t1, a);
+    not (t2, b);
+    and (t3, t1, t2);
+    buf #1 (y, t3);
 endmodule
