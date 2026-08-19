@@ -2860,14 +2860,30 @@ private:
     /// dependency per LRM (input, output) pairing.
     void buildPrimitives(Build& b, const InstanceBodySymbol& body) {
         EvalContext evalCtx(body);
+        std::unordered_map<int32_t, int> anonPrims;
         forEachOfKind<SymbolKind::PrimitiveInstance, PrimitiveInstanceSymbol>(
             body, [&](const PrimitiveInstanceSymbol& prim) {
             auto conns = prim.getPortConnections();
             auto& def = prim.primitiveType;
             TplPrim p;
             p.scope = scopeForSymbol(b, prim);
-            std::string name = leafSegment(prim);
-            p.name = name.empty() ? "<unnamed>" : name;
+            // A gate may be written without an instance name -- `buf (y, a);`
+            // is legal and usual in cell models. Such a symbol has no name of
+            // its own, so its hierarchical path ends at its PARENT, and
+            // taking the last segment gave every anonymous gate the name of
+            // the instance holding it: four gates in one cell became four
+            // siblings called after the cell, and resolving that path
+            // segment returned all of them plus the instance itself.
+            //
+            // Anonymous gates get a synthesised segment instead, counted per
+            // scope so siblings differ, and prefixed with '$' so it cannot
+            // collide with an identifier the source could have written.
+            std::string name(prim.name);
+            if (name.empty()) {
+                auto& n = anonPrims[p.scope];
+                name = "$" + std::string(def.name) + "$" + std::to_string(n++);
+            }
+            p.name = name;
             p.primKind = def.primitiveKind == PrimitiveSymbol::UserDefined
                              ? "udp"
                              : def.primitiveKind == PrimitiveSymbol::BiDiSwitch
