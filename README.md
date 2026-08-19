@@ -77,7 +77,7 @@ granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v10:
+Release build, macOS arm64, against public designs, schema v11:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -142,8 +142,8 @@ examples/basic/         RTL small enough to read, exported by CI
 examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
                         cross-instance references, per-call-site tasks,
                         level-sensitive events, interfaces, assertions,
-                        generate arrays, non-ANSI ports, a deliberate black
-                        box -- exported and asserted by CI
+                        generate arrays, non-ANSI ports, net aliases, a
+                        deliberate black box -- exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
                         designdb-coverage.py (what an export had to approximate),

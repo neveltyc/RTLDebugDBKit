@@ -1,17 +1,36 @@
 # design.db — the field reference
 
-Schema version 10. The version is the *consumption contract*, not the DDL: a
+Schema version 11. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. What bumps it: removing or renaming a table the
 contract names, a view or a view column; changing a column's meaning, value
 domain, NULL rules, or a view's row granularity; changing the required `meta`
-set. What does not: adding a table or column a v10 reader would merely not
+set. What does not: adding a table or column a v11 reader would merely not
 query, or changing how a view is computed while its contract holds.
 
 A v9 database cannot be upgraded in place. The folded model shared one row
 set across every occurrence of a module variant and deduplicated its edges
 across statements, so the per-occurrence identity v10 stores was never in
 the file. v10 databases are produced only by re-exporting the RTL.
+
+## What changed in v11
+
+`alias a = b;` binds nets into one object. v10 exported nothing for it at
+all, so the two halves were simply disconnected: asking what drove one
+answered "nothing", and asking what read the other left out every reader
+of the first.
+
+It is now a statement of its own kind, with a dependency in each
+direction between every pair of names it binds. `stmt.statement_kind`,
+`net_dep.dependency_kind`, `v_driver.driver_kind` and `v_load.load_kind`
+each gain `alias` — a value-domain change, which is what moves the
+version even though no column does.
+
+It is deliberately *not* modelled as a pair of continuous assignments.
+That would have answered the connectivity questions correctly and made
+every multiple-driver query wrong: an alias has no direction and
+contributes no driver, so a net aliased to a driven one would have
+reported two drivers where the design has one.
 
 ## What changed in v10
 
@@ -260,7 +279,8 @@ here has thirteen call statements.
 
 **`stmt`** — one row per statement or statement-level construct; `{a,b} =
 {x,y}` is ONE row however many targets it writes. `statement_kind` is
-`assignment | assertion | wait | call | system_task | event_control`;
+`assignment | assertion | wait | call | system_task | event_control |
+alias`;
 `construct` the construct's own word (`assign`, `always_ff`, `assert`,
 `$display`, `call`, `sensitivity`, `wait`). `assignment_kind` (`continuous |
 blocking | nonblocking`) is set exactly on assignments; `sequence` is
@@ -319,6 +339,7 @@ never the four-way cross product. `dependency_kind`, and what must be set
 | `data` | an assignment moves it | `stmt_id`, and per end either the local reference (`assign_target_id` / `assign_operand_id`) or the resolved hierarchical one (`target_hier_ref_id` / `source_hier_ref_id`) — exactly one of the two per end. `source_net_id` NULL *with no source reference of either kind* is a constant driver (`q <= 8'h0`); the row still names the statement, which is what a driver query reports, and every source column is NULL with it. |
 | `control` | it reaches the target through a branch condition | `stmt_id`, the condition as `expr_ref_id` (role `control`) or `source_hier_ref_id`, the target as `assign_target_id` or `target_hier_ref_id`; `mapping_exact` 0 — a condition gates, it does not map |
 | `primitive` | a gate/switch/UDP couples them | `primitive_id`, per LRM (input, output) pairing; scalar-to-scalar couplings are per-bit |
+| `alias` | an `alias` statement binds them into one object | `stmt_id`, and both an `assign_target_id` and an `assign_operand_id`, since every name an alias binds is written and read at once. One row per ordered pair: `alias a = b = c;` binds every pair mutually rather than in a chain, so it is six rows, not two. `mapping_exact` is 1 — an alias is bit for bit by definition — unless a side could not be narrowed. |
 | `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) or `source_hier_ref_id` on the reading side |
 
 A dependency can cross by name on the target side with no source at all:
@@ -500,6 +521,9 @@ source_path, source_line, source_column`. `driver_kind`:
 * `constant` — a tie-off or constant right-hand side: `driver_net_id` NULL
   and every driver column NULL with it. The statement or connection is
   still named — that is what a driver query reports.
+* `alias` — an `alias` statement binds the two nets into one object.
+  Both directions exist, so each is the other's driver and the other's
+  load. The kind is what keeps it out of a multiple-driver count.
 * `system_task` — a system task wrote the argument. `driver_net_id` is
   NULL, as for a constant, because the source is a file or a plusarg
   rather than a net; `statement_id` names the call. Kept apart from
@@ -521,6 +545,7 @@ load_exact, load_kind, dependency_id, connection_id, statement_id,
 procedure_id, terminal_id, mapping_exact, file_path, source_path,
 source_line, source_column`. `load_kind`: `dataflow` (a dependency reads
 it), `connection` (the crossing reads it; `load_net` is the far side),
+`alias` (the other name the same object goes by),
 `sensitivity`, `wait`, `statement` (an assertion, a `$display`, a read
 whose statement has no local target — including the *condition* gating
 such a statement, which no dependency can carry), `terminal` (a root output/inout/ref

@@ -19,18 +19,19 @@
 #   verify-designdb.py <design.db> udp          + examples/constructs/udp.sv facts
 #   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
 #   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
+#   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr")
+         "unresolved", "xmr", "alias")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 
 
 def one(sql, *args):
@@ -90,13 +91,15 @@ for tbl, col, values, nullable in (
      ("always", "always_ff", "always_comb", "always_latch", "initial", "final",
       "task", "function"), False),
     ("stmt", "statement_kind",
-     ("assignment", "assertion", "wait", "call", "system_task", "event_control"), False),
+     ("assignment", "assertion", "wait", "call", "system_task", "event_control",
+      "alias"), False),
     ("stmt", "assignment_kind", ("continuous", "blocking", "nonblocking"), True),
     ("expr_ref", "role",
      ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
     ("proc_event", "event_kind", ("sensitivity", "wait"), False),
     ("proc_event", "edge_kind", ("posedge", "negedge", "both"), True),
-    ("net_dep", "dependency_kind", ("data", "control", "primitive", "procedure"), False),
+    ("net_dep", "dependency_kind",
+     ("data", "control", "primitive", "procedure", "alias"), False),
     ("hier_ref", "access", ("read", "write", "connect"), False),
 ):
     qs = ",".join("?" for _ in values)
@@ -326,6 +329,12 @@ check(one("""
              OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
              OR d.expr_ref_id IS NOT NULL OR d.source_hier_ref_id IS NOT NULL
              OR d.target_hier_ref_id IS NOT NULL
+        WHEN 'alias' THEN d.stmt_id IS NULL OR d.source_net_id IS NULL
+             OR d.assign_target_id IS NULL OR d.assign_operand_id IS NULL
+             OR d.expr_ref_id IS NOT NULL OR d.primitive_id IS NOT NULL
+             OR d.source_hier_ref_id IS NOT NULL
+             OR d.target_hier_ref_id IS NOT NULL
+             OR d.mapping_exact IS NULL
         WHEN 'procedure' THEN d.primitive_id IS NOT NULL
              OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
              OR d.source_net_id IS NULL
@@ -386,6 +395,28 @@ check(one("""
       AND d.source_hier_ref_id IS NULL AND d.target_hier_ref_id IS NULL
       AND (s.inst_id != st.inst_id OR t.inst_id != st.inst_id)""") == 0,
       "purely local dependencies stay inside one instance")
+# An alias binds nets mutually: every pair it names appears in both
+# directions, so each is the other's driver and the other's load. A single
+# direction would answer one of those two questions and not the other.
+check(one("""
+    SELECT count(*) FROM net_dep d
+    WHERE d.dependency_kind = 'alias'
+      AND NOT EXISTS (SELECT 1 FROM net_dep r
+                      WHERE r.dependency_kind = 'alias'
+                        AND r.stmt_id = d.stmt_id
+                        AND r.source_net_id = d.target_net_id
+                        AND r.target_net_id = d.source_net_id)""") == 0,
+      "every alias dependency has its opposite")
+check(one("""
+    SELECT count(*) FROM net_dep
+    WHERE dependency_kind = 'alias'
+      AND source_net_id = target_net_id""") == 0,
+      "an alias never binds a net to itself")
+check(one("""
+    SELECT count(*) FROM stmt
+    WHERE statement_kind = 'alias'
+      AND (procedure_id IS NOT NULL OR construct != 'alias')""") == 0,
+      "an alias statement is module-level and names itself")
 check(one("""
     SELECT count(*) FROM assign_target a
     WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_target_id = a.id)
@@ -688,12 +719,12 @@ check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind NOT IN ('data','control','primitive','procedure',
                               'connection','connection_expression','constant',
-                              'terminal','system_task')""") == 0,
+                              'terminal','system_task','alias')""") == 0,
       "driver_kind stays in its vocabulary")
 check(one("""
     SELECT count(*) FROM v_load
     WHERE load_kind NOT IN ('dataflow','connection','sensitivity','wait',
-                            'statement','terminal')""") == 0,
+                            'statement','terminal','alias')""") == 0,
       "load_kind stays in its vocabulary")
 
 # ------------------------------------------------- query plan discipline
@@ -723,7 +754,8 @@ if mode:
     top = meta.get("top")
     want_top = {"constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
-                "udp": "udps", "unresolved": "unresolved", "xmr": "xmr"}[mode]
+                "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
+                "alias": "alias_top"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1314,5 +1346,40 @@ if mode == "xmr":
         SELECT count(*) FROM v_load
         WHERE signal_name='q' AND load_kind='terminal'""") == 1,
           "a top-level output reads its net as a terminal")
+
+if mode == "alias":
+    # An alias binds nets into one object, so each side is the other's
+    # driver AND the other's load -- and three names bound in one
+    # statement bind every pair, not a chain.
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE dependency_kind='alias'""") == 6,
+          "three aliased names bind all six ordered pairs")
+    for a, b in (("left", "right"), ("right", "third"), ("left", "third")):
+        check(one("""
+            SELECT count(*) FROM v_driver
+            WHERE signal_name=? AND driver_name=? AND driver_kind='alias'""",
+                  a, b) == 1, f"{b} drives {a} through the alias")
+        check(one("""
+            SELECT count(*) FROM v_load
+            WHERE signal_name=? AND load_name=? AND load_kind='alias'""",
+                  a, b) == 1, f"and {b} reads {a} through it")
+    # The statement is its own kind: an alias is not an assignment, and a
+    # multiple-driver query must be able to leave it out.
+    check(one("""
+        SELECT count(*) FROM v_statement
+        WHERE statement_kind='alias' AND construct='alias'
+          AND assignment_kind IS NULL AND procedure_id IS NULL""") == 1,
+          "the alias statement is its own kind, not an assignment")
+    # What the whole thing is for: the trace crosses the alias.
+    check(one("""
+        WITH RECURSIVE f(n) AS (
+            SELECT net_id FROM v_net WHERE net_name='in_side'
+            UNION SELECT l.load_net_id FROM f
+            JOIN v_load l ON l.signal_net_id = f.n
+            WHERE l.load_net_id IS NOT NULL)
+        SELECT count(*) FROM f JOIN v_net ON net_id = f.n
+        WHERE net_name IN ('right','third','out_side')""") == 3,
+          "and a trace from one side reaches the others")
 
 print("OK")

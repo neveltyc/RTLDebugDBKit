@@ -130,7 +130,17 @@ namespace designdb {
 /// across occurrences and the edge dedup erased statement provenance, so the
 /// per-occurrence identity v10 stores was never in the file. v10 databases
 /// are produced only by re-exporting the RTL.
-inline constexpr int SchemaVersion = 10;
+/// v11 records the alias statement. `alias a = b;` binds two nets into one
+/// object, and v10 exported nothing at all for it: the two halves were
+/// simply disconnected, so asking what drove one answered "nothing" and
+/// asking what read the other left out every reader of the first. It is
+/// its own kind rather than a pair of continuous assignments, because it
+/// is not one -- an alias has no direction and no driver, and counting it
+/// among the assignments would have made every multiple-driver query wrong
+/// in a new way. `stmt.statement_kind`, `net_dep.dependency_kind` and the
+/// driver/load kinds each gain `alias`; that is a value-domain change, so
+/// the version moves even though no column does.
+inline constexpr int SchemaVersion = 11;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row

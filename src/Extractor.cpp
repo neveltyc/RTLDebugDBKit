@@ -2186,6 +2186,7 @@ private:
                 buildProcedure(b, proc);
         }
         buildNetInitialisers(b, body);
+        buildNetAliases(b, body);
         buildPrimitives(b, body);
         buildChildren(b, body);
         stats.truncatedCalls += b.truncatedCalls;
@@ -2852,6 +2853,100 @@ private:
                            /*inSubroutine=*/false, /*firstTarget=*/true,
                            std::string(), /*isContinuous=*/true, "assign",
                            evalCtx);
+            b.curStmt = -1;
+        });
+    }
+
+    /// `alias a = b;` binds nets into one object.
+    ///
+    /// It is not an assignment and has no direction: neither side drives
+    /// the other, they ARE each other. So every reference is recorded as
+    /// both a target and an operand, and every ordered pair gets a
+    /// dependency -- which is what makes each side appear as the other's
+    /// driver and the other's load. An N-way `alias a = b = c;` is N
+    /// references and N*(N-1) dependencies, since the LRM binds all of
+    /// them mutually rather than in a chain.
+    ///
+    /// The kind is its own. Exporting a pair of continuous assignments
+    /// would have answered the connectivity questions correctly and made
+    /// every multiple-driver query wrong, since an alias contributes no
+    /// driver at all.
+    void buildNetAliases(Build& b, const InstanceBodySymbol& body) {
+        EvalContext evalCtx(body);
+        b.curProc = -1;
+        forEachOfKind<SymbolKind::NetAlias, NetAliasSymbol>(
+            body, [&](const NetAliasSymbol& al) {
+            auto refs = al.getNetReferences();
+            if (refs.size() < 2)
+                return;
+            const TplLoc at = locate(al.location);
+            b.curScope = 0;
+            const int32_t stmt = newStmt(b, "alias", "alias", std::string(),
+                                         /*seq=*/-1, std::string(), 0, at);
+            if (stmt < 0)
+                return;
+
+            // One target and one operand per reference, in written order.
+            struct Side { int32_t target = -1; int32_t operand = -1;
+                          int32_t net = -1; Ref ref; };
+            std::vector<Side> sides;
+            for (auto* e : refs) {
+                if (!e)
+                    continue;
+                std::vector<Ref> got;
+                collectRefs(*e, evalCtx, got, /*skipSelectors=*/true);
+                if (got.size() != 1 || !got[0].sym)
+                    continue;
+                Side sd;
+                sd.ref = got[0];
+                sd.net = netFor(b, *sd.ref.sym);
+                if (sd.net < 0) {
+                    // Nothing in this instance to bind; the reference is
+                    // the record, as everywhere else.
+                    const int32_t saved = b.curStmt;
+                    b.curStmt = stmt;
+                    addHierRef(b, true, sd.ref, at, evalCtx);
+                    b.curStmt = saved;
+                    continue;
+                }
+                TplStmtRef tr;
+                tr.stmt = stmt;
+                tr.ordinal = b.targetOrdinal++;
+                tr.net = sd.net;
+                tr.r = rangeOf(sd.ref);
+                sd.target = int32_t(b.t->targets.size());
+                b.t->targets.push_back(std::move(tr));
+
+                TplStmtRef orow;
+                orow.stmt = stmt;
+                orow.ordinal = b.operandOrdinal++;
+                orow.net = sd.net;
+                orow.r = rangeOf(sd.ref);
+                sd.operand = int32_t(b.t->operands.size());
+                b.t->operands.push_back(std::move(orow));
+                sides.push_back(std::move(sd));
+            }
+
+            for (size_t i = 0; i < sides.size(); i++) {
+                for (size_t j = 0; j < sides.size(); j++) {
+                    if (i == j)
+                        continue;
+                    TplDep d;
+                    d.srcNet = sides[i].net;
+                    d.tgtNet = sides[j].net;
+                    d.stmt = stmt;
+                    d.operandRef = sides[i].operand;
+                    d.targetRef = sides[j].target;
+                    d.kind = "alias";
+                    d.srcR = rangeOf(sides[i].ref);
+                    d.tgtR = rangeOf(sides[j].ref);
+                    // An alias is bit for bit by definition; it is only
+                    // coarse if a side could not be narrowed.
+                    d.mappingExact =
+                        (sides[i].ref.exact && sides[j].ref.exact) ? 1 : 0;
+                    b.t->deps.push_back(std::move(d));
+                }
+            }
             b.curStmt = -1;
         });
     }

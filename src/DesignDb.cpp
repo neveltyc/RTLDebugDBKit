@@ -310,7 +310,7 @@ CREATE TABLE stmt(
     sequence              INTEGER,
     statement_kind        TEXT NOT NULL
         /*!*/CHECK(statement_kind IN ('assignment','assertion','wait','call',
-                                 'system_task','event_control'))/*!*/,
+                                 'system_task','event_control','alias'))/*!*/,
     construct             TEXT,
     assignment_kind       TEXT
         /*!*/CHECK(assignment_kind IN ('continuous','blocking','nonblocking'))/*!*/,
@@ -444,7 +444,7 @@ CREATE TABLE net_dep(
     source_hier_ref_id INTEGER REFERENCES hier_ref(id),
     target_hier_ref_id INTEGER REFERENCES hier_ref(id),
     dependency_kind    TEXT NOT NULL
-        /*!*/CHECK(dependency_kind IN ('data','control','primitive','procedure'))/*!*/,
+        /*!*/CHECK(dependency_kind IN ('data','control','primitive','procedure','alias'))/*!*/,
     source_lo          INTEGER,
     source_hi          INTEGER,
     source_exact       INTEGER CHECK(source_exact IN (0,1)),
@@ -931,6 +931,12 @@ FROM arc;
 --                       drives the internal net at range granularity.
 --   constant            a tie-off or a constant RHS: driver_net_id NULL,
 --                       and every driver_* column NULL with it.
+--   alias               an alias statement binds the two nets into one
+--                       object. It has no direction, so both nets appear
+--                       as each other's driver and each other's load; the
+--                       kind is what keeps it out of a multiple-driver
+--                       count, where it would otherwise look like a second
+--                       assignment.
 --   system_task         a system task wrote the argument: $readmemh into a
 --                       memory, $sscanf or $value$plusargs into a variable,
 --                       $cast into its destination. The signal IS driven --
@@ -1078,7 +1084,8 @@ SELECT
     d.target_lo     AS load_lo,
     d.target_hi     AS load_hi,
     d.target_exact  AS load_exact,
-    'dataflow'      AS load_kind,
+    CASE WHEN d.dependency_kind = 'alias' THEN 'alias'
+         ELSE 'dataflow' END AS load_kind,
     d.id            AS dependency_id,
     NULL            AS connection_id,
     d.stmt_id       AS statement_id,
