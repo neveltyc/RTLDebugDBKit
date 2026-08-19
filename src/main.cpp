@@ -59,6 +59,9 @@ struct Options {
     /// most of its time inside SQLite, not in the walk -- and knowing that
     /// is what tells an optimisation attempt where to go.
     bool timing = false;
+    /// Keep the enum-domain CHECK clauses in the schema. Off by default:
+    /// see Writer's constructor for why.
+    bool checkConstraints = false;
 };
 
 /// Phase timer: prints on destruction so a phase is timed by scope.
@@ -98,6 +101,8 @@ void usage() {
         "                   Verilator behave this way; slang defaults to per-file units)\n"
         "  -q               only report errors\n"
         "  --timing         report how long each phase took\n"
+        "  --check-constraints  keep enum CHECK clauses in the schema (slower;\n"
+        "                   verify-designdb.py checks the same domains anyway)\n"
         "  --diag [N]       print elaboration diagnostics (all of them; N caps it)\n"
         "\n"
         "Bare paths are taken as source files.");
@@ -287,6 +292,7 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if (a == "-q") opt.quiet = true;
         else if (a == "--single-unit") opt.singleUnit = true;
         else if (a == "--timing") opt.timing = true;
+        else if (a == "--check-constraints") opt.checkConstraints = true;
         else if (a == "--diag") {
             opt.showDiags = -1;
             if (i + 1 < argc && std::isdigit((unsigned char)argv[i + 1][0]))
@@ -515,7 +521,7 @@ int main(int argc, char** argv) {
         } tempGuard{tmpPath};
         designdb::Stats stats;
         {
-        designdb::Writer writer(tmpPath);
+        designdb::Writer writer(tmpPath, opt.checkConstraints);
         writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
         writer.setMeta("tool", "rtl-designdb");
         // The *elaborated* tops, not the --top argument: slang picks tops even

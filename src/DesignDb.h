@@ -380,7 +380,13 @@ struct HierRefRow {
 class Writer {
 public:
     /// Creates `path`, replacing any existing file.
-    explicit Writer(const std::string& path);
+    /// `checkConstraints` keeps the enum-domain CHECK clauses in the DDL.
+    /// Off by default: they cost more than the rest of the insert put
+    /// together (a string IN-list is evaluated per row, and measured at
+    /// +186% on the widest table), while verify-designdb.py checks every
+    /// one of those domains on the finished file. On, for a database that
+    /// must refuse a bad value at the moment it is written.
+    explicit Writer(const std::string& path, bool checkConstraints = false);
     ~Writer();
 
     Writer(const Writer&) = delete;
