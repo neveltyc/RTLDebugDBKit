@@ -41,7 +41,8 @@ whatever drives it.
 | `--top <module>` | Top module. Without it slang picks every uninstantiated module. |
 | `--single-unit` | Compile the whole list as one compilation unit, so a leading `` `define `` header reaches every later file. VCS and Verilator behave this way; slang defaults to per-file units. Designs that keep their configuration in a header need this. |
 | `-o <file.db>` | Output database. |
-| `--diag [N]` | Print the first N elaboration diagnostics. |
+| `--diag [N]` | Print elaboration diagnostics — all of them, or the first N. |
+| `--timing` | Report how long each phase took. |
 | `-q` | Only report problems. |
 
 Bare paths are taken as source files.
@@ -79,9 +80,9 @@ Release build, macOS arm64, against public designs, schema v10:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 225 | 746 | 4,888 | 0.03 s | 1.23 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.04 s | 1.54 MB |
-| VeeRwolf (`veerwolf_core`) | 86 | 1,920 | 17,808 | 11,088 | 36,621 | 0.35 s | 11.9 MB |
+| picorv32 | 1 | 1 | 225 | 746 | 4,888 | 0.03 s | 1.07 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.04 s | 1.35 MB |
+| VeeRwolf (`veerwolf_core`) | 86 | 1,920 | 17,808 | 11,088 | 36,621 | 0.34 s | 10.7 MB |
 
 The instance-level expansion is the column to watch: VeeRwolf's 1,920
 occurrences stamp out from 164 parameterised bodies (10× replication), and
@@ -89,6 +90,11 @@ the database lands at roughly **2× the folded v9 file** rather than 10× —
 type text stays interned, and the biggest tables scale with statements, not
 with statements times fan-out. `scripts/export-real-designs.sh` reproduces
 this table against a local checkout of the designs.
+
+The shape holds well past these: a 320k-line design elaborating to 145k
+instances exports in about 7 seconds and 324 MB, with `--timing` showing
+where that goes — roughly 15% in slang, 12% in the walk, and the rest
+inside SQLite writing 4.8M rows and building the indexes.
 
 Elaboration cost is slang's: memory scales with the number of elaborated
 instances, so a very large flat design wants `--top` on a subtree.
