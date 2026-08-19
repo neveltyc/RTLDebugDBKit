@@ -16,6 +16,8 @@ module leaf;
     logic rst;
     logic [7:0] g;
     logic [7:0] split;
+    logic [7:0] far_mem [0:3];
+    logic [7:0] tied;
 endmodule
 
 module sink(input logic [7:0] p, output logic [7:0] seen);
@@ -27,7 +29,7 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
            input logic quiet_gate,
            output logic q, output logic [3:0] slice_o, output logic tick,
            output logic [3:0] sp_hi, output logic [3:0] sp_lo,
-           output logic seen);
+           output logic seen, output logic far_o);
     leaf u();
 
     // Read across the boundary: u.x drives q.
@@ -97,6 +99,15 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     // design never wrote it.
     logic [7:0] loaded_mem [0:3];
     initial $readmemh("nonexistent.hex", loaded_mem);
+
+    // The same write, but the memory lives in another instance -- and a
+    // constant driving an outward target. Both had a source of a kind the
+    // schema cannot name AND a target it could only reach by reference, so
+    // both used to record the reference and no driver at all: a trace back
+    // from the far net said nothing ever wrote it.
+    initial $readmemh("nonexistent.hex", u.far_mem);
+    assign u.tied = 8'h5A;
+    assign far_o = u.far_mem[0][0] ^ u.tied[0];
 
     // A port connection tied to something with no name in this instance,
     // beside a constant that tiles the rest of the formal. The tie resolves

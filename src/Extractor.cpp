@@ -961,6 +961,11 @@ struct TplHierRef {
 /// never both.
 struct TplCrossDep {
     std::string kind;        // data | control | procedure
+    /// True when the dependency has no source BY DESIGN -- a system task
+    /// writing across the boundary. Without it, "no source reference" and
+    /// "the source reference did not resolve" look alike, and the second
+    /// must be dropped while the first must not.
+    bool sourceless = false;
     int32_t stmt = -1;
     int32_t srcNet = -1;
     int32_t srcHref = -1;
@@ -2439,10 +2444,23 @@ private:
             return;
         const int32_t netIdx = netFor(b, *r.sym);
         if (netIdx < 0) {
+            // `$readmemh("f.hex", u.mem)` -- the task drives a memory in
+            // another instance. Recording only the reference left that
+            // memory with no driver at all, so a trace back from whatever
+            // reads it stopped dead one step later.
             const int32_t saved = b.curStmt;
             b.curStmt = stmt;
-            addHierRef(b, true, r, at, evalCtx);
+            const int32_t href = addHierRef(b, true, r, at, evalCtx);
             b.curStmt = saved;
+            if (href < 0)
+                return;
+            TplCrossDep d;
+            d.kind = "data";
+            d.sourceless = true;
+            d.stmt = stmt;
+            d.tgtHref = href;
+            d.tgtR = rangeOf(r);
+            b.t->crossDeps.push_back(std::move(d));
             return;
         }
         TplStmtRef tr;
@@ -2642,15 +2660,30 @@ private:
         // sources are all OUTWARD is not that -- its drivers are the
         // cross-instance rows above, and claiming a constant here was a
         // wrong fact, not a conservative one.
-        if (targetIdx >= 0 && !anySource) {
-            TplDep d;
-            d.srcNet = -1;
-            d.tgtNet = dstNet;
-            d.stmt = stmt;
-            d.targetRef = targetIdx;
-            d.kind = "data";
-            d.tgtR = rangeOf(dst);
-            b.t->deps.push_back(std::move(d));
+        if (haveTarget && !anySource) {
+            if (targetIdx >= 0) {
+                TplDep d;
+                d.srcNet = -1;
+                d.tgtNet = dstNet;
+                d.stmt = stmt;
+                d.targetRef = targetIdx;
+                d.kind = "data";
+                d.tgtR = rangeOf(dst);
+                b.t->deps.push_back(std::move(d));
+            }
+            else {
+                // The target is in another instance: `assign u.x = 8'h5A;`.
+                // Gating the constant row on a LOCAL target left every
+                // outward constant write with no driver whatsoever, so a
+                // trace back from the far net said nothing wrote it.
+                TplCrossDep d;
+                d.kind = "data";
+                d.sourceless = true;
+                d.stmt = stmt;
+                d.tgtHref = tgtHref;
+                d.tgtR = rangeOf(dst);
+                b.t->crossDeps.push_back(std::move(d));
+            }
         }
         // Control dependencies: each recorded condition read reaches this
         // target through its branch, whichever side of the boundary either
@@ -4008,7 +4041,7 @@ private:
                     continue;
                 row.sourceNetId = it->second;
             }
-            else {
+            else if (!d.sourceless) {
                 continue;
             }
             if (d.tgtNet >= 0) {

@@ -1239,8 +1239,35 @@ if mode == "xmr":
     check(one("""
         SELECT count(*) FROM v_driver d JOIN v_statement s
           ON s.statement_id = d.statement_id
-        WHERE d.driver_kind='system_task' AND s.construct='$readmemh'""") == 1,
-          "and the row names the call that did it")
+        WHERE d.driver_kind='system_task' AND s.construct='$readmemh'""") == 2,
+          "and each row names the call that did it")
+    # A write whose source the schema cannot name AND whose target is in
+    # another instance: the far net still has a driver, or a trace back
+    # from it says nothing ever wrote it.
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_statement s ON s.statement_id = d.statement_id
+        WHERE d.signal_name='far_mem' AND d.driver_kind='system_task'
+          AND d.signal_instance_id != s.instance_id""") == 1,
+          "a system task writing across the boundary drives the far net")
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_statement s ON s.statement_id = d.statement_id
+        WHERE d.signal_name='tied' AND d.driver_kind='constant'
+          AND d.signal_instance_id != s.instance_id""") == 1,
+          "and a constant driving an outward target does too")
+    # Both are reachable walking back from what reads them.
+    check(one("""
+        WITH RECURSIVE cone(net) AS (
+            SELECT net_id FROM v_net WHERE net_name='far_o'
+            UNION
+            SELECT d.driver_net_id FROM cone c
+            JOIN v_driver d ON d.signal_net_id = c.net
+            WHERE d.driver_net_id IS NOT NULL)
+        SELECT count(*) FROM cone
+        JOIN v_net n ON n.net_id = cone.net
+        WHERE n.net_name IN ('far_mem','tied')""") == 2,
+          "and a fan-in cone reaches both rather than stopping short")
     # The design boundary is visible in both directions.
     check(one("""
         SELECT count(*) FROM v_driver

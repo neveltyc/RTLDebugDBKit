@@ -321,6 +321,13 @@ never the four-way cross product. `dependency_kind`, and what must be set
 | `primitive` | a gate/switch/UDP couples them | `primitive_id`, per LRM (input, output) pairing; scalar-to-scalar couplings are per-bit |
 | `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) or `source_hier_ref_id` on the reading side |
 
+A dependency can cross by name on the target side with no source at all:
+`assign u.x = 8'h5A;` and `$readmemh("f.hex", u.mem)` both drive an object
+in another instance from something this schema cannot name. Those record a
+source-less dependency against the resolved target, so the far net has a
+driver — `constant` or `system_task` — instead of appearing never to have
+been written.
+
 **Dataflow that crosses by name.** `assign q = u.x;` and a modport write
 are dataflow like any other, and they are recorded like any other: the
 dependency carries the resolved net at both ends and names the `hier_ref`
