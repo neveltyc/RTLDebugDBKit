@@ -31,6 +31,7 @@
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/numeric/Time.h"
 #include "slang/util/Bag.h"
+#include "slang/util/ThreadPool.h"
 
 #include "DesignDb.h"
 #include "Extractor.h"
@@ -384,8 +385,15 @@ int main(int argc, char** argv) {
                 loader.addFiles(f);
         }
 
+        // Both the parser and the analysis manager take a thread pool and
+        // run serially without one, which is what they were doing: slang is
+        // built with threading on, and neither was being given a pool. The
+        // parser splits per file (so a single compilation unit stays
+        // serial), the analysis manager per scope.
+        auto pool = std::make_shared<slang::ThreadPool>();
         std::vector<std::shared_ptr<syntax::SyntaxTree>> trees;
-        { Phase p("parse", opt.timing); trees = loader.loadAndParseSources(optionBag); }
+        { Phase p("parse", opt.timing);
+          trees = loader.loadAndParseSources(optionBag, pool.get()); }
         if (!loader.getErrors().empty()) {
             // A source that was named and could not be read means the export is
             // not of the design that was asked for. Continuing would produce a
@@ -489,7 +497,7 @@ int main(int argc, char** argv) {
                          "deeper than 128, or a recursive hierarchy)\n");
         }
 
-        analysis::AnalysisManager analysis;
+        analysis::AnalysisManager analysis({}, pool);
         { Phase p("analyze", opt.timing); analysis.analyze(compilation); }
         auto astats = analysis.getStats();
         if (!fatal && astats.numScopes == 0) {
