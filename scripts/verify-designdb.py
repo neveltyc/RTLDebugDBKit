@@ -696,6 +696,24 @@ check(one("""
                             'statement','terminal')""") == 0,
       "load_kind stays in its vocabulary")
 
+# ------------------------------------------------- query plan discipline
+# A point query on the driver/load views must seek, not scan. These are the
+# two views a consumer walks a net at a time -- a fan-in cone is its own
+# recursive query, by design -- so a plan that scans a base table turns one
+# traced signal into one full scan per hop. It regressed once already:
+# deriving the outer end of a crossing with COALESCE over two tables left
+# the value attributable to neither, so neither table's index could be
+# used, and tracing a clock took minutes.
+for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
+                  ("v_net_dependency", "target_net_id"),
+                  ("v_net_connection", "net_id")):
+    plan = con.execute(
+        f"EXPLAIN QUERY PLAN SELECT * FROM {view} WHERE {col} = 1").fetchall()
+    scanned = [r[3] for r in plan
+               if r[3].startswith("SCAN ") and not r[3].startswith(f"SCAN {view}")]
+    check(not scanned, f"{view} seeks rather than scans for one {col}",
+          "; ".join(scanned))
+
 # ------------------------------------------------------ mode-gated checks
 if mode:
     check(one("""

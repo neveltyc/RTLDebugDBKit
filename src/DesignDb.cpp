@@ -777,24 +777,28 @@ LEFT JOIN source_file sf ON sf.id = f.source_file_id;
 -- the other side does not narrow it, and degraded to exact=0 otherwise --
 -- the range is then an upper bound, which is what exact=0 means everywhere.
 CREATE VIEW v_conn_arc AS
+-- The outer end is either the connection's own net or, for a tie whose
+-- reference resolved, the net that reference landed on. Deriving it with
+-- COALESCE across the two tables read well and cost every consumer dearly:
+-- a value that may come from either table can be pushed down to neither, so
+-- `WHERE signal_net_id = ?` scanned all of net_conn instead of seeking
+-- net_conn_by_net. On a design whose clock reaches a few thousand nets, a
+-- trace walks one such query per hop.
+--
+-- The two cases are disjoint on `c.net_id IS NULL` -- which is exactly what
+-- COALESCE tests -- so splitting there leaves outer_net_id a plain column
+-- reference in each branch and the indexes usable again. The second branch
+-- keeps the LEFT JOIN: a constant tie-off has neither a net nor a
+-- reference, and must still appear with a NULL outer end, since it drives
+-- the inner net.
 WITH seg AS (
     SELECT
         c.id            AS connection_id,
         c.connection_kind AS connection_kind,
-        -- An external tie participates once its reference resolved: the far
-        -- net is the outer end, exactly as a parent-local net would be. An
-        -- unresolved one stays out -- no fabricated arcs.
-        -- All four columns switch on the same test, so the id, the window
-        -- and the exactness always describe the same end. COALESCE per
-        -- column would mix them the moment a row carried both a local net
-        -- and a reference.
-        COALESCE(c.net_id, hr.resolved_net_id) AS outer_net_id,
-        CASE WHEN c.net_id IS NOT NULL THEN c.net_lo
-             ELSE hr.lo END                    AS c_net_lo,
-        CASE WHEN c.net_id IS NOT NULL THEN c.net_hi
-             ELSE hr.hi END                    AS c_net_hi,
-        CASE WHEN c.net_id IS NOT NULL THEN c.net_exact
-             ELSE hr.is_exact END              AS c_net_exact,
+        c.net_id        AS outer_net_id,
+        c.net_lo        AS c_net_lo,
+        c.net_hi        AS c_net_hi,
+        c.net_exact     AS c_net_exact,
         c.term_lo       AS c_lo,
         c.term_hi       AS c_hi,
         c.term_exact    AS c_term_exact,
@@ -825,6 +829,46 @@ WITH seg AS (
            OR c.net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
       AND (c.term_lo IS NULL OR mp.term_hi IS NULL OR c.term_lo <= mp.term_hi)
       AND (mp.term_lo IS NULL OR c.term_hi IS NULL OR mp.term_lo <= c.term_hi)
+      AND c.net_id IS NOT NULL
+    UNION ALL
+    SELECT
+        c.id            AS connection_id,
+        c.connection_kind AS connection_kind,
+        hr.resolved_net_id AS outer_net_id,
+        hr.lo           AS c_net_lo,
+        hr.hi           AS c_net_hi,
+        hr.is_exact     AS c_net_exact,
+        c.term_lo       AS c_lo,
+        c.term_hi       AS c_hi,
+        c.term_exact    AS c_term_exact,
+        c.mapping_exact AS c_map,
+        c.file_id       AS file_id,
+        c.line          AS line,
+        c."column"      AS col,
+        t.id            AS term_id,
+        t.inst_id       AS term_inst_id,
+        t.direction     AS direction,
+        mp.net_id       AS inner_net_id,
+        mp.term_lo      AS m_lo,
+        mp.term_hi      AS m_hi,
+        mp.term_exact   AS m_term_exact,
+        mp.net_lo       AS m_net_lo,
+        mp.net_hi       AS m_net_hi,
+        mp.net_exact    AS m_net_exact,
+        mp.mapping_exact AS m_map
+    FROM net_conn c
+    JOIN term t      ON t.id = c.term_id
+    JOIN term_map mp ON mp.term_id = c.term_id
+    LEFT JOIN hier_ref hr ON hr.id = c.hier_ref_id
+    WHERE c.connection_kind IN ('signal', 'expression_operand', 'constant',
+                                'external_reference')
+      AND (c.connection_kind != 'external_reference'
+           OR hr.resolved_net_id IS NOT NULL)
+      AND (c.connection_kind != 'expression_operand'
+           OR c.net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
+      AND (c.term_lo IS NULL OR mp.term_hi IS NULL OR c.term_lo <= mp.term_hi)
+      AND (mp.term_lo IS NULL OR c.term_hi IS NULL OR mp.term_lo <= c.term_hi)
+      AND c.net_id IS NULL
 ),
 arc AS (
     SELECT seg.*,
