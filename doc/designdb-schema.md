@@ -281,7 +281,9 @@ is not here — it is a `hier_ref` with `access='write'` on the same
 statement.
 
 **`expr_ref`** — every statement read that is not an assignment operand,
-classified: `control` (a branch condition over the statement's targets),
+classified: `control` (a branch condition over the statement — including one that
+writes nothing this instance names, where no dependency can carry it and
+this reference is the only record),
 `assertion`, `wait` (a wait's condition), `event` (a sensitivity expression
 that is not a plain net), `call_argument`, `system_task`. One read lands in
 exactly one of `assign_operand`, `expr_ref` or `proc_event` — the verifier
@@ -339,10 +341,20 @@ independent sources of truth.
 
 ### Leaving the instance
 
-**`hier_ref`** — one row per reference that leaves its instance: an XMR, an
-interface member, a package item. `path` is the canonical text as written
-(selects resolved to the constants they elaborated to, whitespace and
-comments removed); `access` is `read | write | connect`. New in v10, because
+**`hier_ref`** — one row per (reference, direction, statement) that leaves
+its instance: an XMR, an interface member, a package item. `path` is the
+canonical text as written (selects resolved to the constants they
+elaborated to, whitespace and comments removed); `access` is
+`read | write | connect`. The statement is part of the identity because a
+task body is walked once per call site: two calls to a task reading `u.x`
+are two statements and two rows, so "what does *this* statement read
+outside the instance" has an answer for each.
+
+The range is the one the RTL spells, not the one a dependency uses.
+`assign {hi, lo} = u.x;` records one reference to the whole of `u.x`,
+while the two dependencies through it carry `[7:4]` and `[3:0]` in
+`net_dep` — where a range describes a particular dependency rather than
+the reference itself. New in v10, because
 an occurrence knows its place in the hierarchy where a folded row could not:
 `resolved_inst_id` and `resolved_net_id` name the actual rows when the
 export could replay the reference —
@@ -481,6 +493,11 @@ source_path, source_line, source_column`. `driver_kind`:
 * `constant` — a tie-off or constant right-hand side: `driver_net_id` NULL
   and every driver column NULL with it. The statement or connection is
   still named — that is what a driver query reports.
+* `system_task` — a system task wrote the argument. `driver_net_id` is
+  NULL, as for a constant, because the source is a file or a plusarg
+  rather than a net; `statement_id` names the call. Kept apart from
+  `constant` so "is this tied off?" and "is this loaded at startup?" are
+  different answers.
 * `terminal` — the design boundary. A root instance's input/inout/ref
   terminal drives the net it stands for: `driver_net_id` is NULL (the
   world outside the export is the driver) and `terminal_id` names the pin.
@@ -498,7 +515,8 @@ procedure_id, terminal_id, mapping_exact, file_path, source_path,
 source_line, source_column`. `load_kind`: `dataflow` (a dependency reads
 it), `connection` (the crossing reads it; `load_net` is the far side),
 `sensitivity`, `wait`, `statement` (an assertion, a `$display`, a read
-whose statement has no local target), `terminal` (a root output/inout/ref
+whose statement has no local target — including the *condition* gating
+such a statement, which no dependency can carry), `terminal` (a root output/inout/ref
 terminal reads the net it stands for — the boundary counterpart of
 v_driver's `terminal`). The last four have `load_*` NULL: a real reader
 with no nameable target. One read, one row: a reference already carried
@@ -567,6 +585,13 @@ Unchanged from v9, and still deliberate:
   operands, three dependencies onto `y`, `mapping_exact=0`, and no
   fabricated `tmp` net. A consumer that needs the expression's shape reads
   the source at the location the row names.
+* A system task that writes an argument — `$readmemh` into a memory,
+  `$sscanf` or `$value$plusargs` into a variable, `$cast` into its
+  destination — records a target and a source-less dependency, surfacing
+  in `v_driver` as `system_task`. The signal is genuinely driven; the
+  source is a file or a plusarg, which is outside anything this schema
+  names. It is not a `constant`, and the kinds are separate so a consumer
+  cannot mistake one for the other.
 * `force` records as a blocking assignment; `release` leaves no row.
 * Variable initialisers (`logic [7:0] c = 0`) are not drivers; net
   initialisers (`wire w = a & b`) are, because the LRM says so.
@@ -601,12 +626,6 @@ Unchanged from v9, and still deliberate:
   call's target) and the detail arcs through its formals, so a fan-out
   count over both double-counts that read. The detail path also stops at
   the function's return net, which has no arc onward to the target.
-* A `hier_ref` row is one per (reference expression, direction), so a
-  reference surfaced by two statements — a shared branch condition, or a
-  task body walked once per call site — carries the *first* statement's
-  `stmt_id`. Every dependency through it still names its own statement in
-  `net_dep.stmt_id`; the two can disagree, and `net_dep` is the one to
-  trust for "which statement did this".
 * A macro-assembled reference spans two buffers and cannot be recovered as
   one span; it is counted (`meta` external tally), not stored.
 * Statements slang marks bad take their enclosing block out of the walk;

@@ -1043,6 +1043,10 @@ struct PairedSrc {
     Ref src;
     Ref tgt;
     bool mapExact = false;
+    /// The source as the RTL spells it, before pairing narrowed it to this
+    /// target's bits. Only a hier_ref row wants this: it describes the
+    /// reference, not one dependency through it.
+    Ref srcAsWritten;
 };
 
 struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood> {
@@ -1066,7 +1070,17 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                          int64_t seq, SourceRange where)>;
     /// A statement that reads without writing anything nameable: an
     /// assertion, a wait condition, a call, a system task.
+    ///
+    /// The gating stack comes with it. A condition was only ever recorded
+    /// while building an assignment's control dependencies, so a branch
+    /// holding nothing but `$display` or an assertion dropped its
+    /// condition entirely -- `if (gate) $display(payload);` knew about
+    /// payload and not about gate, in any procedure, implicit sensitivity
+    /// or not. There is no target for a dependency here, but the read is
+    /// real and belongs to the statement it gates.
     using EmitRead = std::function<void(const std::vector<Ref>& reads,
+                                        const std::vector<Ref>& gating,
+                                        const std::vector<Ref>& writes,
                                         const std::string& stmtKind,
                                         const std::string& construct, int64_t seq,
                                         SourceRange where)>;
@@ -1104,7 +1118,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const ImmediateAssertionStatement& stmt) {
         std::vector<Ref> reads;
         collectRefs(stmt.cond, eval, reads);
-        emitRead(reads, "assertion", assertionWord(stmt.assertionKind), seq++,
+        emitRead(reads, gating, {}, "assertion",
+                 assertionWord(stmt.assertionKind), seq++,
                  stmt.sourceRange);
         visitDefault(stmt);
     }
@@ -1112,7 +1127,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const ConcurrentAssertionStatement& stmt) {
         std::vector<Ref> reads;
         collectStatementRefs(stmt.propertySpec, reads);
-        emitRead(reads, "assertion", assertionWord(stmt.assertionKind), seq++,
+        emitRead(reads, gating, {}, "assertion",
+                 assertionWord(stmt.assertionKind), seq++,
                  stmt.sourceRange);
         visitDefault(stmt);
     }
@@ -1120,7 +1136,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const WaitStatement& stmt) {
         std::vector<Ref> reads;
         collectRefs(stmt.cond, eval, reads);
-        emitRead(reads, "wait", "wait", seq++, stmt.sourceRange);
+        emitRead(reads, gating, {}, "wait", "wait", seq++, stmt.sourceRange);
         visitDefault(stmt);
     }
 
@@ -1150,7 +1166,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             collectCallReadsInto(stmt.expr, active, reads);
         }
         std::set<const ValueSymbol*> written;
-        collectWrittenTargets(stmt.expr, written);
+        std::vector<Ref> writeRefs;
+        collectWrittenTargets(stmt.expr, written, &writeRefs);
         if (!written.empty()) {
             reads.erase(std::remove_if(reads.begin(), reads.end(),
                                        [&](const Ref& r) {
@@ -1159,28 +1176,43 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                         reads.end());
         }
         const bool sys = call.isSystemCall();
-        emitRead(reads, sys ? "system_task" : "call", callWord(call), seq++,
+        // A system task that writes an argument -- $readmemh into a memory,
+        // $sscanf into a variable, $cast into its destination -- really does
+        // drive it, and slang models the write as an assignment inside the
+        // call. A user subroutine's write is covered by the formal binding,
+        // so only the system case needs targets of its own; without them the
+        // argument read as undriven and its procedure as one that wrote
+        // nothing at all.
+        emitRead(reads, gating, sys ? writeRefs : std::vector<Ref>{},
+                 sys ? "system_task" : "call", callWord(call), seq++,
                  stmt.sourceRange);
         visitDefault(stmt);
     }
 
     void collectWrittenTargets(const Expression& expr,
-                               std::set<const ValueSymbol*>& out) {
+                               std::set<const ValueSymbol*>& out,
+                               std::vector<Ref>* refs = nullptr) {
         struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
             StatementWalker& self;
             std::set<const ValueSymbol*>& out;
-            Finder(StatementWalker& self, std::set<const ValueSymbol*>& out) :
-                self(self), out(out) {}
+            std::vector<Ref>* refs;
+            Finder(StatementWalker& self, std::set<const ValueSymbol*>& out,
+                   std::vector<Ref>* refs) :
+                self(self), out(out), refs(refs) {}
             void handle(const AssignmentExpression& e) {
                 std::vector<Ref> targets;
                 collectRefs(e.left(), self.eval, targets, /*skipSelectors=*/true);
-                for (auto& t : targets)
-                    if (t.sym)
-                        out.insert(t.sym);
+                for (auto& t : targets) {
+                    if (!t.sym)
+                        continue;
+                    out.insert(t.sym);
+                    if (refs)
+                        refs->push_back(t);
+                }
                 visitDefault(e);
             }
         };
-        Finder f(*this, out);
+        Finder f(*this, out, refs);
         expr.visit(f);
     }
 
@@ -1312,7 +1344,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 continue;
             // Reads and writes the same bits of the same object -- as
             // positional as a mapping gets.
-            emitTarget(dst, {PairedSrc{dst, dst, true}}, gating, expr.sourceRange,
+            emitTarget(dst, {PairedSrc{dst, dst, true, dst}}, gating, expr.sourceRange,
                        seq++, true, 0, subDepth > 0, /*firstTarget=*/true,
                        pendingDelay);
         }
@@ -1474,7 +1506,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                     continue;
                 pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
                                           narrowed(dstSlot, lo, hi),
-                                          dstSlot.positional && srcSlot.positional});
+                                          dstSlot.positional && srcSlot.positional,
+                                          srcSlot.ref});
             }
             emitTarget(dstSlot.ref, pairs, gating, expr.sourceRange, stmtSeq,
                        expr.isBlocking(), droppedConstants, subDepth > 0,
@@ -1752,11 +1785,19 @@ private:
         std::unordered_map<const Symbol*, int32_t> netOf;
         std::unordered_map<const Symbol*, int32_t> scopeOf;
         std::unordered_map<const SubroutineSymbol*, int32_t> procOf;
-        /// (reference expression, is-write) -> hierRefs index. Keyed by node
-        /// so a generate loop's four elaborations of one spelling stay four
-        /// rows, and mapped rather than a bare set so a second sighting can
-        /// pair a dependency with the row the first one made.
-        std::map<std::pair<const Expression*, bool>, int32_t> hierSeen;
+        /// (reference expression, is-write, statement) -> hierRefs index.
+        /// Keyed by node so a generate loop's four elaborations of one
+        /// spelling stay four rows, and mapped rather than a bare set so a
+        /// second sighting within one statement pairs its dependency with
+        /// the row the first made.
+        ///
+        /// The statement is part of the key because a body is now walked
+        /// once per call site: two calls to `task sample(); q <= u.x;
+        /// endtask` are two statements, and with one shared row the second
+        /// statement's dependency pointed at a reference belonging to the
+        /// first -- so "what does statement 4 read outside this instance"
+        /// answered nothing.
+        std::map<std::tuple<const Expression*, bool, int32_t>, int32_t> hierSeen;
         int32_t curStmt = -1;      // where call bindings attach
         int32_t curProc = -1;      // procedure of statements being created
         int32_t curScope = 0;
@@ -1935,10 +1976,18 @@ private:
 
     /// Records one reference that leaves the instance -- and, when slang
     /// resolved it, how to find the target again from any occurrence.
+    /// `r` is the reference the dependency uses, which pairing may have
+    /// narrowed to the bits one target takes; `asWritten`, when given, is
+    /// the reference the source actually spells. The row keeps the latter:
+    /// `assign {hi, lo} = u.x;` reads the whole of u.x, and storing the
+    /// first pairing's half made the database claim the RTL only ever
+    /// named four of its bits. The narrowed ranges live in net_dep, where
+    /// they describe a particular dependency rather than the reference.
     int32_t addHierRef(Build& b, bool isWrite, const Ref& r,
                        const TplLoc& at, EvalContext& eval,
-                       const char* access = nullptr) {
-        auto key = std::make_pair(r.origin, isWrite);
+                       const char* access = nullptr,
+                       const Ref* asWritten = nullptr) {
+        auto key = std::make_tuple(r.origin, isWrite, b.curStmt);
         if (auto it = b.hierSeen.find(key); it != b.hierSeen.end())
             return it->second;
         std::string text = canonicalPath(r.origin, eval);
@@ -1955,7 +2004,7 @@ private:
         row.stmt = b.curStmt;
         row.path = std::move(text);
         row.access = access ? access : (isWrite ? "write" : "read");
-        row.r = rangeOf(r);
+        row.r = rangeOf(asWritten ? *asWritten : r);
         row.loc = at;
         fillResolution(b, row, r);
         const int32_t idx = int32_t(b.t->hierRefs.size());
@@ -2325,7 +2374,8 @@ private:
                              [&]() { return s; });
             },
             // ---- a statement that reads without writing anything nameable
-            [&](const std::vector<Ref>& reads, const std::string& stmtKind,
+            [&](const std::vector<Ref>& reads, const std::vector<Ref>& gating,
+                const std::vector<Ref>& writes, const std::string& stmtKind,
                 const std::string& construct2, int64_t seq, SourceRange where) {
                 const TplLoc at = locate(where.start(), procAt);
                 filteredConstants = 0;
@@ -2339,6 +2389,24 @@ private:
                                              : "call_argument";
                 for (auto& r : reads)
                     recordRead(b, s, r, role, at, evalCtx);
+                // The conditions that gate it. No dependency can exist --
+                // the statement writes nothing this instance names -- but
+                // the condition IS read, and dropping it lost the signal
+                // from every load query.
+                for (auto& g : gating)
+                    recordRead(b, s, g, "control", at, evalCtx);
+                // What the task writes. The source is genuinely unknowable
+                // -- a file, a plusarg, a format string -- so the row has
+                // no source, and v_driver tells it apart from a constant
+                // tie-off by the statement it came from.
+                for (auto& w : writes) {
+                    // A system task's write is a write: the procedure that
+                    // contains one has reached a driver, and counting it as
+                    // an empty procedure blamed the walk for a construct it
+                    // now models.
+                    reached = true;
+                    recordSystemWrite(b, s, w, at, evalCtx);
+                }
             },
             evalCtx);
         walker.sensitivityTiming = sens.timingControl;
@@ -2358,6 +2426,40 @@ private:
             stats.emptyProcedures++;
         b.curProc = -1;
         b.curStmt = -1;
+    }
+
+    /// The target of a system task's write: a real assign_target plus a
+    /// source-less dependency, so the argument has a driver and the
+    /// procedure is not mistaken for one that wrote nothing. A target
+    /// outside this instance is a hier_ref with access='write', as
+    /// everywhere else.
+    void recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
+                           const TplLoc& at, EvalContext& evalCtx) {
+        if (!r.sym)
+            return;
+        const int32_t netIdx = netFor(b, *r.sym);
+        if (netIdx < 0) {
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            addHierRef(b, true, r, at, evalCtx);
+            b.curStmt = saved;
+            return;
+        }
+        TplStmtRef tr;
+        tr.stmt = stmt;
+        tr.ordinal = int64_t(b.t->targets.size());
+        tr.net = netIdx;
+        tr.r = rangeOf(r);
+        const int32_t targetIdx = int32_t(b.t->targets.size());
+        b.t->targets.push_back(std::move(tr));
+        TplDep d;
+        d.srcNet = -1;
+        d.tgtNet = netIdx;
+        d.stmt = stmt;
+        d.targetRef = targetIdx;
+        d.kind = "data";
+        d.tgtR = rangeOf(r);
+        b.t->deps.push_back(std::move(d));
     }
 
     /// One read of a statement, wherever it lands: an expr_ref for a net of
@@ -2497,7 +2599,8 @@ private:
                 b.t->operands.push_back(std::move(orow));
             }
             else {
-                srcHref = addHierRef(b, false, p.src, at, evalCtx);
+                srcHref = addHierRef(b, false, p.src, at, evalCtx,
+                                     nullptr, &p.srcAsWritten);
             }
             if (!haveTarget)
                 continue;
@@ -2707,7 +2810,8 @@ private:
                     continue;
                 pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
                                           narrowed(dstSlot, lo, hi),
-                                          dstSlot.positional && srcSlot.positional});
+                                          dstSlot.positional && srcSlot.positional,
+                                          srcSlot.ref});
             }
             b.curScope = 0;
             emitAssignment(b, dstSlot.ref, pairs, {}, at, /*seq=*/-1,

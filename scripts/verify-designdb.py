@@ -283,7 +283,9 @@ check(one("""
 check(one("""
     SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
     WHERE CASE e.role
-        WHEN 'control'     THEN s.statement_kind != 'assignment'
+        -- A condition gates whatever statement it encloses, including one
+        -- that writes nothing this instance names.
+        WHEN 'control'     THEN 0
         WHEN 'assertion'   THEN s.statement_kind != 'assertion'
         WHEN 'wait'        THEN s.statement_kind NOT IN ('wait', 'event_control')
         WHEN 'event'       THEN s.statement_kind != 'event_control'
@@ -338,6 +340,17 @@ check(one("""
     SELECT count(*) FROM net_dep d JOIN hier_ref h ON h.id = d.source_hier_ref_id
     WHERE h.resolved_net_id IS NULL OR h.resolved_net_id != d.source_net_id""") == 0,
       "a hierarchical source copies its reference's resolution")
+# The reference a dependency crossed through is the one its own statement
+# made. Sharing rows across statements -- a task body walked once per call
+# site, a condition gating several statements -- left the second statement
+# pointing at the first's reference, so "what does this statement read
+# outside the instance" answered nothing.
+check(one("""
+    SELECT count(*) FROM net_dep d
+    JOIN hier_ref h ON h.id IN (d.source_hier_ref_id, d.target_hier_ref_id)
+    WHERE d.stmt_id IS NOT NULL AND h.stmt_id IS NOT NULL
+      AND h.stmt_id != d.stmt_id""") == 0,
+      "a dependency's reference belongs to its own statement")
 check(one("""
     SELECT count(*) FROM net_dep d JOIN hier_ref h ON h.id = d.target_hier_ref_id
     WHERE h.resolved_net_id IS NULL OR h.resolved_net_id != d.target_net_id""") == 0,
@@ -639,11 +652,13 @@ print("ok: v_driver and v_load reconcile with their branch formulas")
 
 check(one("""
     SELECT count(*) FROM v_driver
-    WHERE (driver_net_id IS NULL) != (driver_kind IN ('constant','terminal'))""") == 0,
-      "driver-less rows are exactly constants and terminals")
+    WHERE (driver_net_id IS NULL)
+          != (driver_kind IN ('constant','terminal','system_task'))""") == 0,
+      "driver-less rows are exactly constants, terminals and system tasks")
 check(one("""
     SELECT count(*) FROM v_driver
-    WHERE driver_kind IN ('constant', 'terminal') AND (driver_name IS NOT NULL
+    WHERE driver_kind IN ('constant', 'terminal', 'system_task')
+      AND (driver_name IS NOT NULL
        OR driver_lo IS NOT NULL OR driver_hi IS NOT NULL
        OR driver_exact IS NOT NULL OR mapping_exact IS NOT NULL)""") == 0,
       "a driver-less row describes no driver end")
@@ -673,7 +688,7 @@ check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind NOT IN ('data','control','primitive','procedure',
                               'connection','connection_expression','constant',
-                              'terminal')""") == 0,
+                              'terminal','system_task')""") == 0,
       "driver_kind stays in its vocabulary")
 check(one("""
     SELECT count(*) FROM v_load
@@ -1184,6 +1199,48 @@ if mode == "xmr":
         WHERE t.node_name='u_sink' AND d.signal_name='p'
           AND d.driver_kind='constant'""") == 1,
           "the constant tiling the rest of that formal is still recorded")
+    # A condition gating a statement that writes nothing this instance
+    # names is still a read of that signal.
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='quiet_gate' AND load_kind='statement'""") == 1,
+          "a condition gating a targetless statement is still a load")
+    check(one("""
+        SELECT count(*) FROM expr_ref e JOIN net n ON n.id = e.net_id
+        WHERE n.name='quiet_gate' AND e.role='control'""") == 1,
+          "and it is recorded as the control reference it is")
+    # One reference split across two targets: the row names the whole of
+    # what the RTL wrote, the dependencies take their own halves.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path='u.split' AND lo IS NULL AND hi IS NULL AND is_exact=1""") == 1,
+          "a split reference is recorded whole, once")
+    check(one("""
+        SELECT count(*) FROM v_net_dependency
+        WHERE source_name='split' AND target_name IN ('sp_hi','sp_lo')
+          AND source_lo IS NOT NULL AND source_hi IS NOT NULL""") == 2,
+          "while each dependency through it carries its own bits")
+    # Two call sites reading outward: two statements, two references, each
+    # dependency pointing at the one its own statement made.
+    check(one("""
+        SELECT count(*) FROM hier_ref WHERE path='u.x' AND access='read'""") >= 3,
+          "each call site records its own outward reference")
+    check(one("""
+        SELECT count(DISTINCT d.stmt_id) FROM net_dep d
+        JOIN hier_ref h ON h.id = d.source_hier_ref_id
+        JOIN net t ON t.id = d.target_net_id
+        WHERE t.name='seen'""") == 2,
+          "and the two body statements read it independently")
+    # A system task's write is a driver, told apart from a tie-off.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='loaded_mem' AND driver_kind='system_task'""") == 1,
+          "a system task that writes its argument drives it")
+    check(one("""
+        SELECT count(*) FROM v_driver d JOIN v_statement s
+          ON s.statement_id = d.statement_id
+        WHERE d.driver_kind='system_task' AND s.construct='$readmemh'""") == 1,
+          "and the row names the call that did it")
     # The design boundary is visible in both directions.
     check(one("""
         SELECT count(*) FROM v_driver

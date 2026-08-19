@@ -878,6 +878,14 @@ FROM arc;
 --                       drives the internal net at range granularity.
 --   constant            a tie-off or a constant RHS: driver_net_id NULL,
 --                       and every driver_* column NULL with it.
+--   system_task         a system task wrote the argument: $readmemh into a
+--                       memory, $sscanf or $value$plusargs into a variable,
+--                       $cast into its destination. The signal IS driven --
+--                       reporting no driver said the design never wrote it
+--                       -- but the source is a file or a plusarg, outside
+--                       anything this schema names, so driver_net_id is
+--                       NULL like a constant's and the kind keeps the two
+--                       apart. statement_id names the call.
 --   terminal            the design boundary: a root input/inout/ref
 --                       terminal drives the net it stands for. No driver
 --                       net exists -- the world outside is the driver --
@@ -905,8 +913,9 @@ SELECT
     d.source_lo      AS driver_lo,
     d.source_hi      AS driver_hi,
     d.source_exact   AS driver_exact,
-    CASE WHEN d.source_net_id IS NULL THEN 'constant'
-         ELSE d.dependency_kind END AS driver_kind,
+    CASE WHEN d.source_net_id IS NOT NULL THEN d.dependency_kind
+         WHEN s.statement_kind = 'system_task' THEN 'system_task'
+         ELSE 'constant' END AS driver_kind,
     d.id             AS dependency_id,
     NULL             AS connection_id,
     d.stmt_id        AS statement_id,
