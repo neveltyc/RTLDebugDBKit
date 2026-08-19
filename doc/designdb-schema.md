@@ -1,927 +1,648 @@
-# Design database — internals and field reference
+# design.db — the field reference
 
-The complete schema of the design database: every table, every column, how the
-model is folded, how bit ranges are encoded, and what the database deliberately
-does *not* record.
+Schema version 10. The version is the *consumption contract*, not the DDL: a
+reader that does not know the number must refuse the file rather than read it
+as though the layout held. What bumps it: removing or renaming a table the
+contract names, a view or a view column; changing a column's meaning, value
+domain, NULL rules, or a view's row granularity; changing the required `meta`
+set. What does not: adding a table or column a v10 reader would merely not
+query, or changing how a view is computed while its contract holds.
 
-**In:** a VCS-style SystemVerilog filelist (or bare source paths), plus defines,
-include directories, and optionally a top module.
-**Out:** one SQLite file. No runtime, no library, no simulator — anything that
-speaks SQL can read it.
+A v9 database cannot be upgraded in place. The folded model shared one row
+set across every occurrence of a module variant and deduplicated its edges
+across statements, so the per-occurrence identity v10 stores was never in
+the file. v10 databases are produced only by re-exporting the RTL.
 
-**Schema version 9.** `meta.schema_version` carries it. A reader that does not
-know the version should refuse the file rather than read it as though the layout
-had held.
+## What changed in v10
 
-Version 9 carried the bit-precision model across the instance boundary, and
-closed every hole a systematic audit found in the model it was extending. `port`
-gained **`port_lo`/`port_hi`/`port_exact`** — the bits of the *formal* a
-connection element occupies — and **`map_exact`**, `edge.map_exact`'s boundary
-twin (surfaced by `v_port_connection` as `formal_lo`/`formal_hi`/`formal_exact`
-and `mapping_exact`). Before it, `.q({hi, lo})` exported two rows that both
-claimed all of `q` with `outer_exact = 1`: the per-bit precision v7 built for
-assignments ended at every port. `.q({2{r}})` was worse — dedup keyed only on
-the outer side folded the two copies into one row, deleting the second window
-outright; the window is part of the dedup key now, so a replication is as many
-segments as it has copies. A constant element (`.q({hi, 3'b000, en})`) gets a
-`conn_kind = 1` row with its window, so the formal's bits tile rather than
-leaving a silent gap.
+v9 folded rows onto the module variant: `symbol`, `edge`, `port` and
+`assignment` hung off "a definition plus the parameter values it elaborated
+with", every instance of that variant shared them, and `instance` alone
+scaled with the design. v10 unfolds:
 
-The audit's other corrections, all riding the same version:
+* **`module` is the source definition again** — what was written, keyed by
+  (name, file, line). The parameter values a body elaborated with are
+  per-occurrence facts on `inst.parameter_signature`.
+* **The hierarchy is one id space.** `tree_node` is the supertype; a module
+  instance is a `tree_node` plus an `inst` row under the same id, a gate a
+  `tree_node` plus a `primitive` row, a generate level a bare node.
+* **Every connectable object of every occurrence is a row.** `net` and
+  `term` replace `symbol` and the two-faced `port`; the inside of a terminal
+  (`term_map`) and its outside (`net_conn`) are separate relations, each
+  with its own bit windows.
+* **Dependencies are occurrences, not summaries.** `net_dep` replaces
+  `edge`: one row per statement-level dependency, never deduplicated across
+  statements, each naming the operand, target, condition reference, call or
+  primitive it came from. The statement layer behind it (`procedure`,
+  `stmt`, `assign_target`, `assign_operand`, `expr_ref`, `proc_event`) has
+  real keys — v9's bare `proc`/`stmt` integers are gone.
+* **References that leave an instance resolve, and carry dataflow.**
+  `hier_ref` still stores the path as written; where slang resolved it and
+  the target is in the export, `resolved_inst_id`/`resolved_net_id` name
+  the actual rows — and the dependency that used the reference is a real
+  `net_dep` row across the boundary, naming that reference on the end it
+  crossed.
+* **The intern tables are gone, except `data_type`.** Names are TEXT on
+  their object rows; kinds and directions are words, never 0/1/2/3 codes;
+  `_id` appears exactly where a column holds another table's key.
+* **Nine views become twelve**, and `v_driver`/`v_load` now compose the
+  hierarchy crossing (`net_conn` against `term_map`) that v9 left to every
+  consumer to reinvent.
 
-- **Null-source rows describe nothing.** `edge` rows with `src` NULL now carry
-  NULL in `src_lo`/`src_hi`/`src_exact`/`map_exact`, where they used to claim
-  `src_exact = 1, map_exact = 1` — "the whole of nothing, exactly".
-- **The v7 slot model now covers what it missed.** Selector reads and a called
-  function's free reads are pinned to their own element's window instead of
-  pairing with every target of a concatenated left-hand side (`{m[i], n} =
-  {x, y}` fabricated `i → n`); width-preserving conversions are transparent and
-  truncating ones clip (`assign wt = {a, b}` with a narrower target no longer
-  reports the discarded `a`, and `q = wide` narrows the source to
-  `wide[3:0]`); net initialisers (`wire w = {a, b}`) go through the same slot
-  machinery as `assign`, call reads included; simple assignment patterns
-  (`'{a, b}`) position like the concatenation they are; and a subroutine
-  actual claims `map_exact = 1` only when it *is* a reference filling its
-  formal.
-- **One statement, one `stmt` ordinal**, however many targets its left-hand
-  side names.
-- **`port.child` was renamed `child_name`** (a name id, per the `def_name`
-  precedent), removing the schema's one column wearing another table's name.
-- **`v_database_info.schema_version` is CAST to INTEGER**, so `WHERE
-  schema_version = 9` matches through the view.
-- The `stmt_read.kind = 'assertion'` value the doc promised was never emitted —
-  slang wraps even module-scope concurrent assertions in implicit procedures —
-  and is no longer documented; the assertion's own word is the `construct`.
+Why unfold at all: in the folded model, "this instance's `q`" was not a row
+— it was an (instance path × module variant × name) combination computed by
+every consumer, and a trace that crossed a boundary re-derived it at every
+step. Instance-level rows give every net one id, which is what makes "who
+drives bit 3 of THIS `q`" an indexed lookup and a fan-in cone a recursive
+CTE instead of application-side path algebra. The price is replication:
+identical instances no longer share rows. Measured on VeeRwolf (1,920
+occurrences from 164 parameterised bodies, 10× replication) the database is
+about 2× the folded file, not 10× — the widest tables scale with statements
+and the type text stays interned.
 
-v9 also completed the stable interface's object model, from seven views to
-**nine**: `v_load` became **every recorded read** of a signal — dataflow,
-sensitivity, wait, and target-less statement reads, discriminated by
-`load_kind` — so "who reads it" stopped being a hand-written union over three
-tables; and the statement layer gained its views, **`v_statement`** (one row
-per assignment, `statement_id = assignment.id`) and **`v_statement_operand`**
-(the per-statement read set), closing the half of the edge/assignment dual
-projection that had no interface.
-
-The same pass slimmed the contract to columns that carry information: the
-views dropped the raw enum integers (`direction`, `connection_kind`) in favour
-of their total name columns, `v_tree_node` dropped `child_kind` and
-`definition_module_id` (both provably equal to columns beside them), and
-`warning_count` left the database entirely — a count whose contents the
-database cannot show describes the terminal log, not the database, and a
-number nobody can inspect is not information. The enum name-to-value mappings
-are pinned by the verifier against the base tables, count for count.
-
-Version 8 added the [stable query interface](#stable-query-interface): seven
-views — `v_database_info`, `v_tree_node`, `v_signal`, `v_port_connection`,
-`v_dependency`, `v_driver`, `v_load` — that resolve the intern tables and spell
-out the NULL conventions, so an ordinary consumer never joins `name`/`type`/
-`file` or decodes `conn_kind` itself. The version moves because the views'
-existence and column sets are now contract, and a v7 file answers those queries
-with "no such table". From here on, removing or renaming a view or view column,
-changing a column's semantics or NULL rules, or changing a view's row
-granularity bumps the version; changing only how a view is computed, with its
-contract intact, does not.
-
-v8 also gave `port` a **`child_id`** foreign key (indexed, surfaced by both
-hierarchy views), because without it the composition the views promise did not
-hold: the tree spells an instance one segment at a time while port rows carry
-the folded generate-prefixed spelling, so joining the two by name returned
-nothing exactly at generate boundaries — and `(module, name)` is no substitute
-key, since two unnamed gates in one module legally share a name.
-
-Version 7 stopped crossing the two sides of an assignment. Every target used to
-be paired with every operand, so
-
-```systemverilog
-assign {a, b} = {x, y};
-```
-
-exported four edges where the RTL has two — and `y → a` and `x → b`, which are
-not dataflow at all, carried `src_exact = 1` and `dst_exact = 1` exactly like the
-two real ones. Both sides are now walked as positioned slots and paired only
-where their bits meet, which also narrows the target: `q[7:0] = {hi, lo}` records
-`hi → q[7:4]` rather than `hi → q`. `assign_operand` was crossed the same way and
-is fixed with it. The new `edge.map_exact` column says whether the pairing is
-per-bit — see [Bit correspondence](#bit-correspondence).
-
-Version 6 gave names to two relations that were being guessed from file and line.
-
-`assignment`, `hier_ref` and `stmt_read` gained **`stmt`**, a per-module
-statement ordinal. A statement whose target is *outward* has no `assignment` row
-to gather its parts — the write goes to `hier_ref` and the reads to `stmt_read` —
-so `assign top.a = x; assign top.b = y;` exported two writes and two reads that
-a consumer could pair four ways when the RTL supports one. See
-[Statement identity](#statement-identity).
-
-`child` gained **`id`** and **`kind`**, and `instance` gained **`child`**.
-`def_module IS NULL` had meant "a primitive" and "a definition slang could not
-find" indistinguishably, though a trace stopping at one means something quite
-different from a trace stopping at the other; the folded and expanded hierarchy
-tables were related by nothing a consumer could join on; and an unresolved
-instantiation had no `instance` row at all, so a path through a black box did not
-resolve and the tree reported the same emptiness as a module that instantiates
-nothing. All three are fixed together in [Hierarchy](#hierarchy).
-
-Version 5 changed no table and no column. It moved because the version is the
-**consumption contract**, not the DDL: `meta` gained `duplicate_path_count` and
-`producer_revision` as rows that are now always written, and `analysis_status`
-gained a constraint it did not have — it must agree with the counts beside it,
-so `complete` next to a non-zero `error_count` is a malformed file rather than a
-merely surprising one. Because `meta` is key-value, a v4 reader sees the new
-rows as rows it does not query; what changed is the set a consumer may *rely*
-on, and a database written before this would otherwise also answer `4`.
-
-Version 4 made `instance.name` **one path segment, always**. A generate block
-is now a level of the tree in its own right, so `g_lane[3].u_dp` is two rows
-rather than one name containing a dot, and the walk below resolves one segment
-at a time as it says. Gate, switch and UDP instances gained `child` and
-`instance` rows too, so a netlist-style module no longer reads as instantiating
-nothing and `u_and` is a name you can look up.
-
-Both are why the version moved rather than being additions. `instance.module`
-is **NULL** for a level that is not a module instance, and `child.def_module`
-NULL now means "a primitive, which has no module row" as well as "a definition
-slang could not resolve". A v3 reader gets both wrong rather than missing them.
-To tell a generate level from a primitive: a primitive has a `child` row under
-its parent's module and a generate block does not.
-
-Version 3 added: the [`stmt_read`](#reads-with-no-target) table, so an
-assertion's reads and the read side of an outward write have somewhere to live;
-[`port.inner`](#crossing-a-module-boundary), for a formal whose connection
-names it something else (`.ext_one(inner)`); drivers for nets declared with an
-initialiser (`wire w = a & b`), which had none at all; a call's actuals tied to
-the formals they bind to, so a trace crosses `bump(d)`; and an `outer` on
-interface-array bindings, which carried none.
-
-Those are all additions a v2 reader would simply not ask about. What moved the
-version is `assignment.proc`, which **gained NULL** — a statement in no
-procedure at all, which is what a net's initialiser is. A reader that joins it
-against `proc_event.proc`, or indexes procedures by it, reads NULL as a fact
-about procedure 0 unless it knows the layout changed.
-
-Version 2 added: the [`hier_ref`](#leaving-the-hierarchy) table; bit ranges,
-interface bindings and expression operands on [`port`](#crossing-a-module-boundary)
-— `conn_kind` gained values 3, 4 and 5, which a v1 reader would misread as plain
-nets, and that misreading is why the version moved rather than staying a pure
-addition; statement-level waits, with `wait`, `file` and `line`, in
-`proc_event` — a v1 reader treating those rows as sensitivity reads an
-`initial` block as clocked, which is the second reason the version moved;
-primitive edges (`kind='primitive'`); `symbol.kind='interface_port'`;
-`file.source_file`; self-feedback edges; and `meta.top` written from the
-elaborated tops whether or not `--top` was passed.
-
-## Contents
-
-- [What it answers](#what-it-answers)
-- [The model: folded](#the-model-folded)
-- [Table index](#table-index)
-- [Stable query interface](#stable-query-interface) — the nine views
-- [Hierarchy](#hierarchy) — `module`, `instance`, `child`
-- [Declarations](#declarations) — `symbol`
-- [Dataflow](#dataflow) — `edge`, `assignment`, `assign_operand`, `proc_event`
-- [Crossing a module boundary](#crossing-a-module-boundary) — `port`
-- [Leaving the hierarchy](#leaving-the-hierarchy) — `hier_ref`
-- [Reads with no target](#reads-with-no-target) — `stmt_read`
-- [Bit ranges](#bit-ranges)
-- [Provenance](#provenance) — `source_file`, `meta`
-- [Naming rules](#naming-rules)
-- [What is deliberately not here](#what-is-deliberately-not-here)
-- [Why in-module replication is not folded](#why-in-module-replication-is-not-folded)
-- [Known limits](#known-limits)
+The exporter pays analysis once per (definition, parameters) group — the
+body slang's analysis manager actually analysed — and stamps each
+occurrence's rows from that template. Two instances with one signature carry
+identical rows under different ids; what genuinely differs per occurrence
+(the place in the tree, the connections written in the parent, the
+resolution of hierarchical references) is computed per occurrence.
 
 ## What it answers
 
-A waveform carries values over time and no connectivity at all. A netlist
-carries connectivity and has lost the source. This database is the missing
-half: the elaborated structure of the design, addressable by name, with a
-`file:line` on every row.
+* *Where am I?* `v_tree_node`: one node per level, one path segment per
+  node, resolved one indexed lookup per segment.
+* *What is here?* `v_net`, `v_terminal`: every declaration of this
+  occurrence, implicit nets flagged, directions on the terminals that have
+  them.
+* *Who drives it / who reads it?* `v_driver`, `v_load`: every recorded arc,
+  in-module and across the boundary, discriminated by kind.
+* *Which statement did that?* `v_statement` and its target/operand views;
+  every dependency names its statement.
+* *What leaves this instance?* `hier_ref`, as written and — where possible
+  — resolved.
 
-| Question | Where the answer is |
-|---|---|
-| What drives this signal? | `edge` where `dst` is the signal — with the construct and the statement's own line |
-| Which *statement* wrote it, when several do? | `assignment` (one row per statement, with `proc`/`seq`/`blocking`) + `assign_operand` |
-| Which *bits* came from where? | `src_lo`/`src_hi`/`dst_lo`/`dst_hi` on `edge`, read with `*_exact` |
-| Where does this path leave the module? | `port` — the only table spanning two modules, interface bindings included |
-| What does this module touch outside itself? | `hier_ref` — every reference that leaves it, exactly as written |
-| What reads it? | the union of `edge` where `src` is it, `assign_operand`, `proc_event`, `hier_ref` with `write = 0`, and `stmt_read` — each records a different kind of read |
-| What is this instance, and what is it inside? | `instance` (leaf name + parent chain) and `module` |
-| How wide is it, which direction, where is it declared? | `symbol` |
-| What is this procedure sensitive to, or waiting on? | `proc_event` |
-| Is my database still valid for this source tree? | `source_file` — every file read, with its SHA-256 |
+## Tables
 
-Two properties make it usable as a *back end* rather than a report: the names
-are the elaborated names a waveform also uses, so a signal in a dump joins to a
-row by path; and every row carries `file`/`line`, so an answer is always
-something the reader can open.
-
-## The model: folded
-
-Rows hang off a **module** — a definition together with the parameter values it
-elaborated with — not off an instance. Thirty-two copies of one core share one
-set of edges, and a separate `instance` table expands them back into hierarchy.
-
-That is the difference between a database sized by the amount of unique RTL and
-one sized by the elaborated instance count, and on a large SoC it is the
-difference between practical and not.
-
-Folding is **across** instances, not within one. Replication written *inside* a
-module — a generate loop, an instance array — is elaborated before the fold is
-applied, so `child`, `symbol`, `port`, `edge` and `assignment` each carry one
-row per iteration. The same source with four lanes and with sixty-four gives
-6 and 66 `child` rows. What they grow with is the module's elaborated contents,
-not the file's line count; only `instance` grows with the whole design.
-
-Names inside a module are **module-relative**, generate-block prefix included
-(`g_lane[3].u_dp.data`). A consumer resolves a hierarchical path by walking down
-one segment at a time against the `(parent, name)` index — one indexed lookup
-per segment, no recursion over the table — then reads the rows of that
-instance's module and prefixes them with the path it walked.
-
-```sql
--- what drives `data_o` in top.u_core.u_dp
-WITH RECURSIVE walk(id, rest) AS (
-    SELECT NULL, 'top.u_core.u_dp'
-    -- …descend segment by segment against instance(parent, name)…
-)
-SELECT s.text, e.construct, f.path, e.line
-FROM edge e
-JOIN name d ON d.id = e.dst
-LEFT JOIN name s ON s.id = e.src
-LEFT JOIN file f ON f.id = e.file
-WHERE e.module = :module_of_that_instance AND d.text = 'data_o';
-```
-
-## Table index
-
-Repeated strings are interned into three tables — `name` (identifiers), `type`
-(type text), and `file` (paths) — each `(id, text)`. **Every `INTEGER` column
-referencing one of those is a row id**, so reading a name means joining
-`name.id`; the examples throughout show the join.
-
-| Table | One row per | Grows with |
+| Group | Table | One row is |
 |---|---|---|
-| [`module`](#hierarchy) | definition + parameter values it elaborated with | unique RTL |
-| [`instance`](#hierarchy) | elaborated instance | **the design** |
-| [`child`](#hierarchy) | instantiation written inside a module — modules, primitives and unresolved black boxes, told apart by `kind` | elaborated module contents |
-| [`symbol`](#declarations) | declaration inside a module | elaborated module contents |
-| [`edge`](#dataflow) | dependency (one signal drives another) | elaborated module contents |
-| [`assignment`](#dataflow) | statement that writes a target | elaborated module contents |
-| [`assign_operand`](#dataflow) | signal read by an assignment's RHS | unique RTL |
-| [`proc_event`](#dataflow) | edge event a procedure triggers on or waits on | unique RTL |
-| [`port`](#crossing-a-module-boundary) | port connection on a child instance | elaborated module contents |
-| [`hier_ref`](#leaving-the-hierarchy) | reference that leaves the module, as written | unique RTL |
-| [`stmt_read`](#reads-with-no-target) | signal read by a statement that writes nothing nameable | unique RTL |
-| [`source_file`](#provenance) | file slang actually read | source tree |
-| [`meta`](#provenance) | key/value (schema version, tool, top) | fixed |
+| provenance | `meta` | one key/value of the seal |
+| | `source_file` | one file slang read, with its SHA-256 |
+| | `file` | one path spelling rows carry, joined to its source_file |
+| | `data_type` | one interned type text |
+| hierarchy | `module` | one source definition |
+| | `tree_node` | one level of the elaborated tree |
+| | `inst` | one module/interface/program instance occurrence |
+| | `primitive` | one gate, switch or UDP instance |
+| objects | `net` | one connectable object of one occurrence |
+| | `term` | one terminal on one occurrence's boundary |
+| | `term_map` | one segment of a terminal's inside |
+| | `net_conn` | one segment of a terminal's outside |
+| statements | `procedure` | one always/initial/final block |
+| | `stmt` | one statement or statement-level construct |
+| | `assign_target` | one left-hand-side reference |
+| | `assign_operand` | one right-hand-side reference |
+| | `expr_ref` | one non-operand read, classified by role |
+| | `proc_event` | one edge event triggered or waited on |
+| dataflow | `net_dep` | one net-to-net dependency occurrence |
+| boundary | `hier_ref` | one reference that leaves its instance |
 
-## Stable query interface
+The DDL in `src/DesignDb.cpp` carries the authoritative per-column comments;
+this file states the semantics a consumer builds on.
 
-**Start here as a consumer.** Nine views resolve the intern tables and spell
-out the NULL conventions, so ordinary queries never join `name`, `type`, `file`
-or `source_file`, and never decode `conn_kind` or NULL patterns by hand. The
-views are an object model — the database, a tree node, a signal, a binding, a
-dependency, a statement — with few nouns and complete attributes, not one view
-per storage table. The
-base tables remain the normative storage layer — the views add no data, no
-precomputation and no size — but from v8 the views' existence and column sets
-are part of the schema contract, verified by `verify-designdb.py` on every
-export.
+### Hierarchy
 
-| view | one row is | built on |
-|---|---|---|
-| `v_database_info` | the whole database (exactly one row) | `meta`, pivoted to fixed columns with counts CAST to INTEGER |
-| `v_tree_node` | one node of the expanded instance tree | `instance` + resolved names + `node_kind` |
-| `v_signal` | one declaration in one module variant | `symbol` + type text + both file spellings |
-| `v_port_connection` | one port binding in the **folded** model | `port` + `connection_kind_name` + coalesced inner name + `child_id`, the join key to `v_tree_node` + both ends' bit windows (`formal_*`, `outer_*`, `mapping_exact`) |
-| `v_dependency` | one intra-module dependency | `edge`, direction-neutral |
-| `v_driver` | one direct driving relation of `signal_name` | `v_dependency`, read from the target's side |
-| `v_load` | **one recorded read** of `signal_name`, whatever recorded it | `v_dependency` reads ∪ sensitivity/wait events ∪ target-less statement reads, discriminated by `load_kind` |
-| `v_statement` | one statement that writes a target | `assignment`, names and files resolved; `statement_id` is `assignment.id` |
-| `v_statement_operand` | one signal a statement's right-hand side reads | `assign_operand` + the statement's module, keyed by `statement_id` |
+**`module`** — `id, name, definition_kind, file_id, line, column`, unique on
+(name, file_id, line). `definition_kind` is `module | interface | program |
+checker`. However many parameterisations elaborate, the definition is one
+row.
 
-Rules a consumer can rely on:
+**`tree_node`** — `id, parent_node_id, name, node_kind, ordinal`. One path
+segment per node, `[i]` included for array elements (`u[0]`, `lane[3]`), so
+resolving `a.b[0].c` is one indexed lookup per segment against
+(parent_node_id, name) and no path strings are stored. `ordinal` is the
+order among siblings. `node_kind`:
 
-- **One view row is one base row.** Every join inside a view is against a
-  primary key, so nothing fans out; `count(view) == count(base)` is asserted.
-- **`v_driver` and `v_load` are one step, inside one module.** Fan-in cones,
-  root drivers and anything crossing an instance boundary are the consumer's
-  loop: follow `v_driver`/`v_load` inside the module, cross the boundary with
-  `v_port_connection`, and walk levels with `v_tree_node`.
-- **The two hierarchy views join on `child_id`, and on nothing else.**
-  `v_tree_node.child_id = v_port_connection.child_id` is the boundary-crossing
-  hop. The *names* do not relate them: the tree spells an instance one segment
-  at a time (`u_dec`) while port rows carry the folded spelling with the
-  generate prefix (`g_rep[0].u_dec`), so a name join returns nothing exactly
-  where a trace needs it.
-- **Key on `module_id`, not `module_name`.** One definition elaborated with two
-  parameter sets is two module variants, and a `module_name` filter returns rows
-  from all of them. The tree node you selected carries the right `module_id`;
-  name (plus `module_params`) is for a human browsing.
-- **`v_dependency` does not name the assignment statement.** `edge` and
-  `assignment` are [independent projections](#they-are-two-projections-not-two-halves-of-a-join);
-  per-statement operands stay in `assign_operand`.
-- **Bit ranges keep `edge`'s semantics unchanged**: LSB-relative offsets into
-  the flattened object, `NULL` + `exact=1` the whole object, `NULL` + `exact=0`
-  somewhere unknown inside it — see [Bit ranges](#bit-ranges).
-- **`mapping_exact=0` does not mean the dependency is doubtful.** The source
-  reaches the target; only the bit-for-bit correspondence is unavailable — see
-  [Bit correspondence](#bit-correspondence).
-- **`driver_name` NULL is a real driving statement** (`assign q = 1'b0;`, a
-  target fed only from outside the module). It is kept in `v_driver` and, being
-  no signal's load, excluded from `v_load`.
-- **`v_load` is the whole answer to "who reads it".** A read is a load however
-  it was stored: `load_kind` says `dataflow` (an edge, with `load_*` naming the
-  target), `sensitivity`/`wait` (a procedure triggering or suspending on it —
-  the flop clock pins of a netlist database — **whatever the spelling**: a
-  selected-bit event like `@(posedge clks[2])` classifies exactly as the plain
-  one does), or `statement` (an assertion, a `$display`, a writing call's
-  argument). Target-less reads carry `load_*` all NULL —
-  symmetric with `v_driver`'s null-driver rows. What it cannot include: reads
-  made *from other modules* through hierarchical paths, which are `hier_ref`
-  text resolved by the consumer.
-- **The statement layer is `v_statement` + `v_statement_operand`.** Which
-  statement wrote it, in which procedure, in what order, blocking or not —
-  and the exact per-statement read set the naive edge join cannot give.
-  `statement_id` is the join key; `stmt` beside it is the per-module ordinal
-  shared with `hier_ref`/`stmt_read`. The operand-by-name query shape walks
-  the module's assignments today; the dedicated reverse index remains a
-  measure-on-a-real-design decision.
-- **Read `connection_kind_name`, not NULL patterns**: a constant tie, an
-  unconnected port and an external tie all have `outer_signal_name` NULL, and
-  the kind is what tells them apart. The views carry enum *names* only — the
-  integers are storage encoding, and the name column is total over it.
-- **Bit precision crosses the boundary.** A binding carries both ends' windows:
-  `formal_lo`/`formal_hi`/`formal_exact` say which bits of the formal this
-  element occupies, `outer_lo`/`outer_hi`/`outer_exact` which bits of the outer
-  net it brings, and `mapping_exact` whether the two correspond bit for bit —
-  `.q({hi, lo})` is `hi → q[7:4]` and `lo → q[3:0]`, each `mapping_exact = 1`,
-  and a replication is one row per copy. `mapping_exact` is NULL where the row
-  has no outer end (constant, unconnected, external, interface); 0 means the
-  tie is real at range granularity, exactly as on `edge`.
-- **`node_kind` classifies the tree**: `root` and `generate` are structural
-  levels nothing declared; `module` descends; `primitive`'s dataflow is already
-  in the parent's edges; `unresolved` is a black box with no dataflow anywhere.
+* `root` — a top instance; has an `inst` row, no parent.
+* `instance` — a resolved module/interface/program instance; has an `inst`
+  row.
+* `generate` — a generate block or one element of a generate array. A
+  naming level; nothing subtypes it.
+* `primitive` — a gate, switch or UDP; has a `primitive` row.
+* `unresolved` — an instantiation whose definition slang could not find;
+  has an `inst` row with `module_id` NULL and `unresolved_definition` set.
+  A trace really does stop here, and that is different from stopping at a
+  gate — which is why the kinds are distinct words.
 
-Five queries that cover most consumers. The driver/load forms take `module_id`
-from the tree node already selected — filtering by `module_name` instead would
-mix every parameterisation of that definition:
+The verifier holds the bijections: instance-like kinds have `inst` rows and
+no others do; `primitive` likewise.
 
-```sql
--- The children of one tree node.
-SELECT instance_id, instance_name, node_kind, module_id, module_name
-FROM v_tree_node
-WHERE parent_instance_id = ?;
-```
+**`inst`** — `id` IS the tree_node id (one id space for the hierarchy).
+`parent_inst_id` is the nearest enclosing module instance, skipping generate
+levels — the ancestry `tree_node` already encodes, denormalised one hop
+because every ownership rule walks it; the verifier holds the two encodings
+equal. `parameter_signature` is the elaborated parameter values, normalised,
+declaration order, localparams included — it over-splits and never
+under-splits, exactly as v9's variant key did. Instances of one module with
+one signature carry identical row sets. Location is the instantiation site;
+the root has none.
 
-```sql
--- What directly drives this signal, in the selected node's module variant.
-SELECT driver_name, driver_lo, driver_hi, driver_exact,
-       is_control, mapping_exact, file_path, source_line
-FROM v_driver
-WHERE module_id = ? AND signal_name = ?;
-```
+**`primitive`** — `id` IS the tree_node id; `inst_id` the instance whose
+body wrote it; `primitive_kind` is `gate | switch | udp`; `definition_name`
+the gate's own word (`and`, `tranif1`) or the UDP's name. A primitive is not
+a statement and has no terminals of its own: its dataflow is `net_dep` rows
+carrying `primitive_id`, one per LRM (input, output) pairing. Expression
+operators (`&`, `+`, `?:`) are not primitives — they stay inside their
+statement's rows.
 
-```sql
--- Everything that reads this signal, in the same variant: dataflow targets,
--- the procedures it clocks, the assertions and waits that sample it.
-SELECT load_kind, load_name, construct, file_path, source_line
-FROM v_load
-WHERE module_id = ? AND signal_name = ?;
-```
+### Objects
 
-```sql
--- Cross the boundary: the selected instance's port bindings.
-SELECT formal_port_name, direction_name, outer_signal_name,
-       connection_kind_name, outer_lo, outer_hi
-FROM v_port_connection
-WHERE child_id = ?;   -- the tree node's child_id
-```
+**`net`** — every object that can be driven, read or wired: nets and
+variables, of the instance body and its generate scopes, and — because a
+dependency end is an id and an id must exist — subroutine formals, locals
+and block variables, named by their scope-relative dotted path (`bump.v`,
+`g[0].sig`). Parameters, type parameters and specparams are *not* here: they
+are not connectivity, and folding them into the object list made every
+"signals of this scope" query filter them back out. `declaration_kind` is
+the net type's own word (`wire`, `wand`, `trireg`, a user-defined nettype's
+name) or `variable`. `is_implicit=1` marks a net slang created for an
+undeclared identifier under the active `` `default_nettype ``; its location
+is the first use. `width` is the flattened bit width, NULL when the type is
+not integral — bit *offsets* still index the flattened space slang computes
+for unpacked objects, so ranges on a NULL-width net remain meaningful.
+`scope_node_id` is the instance or generate node that declares it.
 
-```sql
--- The statements writing this signal, and what each one reads.
-SELECT s.seq, s.blocking, s.construct, s.source_line, o.operand_name
-FROM v_statement s
-LEFT JOIN v_statement_operand o ON o.statement_id = s.statement_id
-WHERE s.module_id = ? AND s.target_name = ?
-ORDER BY s.proc, s.seq;
-```
+**`term`** — one terminal per port, in port-list order (`ordinal`). The
+root's terminals are the design's top-level ports; a child's are the pins
+its parent connects — one noun, because they are the same object seen from
+two sides. `terminal_kind` is `signal | interface`; `direction` is `input |
+output | inout | ref`, NULL for an interface terminal (it has none) and for
+a terminal of an unresolved instance (nobody knows). `modport` is the
+declared modport, when the port declares one. A non-ANSI `.p({hi, lo})`
+formal is one terminal whose inside has two segments. An unresolved instance
+still gets terminal rows — one per connection its parent wrote, named as
+the connection names them — so "connected to a black box" stays distinct
+from "unconnected".
 
-All five resolve through the existing indexes (`edge_by_dst`, `edge_by_src`,
-`assign_by_dst`, `instance_by_parent`, `port_by_child`, and for v_load's other
-read kinds `pevent_by_proc` and `sread_by_name`); the views add none of their
-own.
+**`term_map`** — the INSIDE of a terminal: which nets of its own instance it
+stands for, one row per segment, keyed (term_id, ordinal). An ANSI port is
+one whole-to-whole segment with `mapping_exact=1`; a port expression
+produces one segment per element with its window of the terminal
+(`term_lo/term_hi`) and of the net. Both nets belong to the terminal's own
+instance; the outside is `net_conn`'s business, and keeping the two
+relations apart is what v9's one-table version kept getting wrong.
 
-## Hierarchy
+**`net_conn`** — the OUTSIDE of a terminal: what the parent wired to it, one
+row per atomic segment. Each concatenation element and each replication copy
+is its own row with its own window of the formal — `.q({2{r}})` is two rows
+whose windows tile `q`. `connection_kind`:
 
-| table | column | meaning |
-|---|---|---|
-| `module` | `id`, `name`, `params` | A definition plus its elaborated parameter values — **and its localparams**, which slang models the same way. That only ever over-splits, never under-splits, so it remains a sound identity; but a key rebuilt from the overrides written at instantiation will not match it. The parameters are part of the identity: a different parameterisation resolves different generate branches and different widths, so it is a different netlist. |
-| `instance` | `id`, `name`, `module`, `parent` | The instance tree. `name` is **one path segment** — a generate block is its own level, so the chain of names to the root *is* the hierarchical path, joined with `.`. `module` is NULL for a level that is not a module instance (a generate block, a primitive, or an unresolved black box). Paths are not stored — they are all distinct, so interning saves nothing and storing them costs the text twice once the lookup index is counted. |
-| | `child` | The instantiation in the parent's module body this row expands. NULL only for the root and for a generate block — neither is something anyone wrote as an instance. See below. |
-| `child` | `id`, `module`, `name`, `def_name`, `def_module` | What a module instantiates. `def_name` always names the definition as written (`counter`, `and`, `my_latch`); `def_module` points at its rows when there are any. |
-| | `kind` | `module`, `primitive`, or `unresolved` — what `def_module IS NULL` could not say. |
+* `signal` — `net_id` names a net of the parent instance.
+* `constant` — a tie-off. No net, but the window is kept, so the formal's
+  bits tile rather than leaving a gap indistinguishable from an exporter
+  bug.
+* `unconnected` — recorded, not omitted: absence would also mean "the
+  exporter did not get this far".
+* `expression_operand` — the actual is an expression; this row is one net
+  it reads. `.en(state == RUN)` samples `state` but does not alias it to
+  `en`; `mapping_exact` is 0 by construction. An operand with no name in
+  the parent carries `hier_ref_id` instead of `net_id`.
+* `interface` — `interface_inst_id` names the bound interface instance,
+  through pass-through chains: a grandchild handed the parent's own
+  interface port resolves to the instance the parent was handed. NULL when
+  the binding has no per-occurrence object (an interface array element).
+  No dataflow arc pretends to cross an interface binding.
+* `external_reference` — tied to something with no name in the parent
+  (`.p(u.g[7:4])`); `hier_ref_id` says what, with `access='connect'`. It
+  crosses like any other connection once that reference resolves; an
+  upward tie (`.a(tb.glob)`) does not resolve, so it stays a recorded
+  connection with no arc.
 
-### The two hierarchies, and how they relate
+Width degradation: when the connection expression's width and the declared
+terminal width disagree (an output narrower than the net it drives arrives
+as a plain assignment with no conversion node), every element's position is
+unstatable and no mapping is per-bit — `term_exact=0`, `mapping_exact=0`,
+the same degradation a width-changing conversion gets. Instance-array
+elements share the whole array's connection expression and degrade the same
+way. Connections to an unresolved instance have no formal to measure
+against: their terminal side is NULL and `mapping_exact` NULL.
 
-`child` is folded (one row per instantiation *written*, shared by every instance
-of the enclosing module) and `instance` is expanded (one row per instantiation
-*elaborated*). `instance.child` is the link, and it is one-to-many in the
-direction you would expect: a `child` row of a module instantiated 32 times has
-32 `instance` rows pointing at it.
+### Statements
 
-The two also spell names differently, which is why the link is worth storing
-rather than recomputing. For
+**`procedure`** — one row per always/always_ff/always_comb/always_latch/
+initial/final block, `ordinal` in declaration order. Task and function
+bodies do not get procedure rows: their statements belong to the calling
+procedure — a `=` inside a function reached from an `assign` is still
+`blocking`, and executes in no procedure (`procedure_id` NULL).
+
+A body is walked **once per call site**, not once per subroutine. The
+statements are the effect of *that* call, so they carry its gating stack
+and its delay:
 
 ```systemverilog
-for (genvar i = 0; i < 2; i++) begin : g
-    leaf u_leaf(...);
+always_ff @(posedge clk) begin
+    if (g1) put(d1);
+    if (g2) put(d2);
 end
 ```
 
-`child` holds `g[0].u_leaf` and `g[1].u_leaf` — the whole path, relative to the
-module body — while `instance` holds `g[0]` and `g[1]` as levels of their own with
-`u_leaf` beneath each. Recovering one from the other meant re-parsing the text and
-walking it segment by segment; `instance.child` is that work done once.
+records the body's write twice, once under `g1` and once under `g2`.
+Walking the body once instead was cheaper and wrong: the write inherited
+only the first call site's condition, so `g2` never reached the target and
+the answer depended on which call the walk happened to reach first.
 
-**`child.kind` is not decoration — the three kinds stop a trace differently.**
+Recursion is bounded by an active-call guard, so a self-calling task is
+expanded once, not forever. Fan-out is bounded by a per-module budget: the
+guard stops cycles but not a call DAG that branches, which costs 2^depth,
+so a module that exceeds the budget stops instantiating bodies, counts the
+call sites it skipped, and reports `analysis_status='partial'`. Measured
+RTL does not come close — the heaviest caller among the designs exported
+here has thirteen call statements.
 
-| kind | `def_module` | has an `instance` row | what it means when a trace arrives |
-|---|---|---|---|
-| `module` | its module | yes | Descend: the module's own rows continue the trace. |
-| `primitive` | NULL | yes | Do not descend. A gate has no module and never will; its dataflow is already in the parent's `edge` rows with `kind='primitive'`. |
-| `unresolved` | NULL | yes | Stop. This is a black box — slang could not find the definition, so no dataflow for it exists anywhere in the database. Counted in `meta.unresolved_count`; these are the individual rows. |
+**`stmt`** — one row per statement or statement-level construct; `{a,b} =
+{x,y}` is ONE row however many targets it writes. `statement_kind` is
+`assignment | assertion | wait | call | system_task | event_control`;
+`construct` the construct's own word (`assign`, `always_ff`, `assert`,
+`$display`, `call`, `sensitivity`, `wait`). `assignment_kind` (`continuous |
+blocking | nonblocking`) is set exactly on assignments; `sequence` is
+execution order within the procedure (NULL outside one, and on the
+procedure-header `event_control` row that holds a non-plain sensitivity's
+reads). `delay` is the delay control's normalised source text — `#3`,
+`#(rise, fall)` — never a number this tool pretended to evaluate; intra-
+assignment delays land on their own statement. `dropped_operand_count` is
+operands not recorded: compile-time constants, and references that could not
+be stored as a path.
 
-A generate level is none of the three: it has `module IS NULL` *and*
-`child IS NULL`, which is what distinguishes it from a primitive or a black box.
+**`assign_target` / `assign_operand`** — the statement's left- and right-
+hand references, (stmt_id, ordinal)-unique, in written order. Operands
+belong to the STATEMENT, not to a target: which operand feeds which target
+is `net_dep`'s answer, and pairing them here is exactly the cross product v7
+removed. A read occurring twice is two rows. A target outside the instance
+is not here — it is a `hier_ref` with `access='write'` on the same
+statement.
 
-## Declarations
+**`expr_ref`** — every statement read that is not an assignment operand,
+classified: `control` (a branch condition over the statement — including one that
+writes nothing this instance names, where no dependency can carry it and
+this reference is the only record),
+`assertion`, `wait` (a wait's condition), `event` (a sensitivity expression
+that is not a plain net), `call_argument`, `system_task`. One read lands in
+exactly one of `assign_operand`, `expr_ref` or `proc_event` — the verifier
+holds the view formulas that make double counting visible.
 
-| table | column | meaning |
+**`proc_event`** — one row per event a procedure triggers on
+(`event_kind='sensitivity'`, `stmt_id` NULL) or waits on (`'wait'`, the
+statement set). All of them, since an event list has no order. `edge_kind`
+is `posedge`/`negedge`/`both`, or NULL for a level-sensitive event written
+explicitly (`always @(b)`) — the event is a fact whether or not it names an
+edge, and a signal appearing *only* in a sensitivity list is otherwise
+invisible to every load query. `net_id` is NULL when the expression is not
+a plain net; the reads then live as `expr_ref` rows with role `event`.
+
+An *implicit* list (`always @*`, `always_comb`, `always_latch`) gets no
+event rows: its sensitivity IS the read set, which the dataflow rows
+already carry, and duplicating it would report every combinational read
+twice — once as `dataflow` and once as `sensitivity`. Which event is the
+clock is deliberately not decided here.
+
+### Dataflow
+
+**`net_dep`** — the adjacency list `v_driver` and `v_load` index, and the
+provenance record v9's deduplicated `edge` erased. One row per statement- or
+primitive-level dependency occurrence: the same source reaching the same
+target from two statements is two rows, each naming its statement. `{a,b} =
+{x,y}` is `x -> a` and `y -> b`, each naming its operand and target rows —
+never the four-way cross product. `dependency_kind`, and what must be set
+(verifier-enforced):
+
+| kind | means | names |
 |---|---|---|
-| `symbol` | `module`, `name`, `kind`, `type`, `width`, `direction`, `file`, `line`, `col` | Every declaration. `kind` is `variable`/`net`/`parameter`/`type_parameter`/`specparam`/`port`/`interface_port`. A `type_parameter`'s `type` is the type it stands for; a generic `interface` port's is the word `interface`, since it names no definition. `direction` is `0`=in, `1`=out, `2`=inout, `3`=ref, and non-NULL exactly when the signal is an ordinary port — an `interface_port` has no direction. For an `interface_port`, `type` is the interface definition, with the declared modport when the port restricts itself to one (`simple_bus.master`); it is the name a reference like `bus.vld` resolves its first segment against. |
+| `data` | an assignment moves it | `stmt_id`, and per end either the local reference (`assign_target_id` / `assign_operand_id`) or the resolved hierarchical one (`target_hier_ref_id` / `source_hier_ref_id`) — exactly one of the two per end. `source_net_id` NULL *with no source reference of either kind* is a constant driver (`q <= 8'h0`); the row still names the statement, which is what a driver query reports, and every source column is NULL with it. |
+| `control` | it reaches the target through a branch condition | `stmt_id`, the condition as `expr_ref_id` (role `control`) or `source_hier_ref_id`, the target as `assign_target_id` or `target_hier_ref_id`; `mapping_exact` 0 — a condition gates, it does not map |
+| `primitive` | a gate/switch/UDP couples them | `primitive_id`, per LRM (input, output) pairing; scalar-to-scalar couplings are per-bit |
+| `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) or `source_hier_ref_id` on the reading side |
 
-One row per real signal. slang carries a `Port` symbol *and* the net or variable
-behind it; the port contributes its direction to the signal's row rather than a
-row of its own.
+A dependency can cross by name on the target side with no source at all:
+`assign u.x = 8'h5A;` and `$readmemh("f.hex", u.mem)` both drive an object
+in another instance from something this schema cannot name. Those record a
+source-less dependency against the resolved target, so the far net has a
+driver — `constant` or `system_task` — instead of appearing never to have
+been written.
 
-This table exists because the rest of the schema is derived from edges, so a
-signal would otherwise appear only if it took part in dataflow — a
-declared-but-unused signal, and a clock that only appears in a sensitivity
-list, would not be here at all.
+**Dataflow that crosses by name.** `assign q = u.x;` and a modport write
+are dataflow like any other, and they are recorded like any other: the
+dependency carries the resolved net at both ends and names the `hier_ref`
+row the reference went through instead of a local operand/target row. The
+pairing is made where the statement was walked — one row per (source
+element, target element) that share bits — never by joining `hier_ref` to
+operands on `stmt_id` afterwards, which would resurrect the cross product
+v7 removed. A reference that did not resolve produces no dependency at all:
+the `hier_ref` text is the honest record, and a guessed edge would be a
+wrong one. (In v10's first cut these produced only `hier_ref` rows, so a
+target fed entirely from outside reported `constant` — a confident wrong
+answer, which is exactly what this schema exists not to give.)
 
-It does **not** offer "which outputs are undriven" as a query, and an earlier
-draft that did was wrong: an output driven by a child instance's output port
-has a `port` row and no `edge` row, so a `symbol` MINUS `edge` test reports
-every structurally driven output as dead — on a design of ordinary shape,
-nothing but false positives. Deciding that a signal is undriven means reading
-`edge`, `port` and `hier_ref` together and knowing which of them the design
-uses, which is the consumer's judgement to make, not a column here.
+`source_net_id`/`target_net_id` repeat what the referenced rows already
+know. That is deliberate, *verified* redundancy — this table is the
+driver/load index, and the verifier holds the copies equal — not two
+independent sources of truth.
 
-## Dataflow
+### Leaving the instance
 
-| table | column | meaning |
-|---|---|---|
-| `edge` | `module`, `src`, `dst` | One dependency inside a module. `src` is NULL when no operand has a name in this module's namespace — the right-hand side read nothing at all (`q <= 8'h0`), or everything it read lives outside the module (`assign seen = bus.vld`, where the operands are in `hier_ref` at the same `module`/`file`/`line`). Either way the row names the statement, so a driver query answers — and every column describing the source end (`src_lo`/`src_hi`/`src_exact`, `map_exact`) is NULL with it: a row with no source describes no source, exactly as a tied-off port's outer columns are NULL. Self-feedback is a real row: `cnt <= cnt + 1` records `cnt → cnt`, which is what makes "who reads cnt" answerable. A downward hierarchical reference that stays inside the module's subtree is an ordinary row whose name is dotted (`u_child.sig`). |
-| | `src_type`, `dst_type` | Type text. |
-| | `kind`, `construct` | `continuous_assign`/`procedural`/`primitive`/`procedure`, and the construct: `assign`, `always_ff`, `gate:and`, `udp:my_latch`, … A gate, switch or UDP instance is one edge per (input, output) pairing — `and (y, a, b)` is `a → y` and `b → y`. |
-| | `control` | 1 when the operand reached the target through a branch condition rather than the right-hand side. |
-| | `file`, `line` | The statement's own line, not the enclosing procedure's. |
-| | `src_lo`/`src_hi`/`src_exact`, `dst_lo`/`dst_hi`/`dst_exact` | Bit ranges — see [below](#bit-ranges). |
-| | `map_exact` | Whether the source's bits map one-to-one onto the target's. Not a restatement of the two `*_exact` columns — see [Bit correspondence](#bit-correspondence). |
+**`hier_ref`** — one row per (reference, direction, statement) that leaves
+its instance: an XMR, an interface member, a package item. `path` is the
+canonical text as written (selects resolved to the constants they
+elaborated to, whitespace and comments removed); `access` is
+`read | write | connect`. The statement is part of the identity because a
+task body is walked once per call site: two calls to a task reading `u.x`
+are two statements and two rows, so "what does *this* statement read
+outside the instance" has an answer for each.
 
-| table | column | meaning |
-|---|---|---|
-| `assignment` | `id`, `module`, `dst`, `dst_lo`/`dst_hi`/`dst_exact` | One statement that writes a target. |
-| | `kind`, `construct`, `file`, `line` | As `edge`. |
-| | `proc`, `seq` | Which procedure in the module, and the order within it — within the procedure's own statements. A subroutine's body is numbered *after* the call that invokes it, so `seq` is not execution order across a call. Both are needed: `seq` restarts per procedure, so without `proc` two assignments from different `always` blocks read as one ordered sequence. `proc` is **NULL** when the statement is in no procedure — a net declared with an initialiser is a continuous assignment written at the declaration. |
-| | `blocking` | 1 for `=`, 0 for `<=`, NULL for a continuous assign. It describes **the statement**, so a `=` inside a function keeps its 1 whether the function was reached from an `assign` or from an `always_ff` — while `kind`/`construct` beside it name the *enclosing* construct, which is how the same body reports `assign` from one caller and `always_ff` from another. Not decoration — two assignments to one target in one block resolve by different rules, and it separates a block-local temporary written with `=` inside an `always_ff` from a real register. |
-| | `dropped_operands` | Operands not recorded: compile-time constants, and references outside this module. A row with one operand and three dropped is not a row that reads one signal. |
-| | `stmt` | Which statement in the module, as [an ordinal](#statement-identity). Shared with the `hier_ref` and `stmt_read` rows of the same statement — which is how an assignment that also reads something outward is related to that reference. |
-| `assign_operand` | `assignment`, `name`, `src_lo`/`src_hi`/`src_exact` | What the right-hand side reads. |
-| `proc_event` | `module`, `proc`, `signal`, `edge_kind`, `wait`, `file`, `line` | Every edge event a procedure triggers on **or waits on**. `signal` is NULL when the event expression is not a plain reference. `wait` is the discriminator: `0` is the procedure's sensitivity list, so the event triggers the block; `1` is an event control reached during execution (`@(posedge clk);` inside an initial block or a task), which suspends it and says nothing about what triggers it. **Filter on `wait = 0` to ask what a procedure is sensitive to** — an `initial` block has only `wait = 1` rows, and reading those as a trigger set makes it look clocked. |
+The range is the one the RTL spells, not the one a dependency uses.
+`assign {hi, lo} = u.x;` records one reference to the whole of `u.x`,
+while the two dependencies through it carry `[7:4]` and `[3:0]` in
+`net_dep` — where a range describes a particular dependency rather than
+the reference itself. New in v10, because
+an occurrence knows its place in the hierarchy where a folded row could not:
+`resolved_inst_id` and `resolved_net_id` name the actual rows when the
+export could replay the reference —
 
-`edge` flattens a procedure into "these signals drive that one". `assignment`
-keeps the statements apart, so a target written in four places reads as four
-statements rather than one merged set.
+* downward (`u_cnt.cnt`): resolved, per occurrence;
+* absolute and package-scoped paths into the exported tree: resolved;
+* through one of the instance's own interface ports (`bus.vld`, modports
+  included): resolved to the interface instance each occurrence is actually
+  bound to;
+* upward references and interface-array bindings: NULL. The one analysed
+  body speaks for occurrences whose surroundings may differ, and a guess
+  stored as fact is the one thing the columns must never hold.
 
-### They are two projections, not two halves of a join
-
-There is no key that recovers one from the other, and
-**`(module, dst, file, line)` is not one.** Those columns are shared by every
-statement written on a line, so joining on them returns a cross product rather
-than an error:
-
-```systemverilog
-always_ff @(posedge clk) begin if (c) q <= a; else q <= b; end
-```
-
-is two `assignment` rows and three `edge` rows — `a → q`, `b → q`, and `c → q`
-with `control = 1` — and all five carry the same module, `dst`, file and line.
-Joined on them, each assignment pairs with all three edges, and a consumer
-asking what the first statement reads is told `a`, `b` *and* `c`.
-
-Ask each table what it can answer:
-
-| question | table |
-|---|---|
-| What does **this statement** read? | `assign_operand`, keyed on `assignment.id`. Exact: `a` for the first assignment above, `b` for the second. |
-| Does `a` reach `q` **at all**? | `edge`. Deduplicated on purpose — one row however many statements produced it. |
-| In what order, in which procedure, blocking or not? | `assignment` — `proc`, `seq`, `blocking`. |
-
-Neither direction can be tightened into a foreign key. One edge covers many
-assignments by design; and some edges have no assignment at all — a gate is not
-a statement, and a subroutine call's actual-to-formal binding
-(`always_ff @(posedge clk) bump(d);`) is dataflow nobody wrote an assignment
-for.
-
-**Which branch condition guards which statement is not recorded.** The `c → q`
-edge says `c` reaches `q` as a condition, not which of the two assignments it
-gates. That is the [deliberate omission](#what-is-deliberately-not-here) below,
-not a gap in this pair of tables.
-
-### Bit correspondence
-
-Three columns on `edge` describe precision, and they answer different questions.
-`src_exact` and `dst_exact` each describe **one end**: whether that end's bit
-range could be narrowed, or is an upper bound. **`map_exact` describes the
-relationship between the ends** — whether a bit of the source can be followed to
-a specific bit of the target.
-
-They are independent. `q = a + b` knows both ranges exactly and still cannot say
-which bit of `a` reaches which bit of `q`, because a carry crosses them:
-`src_exact = 1`, `dst_exact = 1`, `map_exact = 0`.
-
-| what the RTL says | edges | `map_exact` |
-|---|---|---|
-| `{a, b} = {x, y}` | `x → a`, `y → b` | 1 — the halves correspond, and the pairs that do not share a bit are not edges at all |
-| `q[7:0] = {hi, lo}` | `hi → q[7:4]`, `lo → q[3:0]` | 1 — each operand drives its own slice |
-| `q = a + b` | `a → q`, `b → q` | 0 — real dependencies, no per-bit mapping |
-| `q = {2{a}}` | `a → q` | 0 — one source in two places |
-| `q = f(a)` | `a → q` | 0 — opaque |
-
-**`map_exact = 0` does not mean the dependency is doubtful.** The source does
-reach the target; the pairing is simply at range granularity rather than bit
-granularity. A consumer doing bit-level tracing should follow `map_exact = 1`
-edges bit by bit and treat `map_exact = 0` edges as coupling the whole ranges.
-`map_exact` is **NULL** on a null-source row — no source end, nothing to
-correspond with — mirroring `port.map_exact`'s NULL for a tie-off.
-
-A few conservative cases report 0 where a sharper answer exists: a widened
-operand (`q = a` with `a` narrower), a truncated one, and bitwise operators like
-`~a` that really are per-bit. Being wrong in the other direction — claiming a
-correspondence that does not hold — is what this column exists to prevent, so the
-rule is deliberately narrow: only a plain reference filling its window exactly.
-
-### Statement identity
-
-`assignment`, `hier_ref` and `stmt_read` each carry **`stmt`**: an ordinal the
-exporter assigns while walking a module. Rows sharing `(module, stmt)` came from
-one statement. The number is meaningless outside its module and is not an id into
-any table — it exists to say "these rows are one statement".
-
-For a statement writing a target the module *can* name, `assignment.id` already
-did this job and `assign_operand` hangs off it. `stmt` matters where there is no
-assignment row to hang from — a write that leaves the module:
-
-```systemverilog
-assign top.a = x; assign top.b = y;
-```
-
-The writes land in `hier_ref`, the reads in `stmt_read`, and every one of those
-four rows carries the same module, file and line. Pairing them on those columns
-gives `top.a` fed by both `x` and `y`, and `top.b` likewise — four answers where
-the source gives two. Pairing on `stmt` gives exactly `top.a ← x` and
-`top.b ← y`:
-
-```sql
-SELECT hp.text AS writes, rn.text AS fed_by
-FROM hier_ref h
-JOIN name hp ON hp.id = h.path
-JOIN stmt_read r ON r.module = h.module AND r.stmt = h.stmt
-JOIN name rn ON rn.id = r.name
-WHERE h.write = 1;
-```
-
-This is what makes an interface or XMR driver chain resolvable at all, which is
-most of what a modport driver is: `assign bus.vld = ready;` beside
-`assign bus.data = payload;` is the ordinary shape of that code, not a
-contrived one.
-
-`stmt` is NULL where a row belongs to no statement the walk opened. `edge`
-deliberately has no `stmt` column: it is deduplicated, so one row can be several
-statements and there would be nothing single to point at — see
-[above](#they-are-two-projections-not-two-halves-of-a-join).
-
-## Crossing a module boundary
-
-| table | column | meaning |
-|---|---|---|
-| `port` | `module`, `child_name`, `def_module`, `port` | A port connection, recorded against the parent module that writes it. `module` is the parent, `child_name` the instance's folded name (a name id, per the `def_name` precedent), `def_module` the child's module, `port` the formal inside it. |
-| | `direction` | 0=in, 1=out, 2=inout, 3=ref. NULL for an interface binding — an interface port has no direction. |
-| | `inner` | The signal inside the child that `port` stands for, when the connection names the formal something else (`module m(.ext_one(inner))`). NULL when the two are one name, which is the ordinary case. Without it a consumer holding the internal name has no way back to the binding. |
-| | `outer`, `outer_type` | The net in the *parent's* namespace. |
-| | `outer_width` | The width of the connection **as written**, looking through the implicit conversion slang inserts to fit the formal. Comparing it against the formal's `symbol.width` is how a width-mismatched connection is found. NULL for an element of an instance array, where every element shares the array's connection expression and the comparison has no meaning — and NULL whenever the connection's type is not integral (an unpacked array or struct port), so `outer_width IS NULL` is not a test for "array element". |
-| | `outer_lo`/`outer_hi`/`outer_exact` | The bits of `outer` the connection selects: `.idx(stim[3:0])` attaches bits 0..3 of `stim`, not all of it. Same encoding as `edge` — see [Bit ranges](#bit-ranges). NULL with exact=0 for an element of an instance array, as with `outer_width`. |
-| | `conn_kind` | 0=a net, 1=tied to a constant, 2=left unconnected, 3=an operand of an expression, 4=an interface binding, 5=attached to a signal with no name in this module. |
-| | `modport` | The modport restricting an interface binding, when one does. NULL otherwise. |
-| | `file`, `line` | Where the connection itself is written, in the parent — not the instantiation's own line, which on an instance written one port per line would be the same for every row and would tell two ports of it apart from neither each other nor the header. A port left **unconnected** has no connection text to point at and falls back to the instantiation. |
-| | `child_id` | The [`child`](#hierarchy) row this binding belongs to — the stable key relating a port row to the hierarchy, and through `instance.child` to the expanded tree. `child_name` is not that key: it carries the folded spelling with the generate prefix (`g_rep[0].u_dec`) while the tree spells one segment per level, and two unnamed gates in one module legally share a name. Indexed (`port_by_child`): a trace crosses every boundary through this column. |
-| | `port_lo`/`port_hi`/`port_exact` | The bits of the **formal** this row's element occupies: `.q({hi, lo})` is two rows, `hi` at 4..7 of `q` and `lo` at 0..3. Same encoding as every range: NULL + exact=1 the whole formal, NULL + exact=0 position unstatable (a width-changing conversion, an instance-array element), exact NULL where the row has no formal bit domain. A replication (`.q({2{r}})`) is one row **per copy**, each with its own window. |
-| | `map_exact` | `edge.map_exact` at the boundary: 1 when this row's outer bits map one-to-one onto its formal window, 0 when the tie is real but range-granular (an expression operand, a degraded window), NULL when there is no outer end to correspond with (constant, unconnected, external, interface). 0 is not doubt. |
-
-Both directions are indexed, because the two queries need opposite ones: a
-driver query walks inward from a net, a load query outward from a formal. This
-is the only table spanning two modules, and it is what lets a trace leave the
-module it started in — which matters more than it sounds: on real designs a
-large share of modules are pure structural wrappers with no procedural logic at
-all, and without port rows every path through a register leaves the graph.
-
-**`conn_kind` 3 is not a wire.** `.en(state == RUN)` samples `state`, but it
-does not alias it to `en`: treating the operand as a connection attributes
-every reader of `en` to `state`. The operands are still recorded — they are
-what the expression reads, selector indices included — flagged so a consumer
-can tell wire from computation.
-
-**`conn_kind` 5 has a NULL `outer` and is still a connection.** `.a(tb.glob)`
-attaches the port to a signal this module cannot name, so there is nothing to
-put in `outer`; what it is tied to is in `hier_ref` at the same `file`/`line`.
-The row is written anyway, because dropping it made a port tied to a
-testbench signal read exactly like a port nobody connected — the distinction
-`conn_kind` 2 exists to draw.
-
-**`conn_kind` 4 is the alias that makes `child.bus.*` resolvable.** For an
-interface binding, `port` is the child's interface port, `outer` the interface
-instance — or the parent's own interface port, passed through — in the parent's
-namespace, and `outer_type` the interface definition. The signals live in the
-interface instance; this row is how a reference on either side finds them.
-
-## Leaving the hierarchy
-
-| table | column | meaning |
-|---|---|---|
-| `hier_ref` | `module`, `path` | One reference that leaves the module, **as written and normalised**: `bus.vld` through an interface port, `tb.u_dut.state` as an XMR. Whitespace and comments are removed, so one reference interns as one name however it was spelled. Constant selects are resolved only where the reference is a chain of member accesses slang keeps as such; an XMR or an interface member is resolved to a *single* symbol, and there the text is kept verbatim — `arr[LO+1].vld` interns separately from `arr[1].vld`, and a genvar stays unresolved. Trailing selects are stripped to the root object, because that is what `path_lo`/`path_hi` are offsets into. A trailing select is *not* part of the path — the bits it selects are in `path_lo`/`path_hi`, as in `edge`. |
-| | `write` | 1 when the module writes the path, 0 when it reads it. An inout port connection tied to an external signal is recorded as the write. |
-| | `kind`, `construct` | The enclosing construct, in `edge`'s vocabulary — plus `kind='port'` with the direction in `construct` for a port connection tied to an external signal. |
-| | `file`, `line` | Where the reference is written. |
-| | `path_lo`/`path_hi`/`path_exact` | The bits the reference touches, as everywhere else. |
-| | `stmt` | Which statement produced the reference, as [an ordinal](#statement-identity). This is what pairs an outward *write* with the `stmt_read` rows that fed it; file and line cannot, because two outward writes on one line share them. |
-
-The target of such a reference cannot go into `edge` or `port` rows: those name
-signals in the module's own namespace, shared by every instance of it, and an
-absolute path would bake one instance's hierarchy into all of them. The
-as-written *text* has no such problem — every instance of the module carries
-the same spelling — so the text is what is stored. Resolving it against the
-hierarchy belongs to the consumer, who has the `instance` tree and the
-interface bindings (`port.conn_kind=4`) this table's rows resolve through.
-
-Two deliberate exclusions. A **bare name** that leaves the module — typically a
-package-level variable read by a called subroutine — is counted in the
-exporter's external-reference note but not stored: with no path in the text, it
-resolves against imports a reader cannot see, and a bare `mask` row would be
-noise pretending to be an answer (`pkg::mask`, written with its package, is
-stored). And a **downward reference that stays inside the module's subtree**
-(`u_child.sig`) was never external at all: it lands in ordinary `edge` and
-`assignment` rows as a dotted module-relative name.
-
-## Reads with no target
-
-| table | column | meaning |
-|---|---|---|
-| `stmt_read` | `module`, `name` | One signal read by a statement that writes nothing this module can name. |
-| | `kind`, `construct` | `kind` is `edge`'s vocabulary — there is no separate `assertion` kind, because slang wraps even a module-scope concurrent assertion in an implicit procedure. The reading statement's own word is the construct: an assertion's (`assert`, `assume`, `cover`, `restrict`, `expect`), a system task's name (`$display`, `$error`, …), `wait` for a wait condition, or `call` for a void call to a user subroutine that assigns nothing. |
-| | `file`, `line` | The statement's own location. |
-| | `src_lo`/`src_hi`/`src_exact` | Bits of the thing read, spelled as everywhere else. A **concurrent** assertion's operands are walked for value references rather than through path analysis, so their ranges come back NULL with `src_exact = 0`. An **immediate** assertion, a `wait` condition and a system task's arguments go through path analysis like any other read and carry real ranges. |
-| | `stmt` | The statement this read belongs to, as [an ordinal](#statement-identity). Join it against `hier_ref.stmt` to find the outward write this read actually fed, rather than every outward write on the line. |
-
-One rule decides what lands here: **a statement that reads and writes nothing
-this module can name**. Such a statement has nowhere else to go — `edge`
-requires a `dst`, and an `assign_operand` row hangs off an `assignment` that
-cannot exist without a module-relative target.
-
-- **An assertion** writes nothing at all. `assert (req !== 1'bx)` and
-  `assert property (@(posedge clk) req |-> ##1 ack)` read `req`, `ack` and
-  `clk`, and without this table those signals read as though no part of the
-  design looked at them.
-- **An assignment whose target lies outside the module** —
-  `assign bus.vld = |payload;` through an interface port. The write is in
-  `hier_ref`; this is the read side of the same statement, at the same
-  `file`/`line`. An operand that is *itself* outward goes to `hier_ref` too.
-- **A statement whose whole effect is to read**: a system task's arguments
-  (`$display("%0h", watched);`), a wait condition (`wait (done);`), a void call
-  to a subroutine that assigns nothing. A testbench that only ever prints a
-  signal was otherwise reporting it as one nothing had looked at.
-
-A call that *does* write is not here: its reads are already attributed through
-the edges pairing them with what the subroutine assigns, and recording them
-again would double-count. The same goes for a condition whose branch writes —
-`if (x) r <= 1;` makes `x` a control edge on `r`, which is the more informative
-row.
-
-**Answering "what reads this signal" means a union**: `edge.src`,
-`assign_operand.name`, `proc_event.signal`, `hier_ref` where `write = 0`, and
-`stmt_read.name`. Each records a different kind of read, and none subsumes
-another.
+NULL `resolved_*` is "not resolved here", never a fabricated object. Bare
+names that leave the instance (a package-level free variable used without
+its package) resolve against imports this table cannot see; they are
+counted, not stored.
 
 ## Bit ranges
 
-`src_lo`/`src_hi` and `dst_lo`/`dst_hi` — and the same pairs on
-`assign_operand`, `port.outer_*` and `hier_ref.path_*` — are **LSB-relative
-offsets into the flattened object**, not declared indices. `logic [15:8] off` has bit 15 at
-offset 7; `logic [0:7] up` has bit 0 at offset 7. A consumer mapping them onto
-declared indices mislabels every signal not declared `[N-1:0]`; the declared
-range is recoverable from `src_type`/`dst_type`.
+One encoding everywhere, unchanged since v7. A range is LSB-relative offsets
+into the flattened object, NOT declared indices: `logic [15:8] off` has bit
+15 at offset 7, `logic [0:7] up` has bit 0 at offset 7. A consumer that maps
+offsets straight onto declared indices mislabels every signal not declared
+`[N-1:0]`; the declared shape is recoverable from the type text.
 
-Read them together with `*_exact`:
+* NULL bits with `exact=1` — the whole object.
+* NULL bits with `exact=0` — somewhere inside it, unknown where.
+* present bits with `exact=1` — exactly those bits.
+* present bits with `exact=0` — an upper bound, not the bits actually
+  touched (a dynamic selector).
 
-| bits | exact | meaning |
-|---|---|---|
-| NULL | 1 | the whole object |
-| NULL | 0 | somewhere inside it, and we cannot say where (`q[i] <= d`) |
-| set | 1 | exactly those bits |
-| set | 0 | somewhere **within** those bits — a static outer select with a dynamic inner one (`mem2[1][i]`) narrows the range without pinning it |
+`mapping_exact` is never a restatement of the two sides' own `exact` flags:
+those describe each end's range, this describes the correspondence BETWEEN
+the ends. `q = a + b` knows both ranges exactly and still cannot say which
+bit of `a` reaches which bit of `q`, because a carry crosses them. 0 is not
+doubt — the dependency is real — it is range granularity. NULL is "no
+second end to correspond with" (a constant, an unconnected pin).
 
-Storing both NULL cases the same way made uncertainty read as fact.
+Columns describing an end that does not exist are NULL together: a tie-off
+never reads as "the whole of nothing, exactly".
 
-`*_exact` describes **one end's own range**. Whether the two ends correspond bit
-for bit is a separate question with a separate column — see
-[Bit correspondence](#bit-correspondence).
+## The stable query interface
 
-## Provenance
+Twelve views. Their existence, column sets and order, column semantics, NULL
+rules and row granularity are the contract; `verify-designdb.py` asserts all
+of it on every export. Ground rules:
 
-| table | meaning |
-|---|---|
-| `source_file` | Every file slang actually read, with its SHA-256 — including headers reached by `` `include ``, which are exactly the files that change without the filelist changing. `file.source_file` joins every interned as-written path to its hashed row, so checking freshness never means matching spellings. |
-| `meta` | Key/value. Every key below is written on every successful export — that set is part of the schema version, so a v5 database always has all of them. A reader that does not know the version should refuse the file rather than read it as though the layout had held. |
+* A FACT view's row is one base-table row — `v_tree_node`, `v_net`,
+  `v_terminal`, `v_terminal_map`, `v_net_connection`, `v_net_dependency`,
+  `v_statement`, `v_statement_target`, `v_statement_operand` — and
+  count(view) == count(base) is checked. Every internal join is against a
+  primary key; nothing fans out.
+* `v_driver` and `v_load` are COMPOSITE: UNION ALL branches discriminated
+  by `driver_kind`/`load_kind`, each branch's row count reconcilable by a
+  formula the verifier evaluates. The dependency, event, statement and
+  terminal branches reconcile against base tables; the two crossing
+  branches reconcile against `v_conn_arc`, which is the composition
+  itself — so a fault inside that composition would inflate both sides
+  equally and pass. That is the one seam these formulas do not check.
+* `v_conn_arc` exists in the file but is NOT contract: it is the scaffolding
+  the two composite views share, may change or vanish without a version
+  bump, and consumers must not query it.
+* Explicit column lists, never `SELECT *`; no transitive closure — a
+  fan-in cone is the consumer's recursive query, one step per row here.
 
-Every row of `meta` is written after the data and the indexes are complete, so
-a file carrying them is a file whose export ran to the end.
+**`v_database_info`** — the meta seal as one row, counts CAST to INTEGER:
+`schema_version, tool_version, slang_version, producer_revision, top,
+analysis_status, error_count, unresolved_count, empty_procedure_count,
+duplicate_path_count, config_digest`.
 
-| key | meaning |
-|---|---|
-| `schema_version` | This document's version. `9`. Stored as TEXT in `meta` like every value there; `v_database_info` CASTs it to INTEGER, so compare it as a number through the view. |
-| `tool` | Always `rtl-designdb`. |
-| `top` | The *elaborated* top(s), space-separated when the design has several — written whether or not `--top` was passed. Absent when nothing elaborated at all (a fatally errored compilation), which is the one case `analysis_status = hierarchy_only` already flags. |
-| `analysis_status` | `complete`, `partial`, or `hierarchy_only`. See below. |
-| `error_count` | Elaboration errors. There is deliberately no `warning_count`: a count whose contents the database cannot show describes the terminal log, not the database, and a number nobody can inspect is not information. The warnings themselves appear on the exporter's stderr, where the log lives. |
-| `unresolved_count` | Instantiations whose module slang could not resolve — black boxes. Recorded with a null `child.def_module` rather than dropped. |
-| `empty_procedure_count` | Procedures the analysis says drive something but from which nothing could be extracted, normally a statement slang marked bad. |
-| `duplicate_path_count` | Instances whose hierarchical path was already taken. Non-zero means a path lookup may be ambiguous. |
-| `tool_version` | The exporter's release version. |
-| `slang_version` | The slang tag it was built against. |
-| `producer_revision` | The commit it was built from (`git describe --always --dirty --tags`), or `unknown` outside a checkout. `tool_version` moves once a release; extraction semantics move more often, so this is what tells two exporters apart. |
-| `config_digest` | SHA-256 over the generation conditions: input files, include directories, defines, single/multi-unit, elaborated tops, default timescale, tool and slang version — each tagged and length-prefixed, so `+incdir+a +define+b` and `+incdir+a+b` do not collide. Equal digests mean two databases were produced under the same conditions; it is not a build command you can replay. |
+**`v_tree_node`** — one row per node: `node_id, parent_node_id, node_name,
+node_kind, ordinal, instance_id, parent_instance_id, module_id, module_name,
+parameter_signature, definition_name, file_path, source_path, source_line,
+source_column`. NULL by kind: `generate` has no subtype columns; `primitive`
+has `instance_id` NULL, `parent_instance_id` its owning instance and
+`definition_name` the gate/UDP name; `unresolved` has `module_id` NULL and
+`definition_name` the unresolvable spelling; the root and generate levels
+have no location.
 
-**`analysis_status` agrees with the counts.** `complete` requires
-`error_count`, `empty_procedure_count` and `duplicate_path_count` all zero;
-`partial` requires at least one of them non-zero. `hierarchy_only` means the
-compilation was fatally errored or nothing was analysed — the dataflow tables
-are empty because none could be read, which a consumer must not report as "this
-design has no drivers". `unresolved_count` constrains nothing: a design that
-instantiates a vendor macro it has no source for is as complete as its sources
-allow.
+**`v_net`** — one row per net: `net_id, instance_id, module_id, module_name,
+parameter_signature, scope_node_id, net_name, declaration_kind, data_type,
+width, is_implicit, file_path, source_path, source_line, source_column`.
+No direction column — direction belongs to terminals, and a net's port-ness
+is one `v_terminal_map` join away.
+
+**`v_terminal`** — one row per terminal: `terminal_id, instance_id,
+module_id, module_name, terminal_name, terminal_kind, direction, data_type,
+width, ordinal, is_const, modport, file_path, source_path, source_line,
+source_column`.
+
+**`v_terminal_map`** — one row per inside segment: `terminal_id,
+terminal_instance_id, terminal_name, mapping_ordinal, internal_net_id,
+internal_net_name, terminal_lo, terminal_hi, terminal_exact, net_lo, net_hi,
+net_exact, mapping_exact`.
+
+**`v_net_connection`** — one row per outside segment: `connection_id,
+net_id, net_instance_id, net_name, terminal_id, terminal_instance_id,
+terminal_name, direction, connection_kind, ordinal, net_lo, net_hi,
+net_exact, terminal_lo, terminal_hi, terminal_exact, mapping_exact,
+interface_instance_id, hier_ref_id, file_path, source_path, source_line,
+source_column`. Deliberately NOT composed with `term_map` — this view is
+the fact, `v_driver`/`v_load` are the composition.
+
+**`v_net_dependency`** — one row per dependency: `dependency_id,
+source_net_id, source_instance_id, source_name, source_lo, source_hi,
+source_exact, target_net_id, target_instance_id, target_name, target_lo,
+target_hi, target_exact, statement_id, assign_operand_id, assign_target_id,
+expression_reference_id, primitive_id, source_hier_ref_id,
+target_hier_ref_id, dependency_kind, mapping_exact, file_path, source_path,
+source_line, source_column`. Location is the statement's, or the
+primitive's for a primitive arc. A row whose `source_instance_id` and
+`target_instance_id` differ crossed by name; the `*_hier_ref_id` column on
+that end names the reference it went through. Not deduplicated.
+
+**`v_driver`** — every direct driving arc of `signal_net`, one row each:
+`signal_net_id, signal_instance_id, signal_name, signal_lo, signal_hi,
+signal_exact, driver_net_id, driver_instance_id, driver_name, driver_lo,
+driver_hi, driver_exact, driver_kind, dependency_id, connection_id,
+statement_id, primitive_id, terminal_id, mapping_exact, file_path,
+source_path, source_line, source_column`. `driver_kind`:
+
+* `data | control | primitive | procedure` — a `net_dep` row, kind carried
+  through.
+* `connection` — the crossing: for an input/inout/ref terminal the
+  parent-side net drives the child's internal net; for output/inout/ref the
+  internal net drives the parent's. `inout` and `ref` arc both ways, one
+  row each. An external tie (`.p(u.g[7:4])`) whose reference resolved
+  crosses the same way, its far net as the outer end; one that did not
+  resolve contributes no arc. The two windows are
+  intersected on the terminal; a side's range is narrowed through the
+  overlap when every link of its chain is exact, and degraded to `exact=0`
+  otherwise. Interface bindings do not arc.
+* `connection_expression` — the actual is an expression; each net it reads
+  drives the internal net at range granularity.
+* `constant` — a tie-off or constant right-hand side: `driver_net_id` NULL
+  and every driver column NULL with it. The statement or connection is
+  still named — that is what a driver query reports.
+* `system_task` — a system task wrote the argument. `driver_net_id` is
+  NULL, as for a constant, because the source is a file or a plusarg
+  rather than a net; `statement_id` names the call. Kept apart from
+  `constant` so "is this tied off?" and "is this loaded at startup?" are
+  different answers.
+* `terminal` — the design boundary. A root instance's input/inout/ref
+  terminal drives the net it stands for: `driver_net_id` is NULL (the
+  world outside the export is the driver) and `terminal_id` names the pin.
+  Without it, a top-level input's net reported no driver at all, and a
+  consumer could not tell "nothing drives this" from "this is where the
+  design ends" — two answers that mean opposite things.
+
+An unconnected terminal contributes no row.
+
+**`v_load`** — every recorded read of `signal_net`, one row each:
+`signal_net_id, signal_instance_id, signal_name, signal_lo, signal_hi,
+signal_exact, load_net_id, load_instance_id, load_name, load_lo, load_hi,
+load_exact, load_kind, dependency_id, connection_id, statement_id,
+procedure_id, terminal_id, mapping_exact, file_path, source_path,
+source_line, source_column`. `load_kind`: `dataflow` (a dependency reads
+it), `connection` (the crossing reads it; `load_net` is the far side),
+`sensitivity`, `wait`, `statement` (an assertion, a `$display`, a read
+whose statement has no local target — including the *condition* gating
+such a statement, which no dependency can carry), `terminal` (a root output/inout/ref
+terminal reads the net it stands for — the boundary counterpart of
+v_driver's `terminal`). The last four have `load_*` NULL: a real reader
+with no nameable target. One read, one row: a reference already carried
+into `dataflow` by a dependency is not repeated as `statement`. The netlist
+analogy decides membership: a clock net's loads include the flop clock
+pins, so sensitivity is a load.
+
+**`v_statement`** — one row per statement: `statement_id, instance_id,
+module_id, module_name, scope_node_id, procedure_id, ordinal, sequence,
+statement_kind, construct, assignment_kind, delay, dropped_operand_count,
+file_path, source_path, source_line, source_column`.
+
+**`v_statement_target` / `v_statement_operand`** — one row per reference:
+`target_id/operand_id, statement_id, ordinal, net_id, net_name, *_lo, *_hi,
+*_exact`.
+
+`file_path` is the spelling as written in the filelist; `source_path` the
+absolute path it resolved to. They answer different questions and neither
+substitutes for the other.
 
 ## Naming rules
 
-So a column name can be guessed rather than looked up:
+* Tables are `singular_snake_case`. `_id` appears exactly where a column
+  holds another table's primary key, and nowhere else.
+* A bit range is prefixed with the end it describes (`source_lo`,
+  `term_exact`); a single-range table spells its own bare (`lo`/`hi`/
+  `is_exact`).
+* Kinds, directions and roles are their words. The words are a wire format:
+  they come from this schema, not from slang's enum printer, so a slang
+  upgrade cannot change the vocabulary underneath a consumer.
+* `ordinal` is position in a declaration or extraction list; `sequence` is
+  execution order inside a procedure. Neither is an identity.
+* Every id is issued by the exporter in one pass; 0 is never an id. The
+  REFERENCES clauses are enforced by the verifier's `foreign_key_check`,
+  not per-insert.
 
-- A bit range is prefixed with the column it describes: `src_lo` beside `src`,
-  `dst_lo` beside `dst`, and `assign_operand` uses `src_*` for the same idea so
-  one spelling covers "bits of the thing read" everywhere.
-- A foreign key is named for the table it points at; a text name ends in
-  `_name`. `child.def_module` is a module id, `child.def_name` is the text.
-- No column takes a table's name.
+## Provenance
+
+`source_file` holds every file slang actually read, absolute path and
+SHA-256, so a consumer can tell the database and the RTL diverged instead of
+answering from stale data. `file` holds the spellings rows carry — as
+written in the filelist — joined to their source_file. `meta` is the seal;
+its required keys are the `v_database_info` columns plus `tool`.
+`analysis_status` is `complete | partial | hierarchy_only` and must agree
+with the counts beside it. `unresolved_count` counts unresolved
+instantiation *sites* (one per written instantiation, however many
+occurrences stamp out); the per-occurrence picture is
+`tree_node.node_kind='unresolved'`. `config_digest` fingerprints the inputs;
+two exports with one digest saw the same filelist, defines and flags.
 
 ## What is deliberately not here
 
-The database records what the source says. It does not record conclusions drawn
-from it, and several fields were written, measured, and then removed for
-claiming more than transcription can support.
+Unchanged from v9, and still deliberate:
 
-**No clock domains, and no CDC.** Without constraints, structural analysis can
-establish "these two registers are clocked by different nets" and nothing more.
-That is a candidate list, not a finding: a divide-by-2 off the same source
-counts as a different net and is not a crossing, and no amount of netlist
-walking can tell you otherwise. Deciding which net is a clock, whether two are
-related, and whether a crossing is real needs an SDC this tool does not read.
-
-**No `clocked` flag on a signal.** It was computed once per procedure and
-stamped onto every target in it, which runs "this procedure is edge-triggered"
-(a fact) into "this target is held by a flop" (not the same thing) — a
-block-local temporary written with `=` inside an `always_ff` got it too. Whether
-a procedure has an edge is in `proc_event`, attributed to the procedure, where
-it belongs.
-
-**No single "the clock" per procedure.** An event list has no order:
-`@(posedge clk or negedge rst_n)` and `@(negedge rst_n or posedge clk)` are the
-same block written two ways and both are ordinary. Recording the first would
-have recorded how the author arranged the list, and would have named the reset
-in half of all async-reset flops. `proc_event` holds all of them.
-
-**No branch conditions on assignments.** An earlier version stored the
-`if`/`case` chain reaching each assignment, so a consumer could evaluate it
-against a waveform and name the assignment in effect at a given time. It worked
-and it was still wrong to ship: evaluating the conditions means evaluating
-SystemVerilog expressions, which a waveform tool cannot do; the sampling instant
-is an edge of a clock this schema deliberately does not identify; guard operands
-are frequently absent from a dump; X during reset makes a chain neither true nor
-false; and for blocking assignments the question has no single answer because
-all of them ran. The statements and their line numbers are here. The reasoning
-belongs to the reader.
-
-**No source text.** `file:line` is enough to find a statement, and a reader who
-wants the line can open the file. Storing it would duplicate something that can
-go stale against a digest that can only say *that* it changed.
+* No clock domains, no `clocked` flag, no election of "the" clock. That
+  needs constraints this tool does not read; a consumer that knows gets
+  both events of `@(posedge clk or negedge rst_n)` and can say.
+* No branch-condition truth tables on statements. Which assignment "was in
+  effect" is not evaluable from a waveform by SQL, and encoding the
+  judgement as data would produce confident wrong answers. The conditions
+  ARE recorded — as `control` dependencies with their expression
+  references — the reasoning belongs to the reader.
+* No source text. The file, line and column are here; the text is in the
+  file.
+* No expression trees, no temporaries. `assign y = (a & b) | c` is three
+  operands, three dependencies onto `y`, `mapping_exact=0`, and no
+  fabricated `tmp` net. A consumer that needs the expression's shape reads
+  the source at the location the row names.
+* A system task that writes an argument — `$readmemh` into a memory,
+  `$sscanf` or `$value$plusargs` into a variable, `$cast` into its
+  destination — records a target and a source-less dependency, surfacing
+  in `v_driver` as `system_task`. The signal is genuinely driven; the
+  source is a file or a plusarg, which is outside anything this schema
+  names. It is not a `constant`, and the kinds are separate so a consumer
+  cannot mistake one for the other.
+* `force` records as a blocking assignment; `release` leaves no row.
+* Variable initialisers (`logic [7:0] c = 0`) are not drivers; net
+  initialisers (`wire w = a & b`) are, because the LRM says so.
 
 ## Known limits
 
-- SystemVerilog only: the front end is slang. VHDL, and mixed-language designs'
-  VHDL halves, are out of scope.
-- **A black box's boundary is unrecorded, not just its inside.** An unresolved
-  instantiation gets its `child` and `instance` rows and its
-  `meta.unresolved_count` — but the connections written on it (`ghost u(.a(x))`)
-  produce no `port`, `hier_ref` or `stmt_read` rows, so `x`'s tie to the box is
-  invisible and `x` can read as unloaded. Recording those bindings would need an
-  unknown-direction story and is a future version's work; until then, a signal's
-  loads are complete only up to the black boxes the design instantiates.
-- No table promises row order. `instance` parents happen to precede children in
-  id order today; treat that as coincidence, not contract.
-- `module.params` is opaque identity text: compare it for equality, never parse
-  it. `''` means "no parameters".
-- Two affinity homonyms to keep straight: `module.name` is raw TEXT while every
-  other `name` column is a name-table id, and `hier_ref.path` is a name-table id
-  while `file.path`/`source_file.path` are raw TEXT.
-- In `v_dependency`, the `source_*` prefix covers two things: `source_name`/
-  `source_lo`/`source_hi`/`source_exact`/`source_type` describe the *source end*
-  of the dependency, while `source_path`/`source_line` describe the *statement's
-  location*. `v_driver`/`v_load` avoid the collision by renaming the ends.
-- `force` is recorded as an ordinary blocking assignment in its enclosing
-  construct; `release` leaves no row. The force's overriding semantics are not
-  modelled — a consumer replaying drive order sees it as one more write.
-- A statement whose target lives outside the module (`assign bus.vld = x;`)
-  has no `assignment` row, since that row cannot exist without a
-  module-relative target. The write is in `hier_ref`, an outward operand joins
-  it there, and an operand inside the module is in
-  [`stmt_read`](#reads-with-no-target). The three carry a shared
-  [`stmt`](#statement-identity) ordinal, so they can be reassembled into the one
-  statement they came from; what is still missing is the statement's `proc`,
-  `seq` and `blocking`, which only `assignment` records and which such a
-  statement therefore has nowhere to put.
-- A port that stands for a *concatenation* of internal signals
-  (`module m(.ext_pair({hi, lo}))`) records the binding, but `hi` and `lo`
-  keep a NULL `symbol.direction`: slang offers the concatenation through
-  neither the scope's members nor the body's port list, so there is nothing to
-  attribute the direction from.
-- A variable initialiser (`logic [7:0] c = 0`) is not a driver and has no row.
-  It writes once at time zero; treating it as a continuous assignment would
-  put one on every register that declares a reset value.
-- A reference assembled through a macro (`` `DEFINED_XMR ``, or ``tb.`SIG``)
-  is counted in the external-reference note but has no `hier_ref` row: its
-  text spans two buffers and cannot be recovered as one span, and the
-  elaborated symbol's own path names one instance's hierarchy — which is the
-  one thing a row shared by every instance must not carry.
-- A reference that slang resolves to a single hierarchical symbol keeps its
-  spelling verbatim, so a genvar inside one (`b[g].sig` in a generate loop)
-  stays unresolved. Each elaborated reference is its own row and its own
-  count — the loop above yields four — but the four share a spelling and only
-  `file`/`line` and their order distinguish them.
-- Function and task locals appear as edge and assignment endpoints but have no
-  `symbol` row — they are not declared in the module.
-- `assign_operand` is not deduplicated: an expression reading one signal twice
-  yields two rows, which is what the source says.
-- A statement slang marks bad is skipped, and a bad child takes its enclosing
-  block with it, so a malformed procedure can leave the export silently. Only
-  invalid RTL reaches that state, and the diagnostic count is reported —
-  warnings included, since the diagnostic responsible can be one.
-- Elaboration cost is slang's: memory scales with the number of elaborated
-  instances, so a very large flat design wants `--top` on a subtree.
+* Upward hierarchical references (`$root.`-relative climbs from a shared
+  body) keep `resolved_*` NULL — the one analysed body speaks for
+  occurrences whose surroundings may differ. The path text is still there.
+* Interface-array element bindings (`.b(arr[k])`) have no per-occurrence
+  instance id; `interface_instance_id` stays NULL and the member references
+  through them stay text-only.
+* A non-ANSI concatenation formal (`.p({hi, lo})`) is exported as one
+  terminal with its two inside segments, but no lint fixture covers it:
+  Verilator rejects the construct, so it is verified by hand.
+* Task and function bodies have no `procedure` rows; their statements
+  belong to the procedure that reached them, and a subroutine no procedure
+  walks contributes nothing. A body called from N sites is N sets of rows,
+  bounded by a per-module expansion budget — a pathological call DAG that
+  exceeds it reports the skipped sites rather than exhausting memory, and
+  `meta` says the export is `partial`.
+* A subroutine's formals are one net per subroutine, not one per call site.
+  Each call's gating and delay are its own, but the formal is shared, so
+  the transitive cone through a task called twice admits combinations no
+  single call makes (`g1` with the second call's argument). Per-call-site
+  formals would fix it and are not in v10.
+* A resolved external tie crosses at range granularity: `net_conn` does
+  not record a `mapping_exact` for it, so the arc reports 0 even where
+  both windows are exact. Recording it would let those ties be traced bit
+  by bit; it is not in v10.
+* A function call contributes both a summary arc (each argument to the
+  call's target) and the detail arcs through its formals, so a fan-out
+  count over both double-counts that read. The detail path also stops at
+  the function's return net, which has no arc onward to the target.
+* A macro-assembled reference spans two buffers and cannot be recovered as
+  one span; it is counted (`meta` external tally), not stored.
+* Statements slang marks bad take their enclosing block out of the walk;
+  `empty_procedure_count` says how often, and the diagnostics say why.
 
-## Why in-module replication is not folded
+## Reading it honestly
 
-Folding is across instances. A generate loop or an instance array *inside* a
-module is elaborated first, so its rows are per iteration — and that is a
-deliberate stop, not an unfinished one.
-
-Measured before deciding. On two real cores the question does not arise:
-picorv32 has no replication-derived rows at all among 4,455 edges, tinyriscv
-has 2 of 912 symbols and none of its 4,869 edges. On a synthetic bank of N
-lanes, rows grow linearly at about **83 bytes each** — a 1,024-lane module,
-far past anything ordinary, costs ~1 MB and exports in 0.03 s.
-
-The reason not to fold is not the size, though. It is what the iterations
-contain. Take the two statements in that loop:
-
-| statement | rows at N=64 | distinct contents |
-|---|---:|---:|
-| `assign par[i] = ^din[i*W +: W];` | 64 | **64** |
-| `always_ff @(posedge clk) tick <= clk;` | 64 | 1 |
-
-Only the second folds. The first differs in exactly the columns that make it
-useful — `dst_lo`/`dst_hi` walk 0,1,2… and `src_lo`/`src_hi` walk 0-7, 8-15,
-16-23 — because indexing by the iteration is what a generate loop is *for*. A
-loop body that ignores its genvar is the rare case.
-
-To fold the first, the row would have to store a stride and a base rather than
-a range, and the consumer would have to evaluate index arithmetic to recover
-the bits. That is the same trade this schema refuses for branch conditions:
-storing something a reader must compute against, in place of the fact itself.
-The bits are the answer, and one row per iteration is what states them.
+The database is a build artifact: rebuilt from source, sealed by digest,
+version-gated. Read `v_database_info` first; refuse a version you do not
+know. Treat `exact=0` ranges as upper bounds, `mapping_exact=0` as "follow
+at range granularity", NULL resolved columns as "resolve it yourself or do
+not" — every one of those is the exporter telling the truth about what it
+could not narrow, and the verifier exists to keep it that way.

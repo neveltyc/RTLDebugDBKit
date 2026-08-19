@@ -17,14 +17,14 @@ build/rtl-designdb -f rtl.f --top my_core -o design.db
 ```
 
 ```
-design.db: 34 modules, 49 instances, 912 symbols, 4839 edges, 1458 assignments, 44 children, 478 ports
+design.db: 26 modules, 43 instances, 870 nets, 487 terminals, 470 connections, 1543 statements, 5355 dependencies
 ```
 
 Try it against the RTL in this repo:
 
 ```sh
 build/rtl-designdb examples/basic/top.sv --top top -o design.db
-sqlite3 design.db "SELECT n.text, e.construct FROM edge e JOIN name n ON n.id = e.dst"
+sqlite3 design.db "SELECT signal_name, driver_name, driver_kind FROM v_driver"
 ```
 
 ## Input
@@ -53,40 +53,42 @@ can read it.
 
 | Group | Tables |
 |---|---|
-| Hierarchy | `module` (a definition plus the parameter values it elaborated with), `instance` (the tree), `child` (what a module instantiates) |
-| Declarations | `symbol` — every declaration with kind, type, width, direction, and `file:line:col` |
-| Dataflow | `edge` (what drives what, gates and UDPs included, with bit ranges), `assignment` + `assign_operand` (per statement), `proc_event` (sensitivity and waits) |
-| Boundaries | `port` — port connections with their bit ranges, interface bindings included; `hier_ref` — references that leave the module (XMRs, interface members), as written |
+| Hierarchy | `module` (the source definition), `tree_node` (the elaborated tree, one id space), `inst` (each module instance occurrence, with its parameter signature), `primitive` (gates, switches, UDPs) |
+| Objects | `net` (every connectable object of every instance, implicit nets flagged), `term` + `term_map` (each instance's terminals and what they stand for inside) |
+| Dataflow | `net_dep` — net-to-net dependencies, one row per statement occurrence, each naming the operand, target, condition, call or primitive it came from; `procedure`, `stmt`, `assign_target`, `assign_operand`, `expr_ref`, `proc_event` — the statement layer those rows point into |
+| Boundaries | `net_conn` — what the parent wired to each terminal, segment by segment with bit windows; `hier_ref` — references that leave an instance, as written *and* resolved to the target instance and net where slang could |
 | Provenance | `source_file` (every file slang read, with its SHA-256), `meta` (schema version, tool, top) |
 
-The model is **folded**: rows hang off a *module*, not an instance, so thirty-two
-copies of one core share one set of edges and `instance` is the only table that
-grows with the design.
+The model is **instance-level**: rows hang off the elaborated occurrence, so
+"who drives bit 3 of *this* instance's `q`" is one indexed lookup and a fan-in
+cone is a recursive query — the folded model this replaced could answer
+neither without application-side path algebra. Thirty-two copies of one core
+are thirty-two row sets, stamped from one analysis; the measured cost on a
+real SoC is about 2× the folded file size.
 
 **[doc/designdb-schema.md](doc/designdb-schema.md) is the field reference** —
 every table and column, the bit-range encoding, the naming rules, what the
 schema deliberately does not record, and the known limits. Consumers start at
-its **stable query interface**: nine views (`v_tree_node`, `v_driver`,
-`v_load`, `v_statement`, …) that resolve the intern tables, so ordinary
-queries never join `name`/`type`/`file` by hand.
+its **stable query interface**: twelve views (`v_tree_node`, `v_net`,
+`v_driver`, `v_load`, `v_statement`, …) whose columns, NULL rules and row
+granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs:
+Release build, macOS arm64, against public designs, schema v10:
 
-| design | modules | instances | symbols | edges | ports | time | database |
+| design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 269 | 4,455 | 0 | 0.02 s | 0.56 MB |
-| tinyriscv | 34 | 49 | 912 | 4,869 | 478 | 0.02 s | 0.73 MB |
-| Ibex (`ibex_core`) † | 25 | 32 | 1,703 | 5,723 | 652 | 0.04 s | 0.99 MB |
-| VeeRwolf (`veerwolf_core`) † | 220 | 3,950 | 10,342 | 24,589 | 15,780 | 0.19 s | 5.35 MB |
+| picorv32 | 1 | 1 | 225 | 746 | 4,888 | 0.03 s | 1.23 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.04 s | 1.54 MB |
+| VeeRwolf (`veerwolf_core`) | 86 | 1,920 | 17,808 | 11,088 | 36,621 | 0.35 s | 11.9 MB |
 
-† measured on schema v1 and not re-run since. Expect more edges under v3 on
-the same source: a self-feedback assignment (`cnt <= cnt + 1`) contributes a
-row, gate, switch and UDP instances contribute one per (input, output) pairing,
-a net declared with an initialiser (`wire w = a & b`) gets the driver it never
-had, and a call binds its actuals to the formals. The other columns are
-unaffected.
+The instance-level expansion is the column to watch: VeeRwolf's 1,920
+occurrences stamp out from 164 parameterised bodies (10× replication), and
+the database lands at roughly **2× the folded v9 file** rather than 10× —
+type text stays interned, and the biggest tables scale with statements, not
+with statements times fan-out. `scripts/export-real-designs.sh` reproduces
+this table against a local checkout of the designs.
 
 Elaboration cost is slang's: memory scales with the number of elaborated
 instances, so a very large flat design wants `--top` on a subtree.
@@ -130,11 +132,16 @@ CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
 src/                    main.cpp (CLI + filelist parsing), Extractor, DesignDb
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
-examples/constructs/    self-feedback, primitives, waits, XMRs, interfaces,
-                        assertions -- exported and asserted by CI
+examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
+                        cross-instance references, per-call-site tasks,
+                        level-sensitive events, interfaces, assertions,
+                        generate arrays, non-ANSI ports, a deliberate black
+                        box -- exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
                         designdb-coverage.py (what an export had to approximate),
+                        export-real-designs.sh (the measurements table, from a
+                        local checkout of the public designs),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 

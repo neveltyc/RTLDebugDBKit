@@ -29,6 +29,25 @@ module decode(input logic [3:0] idx, output logic [15:0] onehot);
     assign onehot = 16'b1 << idx;
 endmodule
 
+// v10 facts: a delay is a statement's normalised text, never a number this
+// tool pretends to evaluate; an undeclared name on a continuous assign's
+// left is a real net row with is_implicit set; and one source reaching one
+// target from two statements stays two dependencies -- the occurrence
+// granularity the old deduplicated edge model erased.
+module timing_pair(input logic a, input logic b, output logic r2);
+    assign #3 dly_w = a;                    // implicit net, delayed assign
+    logic q1;
+    always @(a or b) begin
+        q1 = #2 a & b;                      // intra-assignment delay
+        r2 = a;
+        if (b)
+            r2 = a;                         // same pair, second statement
+    end
+    wire dly_r = dly_w | q1;
+    logic unused_ok;
+    always_comb unused_ok = dly_r;
+endmodule
+
 // A net declared with an initialiser is a continuous assignment by the LRM,
 // but slang models it as a net carrying an expression rather than as an
 // `assign`, so it reached no procedure and `w`/`s` had no driver at all.
@@ -239,6 +258,9 @@ module constructs;
     logic [2:0] ev_clks = 3'b000;
     logic ev_q;
     evkinds u_ev(.clks(ev_clks), .d(done), .q(ev_q));
+
+    logic tp_r2;
+    timing_pair u_tp(.a(cnt_o[0]), .b(cnt_o[1]), .r2(tp_r2));
 
 `include "seq.svh"
 

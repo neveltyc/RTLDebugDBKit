@@ -108,214 +108,270 @@ namespace designdb {
 /// netlist database are loads of the clock net, and so are ours), and the
 /// statement layer gained v_statement and v_statement_operand, the half of
 /// the edge/assignment dual projection that had no interface.
-inline constexpr int SchemaVersion = 9;
-
-/// One intra-module dataflow edge, in the module's own namespace.
 ///
-/// Paths are relative to the module body, not to any instance: that is what
-/// makes the row shared by every instance of the module. A reader stamps an
-/// instance path in front of it.
-struct EdgeRow {
-    std::string src;
-    std::string dst;
-    std::string srcType;
-    std::string dstType;
-    // continuous_assign | procedural | primitive | procedure
-    std::string kind;
-    std::string construct;    // always_ff / assign / gate:and / udp:foo / ...
-    std::string file;
-    uint32_t line = 0;
-    // Bit ranges, absent for a whole-signal edge. LSB-relative offsets into
-    // the flattened object, not declared indices -- see the schema comment.
-    std::optional<std::pair<uint64_t, uint64_t>> srcBits;
-    std::optional<std::pair<uint64_t, uint64_t>> dstBits;
-    // False when a dynamic selector meant the range could not be narrowed, so
-    // it is an upper bound rather than the bits actually touched.
-    bool srcExact = true;
-    bool dstExact = true;
-    // The operand reached the target through a condition, not the RHS.
-    bool control = false;
-    /// The source's bits map one-to-one onto the target's, so a bit-level trace
-    /// can follow this edge bit by bit. False when the source only influences the
-    /// target's range as a whole -- `a + b` carries across bits, a call is
-    /// opaque. Distinct from srcExact/dstExact, which each describe one end's own
-    /// range and say nothing about the correspondence between the ends.
-    bool mapExact = false;
-};
-
-/// One assignment: a statement that writes a target.
+/// v10 unfolds the model. Rows hang off the elaborated instance occurrence,
+/// not the module variant: `tree_node`/`inst`/`primitive` subtype the
+/// hierarchy under one id space, `net`/`term`/`term_map`/`net_conn` replace
+/// `symbol`/`port` with the boundary's two sides in two relations,
+/// `procedure`/`stmt`/`assign_target`/`assign_operand`/`expr_ref` replace
+/// `assignment`/`assign_operand`/`stmt_read` with real statement objects, and
+/// `net_dep` replaces `edge` -- per statement occurrence, no cross-statement
+/// dedup, every dependency naming the operand, target, expression reference,
+/// primitive or call it came from. `module` returns to being the source
+/// definition; the parameter values a body elaborated with live on each
+/// `inst.parameter_signature`. The `name` intern table is gone (names are
+/// TEXT on their object rows; only `data_type` still interns), the 0-5 and
+/// 0-3 integer codes are gone (kinds and directions are their words), and
+/// every relation is by object id, never by (module, name) string pairing.
+/// Nine views become twelve; v_driver/v_load now compose the hierarchy
+/// crossing (net_conn against term_map) that v9 left to the consumer.
 ///
-/// `edge` flattens a procedure; this keeps its statements apart, so a target
-/// assigned in four places reads as four statements rather than one merged set
-/// of sources.
-struct AssignRow {
-    std::string dst;
-    std::optional<std::pair<uint64_t, uint64_t>> dstBits;
-    // continuous_assign | procedural. Never `primitive`: a gate is not a
-    // statement, so it yields edges and no assignment row.
-    std::string kind;
-    std::string construct;    // assign | always_ff | ...
-    std::string file;
-    uint32_t line = 0;
-    int64_t proc = 0;         // which procedure; negative = none, stored NULL
-    int64_t seq = 0;          // order within that procedure
-    int blocking = -1;        // 1 for `=`, 0 for `<=`, -1 for a continuous assign
-    bool dstExact = true;
-    /// Operands not recorded: compile-time constants, and references to symbols
-    /// outside this module. Without it a row with one operand cannot be told
-    /// apart from a row with one operand and three that were filtered.
-    int64_t dropped = 0;   // operands not recorded
-    /// Which statement in the module this came from; 0 for none, stored NULL.
-    /// Shared with the `hier_ref` and `stmt_read` rows of the same statement.
-    int64_t stmt = 0;
-};
+/// A v9 database cannot be upgraded in place: the fold shared one row set
+/// across occurrences and the edge dedup erased statement provenance, so the
+/// per-occurrence identity v10 stores was never in the file. v10 databases
+/// are produced only by re-exporting the RTL.
+inline constexpr int SchemaVersion = 10;
 
-/// One operand of an assignment.
-struct OperandRow {
+/// Every id in these rows is assigned by the extractor, never by SQLite.
+/// The stamping pass computes cross-references between tables before any row
+/// is written -- a `net_dep` row needs its operand's id, which needs its
+/// statement's id -- so the ids must exist ahead of the inserts, and one
+/// counter per table in one process is cheaper and more legible than reading
+/// last_insert_rowid back per row. 0 in an id field spells "none" and is
+/// stored as NULL; real ids start at 1.
+///
+/// Ranges use one encoding everywhere, unchanged from v7: a range is
+/// LSB-relative offsets into the flattened object (not declared indices), an
+/// absent range with exact=true is the whole object, an absent range with
+/// exact=false is "somewhere inside it, unknown where", and a present range
+/// with exact=false is an upper bound rather than the bits actually touched.
+
+/// One source definition: module, interface, program or checker.
+struct ModuleRow {
+    int64_t id = 0;
     std::string name;
+    std::string definitionKind;   // module | interface | program | checker
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One node of the elaborated hierarchy tree.
+struct TreeNodeRow {
+    int64_t id = 0;
+    int64_t parentNodeId = 0;     // 0 = root (stored NULL)
+    std::string name;             // one path segment, never more
+    std::string nodeKind;         // root | instance | generate | primitive | unresolved
+    int64_t ordinal = 0;          // order among siblings
+};
+
+/// One module instance occurrence. `id` is the same value as its tree_node id.
+struct InstRow {
+    int64_t id = 0;
+    int64_t moduleId = 0;         // 0 when the definition did not resolve
+    int64_t parentInstId = 0;     // nearest enclosing module instance; 0 for the root
+    std::string parameterSignature;
+    std::string unresolvedDefinition;  // the name as written, when moduleId is 0
+    int64_t fileId = 0;           // the instantiation site; 0 for the root
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One gate, switch or UDP instance. `id` is the same value as its tree_node id.
+struct PrimitiveRow {
+    int64_t id = 0;
+    int64_t instId = 0;           // the module instance whose body wrote it
+    std::string primitiveKind;    // gate | switch | udp
+    std::string definitionName;   // and | bufif1 | the UDP's name
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One connectable object inside an instance: a net or a variable, subroutine
+/// formals and locals included (they are dependency endpoints, so they must be
+/// rows -- a name with no row cannot be referenced by id).
+struct NetRow {
+    int64_t id = 0;
+    int64_t instId = 0;
+    int64_t scopeNodeId = 0;      // the instance or generate node declaring it
+    std::string name;             // scope-relative dotted path (`g[0].sig`, `bump.v`)
+    std::string declarationKind;  // wire | tri | ... | variable
+    int64_t dataTypeId = 0;
+    int64_t width = -1;           // flattened bits; -1 = not integral, stored NULL
+    bool isImplicit = false;
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One terminal of an instance: a port on its boundary. The root instance's
+/// terminals are the top-level ports; a child's are its pins.
+struct TermRow {
+    int64_t id = 0;
+    int64_t instId = 0;
+    std::string name;
+    std::string terminalKind;     // signal | interface
+    std::string direction;        // input | output | inout | ref; "" = none (interface,
+                                  // or an unresolved instance), stored NULL
+    int64_t dataTypeId = 0;
+    int64_t width = -1;           // -1 = NULL
+    int64_t ordinal = 0;          // position in the port list
+    int isConst = -1;             // const ref; -1 = does not apply, stored NULL
+    std::string modport;          // "" = NULL
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One segment of a terminal's mapping onto nets inside its own instance.
+struct TermMapRow {
+    int64_t termId = 0;
+    int64_t ordinal = 0;
+    int64_t netId = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> termBits;
+    bool termExact = true;
+    std::optional<std::pair<uint64_t, uint64_t>> netBits;
+    bool netExact = true;
+    bool mappingExact = false;
+};
+
+/// One segment of a terminal's outside connection, written in the parent.
+struct NetConnRow {
+    int64_t id = 0;
+    int64_t netId = 0;            // parent-side net; 0 when the kind has none
+    int64_t termId = 0;
+    int64_t ordinal = 0;
+    std::string connectionKind;   // signal | constant | unconnected |
+                                  // expression_operand | interface | external_reference
+    std::optional<std::pair<uint64_t, uint64_t>> netBits;
+    int netExact = -1;            // -1 = no net end at all, stored NULL
+    std::optional<std::pair<uint64_t, uint64_t>> termBits;
+    int termExact = -1;           // -1 = no formal bit domain, stored NULL
+    int mappingExact = -1;        // -1 = nothing to correspond, stored NULL
+    int64_t interfaceInstId = 0;  // the bound interface instance, kind=interface
+    int64_t hierRefId = 0;        // the outward tie, kind=external_reference
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One procedure: an always/initial/final block, or a task/function body.
+struct ProcedureRow {
+    int64_t id = 0;
+    int64_t instId = 0;
+    int64_t scopeNodeId = 0;
+    std::string name;             // task/function name; "" = anonymous, stored NULL
+    std::string procedureKind;    // always | always_ff | always_comb | always_latch |
+                                  // initial | final | task | function
+    int64_t ordinal = 0;
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One statement, or one statement-level construct.
+struct StmtRow {
+    int64_t id = 0;
+    int64_t instId = 0;
+    int64_t scopeNodeId = 0;
+    int64_t procedureId = 0;      // 0 = not in a procedure (continuous assign)
+    int64_t ordinal = 0;          // order within the instance
+    int64_t sequence = -1;        // execution order within the procedure; -1 = NULL
+    std::string statementKind;    // assignment | assertion | wait | call |
+                                  // system_task | event_control
+    std::string construct;        // assign | always_ff | assert | $display | ...
+    std::string assignmentKind;   // continuous | blocking | nonblocking; "" = NULL
+    std::string delay;            // normalised delay control text; "" = NULL
+    int64_t droppedOperandCount = 0;
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One assignment target reference (LHS).
+struct AssignTargetRow {
+    int64_t id = 0;
+    int64_t stmtId = 0;
+    int64_t ordinal = 0;
+    int64_t netId = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> bits;
+    bool exact = true;
+};
+
+/// One assignment operand reference (RHS).
+struct AssignOperandRow {
+    int64_t id = 0;
+    int64_t stmtId = 0;
+    int64_t ordinal = 0;
+    int64_t netId = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> bits;
+    bool exact = true;
+};
+
+/// One statement read that is not an assignment operand: a branch condition,
+/// an assertion's read, a wait condition, a call argument.
+struct ExprRefRow {
+    int64_t id = 0;
+    int64_t stmtId = 0;
+    int64_t ordinal = 0;
+    int64_t netId = 0;
+    std::string role;             // control | assertion | wait | event |
+                                  // call_argument | system_task
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
 };
 
 /// One edge event a procedure triggers on or waits on.
 struct ProcEventRow {
-    std::string signal;   // empty when the event expression is not a plain name
-    std::string edge;     // posedge | negedge | both
-    /// False for the procedure's sensitivity list, true for an event control
-    /// reached during execution. The distinction is the difference between
-    /// "this triggers the block" and "the block stops here until it happens",
-    /// and an `initial` block has none of the first kind.
-    bool wait = false;
-    std::string file;
-    uint32_t line = 0;    // the sensitivity's procedure, or the wait's statement
-};
-
-/// One declaration inside a module: a signal, a port, or a parameter.
-///
-/// The rest of the database is derived from *edges*, so a signal exists in it
-/// only if it takes part in dataflow. That is enough to trace a driver and
-/// wrong for everything else: a declared-but-unused signal, an output nobody
-/// drives, and a clock that only appears in a sensitivity list are all absent,
-/// and those are exactly the ones worth asking about.
-struct SymbolRow {
-    std::string name;         // module-relative, generate-block prefix included
-    // variable | net | port | parameter | interface_port
-    std::string kind;
-    std::string type;
-    int64_t width = -1;       // bits; -1 when the type is not integral
-    std::string direction;    // "" unless this signal is a port
-    std::string file;
+    int64_t id = 0;
+    int64_t procedureId = 0;
+    int64_t stmtId = 0;           // the wait statement; 0 for a sensitivity list
+    int64_t netId = 0;            // 0 when the event expression is not a plain net
+    std::string eventKind;        // sensitivity | wait
+    std::string edgeKind;         // posedge | negedge | both; "" = NULL
+    int64_t fileId = 0;
     uint32_t line = 0;
-    uint32_t col = 0;
+    uint32_t column = 0;
 };
 
-/// How a child instance's port is attached. `Expression` is an operand of an
-/// expression tied to the port, not a wired net: `.en(state == RUN)` samples
-/// `state` but does not alias it to `en`, and a consumer must be able to tell.
-/// `Interface` binds a child's interface port to an interface instance in the
-/// parent: the row is the alias that lets `child.bus.*` resolve at all.
-/// `External` is attached to something with no name in this module
-/// (`.a(tb.glob)`): `outer` is NULL and `hier_ref` holds what it is tied to,
-/// but the row exists so that "connected to something I cannot name" stays
-/// distinct from "nobody connected it".
-enum class PortConn { Net = 0, Constant = 1, Unconnected = 2, Expression = 3,
-                      Interface = 4, External = 5 };
-
-/// One port connection on a child instance, as written in the parent.
-///
-/// This is the only row type that spans two modules, and it is what lets a
-/// trace leave one and continue in the other: `outer` names a net in the
-/// parent's namespace, `port` names the formal it ties to inside the child.
-/// A module that is nothing but instantiations -- 38% of them on one SoC --
-/// has no dataflow rows at all and is reachable only through these.
-struct PortRow {
-    std::string child;        // child instance name, generate prefix included
-    std::string port;         // the formal, as the connection names it
-    /// The signal inside the child that `port` stands for, when the two differ
-    /// -- `.ext_one(inner)` is `ext_one` on the connection and `inner` within.
-    /// Empty in the ordinary case where they are one name. Paired with `outer`:
-    /// the child's side of the boundary, where `outer` is the parent's.
-    std::string inner;
-    std::string direction;    // in | out | inout | ref
-    std::string outer;        // the connected net, in the PARENT's namespace
-    std::string outerType;
-    int64_t outerWidth = -1;  // width of the connection expression, not of the net
-    // The bits of `outer` the connection selects, absent when it attaches the
-    // whole net. Same encoding as EdgeRow: read with outerExact.
-    std::optional<std::pair<uint64_t, uint64_t>> outerBits;
-    bool outerExact = true;
-    /// The bits of the FORMAL this element occupies -- `.q({hi, lo})` puts hi
-    /// at portBits {4,7} of q. Absent with portExact=1 for the whole formal,
-    /// absent with portExact=0 when the position cannot be stated, and -1
-    /// (stored NULL) where the row has no formal bit domain at all.
-    std::optional<std::pair<uint64_t, uint64_t>> portBits;
-    int portExact = -1;
-    /// Whether this row's outer bits map one-to-one onto its formal window --
-    /// edge.map_exact at the boundary. -1 (stored NULL) when the row has no
-    /// outer end to correspond with: a constant, an unconnected port, an
-    /// external tie, an interface binding.
-    int mapExact = -1;
-    PortConn conn = PortConn::Net;
-    // For an interface binding: the modport restricting it, when one does.
-    std::string modport;
-    std::string file;
-    uint32_t line = 0;
+/// One net-to-net dependency occurrence, with its provenance. An end that
+/// resolved through a hierarchical reference carries the resolved net id
+/// and names the hier_ref row instead of an operand/target row.
+struct NetDepRow {
+    int64_t id = 0;
+    int64_t sourceNetId = 0;      // 0 = a constant drives the target
+    int64_t targetNetId = 0;
+    int64_t stmtId = 0;
+    int64_t assignOperandId = 0;
+    int64_t assignTargetId = 0;
+    int64_t exprRefId = 0;
+    int64_t primitiveId = 0;
+    int64_t sourceHierRefId = 0;
+    int64_t targetHierRefId = 0;
+    std::string dependencyKind;   // data | control | primitive | procedure
+    std::optional<std::pair<uint64_t, uint64_t>> sourceBits;
+    int sourceExact = -1;         // -1 = no source end, stored NULL
+    std::optional<std::pair<uint64_t, uint64_t>> targetBits;
+    bool targetExact = true;
+    int mappingExact = -1;        // -1 = nothing to correspond, stored NULL
 };
 
-/// One signal read by a statement that writes nothing this module can name:
-/// an assertion, or an assignment whose target lies outside the module. Such
-/// reads fit in no other table -- `edge` needs a target and `assign_operand`
-/// needs an assignment row -- so without this the signal reads as unused.
-struct StmtReadRow {
-    std::string name;
-    std::string kind;         // as EdgeRow::kind; the assertion's own word is in construct
-    std::string construct;    // assign | always_ff | assert | assume | cover
-    std::string file;
-    uint32_t line = 0;
-    std::optional<std::pair<uint64_t, uint64_t>> bits;
-    bool exact = true;
-    /// The statement these reads belong to; 0 for none, stored NULL. Joining on
-    /// it is what pairs a read with the outward write it actually fed.
-    int64_t stmt = 0;
-};
-
-/// What sort of instantiation a `child` row records. `def_module` is NULL for
-/// all but Module, and a consumer reading only that cannot tell a gate (whose
-/// dataflow is in the parent's edges) from a black box (whose dataflow does not
-/// exist anywhere) -- though a trace stopping at one means something different
-/// from a trace stopping at the other.
-enum class ChildKind { Module, Primitive, Unresolved };
-
-/// One instantiation inside a module body.
-struct ChildRow {
-    std::string name;         // instance name, generate-block prefix included
-    std::string defName;   // the definition it instantiates
-    int64_t defModule = 0;  // module row id, resolved by the caller
-    ChildKind kind = ChildKind::Module;
-};
-
-/// One reference that leaves the module, exactly as written in the source:
-/// `bus.vld` through an interface port, `tb.u_dut.state` as an XMR,
-/// `pkg::cfg` from a package. The text is module-relative by construction --
-/// every instance of the module carries the same spelling -- which is what
-/// lets the row live in the folded model at all. Resolution belongs to the
-/// consumer, who has the hierarchy this row deliberately does not bake in.
+/// One reference that leaves the instance, as written and, when slang could
+/// resolve it, as the object it lands on.
 struct HierRefRow {
-    std::string path;         // as written
-    bool write = false;       // the module writes it, rather than reads it
-    // edge.kind's vocabulary (continuous_assign | procedural | primitive |
-    // procedure), plus "port" for a reference made by a port connection.
-    std::string kind;
-    std::string construct;    // as edge.construct; the direction for a port
-    std::string file;
-    uint32_t line = 0;
+    int64_t id = 0;
+    int64_t instId = 0;
+    int64_t stmtId = 0;           // 0 = made by a port connection, not a statement
+    std::string path;             // as written, normalised
+    std::string access;           // read | write | connect
+    int64_t resolvedInstId = 0;   // 0 = not resolved to an object in this export
+    int64_t resolvedNetId = 0;
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
-    /// Which statement produced this reference; 0 for none, stored NULL. A
-    /// statement writing an outward target has no `assignment` row to gather its
-    /// parts, so this is what says the write here and the reads in `stmt_read`
-    /// are one statement rather than two that share a line.
-    int64_t stmt = 0;
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
 };
 
 /// Writes the database. One writer, deliberately: SQLite serialises writers, so
@@ -342,67 +398,36 @@ public:
     void linkSourceFiles(
         const std::unordered_map<std::string, std::string>& origins);
 
-    /// Interns a module (name + its elaborated parameter text) and returns its
-    /// row id. Parameters are part of the identity because they change the
-    /// module's contents, not just its numbers.
-    int64_t internModule(const std::string& name, const std::string& params);
-
-    void addEdges(int64_t moduleId, const std::vector<EdgeRow>& rows);
-
-    /// Interns a repeated string into its own table and returns the row id.
+    /// Interns a repeated string into `data_type` and returns the row id.
     ///
-    /// Type text dominates the file otherwise: a SystemVerilog enum or packed
-    /// struct prints as its whole member list, so one edge row can carry
-    /// kilobytes of it. On one design 16.3 MB of a 19.1 MB database was the
-    /// `src_type` column holding 103 distinct values.
-    int64_t internType(const std::string& text);
+    /// The one intern table v10 keeps: a SystemVerilog enum or packed struct
+    /// prints as its whole member list, so one net row can carry kilobytes of
+    /// it, and the instance-level model repeats each row once per occurrence.
+    /// Names are not interned -- they are short, and the join-per-query the
+    /// name table cost every consumer was what the views existed to hide.
+    int64_t internDataType(const std::string& text);
     int64_t internFile(const std::string& path);
 
-    /// Interns an identifier -- a signal, a port, an instance name.
-    ///
-    /// These are short but repeat enormously: a child instance's name is
-    /// written once per port it connects, which on one SoC meant 25.8 MB of
-    /// text for 20207 distinct strings. Every identifier shares one table, so a
-    /// name used as a port on one row and as a net on another is stored once.
-    int64_t internName(const std::string& text);
-    /// Writes the instantiations of one module variant and returns their row
-    /// ids, in the order given. The caller needs them to fill `instance.child`
-    /// when it later expands this module -- which is why they are returned
-    /// rather than discarded.
-    std::vector<int64_t> addChildren(int64_t moduleId, const std::vector<ChildRow>& rows);
-    /// `childId` is the `child` row the connections bind -- every port row
-    /// belongs to exactly one instantiation, and the id rather than the name
-    /// is what a consumer joins on, since two unnamed gates in one module can
-    /// legally share a name.
-    void addPorts(int64_t moduleId, int64_t defModuleId, int64_t childId,
-                  const std::vector<PortRow>& rows);
-    void addSymbols(int64_t moduleId, const std::vector<SymbolRow>& rows);
-    void addStmtReads(int64_t moduleId, const std::vector<StmtReadRow>& rows);
-    void addHierRefs(int64_t moduleId, const std::vector<HierRefRow>& rows);
+    void addModule(const ModuleRow& r);
+    void addTreeNode(const TreeNodeRow& r);
+    void addInst(const InstRow& r);
+    void addPrimitive(const PrimitiveRow& r);
+    void addNet(const NetRow& r);
+    void addTerm(const TermRow& r);
+    void addTermMap(const TermMapRow& r);
+    void addNetConn(const NetConnRow& r);
+    void addProcedure(const ProcedureRow& r);
+    void addStmt(const StmtRow& r);
+    void addAssignTarget(const AssignTargetRow& r);
+    void addAssignOperand(const AssignOperandRow& r);
+    void addExprRef(const ExprRefRow& r);
+    void addProcEvent(const ProcEventRow& r);
+    void addNetDep(const NetDepRow& r);
+    void addHierRef(const HierRefRow& r);
 
-    /// Every edge event a procedure triggers on or waits on. An event list has
-    /// no order, so all of them are recorded and none is singled out.
-    void addProcEvents(int64_t moduleId, int64_t proc,
-                       const std::vector<ProcEventRow>& events);
-
-    int64_t addAssignment(int64_t moduleId, const AssignRow& row,
-                          const std::vector<OperandRow>& operands);
-
-    /// One instance-tree row.
-    ///
-    /// Holds the leaf name and a parent link rather than the full hierarchical
-    /// path: the paths are all distinct by construction, so interning them saves
-    /// nothing, while storing them costs the text twice over once the lookup
-    /// index is counted. A consumer resolves `a.b.c` by walking down from the
-    /// root a segment at a time against the (parent, name) index -- three
-    /// indexed lookups, no recursion over the table.
-    /// `childId` is the `child` row this expands, 0 for the root and for a
-    /// generate level -- neither is an instantiation anyone wrote.
-    void addInstance(const std::string& name, int64_t moduleId, int64_t parentId,
-                     int64_t rowId, int64_t childId);
-
-    /// Builds the indexes and closes. Indexes are created last: filling a table
-    /// that already carries them costs far more than one build at the end.
+    /// Commits, then builds the indexes and creates the views. Indexes come
+    /// after the data: filling a table that already carries them costs far
+    /// more than one build at the end.
     void finish();
 
 private:
@@ -411,21 +436,19 @@ private:
     void step(sqlite3_stmt* stmt);
     void begin();
     void commit();
+    void bumped();
+
+    enum Ins {
+        InsModule, InsTreeNode, InsInst, InsPrimitive, InsNet, InsTerm,
+        InsTermMap, InsNetConn, InsProcedure, InsStmt, InsAssignTarget,
+        InsAssignOperand, InsExprRef, InsProcEvent, InsNetDep, InsHierRef,
+        InsCount
+    };
 
     sqlite3* db = nullptr;
-    sqlite3_stmt* insEdge = nullptr;
-    sqlite3_stmt* insChild = nullptr;
-    sqlite3_stmt* insInstance = nullptr;
-    sqlite3_stmt* insPort = nullptr;
-    sqlite3_stmt* insSymbol = nullptr;
-    sqlite3_stmt* insAssign = nullptr;
-    sqlite3_stmt* insProcEvent = nullptr;
-    sqlite3_stmt* insAssignOp = nullptr;
-    sqlite3_stmt* insStmtRead = nullptr;
-    sqlite3_stmt* insHierRef = nullptr;
-    std::unordered_map<std::string, int64_t> typeIds;
+    sqlite3_stmt* ins[InsCount] = {};
+    std::unordered_map<std::string, int64_t> dataTypeIds;
     std::unordered_map<std::string, int64_t> fileIds;
-    std::unordered_map<std::string, int64_t> nameIds;
     bool inTransaction = false;
     int64_t pending = 0;
 };

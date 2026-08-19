@@ -19,7 +19,9 @@
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Symbol.h"
 #include "slang/ast/ASTVisitor.h"
+#include "slang/ast/expressions/AssertionExpr.h"
 #include "slang/ast/Expression.h"
+#include "slang/ast/HierarchicalReference.h"
 #include "slang/ast/Scope.h"
 #include "slang/ast/expressions/AssignmentExpressions.h"
 #include "slang/ast/expressions/MiscExpressions.h"
@@ -33,6 +35,10 @@
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
+#include "slang/ast/symbols/VariableSymbols.h"
+#include "slang/ast/symbols/ValueSymbol.h"
+#include "slang/ast/types/NetType.h"
+#include "slang/ast/types/Type.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/ValuePath.h"
 #include "slang/ast/expressions/CallExpression.h"
@@ -42,9 +48,7 @@
 #include "slang/ast/TimingControl.h"
 #include "slang/numeric/SVInt.h"
 #include "slang/numeric/ConstantValue.h"
-#include "slang/ast/symbols/VariableSymbols.h"
-#include "slang/ast/symbols/ValueSymbol.h"
-#include "slang/ast/types/Type.h"
+#include "slang/syntax/SyntaxNode.h"
 #include "slang/text/SourceManager.h"
 
 using namespace slang;
@@ -58,10 +62,8 @@ namespace {
 /// True for a symbol that is a compile-time constant rather than a net.
 ///
 /// An enum member or a parameter is not something a waveform carries and not
-/// something a trace can step to, so it is not an edge. Leaving them in also
-/// swamped the count of genuinely dropped cross-module references: on one SoC
-/// 47110 "external" symbols turned out to be 36860 enum members and 7330
-/// package parameters, none of which were connectivity at all.
+/// something a trace can step to, so it is not connectivity. Leaving them in
+/// also swamped the count of genuinely dropped cross-module references.
 bool isConstantSymbol(const ValueSymbol& sym) {
     switch (sym.kind) {
         case SymbolKind::EnumValue:
@@ -69,18 +71,16 @@ bool isConstantSymbol(const ValueSymbol& sym) {
         case SymbolKind::Specparam:
             return true;
         case SymbolKind::Variable:
-            // A `const` variable is a constant in everything but its symbol
-            // kind, and `static const` class properties likewise.
             return sym.as<VariableSymbol>().flags.has(VariableFlags::Const);
         default:
             return false;
     }
 }
 
-
-/// The path of `sym` as seen from `body`, i.e. with the module's own prefix
-/// removed. This is what makes a row shareable: it names a signal inside the
-/// module rather than inside one instance of it.
+/// The path of `sym` as seen from `body`, i.e. with the instance's own prefix
+/// removed. Rows name objects scope-relative (`g[0].sig`, `bump.v`); the
+/// template is stamped per occurrence, so the relative spelling is what every
+/// occurrence shares.
 bool relativePath(const Symbol& sym, const std::string& bodyPrefix, std::string& out) {
     std::string full = sym.getHierarchicalPath();
     if (!bodyPrefix.empty() && full.size() > bodyPrefix.size() &&
@@ -93,11 +93,9 @@ bool relativePath(const Symbol& sym, const std::string& bodyPrefix, std::string&
         out = full;
         return true;
     }
-    // Outside the module: an upward hierarchical reference, an interface
-    // signal, a package item. Its absolute path cannot go into a row that every
-    // instance of this module shares -- it would bake one instance's hierarchy
-    // into all of them, and the other end of the reference would never join.
-    // Reported as a count instead of stored wrongly.
+    // Outside the instance: an upward hierarchical reference, an interface
+    // signal, a package item. Recorded as hier_ref or counted, never stored
+    // as a net of this instance.
     out = full;
     return false;
 }
@@ -106,49 +104,29 @@ std::string typeOf(const ValueSymbol& sym) {
     return sym.getType().toString();
 }
 
-/// A file and a line that came from one source location.
-///
-/// The two travel together deliberately. Taking the line from a statement and
-/// the file from its enclosing procedure names a line in a file that does not
-/// contain it: a task body pulled in by `include` reported the module's file
-/// with the included file's line number, and on a module shorter than that
-/// number the pair points past the end of the file.
+/// A file, line and column that came from one source location. The three
+/// travel together: taking the line from a statement and the file from its
+/// enclosing procedure names a line in a file that does not contain it.
 struct Where {
     std::string file;
     uint32_t line = 0;
+    uint32_t column = 0;
 };
 
-/// `file` and `line` for a source location. Both are read from the same
-/// location, and slang resolves a macro expansion identically for each, so the
-/// pair always names a line in the file it says.
 Where whereOf(SourceLocation loc, const SourceManager& sm) {
     if (!loc)
         return {};
     return Where{std::string(sm.getFileName(loc)),
-                 static_cast<uint32_t>(sm.getLineNumber(loc))};
+                 static_cast<uint32_t>(sm.getLineNumber(loc)),
+                 static_cast<uint32_t>(sm.getColumnNumber(loc))};
 }
 
-/// The canonical text of a reference that leaves its module: the path as
+/// The canonical text of a reference that leaves its instance: the path as
 /// written, with every select resolved to the constant it elaborated to.
-///
-/// Not the raw source text, which is what this was at first and which fails
-/// four different ways. A generate loop writes one `b[g].sig` and elaborates
-/// four references from it, so the text was identical for all four and the
-/// dedup key folded them into a single unresolvable row naming a genvar. Two
-/// spellings of one reference (`tbm . ea` and `tbm.ea`) interned as two names,
-/// as did one carrying a comment or a line break. And a reference assembled
-/// through a macro spans two buffers, so it could not be recovered at all and
-/// was silently dropped.
-///
-/// Trailing selects are left off: `path` names a signal and the bits it
-/// touches are in `path_lo`/`path_hi`, which is how `edge` already spells the
-/// same idea. Selects further in are structural -- `b[2].sig` is a member of
-/// one interface instance out of an array -- and stay.
-///
-/// Empty when the reference is not expressible as a path, in which case the
-/// caller counts it rather than storing a guess.
+/// (See v9's history for why not the raw source text: generate loops share a
+/// spelling across distinct references, spellings differ in whitespace, and
+/// macro-assembled references span buffers.)
 std::string canonicalPath(const Expression* e, EvalContext& eval) {
-    // Strip the outermost selects: those are the bits, not the path.
     for (;;) {
         if (e && e->kind == ExpressionKind::ElementSelect)
             e = &e->as<ElementSelectExpression>().value();
@@ -166,13 +144,9 @@ std::string canonicalPath(const Expression* e, EvalContext& eval) {
                 auto& sym = x->as<ValueExpressionBase>().symbol;
                 if (sym.name.empty())
                     return false;
-                // A package item is written with its package, and the doc says
-                // that spelling is what makes it storable -- a bare `mask`
-                // resolves against imports a reader cannot see. Emitting the
-                // name alone dropped the qualifier, so `pkg::mask` became
-                // `mask` and was then discarded by the bare-name rule, while
-                // `pkg::cfg.mode` survived reading like a module-relative
-                // reference to something called `cfg`.
+                // A package item keeps its package: a bare `mask` resolves
+                // against imports a reader cannot see, `pkg::mask` says where
+                // to look.
                 if (auto* scope = sym.getParentScope()) {
                     auto& owner = scope->asSymbol();
                     if (owner.kind == SymbolKind::Package && !owner.name.empty()) {
@@ -216,22 +190,9 @@ std::string canonicalPath(const Expression* e, EvalContext& eval) {
     return out;
 }
 
-/// The reference as written, with whitespace and comments taken out.
-///
-/// The fallback for a reference `canonicalPath` cannot walk -- an XMR, which
-/// slang resolves to a single node rather than to a chain of member accesses.
-/// Its text has to stay as written, because that is the only spelling that
-/// means the same thing from every instance of the module: the symbol's own
-/// elaborated path names one instance's hierarchy, and baking that into a row
-/// every instance shares is exactly the mistake the folded model exists to
-/// avoid.
-///
-/// Normalising matters because the text is interned as a name: `tbc . glob`,
-/// `tbc.glob` and `tbc/*why*/.glob` are one reference and were three rows.
-/// `stripTrailingSelect` decides whether a final `[...]` is part of the name.
-/// For a reference it is not -- the bits live in their own columns. For an
-/// interface connection it is: `b[0]` names one element of an array, which is
-/// structure, not a bit range.
+/// The reference as written, with whitespace and comments taken out -- the
+/// fallback for a reference `canonicalPath` cannot walk (an XMR slang
+/// resolves to a single node). Empty for a macro-assembled span.
 std::string normalizedText(const Expression* e, const SourceManager& sm,
                            bool stripTrailingSelect = true) {
     if (!e)
@@ -239,7 +200,7 @@ std::string normalizedText(const Expression* e, const SourceManager& sm,
     auto range = e->sourceRange;
     if (!range.start() || !range.end() ||
         range.start().buffer() != range.end().buffer())
-        return {};   // assembled through a macro: not recoverable as one span
+        return {};
     auto text = sm.getSourceText(range.start().buffer());
     const size_t a = range.start().offset();
     const size_t b = range.end().offset();
@@ -256,10 +217,6 @@ std::string normalizedText(const Expression* e, const SourceManager& sm,
             continue;
         }
         if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/') {
-            // A line comment runs to the newline, which is inside the range
-            // when the reference spans lines. Skipping it is the same removal
-            // the block-comment case does; giving up here discarded the row
-            // outright, so `tb. // why\n u_deep.flag` was recorded nowhere.
             auto nl = raw.find('\n', i + 2);
             if (nl == std::string_view::npos)
                 break;
@@ -269,15 +226,8 @@ std::string normalizedText(const Expression* e, const SourceManager& sm,
         if (!std::isspace(static_cast<unsigned char>(raw[i])))
             out += raw[i];
     }
-    // Trailing selects are the bit range, which has columns of its own -- and
-    // *every* one of them, matched by bracket depth.
-    //
-    // `rfind('[')` was wrong twice. It finds the innermost bracket when the
-    // index itself contains a select, so `mem[idx[1]]` truncated to
-    // `mem[idx`, naming nothing. And it removed one group where the bits are
-    // offsets into the *root* object: `mem2[1][2]` kept `mem2[1]`, an 8-bit
-    // object, beside offsets 10..10 that index the 32-bit one -- a path and a
-    // range describing different things.
+    // Trailing selects are the bit range, which has columns of its own --
+    // every group of them, matched by bracket depth.
     while (stripTrailingSelect && !out.empty() && out.back() == ']') {
         int depth = 0;
         size_t i = out.size();
@@ -289,28 +239,46 @@ std::string normalizedText(const Expression* e, const SourceManager& sm,
                 break;
         }
         if (depth != 0 || i == 0)
-            break;              // unbalanced, or nothing but a select
+            break;
         out.resize(i);
     }
     return out;
 }
 
-/// The `[...]` of the last segment of a hierarchical path -- how slang spells
-/// an array element's index, already translated into the source's own
-/// numbering rather than the zero-based element order.
-std::string arrayIndexSuffix(const std::string& hierPath) {
-    const size_t lastDot = hierPath.rfind('.');
-    const std::string seg =
-        lastDot == std::string::npos ? hierPath : hierPath.substr(lastDot + 1);
-    const size_t open = seg.find('[');
-    if (open == std::string::npos || seg.empty() || seg.back() != ']')
+/// The normalised text of a timing control: its syntax with whitespace runs
+/// collapsed. Stored as text, never evaluated -- `#(rise, fall)` and
+/// min:typ:max forms are not one number, and pretending otherwise would
+/// store a guess.
+std::string delayText(const TimingControl* t) {
+    if (!t || !t->syntax)
         return {};
-    return seg.substr(open);
+    switch (t->kind) {
+        case TimingControlKind::Delay:
+        case TimingControlKind::Delay3:
+        case TimingControlKind::CycleDelay:
+            break;
+        default:
+            return {};
+    }
+    std::string raw = t->syntax->toString();
+    std::string out;
+    bool pendingSpace = false;
+    for (char c : raw) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            pendingSpace = !out.empty();
+            continue;
+        }
+        if (pendingSpace) {
+            out += ' ';
+            pendingSpace = false;
+        }
+        out += c;
+    }
+    return out;
 }
 
-/// The word an assertion publishes as its `construct`. Spelled out rather than
-/// taken from slang's enum printer, for the same reason `classify` is: these
-/// are a wire format consumers match on.
+/// The word an assertion publishes as its `construct`. Spelled out rather
+/// than taken from slang's enum printer: these are a wire format.
 std::string assertionWord(AssertionKind kind) {
     switch (kind) {
         case AssertionKind::Assume:        return "assume";
@@ -322,46 +290,23 @@ std::string assertionWord(AssertionKind kind) {
     }
 }
 
-/// What kind of construct a procedure is.
-///
-/// The words are spelled out rather than taken from slang's own enum printer,
-/// because they are a wire format: `continuous_assign` / `procedural` /
-/// `always_ff` are what the database publishes and what consumers match on.
-/// Letting slang's spelling leak through would make the vocabulary change under
-/// us on an upgrade.
-void classify(const Symbol& sym, std::string& kind, std::string& construct) {
-    switch (sym.kind) {
-        case SymbolKind::ContinuousAssign:
-            kind = "continuous_assign";
-            construct = "assign";
-            return;
-        case SymbolKind::ProceduralBlock: {
-            kind = "procedural";
-            switch (sym.as<ProceduralBlockSymbol>().procedureKind) {
-                case ProceduralBlockKind::AlwaysComb:  construct = "always_comb";  break;
-                case ProceduralBlockKind::AlwaysLatch: construct = "always_latch"; break;
-                case ProceduralBlockKind::AlwaysFF:    construct = "always_ff";    break;
-                case ProceduralBlockKind::Always:      construct = "always";       break;
-                case ProceduralBlockKind::Initial:     construct = "initial";      break;
-                case ProceduralBlockKind::Final:       construct = "final";        break;
-                default:                               construct = "procedural";   break;
-            }
-            return;
-        }
-        default:
-            kind = "procedure";
-            construct = "procedure";
-            return;
+/// The procedure_kind word for a procedural block.
+std::string procedureWord(const Symbol& sym) {
+    if (sym.kind != SymbolKind::ProceduralBlock)
+        return "always";
+    switch (sym.as<ProceduralBlockSymbol>().procedureKind) {
+        case ProceduralBlockKind::AlwaysComb:  return "always_comb";
+        case ProceduralBlockKind::AlwaysLatch: return "always_latch";
+        case ProceduralBlockKind::AlwaysFF:    return "always_ff";
+        case ProceduralBlockKind::Always:      return "always";
+        case ProceduralBlockKind::Initial:     return "initial";
+        case ProceduralBlockKind::Final:       return "final";
+        default:                               return "always";
     }
 }
 
-/// Every edge-triggered event in a timing control, in the order written.
-///
-/// All of them, not one: an event list has no ordering semantics, so
-/// `@(posedge clk or negedge rst_n)` and `@(negedge rst_n or posedge clk)` are
-/// the same block spelled two ways and both spellings are ordinary. Singling
-/// out "the first" would record how the author arranged the list, and would
-/// name the reset in half of all async-reset flops.
+/// Every edge-triggered event in a timing control, in the order written --
+/// all of them, since an event list has no ordering semantics.
 void collectEdgeEvents(const TimingControl* t,
                        std::vector<std::pair<const Expression*, std::string>>& out,
                        std::vector<const Expression*>* iffs = nullptr) {
@@ -370,14 +315,21 @@ void collectEdgeEvents(const TimingControl* t,
     switch (t->kind) {
         case TimingControlKind::SignalEvent: {
             auto& se = t->as<SignalEventControl>();
-            if (se.edge == EdgeKind::None)
-                return;                 // level-sensitive: that is the read set
-            out.emplace_back(&se.expr, se.edge == EdgeKind::PosEdge   ? "posedge"
-                                       : se.edge == EdgeKind::NegEdge ? "negedge"
-                                                                      : "both");
-            // `@(posedge clk iff en)` samples `en` too. It qualifies the
-            // event rather than being one, so it gets no `proc_event` row --
-            // but it is a read, and it was reaching no table at all.
+            // An explicitly written event is recorded whether or not it
+            // names an edge: `always @(b)` samples b, and a signal that
+            // appears ONLY in a sensitivity list was otherwise invisible to
+            // every load query. edge_kind stays NULL for the plain form.
+            // Implicit lists (`@*`, always_comb) are deliberately NOT
+            // expanded here: their sensitivity IS the read set, which the
+            // dataflow rows already carry, and duplicating it would list
+            // every combinational read twice.
+            out.emplace_back(&se.expr,
+                             se.edge == EdgeKind::PosEdge   ? "posedge"
+                             : se.edge == EdgeKind::NegEdge ? "negedge"
+                             : se.edge == EdgeKind::BothEdges ? "both"
+                                                              : "");
+            // `@(posedge clk iff en)` samples `en` too; it qualifies the
+            // event rather than being one.
             if (iffs && se.iffCondition)
                 iffs->push_back(se.iffCondition);
             return;
@@ -391,9 +343,9 @@ void collectEdgeEvents(const TimingControl* t,
     }
 }
 
-/// One module's parameter values, as stable text. Part of the module's
-/// identity, so it must be deterministic: declaration order, which is what
-/// slang preserves.
+/// One group's parameter values, as stable text: declaration order, values in
+/// full precision (ConstantValue::toString abbreviates above 128 bits, which
+/// folded distinct parameterisations).
 std::string parameterText(const InstanceBodySymbol& body) {
     std::string out;
     for (auto& member : body.members()) {
@@ -404,16 +356,9 @@ std::string parameterText(const InstanceBodySymbol& body) {
             auto& p = member.as<ParameterSymbol>();
             out += std::string(p.name);
             out += '=';
-            // Spelled in full. ConstantValue::toString abbreviates above 128
-            // bits by dropping the low digits, so two 256-bit INIT/SEED/POLY
-            // values differing in their tail print identically and the two
-            // parameterisations fold into one module.
             out += p.getValue().toString(SVInt::MAX_BITS);
         }
         else if (member.kind == SymbolKind::TypeParameter) {
-            // A type parameter changes the module's contents just as a value
-            // one does. Omitting it folded `box #(.T(logic[7:0]))` and
-            // `box #(.T(logic[31:0]))` into a single row.
             auto& tp = member.as<TypeParameterSymbol>();
             out += std::string(tp.name);
             out += '=';
@@ -423,40 +368,20 @@ std::string parameterText(const InstanceBodySymbol& body) {
     return out;
 }
 
-/// One reference to a signal, with the bits it touches.
-///
-/// `whole` is set when the range covers the entire object, which is the common
-/// case and is stored as NULL rather than as an explicit 0..width-1 on every
-/// row. A dynamic index (`q[i]`) has no static prefix narrower than the object,
-/// so it also comes back whole -- the conservative answer, and the right one:
-/// claiming a specific bit there would be a guess.
+/// One reference to a signal, with the bits it touches. Encoding unchanged
+/// from v7: `whole` spans the object, `exact=false` means the range is an
+/// upper bound (a dynamic selector).
 struct Ref {
     const ValueSymbol* sym = nullptr;
     uint64_t lo = 0;
     uint64_t hi = 0;
     bool whole = true;
-    /// True when the range is exactly the bits touched. False when a dynamic
-    /// selector meant it could not be narrowed, so the recorded range is an
-    /// upper bound: `q[i] <= d` touches one bit of `q` and we cannot say which.
-    /// Without this, "the whole signal" and "somewhere in the signal" are both
-    /// stored as NULL and a consumer reads the second as the first.
     bool exact = true;
-    /// The expression the reference was written as. Only consulted when the
-    /// symbol turns out to live outside the module: its source text is the
-    /// one instance-independent name the reference has (`bus.vld` reads the
-    /// same in every instance), and hier_ref stores exactly that.
+    /// The expression the reference was written as; consulted when the symbol
+    /// lives outside the instance (hier_ref text) and for resolution replay.
     const Expression* origin = nullptr;
 };
 
-/// How many bits a symbol's type can be selected out of.
-///
-/// `getBitWidth()` is 0 for anything non-integral, which forced every reference
-/// to an unpacked array to be recorded as covering the whole object -- even
-/// though slang computes real bounds for `mem[1]` in exactly the flattened
-/// space this schema documents. Beyond losing precision that collapsed distinct
-/// statements together, since the element index was the only thing telling them
-/// apart: four assignments across a generate loop came out as four byte-
-/// identical rows. `getSelectableWidth()` covers both.
 uint64_t bitWidthOf(const ValueSymbol& sym) {
     return sym.getType().getSelectableWidth();
 }
@@ -471,54 +396,17 @@ Ref refOf(const ValuePath& path) {
     r.exact = path.isFullyStatic();
     if (!path.lsp) {
         r.exact = false;
-        // `lspBounds` is only meaningful when a longest static prefix exists.
-        // When bound computation fails -- an out-of-range or X-valued constant
-        // index -- slang leaves it default-constructed {0,0} while rootSymbol()
-        // stays valid, which reads as "bit 0" and is a specific wrong answer
-        // rather than a vague one.
         return r;
     }
     r.lo = path.lspBounds.first;
     r.hi = path.lspBounds.second;
     const uint64_t width = bitWidthOf(*r.sym);
-    // Whole when it spans the object, and whenever the extent is unknown: a
-    // partial range on something whose size cannot be stated is not information
-    // a consumer can use.
     r.whole = width == 0 || (r.lo == 0 && r.hi + 1 >= width);
     return r;
 }
 
-/// A reference's bit range as the dedup key needs it: as it will be *stored*,
-/// not as computed. A root whose width is unknown always serialises as whole,
-/// but its raw bounds differ per element, so keying on those stops the key
-/// collapsing rows that come out byte-identical -- four identical rows for
-/// `mem[g] <= a` across a four-iteration generate loop.
-///
-/// One function rather than one lambda per emitter: the procedure walk and the
-/// primitive walk feed the *same* per-module set, so a change to how a range
-/// keys has to reach both or they stop deduplicating against each other.
-std::pair<uint64_t, uint64_t> keyRange(const Ref& r) {
-    return r.whole ? std::make_pair<uint64_t, uint64_t>(0, 0)
-                   : std::make_pair(r.lo, r.hi);
-}
-
-uint8_t kindTag(std::string_view k) {
-    if (k == "procedural") return 1;
-    if (k == "primitive") return 2;
-    if (k == "procedure") return 3;
-    return 0;
-}
-
-/// Collects every value path in an expression, each with its bit range.
-/// Constants filtered out by the last collectRefs call. A consumer seeing an
-/// assignment with one operand cannot otherwise tell "it reads one signal" from
-/// "it reads one signal and three parameters I removed".
-///
-/// Accumulated, not assigned: an assignment's operands are gathered by three
-/// passes -- the right-hand side, the subroutines it calls, and the selectors on
-/// its left -- and each drops constants of its own. Resetting per pass counted
-/// only the last one, so `q[WIDTH-1] <= f(a)` reported none of them. The single
-/// reader clears it before the first pass and reads it after the third.
+/// Constants filtered per statement; see the v9 note on why accumulated
+/// across the three collection passes of one assignment.
 inline thread_local int64_t filteredConstants = 0;
 
 void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out,
@@ -527,13 +415,6 @@ void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out
         expr, ctx,
         [&](const ValuePath& path) {
             Ref r = refOf(path);
-            // A constant is not something a waveform carries or a trace can
-            // step to. Letting one through is not merely noise: it makes the
-            // assignment look as though it has a data source, which suppresses
-            // the null-source row that records the statement, and the constant
-            // itself is then dropped for living outside the module -- so a
-            // signal assigned only from a package enum loses its driver
-            // entirely.
             if (!r.sym)
                 return;
             if (isConstantSymbol(*r.sym)) {
@@ -545,54 +426,41 @@ void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out
         skipSelectors);
 }
 
-/// A reference together with the bits of the *assignment* it occupies.
-///
-/// Both sides of an assignment are flattened values aligned at the LSB, so a
-/// position in one is comparable with a position in the other. That is what
-/// makes `{a, b} = {x, y}` answerable: `a` sits at bit 1 of the left and `x` at
-/// bit 1 of the right, `b` and `y` at bit 0, and the pairs that do not share a
-/// bit are not dataflow at all.
-///
-/// Pairing every target with every operand instead produced `y -> a` and
-/// `x -> b`, marked exact -- not conservative but wrong, and wrong in the
-/// direction that grows: each false edge is a false fan-out at the next step of
-/// a trace. Concatenated assignment is how a bus is split or a register's fields
-/// are packed, so this was most of the structural RTL in a design.
+/// A reference together with the bits of the *assignment* it occupies -- what
+/// makes `{a, b} = {x, y}` answerable without the v7 cross product.
 struct Slot {
     Ref ref;
-    /// Bit offset within the assignment's value, LSB = 0, inclusive.
     uint64_t lo = 0;
     uint64_t hi = 0;
-    /// True when the reference's own bits map one-to-one onto [lo, hi], so a
-    /// bit of the source can be followed to a specific bit of the target.
-    /// False when the reference merely influences the range as a whole: `a + b`
-    /// carries, `f(a)` is opaque, `{2{a}}` puts one source in two places.
+    /// True when the reference's own bits map one-to-one onto [lo, hi].
     bool positional = false;
 };
 
-/// Spans everything, so it overlaps whatever it is compared against. Used where
-/// a width is not known -- an unpacked type has no bit width -- and the honest
-/// answer is that no position can be ruled out.
 constexpr uint64_t kNoWidth = ~uint64_t{0};
+
+/// How many subroutine bodies one module may instantiate across all its
+/// procedures.
+///
+/// Per-call-site expansion is what makes a call's gating and delay its own,
+/// but the cycle guard bounds only recursion, not fan-out: a call DAG
+/// branching twice per level costs 2^depth, and 21 such levels turned an
+/// 88-line file into 3.1 M statements and 1.2 GB. This bounds that.
+///
+/// The number is set from measurement, not taste: of the designs exported
+/// here, the heaviest user of calls is picorv32 with 13 call statements,
+/// and tinyriscv and VeeRwolf have none. Four thousand is two orders of
+/// magnitude above that, so real RTL -- and any testbench short of a
+/// deliberately exponential one -- never reaches it. What it stops is
+/// counted and reported, never silently dropped.
+constexpr int64_t kCallExpansionBudget = 4000;
 
 uint64_t exprWidthOf(const Expression& e) {
     return e.type ? e.type->getBitWidth() : 0;
 }
 
-/// Whether the expression *is* a reference to storage, rather than a computation
-/// over one.
-///
-/// This is what decides a positional mapping, and counting references is not:
-/// `cnt + 1` holds exactly one reference, filling the whole width, and is not
-/// positional at all -- a carry takes bit 0 of `cnt` to bit 7 of the result. The
-/// question is not how many signals an expression mentions but whether it moves
-/// their bits or combines them.
-///
-/// Selects and member accesses are transparent because they only choose *which*
-/// bits: `hi[3:0]` inside a concatenation still puts one bit per bit. Everything
-/// else answers no, including operators that happen to be bitwise -- `~a` really
-/// is positional, but saying so needs a rule per operator, and being wrong about
-/// one of them costs more than the precision is worth.
+/// Whether the expression *is* a reference to storage rather than a
+/// computation over one; selects and width-preserving conversions are
+/// transparent, everything else answers no.
 bool isPlainReference(const Expression& e) {
     const Expression* p = &e;
     for (;;) {
@@ -610,11 +478,6 @@ bool isPlainReference(const Expression& e) {
                 p = &p->as<MemberAccessExpression>().value();
                 break;
             case ExpressionKind::Conversion: {
-                // A width-preserving conversion -- a signedness change --
-                // moves no bits, and slang inserts one whenever the spelled
-                // type is not the assignment's. Stopping here made the signed
-                // spelling of a statement range-level while the unsigned
-                // spelling of the same bits was positional.
                 auto& conv = p->as<ConversionExpression>();
                 if (exprWidthOf(conv.operand()) != exprWidthOf(*p))
                     return false;
@@ -627,29 +490,17 @@ bool isPlainReference(const Expression& e) {
     }
 }
 
-/// Every reference in `expr`, each tagged with the bits of the assignment it
-/// occupies. `base` is where this subexpression starts.
-///
-/// A concatenation is walked element by element, MSB first as SystemVerilog
-/// writes it, so each element gets its own window. Anything else contributes its
-/// references across its whole window without a per-bit correspondence -- which
-/// is correct rather than approximate for arithmetic, where a low source bit
-/// really can reach a high target bit through a carry.
+/// Every reference in `expr`, tagged with the bits of the assignment it
+/// occupies. Concatenations and simple assignment patterns are positioned
+/// element by element, MSB first; conversions are transparent when width-
+/// preserving or truncating and degrade to range-level when widening.
 void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
                   std::vector<Slot>& out, bool skipSelectors = false) {
     const uint64_t width = exprWidthOf(expr);
 
-    // A concatenation and a simple assignment pattern position their elements
-    // the same way: `'{a, b}` packs a into the high bits of a packed target
-    // exactly as `{a, b}` does, and patterns are the modern idiom for field
-    // packing -- treating only the concat spelling positionally gave the two
-    // spellings of one statement different precision. (A *structured* pattern
-    // maps by member name and stays range-level; an unpacked target has no
-    // width here and degrades on its own.)
     const bool elementwise = expr.kind == ExpressionKind::Concatenation ||
                              expr.kind == ExpressionKind::SimpleAssignmentPattern;
     if (elementwise && width) {
-        // Slots are filled from the top: `{a, b}` writes `a` to the high bits.
         auto ops = expr.kind == ExpressionKind::Concatenation
                        ? expr.as<ConcatenationExpression>().operands()
                        : expr.as<SimpleAssignmentPatternExpression>().elements();
@@ -659,9 +510,6 @@ void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
                 continue;
             const uint64_t w = exprWidthOf(*op);
             if (!w) {
-                // An element of unknown width leaves every position below it
-                // uncertain, so the rest of the concatenation is recorded as
-                // spanning the whole assignment rather than guessed at.
                 std::vector<Ref> rest;
                 collectRefs(expr, ctx, rest, skipSelectors);
                 for (auto& r : rest)
@@ -674,23 +522,6 @@ void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
         return;
     }
 
-    // slang wraps a side in an implicit conversion whenever the spelled type
-    // is not the assignment's type, and the wrapper used to end the walk: the
-    // whole subtree fell to the flat default, so `assign wt = {a, b}` with a
-    // narrower target paired `a` with a target its bits never reach -- an
-    // edge marked exact on both ends for a dependency truncation discards.
-    //
-    //   * Width-preserving (a signedness change): transparent. The bits do
-    //     not move.
-    //   * Truncating: transparent too, at the operand's own width -- the
-    //     operand's slots simply extend past the target's, and the overlap
-    //     pairing drops what the truncation drops. A lone plain reference
-    //     also narrows through this: `q = wide` records `wide[3:0] -> q`.
-    //   * Widening: degraded to the flat default deliberately. Zero-extension
-    //     would be positional at the low bits, but sign-extension fans the
-    //     top bit into every extended position, and claiming the low-bits
-    //     mapping while dropping that fan-out would fabricate the *absence*
-    //     of a dependency. Range-level is the honest reading.
     if (expr.kind == ExpressionKind::Conversion) {
         auto& conv = expr.as<ConversionExpression>();
         const uint64_t iw = exprWidthOf(conv.operand());
@@ -707,11 +538,6 @@ void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
             out.push_back(Slot{r, 0, kNoWidth, false});
         return;
     }
-    // A bit maps to a bit when the window holds one reference to storage, that
-    // reference is statically resolved, and it fills the window exactly. A
-    // computation (`a + b`, `f(x)`) fails the first test even when it mentions a
-    // single signal; a widened operand fails the last, because the bits it does
-    // not supply are extension rather than any bit of it.
     const bool positional =
         isPlainReference(expr) && refs.size() == 1 && refs[0].exact &&
         (refs[0].whole ? bitWidthOf(*refs[0].sym) == width
@@ -720,7 +546,6 @@ void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
         out.push_back(Slot{r, base, base + width - 1, positional});
 }
 
-/// The bits two slots share, if any.
 bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
     if (a.hi == kNoWidth || b.hi == kNoWidth) {
         lo = 0;
@@ -732,15 +557,14 @@ bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
     return lo <= hi;
 }
 
-/// The reference narrowed to the part of it that lands in [lo, hi] of the
-/// assignment. Only meaningful for a positional slot; anything else keeps the
-/// range it came with, because no part of it can be singled out.
+/// The reference narrowed to the part of it landing in [lo, hi] of the
+/// assignment. Only meaningful for a positional slot.
 Ref narrowed(const Slot& s, uint64_t lo, uint64_t hi) {
     Ref r = s.ref;
     if (!s.positional || s.hi == kNoWidth || hi == kNoWidth || !r.sym)
         return r;
     if (lo <= s.lo && hi >= s.hi)
-        return r;                     // the whole slot: nothing to narrow
+        return r;
     const uint64_t offset = r.whole ? 0 : r.lo;
     r.lo = offset + (lo - s.lo);
     r.hi = offset + (hi - s.lo);
@@ -754,28 +578,58 @@ struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::All
     explicit StatementRefCollector(std::vector<Ref>& out) : out(out) {}
     void handle(const NamedValueExpression& e) { addRef(e); }
     void handle(const HierarchicalValueExpression& e) { addRef(e); }
+    /// An assignment's target is written, not read. Visiting it as an
+    /// ordinary value made a subroutine's *writes* come back as reads of
+    /// the call site: `task touch(); freewr = freerd; endtask` reported
+    /// freewr as read at the call, though nothing in the design reads it,
+    /// and the same database showed it with a single driver -- two rows
+    /// contradicting each other. The selectors on the left ARE reads
+    /// (`m[i] = x` reads i), so they are still visited.
+    void handle(const AssignmentExpression& e) {
+        collectLeftSelectorReads(e.left());
+        e.right().visit(*this);
+    }
+    void collectLeftSelectorReads(const Expression& lhs) {
+        switch (lhs.kind) {
+            case ExpressionKind::ElementSelect: {
+                auto& sel = lhs.as<ElementSelectExpression>();
+                sel.selector().visit(*this);
+                collectLeftSelectorReads(sel.value());
+                return;
+            }
+            case ExpressionKind::RangeSelect: {
+                auto& sel = lhs.as<RangeSelectExpression>();
+                sel.left().visit(*this);
+                sel.right().visit(*this);
+                collectLeftSelectorReads(sel.value());
+                return;
+            }
+            case ExpressionKind::MemberAccess:
+                collectLeftSelectorReads(lhs.as<MemberAccessExpression>().value());
+                return;
+            case ExpressionKind::Concatenation:
+                for (auto* op : lhs.as<ConcatenationExpression>().operands())
+                    collectLeftSelectorReads(*op);
+                return;
+            default:
+                return;
+        }
+    }
     void addRef(const ValueExpressionBase& e) {
         Ref r;
         r.sym = &e.symbol;
         r.origin = &e;
-        // No bounds were computed here, so the whole object is an upper bound
-        // rather than the bits actually touched. Left exact, a property
-        // checking `tag[1:0]` claimed to read the whole of `tag` --
-        // uncertainty stored as fact, which is the one thing the range
-        // encoding exists to keep apart.
+        // No bounds computed here: the whole object is an upper bound, and
+        // storing it as exact would state uncertainty as fact.
         r.exact = false;
         out.push_back(r);
     }
 };
 
-/// Templated over the node kind: a subroutine body is a `Statement`, while an
-/// assertion's body is an `AssertionExpr`, and both are walked the same way.
 template<typename NodeT>
 void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
     StatementRefCollector c(out);
     node.visit(c);
-    // Bit ranges are not resolved here: a subroutine's reads are attributed to
-    // its call site, where the caller's own bounds are what matter.
     out.erase(std::remove_if(out.begin(), out.end(),
                              [](const Ref& r) {
                                  if (!r.sym)
@@ -789,12 +643,7 @@ void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
               out.end());
 }
 
-/// A subroutine's free reads -- what a called function samples beyond its
-/// arguments -- reachable from any expression. `active` is the caller-held
-/// recursion guard. A free function rather than a walker method so the net-
-/// initialiser path can use it too: `wire w = masked(a);` used to lose
-/// `masked`'s free reads entirely, uncounted, while the `assign` spelling of
-/// the same statement recorded them.
+/// A called subroutine's free reads -- what it samples beyond its arguments.
 void collectCallReadsInto(const Expression& expr,
                           std::set<const SubroutineSymbol*>& active,
                           std::vector<Ref>& out) {
@@ -809,7 +658,7 @@ void collectCallReadsInto(const Expression& expr,
             if (!sub || !*sub)
                 return;
             if (!active.insert(*sub).second)
-                return;                     // recursive: already on the stack
+                return;
             std::vector<Ref> inner;
             collectStatementRefs((*sub)->getBody(), inner);
             const std::string scope = (*sub)->getHierarchicalPath();
@@ -828,9 +677,7 @@ void collectCallReadsInto(const Expression& expr,
     expr.visit(finder);
 }
 
-
-/// Collects the value symbols an expression reads, with the bit range each
-/// reference touches.
+/// The value symbols an expression reads, subroutine free reads included.
 struct ReadCollector : public ASTVisitor<ReadCollector, VisitFlags::AllGood> {
     std::vector<const ValueSymbol*>& out;
     std::set<const SubroutineSymbol*>& active;
@@ -846,20 +693,13 @@ struct ReadCollector : public ASTVisitor<ReadCollector, VisitFlags::AllGood> {
         if (!isConstantSymbol(e.symbol))
             out.push_back(&e.symbol);
     }
-
-    /// A call reads whatever the subroutine reads.
-    ///
-    /// Without this, `y = masked(a)` depends only on `a`: the `mask` the
-    /// function itself reads never reaches `y`, and the trace stops at the call.
-    /// Only the subroutine's *free* variables are taken -- its arguments, locals
-    /// and return value are internal and would be noise on every call site.
     void handle(const CallExpression& e) {
-        visitDefault(e);                        // the arguments, always
+        visitDefault(e);
         auto sub = std::get_if<const SubroutineSymbol*>(&e.subroutine);
         if (!sub || !*sub)
-            return;                             // a system call has no body here
+            return;
         if (!active.insert(*sub).second)
-            return;                             // recursive: already on the stack
+            return;
         std::vector<const ValueSymbol*> inner;
         ReadCollector c(inner, active);
         (*sub)->getBody().visit(c);
@@ -882,112 +722,442 @@ void collectReads(const Expression& expr, std::vector<const ValueSymbol*>& out) 
     expr.visit(c);
 }
 
+/// The path segment slang gives a generate block: the genvar's *value* for a
+/// loop iteration, the block's name otherwise.
+std::string generateSegment(const GenerateBlockSymbol& block) {
+    if (auto* index = block.getArrayIndex())
+        return "[" + index->toString(LiteralBase::Decimal, false) + "]";
+    std::string name(block.name);
+    return name.empty() ? block.getExternalName() : name;
+}
 
-/// Walks a procedure statement by statement and reports each assignment's own
-/// dependencies.
+/// The last segment of a symbol's hierarchical path: the leaf name with
+/// slang's array-element index already rendered in source numbering
+/// (`u[0]`) -- the one spelling a tree node's name must use, since an
+/// instance-array element's own `name` is the bare `u`.
+std::string leafSegment(const Symbol& sym) {
+    std::string full = sym.getHierarchicalPath();
+    const size_t dot = full.rfind('.');
+    return dot == std::string::npos ? full : full.substr(dot + 1);
+}
+
+/// Calls `fn` for every member of `scope` of kind `K`, descending through
+/// generate blocks and instance arrays but never into an instance's own body.
+template<SymbolKind K, typename SymT, typename F>
+void forEachOfKind(const Scope& scope, F&& fn) {
+    for (auto& member : scope.members()) {
+        if (member.kind == K) {
+            fn(member.as<SymT>());
+            continue;
+        }
+        switch (member.kind) {
+            case SymbolKind::GenerateBlock: {
+                auto& block = member.as<GenerateBlockSymbol>();
+                if (block.isUninstantiated)
+                    break;
+                forEachOfKind<K, SymT>(block, fn);
+                break;
+            }
+            case SymbolKind::GenerateBlockArray:
+                for (auto& entry : member.as<GenerateBlockArraySymbol>().entries)
+                    forEachOfKind<K, SymT>(*entry, fn);
+                break;
+            case SymbolKind::InstanceArray:
+                forEachOfKind<K, SymT>(member.as<InstanceArraySymbol>(), fn);
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+template<typename F>
+void forEachInstance(const Scope& scope, F&& fn) {
+    forEachOfKind<SymbolKind::Instance, InstanceSymbol>(scope, fn);
+}
+
+/// The declaration_kind word for a net or variable.
+std::string declarationKindOf(const Symbol& sym) {
+    if (sym.kind != SymbolKind::Net)
+        return "variable";
+    auto& nt = sym.as<NetSymbol>().netType;
+    switch (nt.netKind) {
+        case NetType::Wire:         return "wire";
+        case NetType::WAnd:         return "wand";
+        case NetType::WOr:          return "wor";
+        case NetType::Tri:          return "tri";
+        case NetType::TriAnd:       return "triand";
+        case NetType::TriOr:        return "trior";
+        case NetType::Tri0:         return "tri0";
+        case NetType::Tri1:         return "tri1";
+        case NetType::TriReg:       return "trireg";
+        case NetType::Supply0:      return "supply0";
+        case NetType::Supply1:      return "supply1";
+        case NetType::UWire:        return "uwire";
+        case NetType::Interconnect: return "interconnect";
+        case NetType::UserDefined:
+            return nt.name.empty() ? "wire" : std::string(nt.name);
+        default:                    return "wire";
+    }
+}
+
+std::string directionWord(ArgumentDirection d) {
+    switch (d) {
+        case ArgumentDirection::In:    return "input";
+        case ArgumentDirection::Out:   return "output";
+        case ArgumentDirection::InOut: return "inout";
+        default:                       return "ref";
+    }
+}
+
+// ---------------------------------------------------------------- templates
+//
+// Everything a group's occurrences share, held with template-local indices.
+// Stamping is then arithmetic: global id = per-occurrence base + index. The
+// invariant that makes this sound: two bodies with one (definition,
+// parameters) key are the same AST, so any deterministic traversal of one is
+// the same traversal of the other.
+
+struct TplLoc {
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+struct TplRange {
+    std::optional<std::pair<uint64_t, uint64_t>> bits;
+    bool exact = true;
+};
+
+TplRange rangeOf(const Ref& r) {
+    TplRange out;
+    if (r.sym && !r.whole)
+        out.bits = std::make_pair(r.lo, r.hi);
+    out.exact = r.sym ? r.exact : true;
+    return out;
+}
+
+struct TplScope {          // a generate level below the instance; 0 = the body
+    int32_t parent = -1;
+    std::string name;
+};
+
+struct TplNet {
+    int32_t scope = 0;
+    std::string name;
+    std::string declKind;
+    int64_t dataTypeId = 0;
+    int64_t width = -1;
+    bool isImplicit = false;
+    TplLoc loc;
+};
+
+struct TplTerm {
+    std::string name;
+    std::string kind;        // signal | interface
+    std::string direction;   // "" = NULL
+    int64_t dataTypeId = 0;
+    int64_t width = -1;
+    int isConst = -1;
+    std::string modport;
+    TplLoc loc;
+};
+
+struct TplTermMap {
+    int32_t term = 0;
+    int64_t ordinal = 0;
+    int32_t net = 0;
+    TplRange termR, netR;
+    bool mappingExact = false;
+};
+
+struct TplProcedure {
+    int32_t scope = 0;
+    std::string name;
+    std::string kind;
+    TplLoc loc;
+};
+
+struct TplStmt {
+    int32_t scope = 0;
+    int32_t proc = -1;
+    int64_t sequence = -1;
+    std::string kind;
+    std::string construct;
+    std::string assignKind;  // "" = NULL
+    std::string delay;
+    int64_t dropped = 0;
+    TplLoc loc;
+};
+
+struct TplStmtRef {          // assign_target and assign_operand share the shape
+    int32_t stmt = 0;
+    int64_t ordinal = 0;
+    int32_t net = 0;
+    TplRange r;
+};
+
+struct TplExprRef {
+    int32_t stmt = 0;
+    int64_t ordinal = 0;
+    int32_t net = 0;
+    std::string role;
+    TplRange r;
+};
+
+struct TplProcEvent {
+    int32_t proc = 0;
+    int32_t stmt = -1;
+    int32_t net = -1;
+    std::string eventKind;
+    std::string edgeKind;
+    TplLoc loc;
+};
+
+struct TplPrim {
+    int32_t scope = 0;
+    std::string name;
+    std::string primKind;
+    std::string defName;
+    TplLoc loc;
+};
+
+struct TplDep {
+    int32_t srcNet = -1;     // -1 = constant source
+    int32_t tgtNet = 0;
+    int32_t stmt = -1;
+    int32_t operandRef = -1;
+    int32_t targetRef = -1;
+    int32_t exprRef = -1;
+    int32_t prim = -1;
+    std::string kind;
+    TplRange srcR, tgtR;
+    int mappingExact = -1;
+};
+
+/// Replay data for one outward reference: how to find the target from an
+/// occurrence of this template. `kind` decides the walk.
+struct TplHierRef {
+    int32_t stmt = -1;
+    std::string path;
+    std::string access;      // read | write | connect
+    TplRange r;
+    TplLoc loc;
+    enum ResolveKind {
+        None,                // slang gave no target usable per occurrence
+        Downward,            // segs descend from the occurrence's own node
+        Absolute,            // segs descend from the design root
+        ViaIfaceTerm         // segs descend from the interface bound to term
+    } resolve = None;
+    int32_t ifaceTerm = -1;  // ViaIfaceTerm: which of this template's terms
+    std::vector<std::string> segs;   // tree segments to descend
+    std::string netName;     // scope-relative net name at the target instance
+};
+
+/// One dependency with at least one end outside the instance, paired where
+/// the statement was walked -- per (source element, target element), never
+/// by joining afterwards -- and materialised once the occurrence's
+/// references resolve. An end is a local net index or a hierRefs index,
+/// never both.
+struct TplCrossDep {
+    std::string kind;        // data | control | procedure
+    /// True when the dependency has no source BY DESIGN -- a system task
+    /// writing across the boundary. Without it, "no source reference" and
+    /// "the source reference did not resolve" look alike, and the second
+    /// must be dropped while the first must not.
+    bool sourceless = false;
+    int32_t stmt = -1;
+    int32_t srcNet = -1;
+    int32_t srcHref = -1;
+    int32_t tgtNet = -1;
+    int32_t tgtHref = -1;
+    int32_t operandRef = -1;
+    int32_t targetRef = -1;
+    int32_t exprRef = -1;
+    TplRange srcR, tgtR;
+    int mappingExact = -1;
+};
+
+struct TplConn {
+    std::string kind;        // net_conn.connection_kind
+    int32_t parentNet = -1;  // index into the PARENT template's nets
+    int32_t childTerm = -1;  // index into the child template's terms
+    int64_t ordinal = 0;     // segment ordinal within that terminal
+    TplRange netR;
+    int netExact = -1;       // -1 = no net end (writer NULLs the range too)
+    TplRange termR;
+    int termExact = -1;
+    int mappingExact = -1;
+    int32_t ifaceChild = -1; // interface binding to a sibling child
+    int32_t ifaceOwnTerm = -1; // interface pass-through of the parent's port
+    int32_t hierRef = -1;    // external tie: index into parent's hierRefs
+    TplLoc loc;
+};
+
+struct TplChild {
+    int32_t scope = 0;
+    std::string name;        // ONE path segment
+    enum Kind { Module, Unresolved } kind = Module;
+    std::string groupKey;    // Module: which template to stamp
+    std::string defName;     // Unresolved: the definition as written
+    std::vector<std::string> unresolvedPorts;  // Unresolved: term names in order
+    std::vector<TplConn> conns;
+    TplLoc loc;
+};
+
+struct Template {
+    int64_t moduleId = 0;
+    std::string params;
+    std::vector<TplScope> scopes;
+    std::vector<TplNet> nets;
+    std::vector<TplTerm> terms;
+    std::vector<TplTermMap> termMaps;
+    std::vector<TplProcedure> procedures;
+    std::vector<TplStmt> stmts;
+    std::vector<TplStmtRef> targets;
+    std::vector<TplStmtRef> operands;
+    std::vector<TplExprRef> exprRefs;
+    std::vector<TplProcEvent> procEvents;
+    std::vector<TplPrim> prims;
+    std::vector<TplDep> deps;
+    std::vector<TplHierRef> hierRefs;
+    std::vector<TplCrossDep> crossDeps;
+    std::vector<TplChild> children;
+    std::unordered_map<std::string, int32_t> termIndex;  // name -> terms index
+    std::unordered_map<std::string, int32_t> netIndex;   // name -> nets index
+    bool hasResolvableRefs = false;
+    bool built = false;
+};
+
+// ------------------------------------------------------- statement walking
+//
+// Walks a procedure statement by statement. Ported from v9 with the callback
+// layer reshaped: a target arrives with its paired operands and the gating
+// stack in one call, because the template needs the pairing (net_dep names
+// the operand and target rows) rather than a stream of independent edges.
+
+/// One operand paired with the part of the target its bits actually reach.
 ///
-/// The alternative — pairing every symbol the procedure reads with every symbol
-/// it drives — is what a `getReadSet()` x `getDrivers()` cross product gives,
-/// and it is badly wrong for the blocks that matter most. One `always_ff` that
-/// updates a dozen registers would report each of them as depending on all the
-/// others' operands. Measured on a vendor PHY, a single register came back with
-/// 2224 operand rows.
-///
-/// So: an assignment's right-hand side feeds its own left-hand side, and the
-/// conditions of the enclosing `if`/`case` feed everything assigned inside the
-/// branch — those genuinely do gate it. `gating` is that enclosing condition
-/// stack, unwound on the way back out.
+/// Both ends are narrowed to the overlap, not just the source. Keeping the
+/// target whole while narrowing the source is what made
+/// `assign swap = {c[3:0], c[7:4]}` export two dependencies each claiming
+/// all eight bits of swap with mapping_exact=1 -- a four-bit source cannot
+/// map one-to-one onto an eight-bit target, so the row was not merely
+/// coarse but impossible, and it said the bytes were not swapped.
+struct PairedSrc {
+    Ref src;
+    Ref tgt;
+    bool mapExact = false;
+    /// The source as the RTL spells it, before pairing narrowed it to this
+    /// target's bits. Only a hier_ref row wants this: it describes the
+    /// reference, not one dependency through it.
+    Ref srcAsWritten;
+};
+
 struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood> {
-    /// `src.sym` is null for a driver with no external operand.
-    /// `mapExact` is true when the source's bits map one-to-one onto the
-    /// target's, so a bit-level trace can follow the pair; false when the source
-    /// merely influences the target's range as a whole.
-    using Emit = std::function<void(const Ref& dst, const Ref& src, bool gatingEdge,
-                                    bool mapExact, SourceRange where)>;
-    /// `firstTarget` opens a new statement; the remaining targets of one
-    /// concatenated left-hand side share it, so `{a, b} = ...` is ONE
-    /// statement in the stmt ordinal's terms -- as the doc promises -- rather
-    /// than one per target.
-    using EmitAssign = std::function<void(const Ref& dst, const std::vector<Ref>& operands,
-                                          SourceRange where, int64_t seq, bool blocking,
-                                          int64_t droppedConstants, bool inSubroutine,
-                                          bool firstTarget)>;
-    /// A statement that reads without writing anything nameable.
-    using EmitRead = std::function<void(const std::vector<Ref>& operands,
-                                        const std::string& construct, SourceRange where)>;
+    /// One assignment target with everything that reaches it. `firstTarget`
+    /// opens the statement; the remaining targets of a concatenated left-hand
+    /// side share it.
+    using EmitTarget = std::function<void(
+        const Ref& dst, const std::vector<PairedSrc>& pairs,
+        const std::vector<Ref>& gating, SourceRange where, int64_t seq,
+        bool blocking, int64_t dropped, bool inSubroutine, bool firstTarget,
+        const std::string& delay)>;
+    /// A call site's actual bound to its formal, by argument direction.
+    /// `bindable` is false when the call sits in a control expression, which
+    /// belongs to no statement this schema records.
+    using EmitCallBinding = std::function<void(const Ref& formal, const Ref& actual,
+                                               bool reads, bool writes,
+                                               bool oneToOne, bool bindable,
+                                               SourceRange where)>;
+    /// A statement-level event control (a wait, not sensitivity).
     using EmitEvent = std::function<void(const Expression* expr, const std::string& edge,
-                                         SourceRange where)>;
+                                         int64_t seq, SourceRange where)>;
+    /// A statement that reads without writing anything nameable: an
+    /// assertion, a wait condition, a call, a system task.
+    ///
+    /// The gating stack comes with it. A condition was only ever recorded
+    /// while building an assignment's control dependencies, so a branch
+    /// holding nothing but `$display` or an assertion dropped its
+    /// condition entirely -- `if (gate) $display(payload);` knew about
+    /// payload and not about gate, in any procedure, implicit sensitivity
+    /// or not. There is no target for a dependency here, but the read is
+    /// real and belongs to the statement it gates.
+    using EmitRead = std::function<void(const std::vector<Ref>& reads,
+                                        const std::vector<Ref>& gating,
+                                        const std::vector<Ref>& writes,
+                                        const std::string& stmtKind,
+                                        const std::string& construct, int64_t seq,
+                                        SourceRange where)>;
 
-    Emit emit;
-    EmitAssign emitAssign;
-    EmitRead emitRead;
+    EmitTarget emitTarget;
+    EmitCallBinding emitBinding;
     EmitEvent emitEvent;
+    EmitRead emitRead;
     EvalContext& eval;
-    /// The timing control the procedure's sensitivity list was derived from.
-    /// `always_ff @(posedge clk)` keeps its event as the body's leading timed
-    /// statement, so without this the same event came out twice: once as
-    /// sensitivity and once as a wait.
     const TimingControl* sensitivityTiming = nullptr;
+    /// The delay control in force for statements below a `#d` timed statement,
+    /// and for a continuous assign's own delay.
+    std::string pendingDelay;
     std::vector<Ref> gating;
     int64_t seq = 0;
     std::set<const SubroutineSymbol*> activeSubs;
-    std::set<const SubroutineSymbol*> walkedSubs;
     std::set<const ValueSymbol*> loopVars;
     int subDepth = 0;
+    /// Remaining subroutine-body instantiations for the whole template, and
+    /// the count of call sites whose body was skipped once it ran out. Both
+    /// owned by the caller: the budget spans every procedure of one module,
+    /// since the blowup compounds across them.
+    int64_t* budget = nullptr;
+    int64_t* truncated = nullptr;
+    /// Whether call bindings currently have a statement to attach to; cleared
+    /// while visiting control expressions, whose calls belong to no statement
+    /// this schema records.
+    bool bindable = true;
 
+    StatementWalker(EmitTarget t, EmitCallBinding b, EmitEvent e, EmitRead r,
+                    EvalContext& eval) :
+        emitTarget(std::move(t)), emitBinding(std::move(b)),
+        emitEvent(std::move(e)), emitRead(std::move(r)), eval(eval) {}
 
-    StatementWalker(Emit emit, EmitAssign emitAssign, EmitEvent emitEvent,
-                    EmitRead emitRead, EvalContext& eval) :
-        emit(std::move(emit)), emitAssign(std::move(emitAssign)),
-        emitEvent(std::move(emitEvent)), emitRead(std::move(emitRead)),
-        eval(eval) {}
-
-    /// `assert (req !== 1'bx);` and its siblings.
-    ///
-    /// An assertion writes nothing, so the walk had nothing to pair its reads
-    /// with and the whole statement vanished: the signals it checks read as
-    /// though no part of the design looked at them. They are reads like any
-    /// other, recorded against the statement rather than against a target.
     void handle(const ImmediateAssertionStatement& stmt) {
         std::vector<Ref> reads;
         collectRefs(stmt.cond, eval, reads);
-        emitRead(reads, assertionWord(stmt.assertionKind), stmt.sourceRange);
+        emitRead(reads, gating, {}, "assertion",
+                 assertionWord(stmt.assertionKind), seq++,
+                 stmt.sourceRange);
         visitDefault(stmt);
     }
 
-    /// The concurrent form: `assert property (@(posedge clk) a |-> b);`.
-    /// Its body is an assertion expression rather than an ordinary one, so the
-    /// reads are gathered by walking it for value references.
     void handle(const ConcurrentAssertionStatement& stmt) {
         std::vector<Ref> reads;
         collectStatementRefs(stmt.propertySpec, reads);
-        emitRead(reads, assertionWord(stmt.assertionKind), stmt.sourceRange);
+        emitRead(reads, gating, {}, "assertion",
+                 assertionWord(stmt.assertionKind), seq++,
+                 stmt.sourceRange);
         visitDefault(stmt);
     }
 
-    /// `wait (done);` -- the condition is read, and the statement writes
-    /// nothing. The body, if there is one, is walked as usual and its own
-    /// writes are recorded normally.
     void handle(const WaitStatement& stmt) {
         std::vector<Ref> reads;
         collectRefs(stmt.cond, eval, reads);
-        emitRead(reads, "wait", stmt.sourceRange);
+        emitRead(reads, gating, {}, "wait", "wait", seq++, stmt.sourceRange);
         visitDefault(stmt);
     }
 
-    /// A statement whose whole effect is to read: `$display("%0h", x);`,
-    /// `$error(...)`, a void call to a task that only samples.
+    /// A statement whose whole effect is a call: `$display(...)`, `t(a, b);`.
+    /// The statement row exists for writing calls too -- the call is where
+    /// the actual-to-formal bindings hang -- but only its *reads* are
+    /// recorded here; a written argument's assignment is walked inside the
+    /// call expression as usual.
     ///
-    /// The rule the assertion handlers above are a special case of -- a
-    /// statement that reads and writes nothing this module can name still
-    /// read. Without it, a signal a testbench only ever prints came back as
-    /// one nothing in the design had ever looked at, which is a wrong answer
-    /// rather than a coarse one: the `$display` is right there in the source.
-    ///
-    /// Only calls whose own subroutine assigns nothing reach here. A task that
-    /// writes is walked by `handle(CallExpression)` and its writes are paired
-    /// with their targets in the ordinary way, so its reads are already
-    /// attributed and must not be recorded twice.
+    /// Only what the call site itself names is read here. A user
+    /// subroutine's own reads are recorded by walking its body, which v10
+    /// does once per call site -- summarising them here as well reported
+    /// every one of them twice, as a `dataflow` load from the body and a
+    /// `statement` load from the call, against a schema that promises one
+    /// read is one row. A system task has no body to walk, so its free
+    /// reads still have to be gathered.
     void handle(const ExpressionStatement& stmt) {
         if (stmt.expr.kind != ExpressionKind::Call) {
             visitDefault(stmt);
@@ -996,14 +1166,13 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         auto& call = stmt.expr.as<CallExpression>();
         std::vector<Ref> reads;
         collectRefs(stmt.expr, eval, reads);
-        collectCallReads(stmt.expr, reads);
-        // What the statement writes is not what it reads. slang models a
-        // system task's output argument as an assignment inside the call --
-        // which is how the write already reaches `assignment` -- and taking
-        // every operand made `$readmemh("f", mem)` report that `mem` reads
-        // itself, at the very line that loads it.
+        if (call.isSystemCall()) {
+            std::set<const SubroutineSymbol*> active;
+            collectCallReadsInto(stmt.expr, active, reads);
+        }
         std::set<const ValueSymbol*> written;
-        collectWrittenTargets(stmt.expr, written);
+        std::vector<Ref> writeRefs;
+        collectWrittenTargets(stmt.expr, written, &writeRefs);
         if (!written.empty()) {
             reads.erase(std::remove_if(reads.begin(), reads.end(),
                                        [&](const Ref& r) {
@@ -1011,99 +1180,124 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                        }),
                         reads.end());
         }
-        if (!reads.empty() && !callWrites(call))
-            emitRead(reads, callWord(call), stmt.sourceRange);
+        const bool sys = call.isSystemCall();
+        // A system task that writes an argument -- $readmemh into a memory,
+        // $sscanf into a variable, $cast into its destination -- really does
+        // drive it, and slang models the write as an assignment inside the
+        // call. A user subroutine's write is covered by the formal binding,
+        // so only the system case needs targets of its own; without them the
+        // argument read as undriven and its procedure as one that wrote
+        // nothing at all.
+        emitRead(reads, gating, sys ? writeRefs : std::vector<Ref>{},
+                 sys ? "system_task" : "call", callWord(call), seq++,
+                 stmt.sourceRange);
         visitDefault(stmt);
     }
 
-    /// Every symbol an expression assigns, however deeply nested.
     void collectWrittenTargets(const Expression& expr,
-                               std::set<const ValueSymbol*>& out) {
+                               std::set<const ValueSymbol*>& out,
+                               std::vector<Ref>* refs = nullptr) {
         struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
             StatementWalker& self;
             std::set<const ValueSymbol*>& out;
-            Finder(StatementWalker& self, std::set<const ValueSymbol*>& out) :
-                self(self), out(out) {}
+            std::vector<Ref>* refs;
+            Finder(StatementWalker& self, std::set<const ValueSymbol*>& out,
+                   std::vector<Ref>* refs) :
+                self(self), out(out), refs(refs) {}
             void handle(const AssignmentExpression& e) {
                 std::vector<Ref> targets;
                 collectRefs(e.left(), self.eval, targets, /*skipSelectors=*/true);
-                for (auto& t : targets)
-                    if (t.sym)
-                        out.insert(t.sym);
+                for (auto& t : targets) {
+                    if (!t.sym)
+                        continue;
+                    out.insert(t.sym);
+                    if (refs)
+                        refs->push_back(t);
+                }
                 visitDefault(e);
             }
         };
-        Finder f(*this, out);
+        Finder f(*this, out, refs);
         expr.visit(f);
     }
 
-    /// The word for a call, as `construct`: the system task's own name
-    /// (`$display`), or `call` for a void call to a user subroutine.
     static std::string callWord(const CallExpression& call) {
         if (call.isSystemCall())
             return std::string(call.getSubroutineName());
         return "call";
     }
 
-    /// Whether a call can assign anything at all, directly or through what it
-    /// calls. A system call cannot; a user subroutine is asked for its drivers.
-    bool callWrites(const CallExpression& call) {
-        auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
-        if (!sub || !*sub)
-            return false;                 // a system call writes no signal
-        struct WriteFinder : ASTVisitor<WriteFinder, VisitFlags::AllGood> {
-            bool found = false;
-            void handle(const AssignmentExpression&) { found = true; }
-            void handle(const UnaryExpression& e) {
-                switch (e.op) {
-                    case UnaryOperator::Preincrement:
-                    case UnaryOperator::Predecrement:
-                    case UnaryOperator::Postincrement:
-                    case UnaryOperator::Postdecrement:
-                        found = true;
-                        return;
-                    default:
-                        visitDefault(e);
-                        return;
-                }
-            }
-        };
-        WriteFinder f;
-        (*sub)->getBody().visit(f);
-        return f.found;
-    }
-
-    /// A statement-level event control: `@(posedge clk); …` in an initial
-    /// block or a task. It is a wait rather than sensitivity, but the signal
-    /// is sampled either way, and the export had no trace of the read at all.
+    /// A statement-level timing control: an event control is a wait; a delay
+    /// control is carried onto the statements it prefixes.
     void handle(const TimedStatement& stmt) {
         if (&stmt.timing != sensitivityTiming) {
             std::vector<std::pair<const Expression*, std::string>> raw;
             collectEdgeEvents(&stmt.timing, raw);
             for (auto& [expr, edge] : raw)
-                emitEvent(expr, edge, stmt.sourceRange);
+                emitEvent(expr, edge, seq++, stmt.sourceRange);
+        }
+        const std::string d = delayText(&stmt.timing);
+        if (!d.empty()) {
+            const std::string saved = pendingDelay;
+            pendingDelay = d;
+            visitDefault(stmt);
+            pendingDelay = saved;
+            return;
         }
         visitDefault(stmt);
     }
 
+    /// Visits the condition expressions of a branch with `bindable` off --
+    /// a call written INSIDE a condition belongs to no statement this
+    /// schema records -- and leaves it on for the branch bodies, whose
+    /// calls are ordinary statements of their own.
+    ///
+    /// Clearing it across the whole subtree instead cost every gated call
+    /// its statement binding: `if (g) put(b);` produced a `procedure`
+    /// dependency with stmt_id and expr_ref_id NULL, while the same call
+    /// written ungated kept both. That is exactly the shape the per-call-
+    /// site walk exists to record, and every call site in the motivating
+    /// case is gated.
+    template<typename F>
+    void visitGuarded(F&& visitConditions) {
+        const bool saved = bindable;
+        bindable = false;
+        visitConditions();
+        bindable = saved;
+    }
+
     void handle(const ConditionalStatement& stmt) {
         const size_t mark = gating.size();
-        for (auto& cond : stmt.conditions)
-            collectRefs(*cond.expr, eval, gating);
-        visitDefault(stmt);
+        visitGuarded([&] {
+            for (auto& cond : stmt.conditions) {
+                collectRefs(*cond.expr, eval, gating);
+                cond.expr->visit(*this);
+            }
+        });
+        stmt.ifTrue.visit(*this);
+        if (stmt.ifFalse)
+            stmt.ifFalse->visit(*this);
         gating.resize(mark);
     }
 
     void handle(const CaseStatement& stmt) {
         const size_t mark = gating.size();
-        collectRefs(stmt.expr, eval, gating);
-        // Item labels select a branch, so they gate it as the case expression
-        // does. Constant labels contribute no operand and drop out.
+        visitGuarded([&] {
+            collectRefs(stmt.expr, eval, gating);
+            stmt.expr.visit(*this);
+            for (auto& item : stmt.items) {
+                for (auto* label : item.expressions) {
+                    collectRefs(*label, eval, gating);
+                    label->visit(*this);
+                }
+            }
+        });
         for (auto& item : stmt.items) {
-            for (auto* label : item.expressions)
-                collectRefs(*label, eval, gating);
+            if (item.stmt)
+                item.stmt->visit(*this);
         }
-        visitDefault(stmt);
+        if (stmt.defaultCase)
+            stmt.defaultCase->visit(*this);
         gating.resize(mark);
     }
 
@@ -1111,10 +1305,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         const size_t mark = gating.size();
         if (stmt.stopExpr)
             collectRefs(*stmt.stopExpr, eval, gating);
-        // The loop's own control variables are iteration counters, not design
-        // signals. Recorded as targets they appear as module-level nets driven
-        // by the increment, where they collide with any real signal of the same
-        // name -- `for (int i = …)` in two procedures both writing to `i`.
         const size_t loopMark = loopVars.size();
         for (auto* v : stmt.loopVars)
             loopVars.insert(v);
@@ -1140,8 +1330,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         gating.resize(mark);
     }
 
-    /// `x++` / `--x` are unary expressions, not assignments, so without this a
-    /// counter written that way has no driver at all while `x <= x + 1` works.
+    /// `x++` / `--x`: an assignment in everything but its expression kind.
     void handle(const UnaryExpression& expr) {
         switch (expr.op) {
             case UnaryOperator::Preincrement:
@@ -1157,74 +1346,57 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         collectRefs(expr.operand(), eval, targets, /*skipSelectors=*/true);
         for (auto& dst : targets) {
             if (loopVars.count(dst.sym))
-                continue;               // a loop counter, not a design signal
-            // `cnt++` writes cnt just as `cnt <= cnt + 1` does; without this the
-            // target keeps its edges but loses its statement line, seq, and
-            // blocking kind. It *reads* cnt the same way, so the operand and the
-            // self-edge are recorded exactly as if it were spelled out.
-            emitAssign(dst, {dst}, expr.sourceRange, seq++, true, 0, subDepth > 0,
-                       /*firstTarget=*/true);
-            // Data before gating, as the assignment path does. An operand can
-            // reach a target both ways at one statement -- `if (c < lim) c++;`
-            // reads `c` in the condition and in the increment -- and the edge
-            // that survives is whichever is emitted first, because `control`
-            // is not part of the dedup key. Emitting gating first here made
-            // the increment's own dependency read as a branch condition,
-            // while the identical circuit spelled `c <= c + 1` read as data.
-            // The data dependency is the stronger fact and the one a consumer
-            // filtering `control = 0` is asking for.
-            // `cnt++` reads and writes the same bits of the same object, which is
-            // as positional as a mapping gets.
-            emit(dst, dst, false, /*mapExact=*/true, expr.sourceRange);
-            for (auto& src : gating)
-                emit(dst, src, true, /*mapExact=*/false, expr.sourceRange);
+                continue;
+            // Reads and writes the same bits of the same object -- as
+            // positional as a mapping gets.
+            emitTarget(dst, {PairedSrc{dst, dst, true, dst}}, gating, expr.sourceRange,
+                       seq++, true, 0, subDepth > 0, /*firstTarget=*/true,
+                       pendingDelay);
         }
         visitDefault(expr);
     }
 
-    /// A called task or function may itself assign a module signal. Without
-    /// following it, `always_ff @(posedge clk) bump();` records nothing at all
-    /// and the register `bump` writes has no driver.
     void handle(const CallExpression& expr) {
         visitDefault(expr);
         auto sub = std::get_if<const SubroutineSymbol*>(&expr.subroutine);
         if (!sub || !*sub)
             return;
-        // Every call, before the once-per-subroutine guard below: the body is
-        // the same wherever it is called from, but the actuals are not.
         bindArguments(expr, **sub);
         if (!activeSubs.insert(*sub).second)
-            return;                             // recursion guard
-        // Once per subroutine, not once per call. A function called from four
-        // places was having its body walked four times, and while `edge`
-        // deduplicates, `assignment` does not -- so its internal statements came
-        // out four times over. The targets are function locals in any case:
-        // they have no `symbol` row and no waveform, so they are attributed but
-        // not re-attributed.
-        if (walkedSubs.insert(*sub).second) {
-            // Depth, so a statement in the body knows it is not the enclosing
-            // construct's own. A `=` inside a function reached from an
-            // `assign` is still a `=`; reporting it as the continuous
-            // assignment's NULL made the same source line answer differently
-            // depending on who called it.
-            subDepth++;
-            (*sub)->getBody().visit(*this);
-            subDepth--;
+            return;                       // recursion guard
+        // Per CALL SITE, deliberately. Walking the body once per subroutine
+        // read cleaner but lost call-site semantics: in
+        // `if (g1) put(d1); if (g2) put(d2);` the body's `q <= v` inherited
+        // g1's gating only, so g2 -> q never existed and the driver cone
+        // depended on which call was walked first. The body's statements
+        // are the effect of THIS call -- its gating stack, its delay -- so
+        // each call instantiates them, exactly as the occurrence model
+        // stamps each instance.
+        //
+        // The cost is body rows per call site, and it compounds: the cycle
+        // guard above stops recursion but not fan-out, so a call DAG where
+        // each level calls the next twice costs 2^depth. Measured at 21
+        // such levels: 3.1 M statements and 1.2 GB from an 88-line file.
+        // The budget bounds that. It is deliberately generous -- ordinary
+        // RTL never approaches it -- and what it skips is counted rather
+        // than silently dropped, so a truncated export says so.
+        if (budget && *budget <= 0) {
+            if (truncated)
+                (*truncated)++;
+            activeSubs.erase(*sub);
+            return;
         }
+        if (budget)
+            (*budget)--;
+        subDepth++;
+        (*sub)->getBody().visit(*this);
+        subDepth--;
         activeSubs.erase(*sub);
     }
 
-    /// The actuals at a call site, tied to the formals they bind to.
-    ///
-    /// The body is walked once and yields `bump.v -> q`; without this the
-    /// other half of the chain -- `d -> bump.v` -- was never recorded, so
-    /// `always_ff @(posedge clk) bump(d);` left `d` reading as though nothing
-    /// used it and `q` as though it came from a local of a task nothing fed.
-    /// The formal has no `symbol` row, being a subroutine local, which is the
-    /// same footing every other reference to one already stands on.
-    ///
-    /// Direction decides which way the edge points: an `input` formal is fed
-    /// by the actual, an `output` feeds it, and `inout`/`ref` do both.
+    /// The actuals at a call site, tied to the formals they bind to; an
+    /// `input` formal is fed by the actual, an `output` feeds it, and
+    /// `inout`/`ref` do both.
     void bindArguments(const CallExpression& expr, const SubroutineSymbol& sub) {
         auto args = expr.arguments();
         auto formals = sub.getArguments();
@@ -1243,63 +1415,40 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             formal.sym = formals[i];
             formal.origin = args[i];
             std::vector<Ref> actuals;
-            // A written actual is a target, so its selectors are reads of the
-            // index rather than part of what is written -- the same split the
-            // assignment path already makes on an lvalue.
             collectRefs(*args[i], eval, actuals, /*skipSelectors=*/writes);
             for (auto& a : actuals) {
                 if (!a.sym)
                     continue;
-                // An actual binds to its formal whole-to-whole -- but only
-                // when the actual IS a reference filling the formal, by the
-                // same rule every positional claim answers to. Counting
-                // references said `bump(a + 4'd1)` was one-to-one because it
-                // holds one reference; a carry crosses bits, and a narrower
-                // actual than its formal has extension bits that are no bit
-                // of it. Same class of wrong the leaf rule exists to prevent.
-                const uint64_t fw =
-                    formal.sym ? bitWidthOf(*formal.sym) : 0;
+                // Whole-to-whole only when the actual IS a reference filling
+                // the formal -- the same leaf rule every positional claim
+                // answers to.
+                const uint64_t fw = formal.sym ? bitWidthOf(*formal.sym) : 0;
                 const bool oneToOne =
                     actuals.size() == 1 && fw != 0 &&
                     isPlainReference(*args[i]) && actuals[0].exact &&
                     (actuals[0].whole ? bitWidthOf(*actuals[0].sym) == fw
                                       : actuals[0].hi - actuals[0].lo + 1 == fw);
-                if (reads)
-                    emit(formal, a, false, oneToOne, expr.sourceRange);
-                if (writes)
-                    emit(a, formal, false, oneToOne, expr.sourceRange);
+                emitBinding(formal, a, reads, writes, oneToOne, bindable,
+                            expr.sourceRange);
             }
         }
     }
 
-    /// A call reads whatever the subroutine reads.
-    ///
-    /// `ValuePath::visitPaths` visits a call's arguments and stops there, so
-    /// without this `y = masked(a)` depends on `a` alone and the `mask` the
-    /// function itself reads never reaches `y` -- the trace stops at the call.
-    /// Only the subroutine's *free* variables are taken; its arguments, locals
-    /// and return value are internal and would be noise on every call site.
-    void collectCallReads(const Expression& expr, std::vector<Ref>& out) {
-        collectCallReadsInto(expr, activeSubs, out);
-    }
-
     void handle(const AssignmentExpression& expr) {
-        // Targets come from slang's own path analysis rather than a hand-rolled
-        // walk of the lvalue: it resolves the root symbol and the bit range the
-        // longest static prefix selects, which is exactly what a member access
-        // or a part-select on the left means. A concatenation yields one path
-        // per element, so `{carry, sum} = …` drives both.
+        // The copy-back slang synthesises for an `output`/`inout` actual:
+        // `bump(i0, o0)` carries an assignment to o0 whose right side is an
+        // empty placeholder. It is not a statement anyone wrote, and it has
+        // no operands -- so recording it produced a source-less dependency,
+        // which v_driver reports as a CONSTANT tie-off on a signal the task
+        // plainly drives. The real record is the `procedure` dependency
+        // from the formal, which bindArguments already makes.
+        if (expr.right().kind == ExpressionKind::EmptyArgument) {
+            visitDefault(expr);
+            return;
+        }
         std::vector<Ref> targets;
         collectRefs(expr.left(), eval, targets, /*skipSelectors=*/true);
         if (targets.empty()) {
-            // Path analysis found nothing to write. No legal RTL is known to
-            // reach here -- the case that prompted this, `assign q[i] = …` with
-            // a non-constant index, is an elaboration error in slang rather
-            // than a path it declines to compute. It is kept because losing a
-            // driver outright is the one outcome that must not happen, and it
-            // resolves the root by walking the lvalue rather than through
-            // `getSymbolReference`, which hands back a *field* symbol for a
-            // member access on an unpacked struct or a class handle.
             const Expression* root = &expr.left();
             for (;;) {
                 if (root->kind == ExpressionKind::ElementSelect)
@@ -1315,6 +1464,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 root->kind == ExpressionKind::HierarchicalValue) {
                 Ref r;
                 r.sym = &root->as<ValueExpressionBase>().symbol;
+                r.origin = root;
                 targets.push_back(r);
             }
             else {
@@ -1323,16 +1473,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             }
         }
 
-        // Where each target sits in the flattened left-hand side. `targets` above
-        // is the same set of references; this adds the position, which is what
-        // decides afterwards whether a given operand reaches a given target.
         std::vector<Slot> lhsSlots;
         collectSlots(expr.left(), eval, 0, lhsSlots, /*skipSelectors=*/true);
         if (lhsSlots.size() != targets.size()) {
-            // The fallback path above resolved a target the slot walk cannot see,
-            // or the two disagree for a reason not understood here. Position is
-            // then not trustworthy, so every target spans the whole assignment
-            // and the pairing falls back to what it always was.
             lhsSlots.clear();
             for (auto& t : targets)
                 lhsSlots.push_back(Slot{t, 0, kNoWidth, false});
@@ -1341,75 +1484,45 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         std::vector<Slot> rhsSlots;
         filteredConstants = 0;
         collectSlots(expr.right(), eval, 0, rhsSlots);
-        // A subroutine's own reads and the selectors on the left are never
-        // positional -- a call is opaque, and an index decides *which* bits are
-        // written rather than supplying any of them -- but they do belong to
-        // ONE ELEMENT, and that window is what keeps them off the other
-        // targets. Appending them windowless paired every such read with every
-        // target of a concatenated left-hand side: `{m[i], n} = {x, y}`
-        // fabricated an `i -> n` edge (and its operand row) marked exact, and
-        // a called function's free reads landed on targets its result never
-        // reaches. The v7 cross-product, resurfaced through the side doors.
         collectAuxSlots(expr.right(), 0, rhsSlots, /*selectors=*/false);
-        // An index or part-select on the left is read, not written:
-        // `q[i] <= d` depends on `i`. Those live inside the selectors that
-        // the target pass skipped, so they are collected separately -- pinned
-        // to their own element's window.
         collectAuxSlots(expr.left(), 0, rhsSlots, /*selectors=*/true);
         const int64_t droppedConstants = filteredConstants;
 
-        // Every non-constant selector evaluation appends a diagnostic and a
-        // note to the context, and nothing here ever reports them, so on a long
-        // procedure they accumulate for the whole traversal. Clearing after each
-        // assignment measurably bounds it.
         eval.reset();
 
+        // An intra-assignment delay (`a = #3 b;`) belongs to this statement
+        // alone; a statement-level one arrives through pendingDelay.
+        std::string delay = pendingDelay;
+        if (expr.timingControl) {
+            const std::string d = delayText(expr.timingControl);
+            if (!d.empty())
+                delay = d;
+        }
+
+        const int64_t stmtSeq = seq++;
         bool firstTarget = true;
         for (auto& dstSlot : lhsSlots) {
             if (loopVars.count(dstSlot.ref.sym))
                 continue;
-            // Only the operands whose bits actually reach this target, each
-            // narrowed to the part that does. `{a, b} = {x, y}` gives `a` one
-            // operand rather than two, which is the same correction the edges
-            // below get -- `assign_operand` crossed the two sides exactly as
-            // `edge` did.
-            struct Pair {
-                Ref dst, src;
-                bool mapExact;
-            };
-            std::vector<Pair> pairs;
-            std::vector<Ref> operands;
+            std::vector<PairedSrc> pairs;
             for (auto& srcSlot : rhsSlots) {
                 uint64_t lo = 0, hi = 0;
                 if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
                     continue;
-                Pair p{narrowed(dstSlot, lo, hi), narrowed(srcSlot, lo, hi),
-                       dstSlot.positional && srcSlot.positional};
-                operands.push_back(p.src);
-                pairs.push_back(std::move(p));
+                pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
+                                          narrowed(dstSlot, lo, hi),
+                                          dstSlot.positional && srcSlot.positional,
+                                          srcSlot.ref});
             }
-            emitAssign(dstSlot.ref, operands, expr.sourceRange, seq++,
+            emitTarget(dstSlot.ref, pairs, gating, expr.sourceRange, stmtSeq,
                        expr.isBlocking(), droppedConstants, subDepth > 0,
-                       firstTarget);
+                       firstTarget, delay);
             firstTarget = false;
-            for (auto& p : pairs)
-                emit(p.dst, p.src, false, p.mapExact, expr.sourceRange);
-            for (auto& src : gating)
-                emit(dstSlot.ref, src, true, /*mapExact=*/false, expr.sourceRange);
-            // A right-hand side that reads nothing at all -- `q <= 8'h0` --
-            // still has a driver, and a query for what drives the target has
-            // to be able to name the statement. One row with a null source
-            // records it; the schema stores edges, so without this the driver
-            // simply is not there. A self-read (`cnt <= cnt + 1`) does not land
-            // here: its edge is real and already names the statement.
-            if (pairs.empty())
-                emit(dstSlot.ref, Ref{}, false, /*mapExact=*/true, expr.sourceRange);
         }
 
         visitDefault(expr);
     }
 
-    /// Reads that appear inside an lvalue's selectors, excluding the target.
     void collectLeftSelectorRefs(const Expression& lhs, std::vector<Ref>& out) {
         switch (lhs.kind) {
             case ExpressionKind::ElementSelect: {
@@ -1437,16 +1550,13 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
     }
 
+    void collectCallReads(const Expression& expr, std::vector<Ref>& out) {
+        collectCallReadsInto(expr, activeSubs, out);
+    }
+
     /// The reads that ride an element without occupying its bits -- a call's
     /// free reads on the right, a selector's index reads on the left -- each
     /// pinned to the WINDOW of the element they ride, never positional.
-    ///
-    /// The window is the point. These reads used to be appended spanning
-    /// everything, which paired them with every target of a concatenated
-    /// left-hand side; the index of `m[i]` has no path to the `n` beside it,
-    /// and a function's free variable reaches only the target its result
-    /// lands in. Mirrors collectSlots' walk (elements, width-preserving and
-    /// truncating conversions) so windows agree between the two.
     void collectAuxSlots(const Expression& expr, uint64_t base,
                          std::vector<Slot>& out, bool selectors) {
         const uint64_t width = exprWidthOf(expr);
@@ -1466,9 +1576,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 if (!bad && (w == 0 || w > cursor - base))
                     bad = true;
                 if (bad) {
-                    // Position lost below this point; the remaining elements'
-                    // reads span everything, as the slot walk's own fallback
-                    // does.
                     std::vector<Ref> reads;
                     if (selectors)
                         collectLeftSelectorRefs(*op, reads);
@@ -1504,264 +1611,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     }
 };
 
-/// The path segment slang gives a generate block, so a prefix built here joins
-/// against the hierarchical paths everything else is named by.
-///
-/// A loop iteration is named by the genvar's *value*, not by its position among
-/// the entries (`slang/source/ast/Symbol.cpp`). Counting entries agrees only
-/// when the loop runs 0,1,2,...; `for (genvar g = 1; g < 32; g++)` shifts every
-/// name by one, and a descending loop reverses them. On one SoC that mismatched
-/// 70 declarations against their own dataflow, and nothing joined.
-std::string generateSegment(const GenerateBlockSymbol& block) {
-    if (auto* index = block.getArrayIndex())
-        return "[" + index->toString(LiteralBase::Decimal, false) + "]";
-    std::string name(block.name);
-    return name.empty() ? block.getExternalName() : name;
-}
-
-/// Calls `fn` for every instance directly inside `scope`, descending through
-/// generate blocks but never into an instance's own body.
-///
-/// Generate blocks matter and are easy to miss: an instance written inside
-/// `for (…) begin : g_lane` is a member of the *block*, not of the module body,
-/// so a scan of the body's own members finds nothing. A design that puts its
-/// replication in a generate loop — which is most of them — would come out with
-/// its leaves missing and no error to say so.
-/// Calls `fn` for every member of `scope` of kind `K`, descending through
-/// generate blocks and instance arrays but never into an instance's own body.
-///
-/// Generate blocks matter and are easy to miss: an instance written inside
-/// `for (…) begin : g_lane` is a member of the *block*, not of the module body,
-/// so a scan of the body's own members finds nothing. A design that puts its
-/// replication in a generate loop — which is most of them — would come out with
-/// its leaves missing and no error to say so.
-///
-/// One traversal for every leaf kind rather than one copy each. The descent
-/// rules are subtle and shared: an uninstantiated generate branch is in the
-/// AST but not in the design, a `GenerateBlockArray` holds its iterations as
-/// entries, and `foo u [3:0] (...)` is an `InstanceArray` wrapping the
-/// elements. Copies of this drifted apart -- one leaf kind would have gone
-/// missing from whichever containers only the other copy had learned about,
-/// with no error to say so.
-template<SymbolKind K, typename SymT, typename F>
-void forEachOfKind(const Scope& scope, F&& fn) {
-    for (auto& member : scope.members()) {
-        if (member.kind == K) {
-            fn(member.as<SymT>());
-            continue;
-        }
-        switch (member.kind) {
-            case SymbolKind::GenerateBlock: {
-                auto& block = member.as<GenerateBlockSymbol>();
-                // A branch this parameterisation did not take: its contents are
-                // present in the AST but are not part of the elaborated design.
-                if (block.isUninstantiated)
-                    break;
-                forEachOfKind<K, SymT>(block, fn);
-                break;
-            }
-            case SymbolKind::GenerateBlockArray:
-                for (auto& entry : member.as<GenerateBlockArraySymbol>().entries)
-                    forEachOfKind<K, SymT>(*entry, fn);
-                break;
-            case SymbolKind::InstanceArray:
-                forEachOfKind<K, SymT>(member.as<InstanceArraySymbol>(), fn);
-                break;
-            default:
-                break;
-        }
-    }
-}
-
-/// Every instance directly inside `scope`.
-template<typename F>
-void forEachInstance(const Scope& scope, F&& fn) {
-    forEachOfKind<SymbolKind::Instance, InstanceSymbol>(scope, fn);
-}
-
-/// Every primitive instance -- a gate, a switch, a UDP -- inside `scope`.
-/// `and g [3:0] (...)` inside a generate loop is the ordinary spelling of
-/// replicated gate-level logic, so it needs the same descent.
-template<typename F>
-void forEachPrimitive(const Scope& scope, F&& fn) {
-    forEachOfKind<SymbolKind::PrimitiveInstance, PrimitiveInstanceSymbol>(scope, fn);
-}
-
-/// (target, source, file, line, target bits, source bits) already emitted for
-/// one module.
-///
-/// The bit range belongs in the key: two part-selects of one signal assigned
-/// from one source on one line are two edges, and without it the second is
-/// discarded. So does the file, and for a sharper reason -- a line number is
-/// only unique within one file, and a module whose task body comes from an
-/// `include`d header has two sources of statements. Keyed on the line alone,
-/// a statement in the header silently deleted the edges of a statement at the
-/// same line number in the module's own file; `assignment`, which does not
-/// dedup, kept both, so the two tables disagreed about how many statements
-/// drive the target. The file is interned to an id so the key stays cheap to
-/// compare.
-///
-/// control, dst_exact, src_exact and kind belong in the key for the same
-/// reason the bit range does: they are stored columns, and two edges that
-/// differ only on one of them are semantically distinct. Without control,
-/// `if (a) y = a` collapses the data edge and the condition edge into one;
-/// without dst_exact, `y[i] = a` and `y = {2{a}}` collapse a dynamic
-/// partial write and a precise full write into one.
-/// map_exact joins them for the same reason: two edges between one pair that
-/// differ only in whether the bit correspondence is positional are different
-/// facts, and folding them keeps whichever was emitted first.
-using SeenSet = std::set<std::tuple<const ValueSymbol*, const ValueSymbol*, uint32_t,
-                                    uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                    bool, bool, bool, uint8_t, bool>>;
-
-/// Calls `fn` for every instantiation in `scope` whose module slang could not
-/// resolve, descending generate blocks exactly as `forEachInstance` does.
-///
-/// These are instances of a module that failed to parse, or that is simply not
-/// in the filelist. slang keeps them as `UninstantiatedDefSymbol` -- the name
-/// and the definition it wanted are known, the body is not. Skipping them is
-/// the worst option available: the parent then shows fewer children than the
-/// RTL has, and nothing in the database says a subtree is missing.
-template<typename F>
-void forEachUnresolved(const Scope& scope, F&& fn, const std::string& gen = "") {
-    for (auto& member : scope.members()) {
-        switch (member.kind) {
-            case SymbolKind::UninstantiatedDef:
-                fn(member.as<UninstantiatedDefSymbol>(), gen);
-                break;
-            case SymbolKind::GenerateBlock: {
-                auto& block = member.as<GenerateBlockSymbol>();
-                if (block.isUninstantiated)
-                    break;
-                forEachUnresolved(block, fn, gen + generateSegment(block) + ".");
-                break;
-            }
-            case SymbolKind::GenerateBlockArray: {
-                auto& arr = member.as<GenerateBlockArraySymbol>();
-                std::string base(arr.name);
-                if (base.empty())
-                    base = arr.getExternalName();
-                for (auto& entry : arr.entries) {
-                    std::string prefix = gen + base;
-                    if (entry->kind == SymbolKind::GenerateBlock)
-                        prefix += generateSegment(entry->as<GenerateBlockSymbol>());
-                    forEachUnresolved(*entry, fn, prefix + ".");
-                }
-                break;
-            }
-            case SymbolKind::InstanceArray:
-                forEachUnresolved(member.as<InstanceArraySymbol>(), fn, gen);
-                break;
-            default:
-                break;
-        }
-    }
-}
-
-/// Every declaration in a module body, generate blocks included.
-///
-/// One row per actual signal: slang carries a `Port` symbol *and* the net or
-/// variable behind it, so the port's direction is folded onto the signal's row
-/// instead of producing a second one. A port whose internal symbol is null (a
-/// null port, or one connecting straight to an expression) keeps a row of its
-/// own, since there is nothing else to carry it.
-template<typename F>
-void forEachDeclaration(const Scope& scope, F&& fn, const std::string& gen = "") {
-    // First pass: which signal does each port stand for, and in which direction.
-    //
-    // A port that stands for a concatenation of internal signals
-    // (`.ext_pair({hi, lo})`) is not reachable this way -- neither the scope's
-    // members nor the body's port list offers it, and `getInternalExpr` is
-    // empty for it -- so `hi` and `lo` keep a NULL direction. Recorded as a
-    // known limit rather than guessed at; the binding itself is in `port`.
-    std::unordered_map<const Symbol*, ArgumentDirection> portDir;
-    for (auto& member : scope.members()) {
-        if (member.kind != SymbolKind::Port)
-            continue;
-        auto& port = member.as<PortSymbol>();
-        if (port.internalSymbol)
-            portDir.emplace(port.internalSymbol, port.direction);
-    }
-
-    for (auto& member : scope.members()) {
-        switch (member.kind) {
-            case SymbolKind::Variable:
-            case SymbolKind::Net:
-            case SymbolKind::Parameter:
-            // A type parameter is already part of the module's identity in
-            // `module.params`, so leaving it out of the declarations was the
-            // same declaration present in one table and absent from the other.
-            // A specparam is a declaration by any reading of the word.
-            case SymbolKind::TypeParameter:
-            case SymbolKind::Specparam: {
-                auto it = portDir.find(&member);
-                fn(member, gen, it == portDir.end()
-                                    ? std::optional<ArgumentDirection>{}
-                                    : std::optional<ArgumentDirection>{it->second});
-                break;
-            }
-            case SymbolKind::Port: {
-                auto& port = member.as<PortSymbol>();
-                if (!port.internalSymbol)
-                    fn(member, gen, std::optional<ArgumentDirection>{port.direction});
-                break;
-            }
-            case SymbolKind::InterfacePort:
-                // No net or variable stands behind an interface port, so it
-                // gets a row of its own -- it is the name a reference like
-                // `bus.vld` resolves its first segment against, and without
-                // the row that segment matches nothing in the module.
-                fn(member, gen, std::optional<ArgumentDirection>{});
-                break;
-            case SymbolKind::GenerateBlock: {
-                auto& block = member.as<GenerateBlockSymbol>();
-                if (block.isUninstantiated)
-                    break;
-                forEachDeclaration(block, fn, gen + generateSegment(block) + ".");
-                break;
-            }
-            case SymbolKind::GenerateBlockArray: {
-                auto& arr = member.as<GenerateBlockArraySymbol>();
-                std::string base(arr.name);
-                if (base.empty())
-                    base = arr.getExternalName();
-                for (auto& entry : arr.entries) {
-                    std::string prefix = gen + base;
-                    if (entry->kind == SymbolKind::GenerateBlock)
-                        prefix += generateSegment(entry->as<GenerateBlockSymbol>());
-                    forEachDeclaration(*entry, fn, prefix + ".");
-                }
-                break;
-            }
-            default:
-                break;
-        }
-    }
-}
-
-
-/// The word for a symbol kind, in the vocabulary the consumer already uses.
-std::string symbolKindName(SymbolKind kind) {
-    switch (kind) {
-        case SymbolKind::Variable:      return "variable";
-        case SymbolKind::Net:           return "net";
-        case SymbolKind::Parameter:     return "parameter";
-        case SymbolKind::TypeParameter: return "type_parameter";
-        case SymbolKind::Specparam:     return "specparam";
-        case SymbolKind::Port:          return "port";
-        case SymbolKind::InterfacePort: return "interface_port";
-        default:                        return "other";
-    }
-}
-
-std::string directionName(ArgumentDirection d) {
-    switch (d) {
-        case ArgumentDirection::In:    return "in";
-        case ArgumentDirection::Out:   return "out";
-        case ArgumentDirection::InOut: return "inout";
-        default:                       return "ref";
-    }
-}
+// -------------------------------------------------------------- the walker
 
 class Walker {
 public:
@@ -1770,37 +1620,46 @@ public:
         sourceManager(*comp.getSourceManager()) {}
 
     Stats run() {
-        // Pass 1: group every instance by what module it actually is, and pick
-        // one body per group to extract from.
-        //
-        // The group key is (definition, parameter values), not the body pointer.
-        // slang shares a canonical body between identical instances only
-        // sometimes; where it does not, keying on the pointer would emit one
-        // module per instance. It is also not enough to take the first body
-        // seen: the analysis manager analyses the canonical body, so a
-        // non-canonical one has no AnalyzedScope and would contribute no
-        // dataflow at all — silently, since an empty scope looks the same as a
-        // module with no logic.
+        // Pass 1: group every instance by what module it actually is, and
+        // pick one body per group to extract from. The group key is
+        // (definition, parameter values), not the body pointer: slang shares
+        // a canonical body only sometimes, and only the canonical body has
+        // an AnalyzedScope -- a non-canonical one would contribute no
+        // dataflow at all, silently.
         for (auto inst : compilation.getRoot().topInstances)
             collect(*inst);
 
-        // Every group gets its row id before anything is emitted: a port
-        // connection names the module on the other side of it, and that module
-        // may well be one this loop has not reached yet.
-        for (auto& [key, group] : groups) {
-            group.id = writer.internModule(group.name, group.params);
-            stats.modules++;
-        }
+        // Module rows: one per source definition, not per parameterisation.
         for (auto& [key, group] : groups)
-            emitModule(*group.body, group.id);
+            internModuleRow(group.body->getDefinition());
 
-        // Pass 2: the instance tree, now that every module has a row.
-        for (auto inst : compilation.getRoot().topInstances)
-            // The root is written in no module body, so it has no `child` row --
-            // an empty Body is what says so.
-            visitInstance(*inst, 0, "", Body{});
+        // Terminals first, for every group: a parent's connection templates
+        // name its children's terminal indices, and a child's group may be
+        // built after the parent's otherwise.
+        for (auto& [key, group] : groups)
+            buildTerms(templates[key], *group.body);
+        // Then the full templates.
+        for (auto& [key, group] : groups) {
+            auto& t = templates[key];
+            t.moduleId = moduleIds[&group.body->getDefinition()];
+            t.params = group.params;
+            buildTemplate(t, *group.body);
+        }
 
-        // Last: file rows exist only once something interned them.
+        // Pass 2: stamp the elaborated tree.
+        for (auto inst : compilation.getRoot().topInstances) {
+            const int64_t nodeId = ++nodeCounter;
+            noteChild(0, std::string(inst->name), nodeId);
+            stampOccurrence(*inst, instanceGroup[inst], std::string(inst->name),
+                            nodeId, /*parentNode=*/0, /*parentInst=*/0,
+                            /*ordinal=*/rootOrdinal++, TplLoc{},
+                            /*ifaceBind=*/{});
+        }
+
+        // Hierarchical references last: an absolute path may land in a
+        // subtree stamped after the referring occurrence.
+        resolveHierRefs();
+
         writer.linkSourceFiles(fileOrigins);
         return stats;
     }
@@ -1810,11 +1669,10 @@ private:
         std::string name;
         std::string params;
         const InstanceBodySymbol* body = nullptr;
-        int64_t id = 0;
     };
 
-    /// The body to extract a group's dataflow from: one that the analysis
-    /// manager actually analysed, else the first seen.
+    /// The body to extract a group's dataflow from: one the analysis manager
+    /// actually analysed, else the first seen.
     void offer(Group& g, const InstanceBodySymbol& body) {
         if (g.body && analysis.getAnalyzedScope(*g.body))
             return;
@@ -1839,703 +1697,1124 @@ private:
         forEachInstance(inst.body, [&](const InstanceSymbol& child) { collect(child); });
     }
 
-    int64_t moduleIdFor(const InstanceSymbol& inst) {
-        auto it = instanceGroup.find(&inst);
-        return it == instanceGroup.end() ? 0 : groups[it->second].id;
-    }
+    // ---------------------------------------------------------- locations
 
-    /// Remembers which absolute path an as-written file spelling came from, so
-    /// the writer can join `file` rows to `source_file` rows at the end. The
-    /// two spellings genuinely differ -- rows carry the filelist's relative
-    /// path, source_file the hashed absolute one -- and matching them by
-    /// basename breaks on the first design with two files of one name.
     void noteFile(SourceLocation loc, const std::string& asWritten) {
         if (!loc || asWritten.empty())
             return;
         if (fileOrigins.count(asWritten))
             return;
-        // Through the expansion, not the raw buffer. A location inside a macro
-        // body belongs to the macro's own buffer, which is not a file, so
-        // `getFullPath` answers with nothing -- and because that nothing was
-        // cached like any other answer, a single macro-expanded row anywhere
-        // in a file left the whole file with a NULL `source_file` and no
-        // digest to check it against. `getFileName` resolves the expansion, so
-        // this has to resolve it the same way to name the same file.
         auto path = sourceManager.getFullPath(
             sourceManager.getFullyExpandedLoc(loc).buffer());
         if (path.empty())
-            return;   // no origin to record; caching the miss would suppress
-                      // the next sighting, which may well have one
+            return;
         fileOrigins.emplace(asWritten, path.string());
     }
 
-    /// A small id for a file name, so the dedup key can carry the file without
-    /// carrying the string. Ids are global rather than per module, which costs
-    /// nothing: the set they key is cleared for each module anyway.
-    uint32_t fileKey(const std::string& path) {
-        if (path.empty())
-            return 0;
-        auto [it, added] = fileKeyIds.try_emplace(path,
-                                                  uint32_t(fileKeyIds.size() + 1));
-        (void)added;
-        return it->second;
-    }
-
-    /// Where a location is, with its file's origin recorded on the way past.
-    ///
-    /// One call rather than a `whereOf` and a `noteFile`: the two were spelled
-    /// out separately at four sites, nothing enforced the pairing, and a site
-    /// that resolved a location without noting it left that file unjoinable to
-    /// its digest -- invisible until a consumer's join came back empty.
-    /// `fallback` is what an unknown location resolves to, which is how a
-    /// statement with no location of its own inherits its procedure's.
-    Where locate(SourceLocation loc, const Where& fallback = {}) {
+    TplLoc locate(SourceLocation loc, const TplLoc& fallback = {}) {
         if (!loc)
             return fallback;
         Where w = whereOf(loc, sourceManager);
         noteFile(loc, w.file);
-        return w;
+        return TplLoc{writer.internFile(w.file), w.line, w.column};
     }
 
-    /// The reads of a statement that writes nothing this module can name.
-    ///
-    /// An assertion writes nothing at all; an assignment whose target is
-    /// outward writes something with no module-relative name. Either way the
-    /// operands fit in no other table -- `edge` needs a target, and an
-    /// `assignment` row cannot exist without one -- and the signals read as
-    /// though the design never looked at them. An operand that is itself
-    /// outward goes to `hier_ref`, as everywhere else.
-    /// Opens a new statement and returns its ordinal.
-    ///
-    /// Called where a statement begins rather than where a row is written,
-    /// because one statement writes rows from several places -- the assignment,
-    /// the outward write, the reads -- and they have to agree. The walker hands
-    /// the assignment callback a statement before it hands over that statement's
-    /// edges, so a reference surfaced by the edge pass lands on the statement
-    /// just opened, which is the one it belongs to.
-    int64_t beginStmt() {
-        curStmt = ++stmtCount;
-        return curStmt;
-    }
+    // ---------------------------------------------------------- terminals
 
-    void addStmtReads(const std::vector<Ref>& operands, const std::string& prefix,
-                      const std::string& kind, const std::string& construct,
-                      const Where& at, EvalContext& eval) {
-        for (auto& r : operands) {
-            if (!r.sym)
+    /// The port list of one group, as terminal templates. A MultiPort (a
+    /// non-ANSI `.p({hi, lo})` formal) is one terminal; its inside is the
+    /// term_map segments built later.
+    void buildTerms(Template& t, const InstanceBodySymbol& body) {
+        for (auto* portSym : body.getPortList()) {
+            if (!portSym)
                 continue;
-            std::string rel;
-            if (!relativePath(*r.sym, prefix, rel)) {
-                addHierRef(false, r, kind, construct, at, eval);
-                continue;
+            TplTerm term;
+            term.name = std::string(portSym->name);
+            term.loc = locate(portSym->location);
+            switch (portSym->kind) {
+                case SymbolKind::Port: {
+                    auto& p = portSym->as<PortSymbol>();
+                    term.kind = "signal";
+                    term.direction = directionWord(p.direction);
+                    term.dataTypeId = writer.internDataType(p.getType().toString());
+                    if (p.getType().isIntegral())
+                        term.width = static_cast<int64_t>(p.getType().getBitWidth());
+                    term.isConst = 0;
+                    if (p.direction == ArgumentDirection::Ref && p.internalSymbol &&
+                        ValueSymbol::isKind(p.internalSymbol->kind)) {
+                        auto& vs = p.internalSymbol->as<ValueSymbol>();
+                        if (vs.kind == SymbolKind::Variable &&
+                            vs.as<VariableSymbol>().flags.has(VariableFlags::Const))
+                            term.isConst = 1;
+                    }
+                    break;
+                }
+                case SymbolKind::MultiPort: {
+                    auto& mp = portSym->as<MultiPortSymbol>();
+                    term.kind = "signal";
+                    term.direction = directionWord(mp.direction);
+                    term.dataTypeId = writer.internDataType(mp.getType().toString());
+                    if (mp.getType().isIntegral())
+                        term.width = static_cast<int64_t>(mp.getType().getBitWidth());
+                    term.isConst = 0;
+                    break;
+                }
+                case SymbolKind::InterfacePort: {
+                    auto& ip = portSym->as<InterfacePortSymbol>();
+                    term.kind = "interface";
+                    std::string text = ip.interfaceDef
+                                           ? std::string(ip.interfaceDef->name)
+                                           : std::string("interface");
+                    term.dataTypeId = writer.internDataType(text);
+                    if (!ip.modport.empty())
+                        term.modport = std::string(ip.modport);
+                    break;
+                }
+                default:
+                    continue;
             }
-            StmtReadRow row;
-            row.name = std::move(rel);
-            row.kind = kind;
-            row.construct = construct;
-            row.file = at.file;
-            row.line = at.line;
-            if (!r.whole)
-                row.bits = std::make_pair(r.lo, r.hi);
-            row.exact = r.exact;
-            row.stmt = curStmt;
-            stmtReads.push_back(std::move(row));
+            if (term.name.empty())
+                term.name = "<unnamed>";
+            t.termIndex.emplace(term.name, int32_t(t.terms.size()));
+            t.terms.push_back(std::move(term));
         }
     }
 
-    /// Records one reference that leaves the module, as written. Every such
-    /// reference also bumps the external counter, which is where all of them
-    /// lived before hier_ref existed; the row is added only when the text is
-    /// recoverable and actually is a path -- a bare name that leaves the
-    /// module (a subroutine's package-level free variable) resolves against
-    /// imports this table cannot see, so it stays a count.
-    /// The expression comes from `r.origin` rather than as its own argument:
-    /// the two were passed side by side at every call site, nothing tied them
-    /// together, and a transposed pair would have recorded one reference's
-    /// text against another's bit range -- a wrong row, not an error.
-    void addHierRef(bool isWrite, const Ref& r, const std::string& kind,
-                    const std::string& construct, const Where& at,
-                    EvalContext& eval) {
-        // One reference, one row, however many passes surface it: the edge, the
-        // assignment's operand list and the gating scan all hand over the same
-        // expression node, so the node itself is the identity. Keying on the
-        // text instead lost data -- a generate loop elaborates `b[g].sig` into
-        // four distinct references that share one spelling, and three of them
-        // were dropped without being counted.
-        if (!hierSeen.emplace(r.origin, isWrite).second)
-            return;
+    // ------------------------------------------------------ template build
+
+    /// Per-build state that does not belong in the finished template.
+    struct Build {
+        Template* t = nullptr;
+        const InstanceBodySymbol* body = nullptr;
+        std::string prefix;
+        std::unordered_map<const Symbol*, int32_t> netOf;
+        std::unordered_map<const Symbol*, int32_t> scopeOf;
+        std::unordered_map<const SubroutineSymbol*, int32_t> procOf;
+        /// (reference expression, is-write, statement) -> hierRefs index.
+        /// Keyed by node so a generate loop's four elaborations of one
+        /// spelling stay four rows, and mapped rather than a bare set so a
+        /// second sighting within one statement pairs its dependency with
+        /// the row the first made.
+        ///
+        /// The statement is part of the key because a body is now walked
+        /// once per call site: two calls to `task sample(); q <= u.x;
+        /// endtask` are two statements, and with one shared row the second
+        /// statement's dependency pointed at a reference belonging to the
+        /// first -- so "what does statement 4 read outside this instance"
+        /// answered nothing.
+        std::map<std::tuple<const Expression*, bool, int32_t>, int32_t> hierSeen;
+        int32_t curStmt = -1;      // where call bindings attach
+        int32_t curProc = -1;      // procedure of statements being created
+        int32_t curScope = 0;
+        int64_t targetOrdinal = 0; // per-stmt ordinals
+        int64_t operandOrdinal = 0;
+        int64_t exprOrdinal = 0;
+        std::vector<int32_t> curControlRefs;   // control expr_refs of curStmt
+        std::vector<int32_t> curControlHrefs;  // outward conditions, as hierRefs
+        std::vector<Ref> curControlSrcs;
+        /// Subroutine-body instantiations left for this module, and the
+        /// call sites skipped once they ran out. See handle(CallExpression)
+        /// for why per-call-site expansion needs a ceiling at all.
+        int64_t callBudget = kCallExpansionBudget;
+        int64_t truncatedCalls = 0;
+    };
+
+    /// The net index for a symbol of this body, creating the row on first
+    /// sight. Everything the dataflow touches must be a net row -- a
+    /// dependency end is an id, and an id must exist -- so subroutine
+    /// formals, locals and block variables are added lazily with their
+    /// scope-relative dotted names.
+    ///
+    /// A symbol inside a CHILD instance is not a net of this one, even
+    /// though its path extends this body's -- `u_cnt.cnt` is the child's
+    /// net, which has a row of its own under the child. v9 stored the dotted
+    /// spelling as a local name because the folded model had nothing to
+    /// point at; the instance model does, so a downward reference goes to
+    /// hier_ref and resolves to the real object.
+    int32_t netFor(Build& b, const ValueSymbol& sym) {
+        if (auto it = b.netOf.find(&sym); it != b.netOf.end())
+            return it->second;
+        std::string rel;
+        if (!relativePath(sym, b.prefix, rel))
+            return -1;
+        for (const Scope* s = sym.getParentScope(); s;) {
+            auto& owner = s->asSymbol();
+            if (owner.kind == SymbolKind::InstanceBody) {
+                if (&owner != &b.body->asSymbol())
+                    return -1;
+                break;
+            }
+            s = owner.getParentScope();
+        }
+        TplNet net;
+        net.scope = 0;
+        net.name = std::move(rel);
+        net.declKind = declarationKindOf(sym);
+        net.dataTypeId = writer.internDataType(typeOf(sym));
+        if (sym.getType().isIntegral())
+            net.width = static_cast<int64_t>(sym.getType().getBitWidth());
+        if (sym.kind == SymbolKind::Net)
+            net.isImplicit = sym.as<NetSymbol>().isImplicit;
+        net.loc = locate(sym.location);
+        const int32_t idx = int32_t(b.t->nets.size());
+        b.t->netIndex.emplace(net.name, idx);
+        b.t->nets.push_back(std::move(net));
+        b.netOf.emplace(&sym, idx);
+        return idx;
+    }
+
+    /// Declared nets and variables of the body and its generate scopes,
+    /// eagerly, so a declared-but-unused signal is still a row -- those are
+    /// exactly the ones worth asking about. scope indices follow the
+    /// generate tree built alongside.
+    void collectDeclarations(Build& b, const Scope& scope, int32_t scopeIdx) {
+        for (auto& member : scope.members()) {
+            switch (member.kind) {
+                case SymbolKind::Variable:
+                case SymbolKind::Net: {
+                    if (member.name.empty())
+                        break;
+                    auto& vs = member.as<ValueSymbol>();
+                    const int32_t idx = netFor(b, vs);
+                    if (idx >= 0)
+                        b.t->nets[size_t(idx)].scope = scopeIdx;
+                    break;
+                }
+                case SymbolKind::GenerateBlock: {
+                    auto& block = member.as<GenerateBlockSymbol>();
+                    if (block.isUninstantiated)
+                        break;
+                    const int32_t idx = addScope(b, block, scopeIdx,
+                                                 generateSegment(block));
+                    collectDeclarations(b, block, idx);
+                    break;
+                }
+                case SymbolKind::GenerateBlockArray: {
+                    auto& arr = member.as<GenerateBlockArraySymbol>();
+                    std::string base(arr.name);
+                    if (base.empty())
+                        base = arr.getExternalName();
+                    for (auto& entry : arr.entries) {
+                        std::string segment = base;
+                        if (entry->kind == SymbolKind::GenerateBlock)
+                            segment += generateSegment(
+                                entry->as<GenerateBlockSymbol>());
+                        const int32_t idx = addScope(b, entry->asSymbol(),
+                                                     scopeIdx, segment);
+                        collectDeclarations(b, *entry, idx);
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+
+    int32_t addScope(Build& b, const Symbol& sym, int32_t parent,
+                     std::string name) {
+        const int32_t idx = int32_t(b.t->scopes.size());
+        b.t->scopes.push_back(TplScope{parent, std::move(name)});
+        b.scopeOf.emplace(&sym, idx);
+        return idx;
+    }
+
+    int32_t scopeForSymbol(Build& b, const Symbol& sym) {
+        // Climb to the nearest scope the template modelled: a generate block
+        // or the body itself. Statement blocks and subroutines fold onto it.
+        const Scope* s = sym.getParentScope();
+        while (s) {
+            auto& owner = s->asSymbol();
+            if (auto it = b.scopeOf.find(&owner); it != b.scopeOf.end())
+                return it->second;
+            if (&owner == &b.body->asSymbol())
+                return 0;
+            s = owner.getParentScope();
+        }
+        return 0;
+    }
+
+    // ----------------------------------------------------- statement rows
+
+    int32_t newStmt(Build& b, std::string kind, std::string construct,
+                    std::string assignKind, int64_t seq, std::string delay,
+                    int64_t dropped, const TplLoc& loc) {
+        TplStmt s;
+        s.scope = b.curScope;
+        s.proc = b.curProc;
+        s.sequence = b.curProc < 0 ? -1 : seq;
+        s.kind = std::move(kind);
+        s.construct = std::move(construct);
+        s.assignKind = std::move(assignKind);
+        s.delay = std::move(delay);
+        s.dropped = dropped;
+        s.loc = loc;
+        const int32_t idx = int32_t(b.t->stmts.size());
+        b.t->stmts.push_back(std::move(s));
+        b.curStmt = idx;
+        b.targetOrdinal = 0;
+        b.operandOrdinal = 0;
+        b.exprOrdinal = 0;
+        // All three condition vectors, always together: they are indexed in
+        // lockstep by the target loop, so clearing two of them leaves the
+        // third holding an earlier statement's entries and every later
+        // lookup reads the wrong slot -- a control edge attributed to the
+        // wrong signal, or dropped, with nothing in the row to show for it.
+        b.curControlRefs.clear();
+        b.curControlHrefs.clear();
+        b.curControlSrcs.clear();
+        return idx;
+    }
+
+    int32_t addExprRef(Build& b, int32_t stmt, const Ref& r, std::string role,
+                       int32_t netIdx) {
+        TplExprRef e;
+        e.stmt = stmt;
+        e.ordinal = b.exprOrdinal++;
+        e.net = netIdx;
+        e.role = std::move(role);
+        e.r = rangeOf(r);
+        const int32_t idx = int32_t(b.t->exprRefs.size());
+        b.t->exprRefs.push_back(std::move(e));
+        return idx;
+    }
+
+    /// Records one reference that leaves the instance -- and, when slang
+    /// resolved it, how to find the target again from any occurrence.
+    /// `r` is the reference the dependency uses, which pairing may have
+    /// narrowed to the bits one target takes; `asWritten`, when given, is
+    /// the reference the source actually spells. The row keeps the latter:
+    /// `assign {hi, lo} = u.x;` reads the whole of u.x, and storing the
+    /// first pairing's half made the database claim the RTL only ever
+    /// named four of its bits. The narrowed ranges live in net_dep, where
+    /// they describe a particular dependency rather than the reference.
+    int32_t addHierRef(Build& b, bool isWrite, const Ref& r,
+                       const TplLoc& at, EvalContext& eval,
+                       const char* access = nullptr,
+                       const Ref* asWritten = nullptr) {
+        auto key = std::make_tuple(r.origin, isWrite, b.curStmt);
+        if (auto it = b.hierSeen.find(key); it != b.hierSeen.end())
+            return it->second;
         std::string text = canonicalPath(r.origin, eval);
         if (text.empty())
             text = normalizedText(r.origin, sourceManager);
-        // A path, or a package qualification. `pkg::mask` is stored for the
-        // reason the doc gives -- it names where to look -- while a bare
-        // `mask` resolves against imports a reader cannot see and stays a
-        // count. Testing only for a dot discarded the qualified form too.
         if (text.empty() || (text.find('.') == std::string::npos &&
                              text.find("::") == std::string::npos)) {
             stats.external++;
-            return;
+            b.hierSeen.emplace(key, -1);
+            return -1;
         }
         stats.external++;
-        HierRefRow row;
+        TplHierRef row;
+        row.stmt = b.curStmt;
         row.path = std::move(text);
-        row.write = isWrite;
-        row.kind = kind;
-        row.construct = construct;
-        row.file = at.file;
-        row.line = at.line;
-        if (r.sym && !r.whole)
-            row.bits = std::make_pair(r.lo, r.hi);
-        row.exact = r.sym ? r.exact : true;
-        row.stmt = curStmt;
-        hierRefs.push_back(std::move(row));
+        row.access = access ? access : (isWrite ? "write" : "read");
+        row.r = rangeOf(asWritten ? *asWritten : r);
+        row.loc = at;
+        fillResolution(b, row, r);
+        const int32_t idx = int32_t(b.t->hierRefs.size());
+        if (row.resolve != TplHierRef::None)
+            b.t->hasResolvableRefs = true;
+        b.t->hierRefs.push_back(std::move(row));
+        b.hierSeen.emplace(key, idx);
+        return idx;
     }
 
-    /// Everything that belongs to the module rather than to an instance: its
-    /// intra-module dataflow and the list of what it instantiates. Emitted once
-    /// per canonical body, however many instances share it.
-    void emitModule(const InstanceBodySymbol& body, int64_t moduleId) {
-        const std::string prefix = body.getHierarchicalPath();
-        hierRefs.clear();
-        stmtReads.clear();
-        hierSeen.clear();
-        // Per module, like `proc` beside it: the rows that share a statement all
-        // carry this module's id too, so the ordinal only has to be unique
-        // within one body and stays a small number on a large design.
-        curStmt = 0;
-        stmtCount = 0;
+    /// How to reach the reference's target from an occurrence. Downward
+    /// targets replay inside the occurrence's own subtree; absolute ones
+    /// replay from the root; a reference through one of this template's own
+    /// interface terminals replays from whatever instance the terminal is
+    /// bound to in that occurrence. Upward references (upwardCount > 0) stay
+    /// unresolved -- the one analysed body speaks for occurrences whose
+    /// upward surroundings may differ, and a guess is worse than a NULL.
+    void fillResolution(Build& b, TplHierRef& row, const Ref& r) {
+        // The reference expression may be wrapped in selects and
+        // conversions; the resolved reference lives on the base value node.
+        const Expression* e = r.origin;
+        while (e) {
+            if (e->kind == ExpressionKind::ElementSelect)
+                e = &e->as<ElementSelectExpression>().value();
+            else if (e->kind == ExpressionKind::RangeSelect)
+                e = &e->as<RangeSelectExpression>().value();
+            else if (e->kind == ExpressionKind::MemberAccess)
+                e = &e->as<MemberAccessExpression>().value();
+            else if (e->kind == ExpressionKind::Conversion)
+                e = &e->as<ConversionExpression>().operand();
+            else
+                break;
+        }
+        if (!e || e->kind != ExpressionKind::HierarchicalValue)
+            return;
+        auto& hv = e->as<HierarchicalValueExpression>();
+        const Symbol* target = hv.ref.target;
+        if (!target || !r.sym)
+            return;
+        if (hv.ref.isUpward())
+            return;
+        // A modport port stands for the net behind it: the reference
+        // resolves to that net, not to the modport's own symbol -- whose
+        // path carries the modport level (`bus.src.vld`) that the stamped
+        // net names do not.
+        if (target->kind == SymbolKind::ModportPort) {
+            auto* inner = target->as<ModportPortSymbol>().internalSymbol;
+            if (!inner)
+                return;   // an explicit modport expression names no one net
+            target = inner;
+        }
+        std::string full = target->getHierarchicalPath();
+        // The interface-port case: the reference entered through one of this
+        // template's own interface terminals.
+        if (hv.ref.isViaIfacePort() && !hv.ref.path.empty()) {
+            const Symbol* first = hv.ref.path.front().symbol;
+            if (first && first->kind == SymbolKind::InterfacePort) {
+                auto it = b.t->termIndex.find(std::string(first->name));
+                if (it != b.t->termIndex.end()) {
+                    auto& ip = first->as<InterfacePortSymbol>();
+                    auto [iface, modport] = ip.getConnection();
+                    if (iface) {
+                        std::string ifacePrefix = iface->getHierarchicalPath();
+                        std::string rel;
+                        if (splitBelow(full, ifacePrefix, rel)) {
+                            row.resolve = TplHierRef::ViaIfaceTerm;
+                            row.ifaceTerm = it->second;
+                            splitSegsAndNet(rel, *target, row);
+                            return;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        std::string rel;
+        if (splitBelow(full, b.prefix, rel)) {
+            row.resolve = TplHierRef::Downward;
+            splitSegsAndNet(rel, *target, row);
+            return;
+        }
+        row.resolve = TplHierRef::Absolute;
+        splitSegsAndNet(full, *target, row);
+    }
 
-        std::vector<EdgeRow> edges;
-        // One dedup set for the whole module: procedures and primitives can
-        // legitimately drive the same pair from the same line only in the
-        // replicated-generate case the set exists to fold.
-        SeenSet seen;
+    static bool splitBelow(const std::string& full, const std::string& prefix,
+                           std::string& rel) {
+        if (prefix.empty() || full.size() <= prefix.size())
+            return false;
+        if (full.compare(0, prefix.size(), prefix) != 0 ||
+            full[prefix.size()] != '.')
+            return false;
+        rel = full.substr(prefix.size() + 1);
+        return true;
+    }
+
+    /// Splits `rel` into the tree segments that lead to the target's
+    /// instance and the scope-relative net name inside it. The instance
+    /// chain is recovered from the target symbol's own ancestry: every
+    /// enclosing InstanceSymbol contributes its path segments.
+    void splitSegsAndNet(const std::string& rel, const Symbol& target,
+                         TplHierRef& row) {
+        // The nearest enclosing instance of the target decides where the
+        // tree walk ends and the net name begins.
+        const Scope* s = target.getParentScope();
+        const InstanceBodySymbol* owner = nullptr;
+        while (s) {
+            auto& sym = s->asSymbol();
+            if (sym.kind == SymbolKind::InstanceBody) {
+                owner = &sym.as<InstanceBodySymbol>();
+                break;
+            }
+            s = sym.getParentScope();
+        }
+        if (!owner) {
+            row.resolve = TplHierRef::None;
+            return;
+        }
+        std::string ownerPath = owner->getHierarchicalPath();
+        std::string netRel;
+        std::string treePath;
+        std::string targetFull = target.getHierarchicalPath();
+        if (!splitBelow(targetFull, ownerPath, netRel)) {
+            row.resolve = TplHierRef::None;
+            return;
+        }
+        // The tree part is what remains of `rel` once the net part (and its
+        // dot) is dropped from the end.
+        if (netRel.size() + 1 <= rel.size() &&
+            rel.compare(rel.size() - netRel.size(), netRel.size(), netRel) == 0 &&
+            (rel.size() == netRel.size() ||
+             rel[rel.size() - netRel.size() - 1] == '.')) {
+            treePath = rel.size() == netRel.size()
+                           ? std::string()
+                           : rel.substr(0, rel.size() - netRel.size() - 1);
+        }
+        else if (rel == netRel) {
+            treePath.clear();
+        }
+        else {
+            row.resolve = TplHierRef::None;
+            return;
+        }
+        row.netName = netRel;
+        row.segs.clear();
+        // Split the tree path into per-node segments. Generate levels are
+        // one node per segment exactly as instance levels are; an array
+        // index `[k]` belongs to the segment before it in the stamped names.
+        size_t start = 0;
+        while (start < treePath.size()) {
+            size_t dot = treePath.find('.', start);
+            if (dot == std::string::npos)
+                dot = treePath.size();
+            row.segs.push_back(treePath.substr(start, dot - start));
+            start = dot + 1;
+        }
+    }
+
+    // ----------------------------------------------------- template build
+
+    void buildTemplate(Template& t, const InstanceBodySymbol& body) {
+        Build b;
+        b.t = &t;
+        b.body = &body;
+        b.prefix = body.getHierarchicalPath();
+        t.scopes.push_back(TplScope{-1, std::string()});
+        b.scopeOf.emplace(&body.asSymbol(), 0);
+
+        collectDeclarations(b, body, 0);
+        buildTermMaps(b, body);
+
         if (auto* scope = analysis.getAnalyzedScope(body)) {
-            int64_t procIndex = 0;
             for (auto& proc : scope->procedures)
-                emitProcedure(proc, prefix, edges, seen, moduleId, procIndex++);
+                buildProcedure(b, proc);
         }
-        emitPrimitives(body, prefix, edges, seen);
-        emitNetInitialisers(body, prefix, edges, seen, moduleId);
-        stats.edges += static_cast<int64_t>(edges.size());
-        writer.addEdges(moduleId, edges);
-
-        std::vector<SymbolRow> symbols;
-        forEachDeclaration(body, [&](const Symbol& sym, const std::string& gen,
-                                     std::optional<ArgumentDirection> dir) {
-            SymbolRow row;
-            row.name = gen + std::string(sym.name);
-            if (row.name.empty() || std::string(sym.name).empty())
-                return;                   // an unnamed declaration is not askable
-            row.kind = symbolKindName(sym.kind);
-            if (dir)
-                row.direction = directionName(*dir);
-            if (sym.kind == SymbolKind::TypeParameter) {
-                row.type = sym.as<TypeParameterSymbol>().targetType.getType().toString();
-            }
-            else if (ValueSymbol::isKind(sym.kind)) {
-                auto& vs = sym.as<ValueSymbol>();
-                row.type = vs.getType().toString();
-                if (vs.getType().isIntegral())
-                    row.width = static_cast<int64_t>(vs.getType().getBitWidth());
-            }
-            else if (sym.kind == SymbolKind::InterfacePort) {
-                // Not a value symbol, so the type is spelled by hand: the
-                // interface definition, with the declared modport when the
-                // port restricts itself to one.
-                auto& ip = sym.as<InterfacePortSymbol>();
-                if (ip.interfaceDef)
-                    row.type = std::string(ip.interfaceDef->name);
-                else
-                    // A generic `interface bus` port names no definition, and
-                    // leaving `type` NULL left the first segment of `bus.va`
-                    // with nothing to resolve against. The word says which
-                    // case it is rather than leaving the reader to guess.
-                    row.type = "interface";
-                if (!ip.modport.empty())
-                    row.type += "." + std::string(ip.modport);
-            }
-            const Where at = locate(sym.location);
-            row.file = at.file;
-            row.line = at.line;
-            if (sym.location)
-                row.col = static_cast<uint32_t>(sourceManager.getColumnNumber(sym.location));
-            symbols.push_back(std::move(row));
-        });
-        stats.symbols += static_cast<int64_t>(symbols.size());
-        writer.addSymbols(moduleId, symbols);
-
-        std::vector<ChildRow> children;
-        // The instances whose port bindings are emitted below, in lockstep with
-        // the leading entries of `children`. A port row names the child row it
-        // binds (port.child_id), and those ids only exist once addChildren has
-        // run -- so the ports move after it, and the pairing is positional.
-        // Positional deliberately, not by name: two unnamed gates in one module
-        // share a name, so a name lookup hands both the first id.
-        std::vector<const InstanceSymbol*> instChildren;
-        forEachInstance(body, [&](const InstanceSymbol& child) {
-            // Named relative to the module, generate-block prefix included, so
-            // the row reads the same for every instance that shares this body.
-            std::string childName;
-            relativePath(child, prefix, childName);
-            auto it = groups.find(groupKey(child.getCanonicalBody() ? *child.getCanonicalBody()
-                                                                    : child.body));
-            const int64_t defModule = it == groups.end() ? 0 : it->second.id;
-            children.push_back(ChildRow{childName,
-                                        std::string(child.getDefinition().name),
-                                        defModule, ChildKind::Module});
-            instChildren.push_back(&child);
-        });
-        // A gate, switch or UDP is an instantiation written inside the module,
-        // so it belongs here beside the module instances. Its `def_module` is
-        // NULL because a primitive has no module row -- `def_name` carries
-        // what it is (`and`, `my_latch`), which is the only place that name
-        // was recoverable from before.
-        forEachPrimitive(body, [&](const PrimitiveInstanceSymbol& prim) {
-            std::string primName;
-            relativePath(prim, prefix, primName);
-            if (primName.empty())
-                primName = "<unnamed>";
-            children.push_back(ChildRow{primName,
-                                        std::string(prim.primitiveType.name), 0,
-                                        ChildKind::Primitive});
-        });
-        // Instantiations slang could not resolve are recorded with a null
-        // child_module: a consumer can then tell "there is an instance here
-        // whose module I do not have" apart from "this module instantiates
-        // nothing", which is the distinction that matters when a trace stops.
-        forEachUnresolved(body, [&](const UninstantiatedDefSymbol& u,
-                                    const std::string& gen) {
-            // An unnamed instantiation would intern to name id 0, which is not
-            // a row, and every join on it would silently drop the child.
-            std::string name(u.name);
-            if (name.empty())
-                name = "<unnamed>";
-            children.push_back(ChildRow{gen + name,
-                                        std::string(u.definitionName), 0,
-                                        ChildKind::Unresolved});
-            stats.unresolved++;
-        });
-        stats.children += static_cast<int64_t>(children.size());
-        // Keyed by the name the row carries, so the instance walk can find the
-        // row it expands. The walk names things one segment at a time and these
-        // names hold the whole generate-nested path, so the walk rebuilds the
-        // body-relative name to look it up -- which is the work `instance.child`
-        // exists to spare a consumer.
-        auto& byName = childIdsByModule[moduleId];
-        const std::vector<int64_t> ids = writer.addChildren(moduleId, children);
-        for (size_t i = 0; i < ids.size(); i++)
-            byName.emplace(children[i].name, ids[i]);
-
-        // Ports now that every instantiation has its row id: ids[k] belongs to
-        // instChildren[k] because the instance loop above filled `children` and
-        // `instChildren` in lockstep, and primitives and unresolved rows were
-        // appended after the instances.
-        for (size_t k = 0; k < instChildren.size(); k++) {
-            std::vector<PortRow> ports;
-            emitPorts(*instChildren[k], children[k].name, prefix, ports, body);
-            stats.ports += static_cast<int64_t>(ports.size());
-            writer.addPorts(moduleId, children[k].defModule, ids[k], ports);
-        }
-
-        writer.addHierRefs(moduleId, hierRefs);
-        writer.addStmtReads(moduleId, stmtReads);
-        stats.stmtReads += static_cast<int64_t>(stmtReads.size());
+        buildNetInitialisers(b, body);
+        buildPrimitives(b, body);
+        buildChildren(b, body);
+        stats.truncatedCalls += b.truncatedCalls;
+        t.built = true;
     }
 
-    /// One event as a proc_event row: named module-relative where it can be,
-    /// recorded with an empty signal where it cannot -- the event being an
-    /// edge is a fact even where its source is not nameable. An external
-    /// event signal (`@(posedge tb.clk)`) also lands in hier_ref.
-    ProcEventRow eventRow(const Expression* expr, const std::string& edge,
-                          const std::string& prefix, const std::string& kind,
-                          const std::string& construct, const Where& at,
-                          bool isWait, EvalContext& evalCtx) {
-        std::string signal;
-        if (expr && (expr->kind == ExpressionKind::NamedValue ||
-                     expr->kind == ExpressionKind::HierarchicalValue)) {
-            if (!relativePath(expr->as<ValueExpressionBase>().symbol, prefix,
-                              signal)) {
-                signal.clear();
-                Ref r;
-                r.origin = expr;   // no bits: an event names a whole signal
-                addHierRef(false, r, kind, construct, at, evalCtx);
+    /// The inside of each terminal: which nets it stands for. An ANSI port
+    /// maps whole-to-whole onto its internal symbol; a non-ANSI port
+    /// expression and a MultiPort produce one segment per element with its
+    /// window, through the same machinery the outside uses.
+    void buildTermMaps(Build& b, const InstanceBodySymbol& body) {
+        EvalContext evalCtx(body);
+        for (auto* portSym : body.getPortList()) {
+            if (!portSym)
+                continue;
+            auto termIt = b.t->termIndex.find(std::string(
+                portSym->name.empty() ? std::string_view("<unnamed>") : portSym->name));
+            if (termIt == b.t->termIndex.end())
+                continue;
+            const int32_t termIdx = termIt->second;
+            int64_t ordinal = 0;
+            auto addSeg = [&](int32_t netIdx, const TplRange& termR,
+                             const TplRange& netR, bool mapping) {
+                if (netIdx < 0)
+                    return;
+                TplTermMap m;
+                m.term = termIdx;
+                m.ordinal = ordinal++;
+                m.net = netIdx;
+                m.termR = termR;
+                m.netR = netR;
+                m.mappingExact = mapping;
+                b.t->termMaps.push_back(std::move(m));
+            };
+            if (portSym->kind == SymbolKind::Port) {
+                auto& p = portSym->as<PortSymbol>();
+                if (p.internalSymbol && ValueSymbol::isKind(p.internalSymbol->kind)) {
+                    const int32_t netIdx =
+                        netFor(b, p.internalSymbol->as<ValueSymbol>());
+                    addSeg(netIdx, TplRange{}, TplRange{}, true);
+                }
+                else if (auto* inner = p.getInternalExpr()) {
+                    std::vector<ConnRef> segs;
+                    collectConnRefs(*inner, evalCtx, segs);
+                    for (auto& cn : segs) {
+                        if (!cn.ref.sym)
+                            continue;
+                        const int32_t netIdx = netFor(b, *cn.ref.sym);
+                        if (netIdx < 0)
+                            continue;
+                        TplRange termR;
+                        const uint64_t fw =
+                            inner->type ? inner->type->getBitWidth() : 0;
+                        if (cn.windowExact && fw &&
+                            !(cn.winLo == 0 && cn.winHi + 1 >= fw))
+                            termR.bits = std::make_pair(cn.winLo, cn.winHi);
+                        termR.exact = cn.windowExact;
+                        addSeg(netIdx, termR, rangeOf(cn.ref), cn.positional);
+                    }
+                }
             }
+            else if (portSym->kind == SymbolKind::MultiPort) {
+                // Members are declared MSB first, exactly as a concatenation
+                // is written; each maps whole onto its own window.
+                auto& mp = portSym->as<MultiPortSymbol>();
+                uint64_t total = mp.getType().isIntegral()
+                                     ? mp.getType().getBitWidth()
+                                     : 0;
+                uint64_t cursor = total;
+                for (auto* member : mp.ports) {
+                    if (!member || !member->internalSymbol ||
+                        !ValueSymbol::isKind(member->internalSymbol->kind))
+                        continue;
+                    auto& vs = member->internalSymbol->as<ValueSymbol>();
+                    const uint64_t w = member->getType().isIntegral()
+                                           ? member->getType().getBitWidth()
+                                           : 0;
+                    TplRange termR;
+                    bool mapping = false;
+                    if (total && w && w <= cursor) {
+                        cursor -= w;
+                        if (!(cursor == 0 && w == total))
+                            termR.bits = std::make_pair(cursor, cursor + w - 1);
+                        termR.exact = true;
+                        mapping = true;
+                    }
+                    else {
+                        termR.exact = false;
+                    }
+                    addSeg(netFor(b, vs), termR, TplRange{}, mapping);
+                }
+            }
+            // InterfacePort: no nets behind it, no map rows.
         }
-        else if (expr) {
-            // Not a plain reference -- `@(posedge clks[2])`, a clock mux --
-            // so `signal` stays NULL, as documented. The signals it samples
-            // are still read, and for a module-local one no other table was
-            // reaching them: `clks` was declared, named by two sensitivity
-            // lists, and absent from every one of the five tables the doc
-            // says answer "what reads this".
-            std::vector<Ref> reads;
-            collectRefs(*expr, evalCtx, reads);
-            addStmtReads(reads, prefix, kind, isWait ? "wait" : "sensitivity",
-                         at, evalCtx);
-        }
-        return ProcEventRow{std::move(signal), edge, isWait, at.file, at.line};
     }
 
-    /// One procedure's edges, paired statement by statement.
-    /// `seen` is owned by the caller and spans the whole module: a generate
-    /// loop gives each iteration its own AnalyzedProcedure, so a per-procedure
-    /// set never sees that all of them assign the same module-level pair from
-    /// the same line. Keyed on the line too, since two distinct statements
-    /// driving one pair are two edges.
-    void emitProcedure(const AnalyzedProcedure& proc, const std::string& prefix,
-                       std::vector<EdgeRow>& out, SeenSet& seen, int64_t moduleId,
-                       int64_t procIndex) {
-        std::string kind, construct;
-        classify(*proc.analyzedSymbol, kind, construct);
-        // The procedure's own location, and the fallback for any statement
-        // inside it that has none of its own.
-        const Where procAt = locate(proc.analyzedSymbol->location);
+    // One procedure: its row, its sensitivity, and its statements.
+    void buildProcedure(Build& b, const AnalyzedProcedure& proc) {
+        const Symbol& sym = *proc.analyzedSymbol;
+        const bool isContinuous = sym.kind == SymbolKind::ContinuousAssign;
+        const TplLoc procAt = locate(sym.location);
+        EvalContext evalCtx(sym);
 
-        // Declared before the sensitivity pass, which needs it to resolve the
-        // selects in an event expression that leaves the module.
-        EvalContext evalCtx(*proc.analyzedSymbol);
+        std::string construct;
+        if (isContinuous)
+            construct = "assign";
+        else
+            construct = procedureWord(sym);
+
+        int32_t procIdx = -1;
+        if (!isContinuous) {
+            TplProcedure p;
+            p.scope = scopeForSymbol(b, sym);
+            p.kind = construct == "assign" ? "always" : construct;
+            p.loc = procAt;
+            procIdx = int32_t(b.t->procedures.size());
+            b.t->procedures.push_back(std::move(p));
+        }
+        b.curProc = procIdx;
+        b.curScope = scopeForSymbol(b, sym);
+        b.curStmt = -1;
 
         auto& sens = proc.getSensitivityList();
-
-        // Sensitivity rows carry the procedure's own location; the waits the
-        // walker reports below carry their statement's. Written together once
-        // the walk is done.
-        std::vector<ProcEventRow> events;
-        {
+        // Sensitivity rows carry the procedure's location. An event whose
+        // expression is not a plain net keeps net NULL and its reads land as
+        // expr_ref role='event' on a synthetic event_control statement --
+        // one read, one table.
+        int32_t sensStmt = -1;
+        auto sensReadStmt = [&]() {
+            if (sensStmt < 0) {
+                sensStmt = newStmt(b, "event_control", "sensitivity",
+                                   std::string(), -1, std::string(), 0, procAt);
+            }
+            return sensStmt;
+        };
+        if (procIdx >= 0) {
             std::vector<std::pair<const Expression*, std::string>> raw;
             std::vector<const Expression*> iffs;
             collectEdgeEvents(sens.timingControl, raw, &iffs);
             for (auto& [expr, edge] : raw)
-                events.push_back(eventRow(expr, edge, prefix, kind, construct,
-                                          procAt, /*isWait=*/false, evalCtx));
+                addProcEvent(b, procIdx, -1, expr, edge, "sensitivity", procAt,
+                             evalCtx, sensReadStmt);
             for (auto* cond : iffs) {
                 std::vector<Ref> reads;
                 collectRefs(*cond, evalCtx, reads);
-                addStmtReads(reads, prefix, kind, "sensitivity", procAt, evalCtx);
+                const int32_t s = sensReadStmt();
+                for (auto& r : reads)
+                    recordRead(b, s, r, "event", procAt, evalCtx);
             }
         }
 
-        // Input-port drivers belong to the parent, not to this module: the port
-        // is receiving a value from outside, and reporting it here would name
-        // the wrong side of the boundary.
         std::unordered_set<const ValueSymbol*> inputPorts;
         for (auto* d : proc.getDrivers()) {
             if (d->isInputPort())
                 inputPorts.insert(&d->getSymbol());
         }
 
-        // Whether the walk found anything at all, as distinct from whether a
-        // row survived. Dedup spans the module, and a generate loop gives each
-        // iteration its own analyzed procedure, so later iterations legitimately
-        // add no rows -- counting appended rows would report every one of them
-        // as a procedure that yielded nothing.
         bool reached = false;
 
-        // A null-source edge is the truth only when *no* operand of the
-        // statement had a name in this module. The emit callback sees one
-        // operand at a time, so the decision waits until the walk is done:
-        // `namedSource` records the targets some operand did reach,
-        // `pendingNull` the rows to write for the ones none did.
-        using StmtKey = std::tuple<const ValueSymbol*, std::string, uint32_t>;
-        std::set<StmtKey> namedSource;
-        std::map<StmtKey, EdgeRow> pendingNull;
-
-        StatementWalker walker([&](const Ref& dst, const Ref& src, bool gatingEdge,
-                                   bool mapExact, SourceRange where) {
-            reached = true;
-            // Self-feedback is kept, same bits included. Following a *driver*
-            // backwards, `cnt <= cnt + 1` adds nothing new -- which is why an
-            // earlier version dropped it -- but the same row read the other way
-            // answers "who reads cnt", and dropping it made the only reader of
-            // a free-running counter disappear: a load query answered "nobody"
-            // about a signal the simulator's own database reports as read.
-            if (inputPorts.count(dst.sym))
-                return;
-            // The assignment's own location, not the procedure header's. Using
-            // the header made every edge in a 200-line always block report the
-            // `always` keyword, and -- because the dedup key includes the line
-            // -- made two different statements driving the same pair look like
-            // one, so the second was dropped. A control edge emitted early in a
-            // block silently suppressed the real data edge later in it.
-            //
-            // The file travels with the line. Taking only the line and keeping
-            // the procedure's file broke every statement that lives in another
-            // file -- a task body reached by `include` -- into a pair naming a
-            // line the file does not have.
-            const Where at = locate(where.start(), procAt);
-            const uint32_t stmtLine = at.line;
-            const auto dk = keyRange(dst);
-            const auto sk = src.sym ? keyRange(src) : std::make_pair<uint64_t, uint64_t>(0, 0);
-            if (!seen.emplace(dst.sym, src.sym, fileKey(at.file), stmtLine,
-                              dk.first, dk.second,
-                              sk.first, sk.second,
-                              gatingEdge, dst.exact,
-                              src.sym ? src.exact : true,
-                              kindTag(kind), mapExact)
-                     .second)
-                return;
-            EdgeRow row;
-            if (!relativePath(*dst.sym, prefix, row.dst)) {
-                addHierRef(true, dst, kind, construct, at, evalCtx);
-                // The operand too, gating conditions included -- those reach
-                // here and nowhere else, so returning on the target alone lost
-                // the only record of what an outward write depends on.
-                if (src.sym)
-                    addHierRef(false, src, kind, construct, at, evalCtx);
-                return;
-            }
-            if (!dst.whole)
-                row.dstBits = std::make_pair(dst.lo, dst.hi);
-            row.dstExact = dst.exact;
-            if (src.sym) {
-                if (!relativePath(*src.sym, prefix, row.src)) {
-                    addHierRef(false, src, kind, construct, at, evalCtx);
-                    // The operand has no name this row can carry, but the
-                    // statement may still drive the target from outside the
-                    // module entirely -- `assign seen = bus.vld` in an
-                    // interface-using design -- and dropping the row outright
-                    // made that read as "nothing drives it".
-                    //
-                    // Held back rather than written here. Whether a null
-                    // source is the truth depends on the statement's *other*
-                    // operands, which this callback sees one at a time: an
-                    // earlier version wrote the row per outward operand, so
-                    // `assign y = a & bus.vld` claimed both that `a` drives y
-                    // and that nothing does. It is materialised after the walk,
-                    // and only for a target no named operand reached.
-                    //
-                    // Finished here rather than at the push site below, which
-                    // this path never reaches: `relativePath` writes the
-                    // *absolute* path into `row.src` when it fails, so leaving
-                    // it would leak one instance's hierarchy into a folded row.
-                    row.src.clear();
-                    row.srcType.clear();
-                    row.srcBits.reset();
-                    row.srcExact = true;
-                    row.dstType = typeOf(*dst.sym);
-                    row.kind = kind;
-                    row.construct = construct;
-                    row.control = gatingEdge;
-                    row.mapExact = mapExact;
-                    row.file = at.file;
-                    row.line = at.line;
-                    pendingNull.try_emplace({dst.sym, at.file, stmtLine}, row);
+        StatementWalker walker(
+            // ---- one assignment target with its pairs and gating
+            [&](const Ref& dst, const std::vector<PairedSrc>& pairs,
+                const std::vector<Ref>& gating, SourceRange where, int64_t seq,
+                bool blocking, int64_t dropped, bool inSubroutine,
+                bool firstTarget, const std::string& delay) {
+                reached = true;
+                if (!dst.sym || inputPorts.count(dst.sym))
                     return;
+                const TplLoc at = locate(where.start(), procAt);
+                emitAssignment(b, dst, pairs, gating, at, seq, blocking,
+                               dropped, inSubroutine, firstTarget, delay,
+                               isContinuous, construct, evalCtx);
+            },
+            // ---- a call site's actual bound to its formal
+            [&](const Ref& formal, const Ref& actual, bool reads, bool writes,
+                bool oneToOne, bool bindable, SourceRange where) {
+                reached = true;
+                emitCallBinding(b, formal, actual, reads, writes, oneToOne,
+                                bindable, locate(where.start(), procAt), evalCtx);
+            },
+            // ---- a statement-level event control (a wait)
+            [&](const Expression* e, const std::string& edge, int64_t seq,
+                SourceRange where) {
+                if (procIdx < 0)
+                    return;
+                const TplLoc at = locate(where.start(), procAt);
+                const int32_t s = newStmt(b, "event_control", "wait",
+                                          std::string(), seq, std::string(), 0,
+                                          at);
+                addProcEvent(b, procIdx, s, e, edge, "wait", at, evalCtx,
+                             [&]() { return s; });
+            },
+            // ---- a statement that reads without writing anything nameable
+            [&](const std::vector<Ref>& reads, const std::vector<Ref>& gating,
+                const std::vector<Ref>& writes, const std::string& stmtKind,
+                const std::string& construct2, int64_t seq, SourceRange where) {
+                const TplLoc at = locate(where.start(), procAt);
+                filteredConstants = 0;
+                const int32_t s = newStmt(b, stmtKind, construct2,
+                                          std::string(), seq, std::string(), 0,
+                                          at);
+                const std::string role = stmtKind == "assertion" ? "assertion"
+                                         : stmtKind == "wait"    ? "wait"
+                                         : stmtKind == "system_task"
+                                             ? "system_task"
+                                             : "call_argument";
+                for (auto& r : reads)
+                    recordRead(b, s, r, role, at, evalCtx);
+                // The conditions that gate it. No dependency can exist --
+                // the statement writes nothing this instance names -- but
+                // the condition IS read, and dropping it lost the signal
+                // from every load query.
+                for (auto& g : gating)
+                    recordRead(b, s, g, "control", at, evalCtx);
+                // What the task writes. The source is genuinely unknowable
+                // -- a file, a plusarg, a format string -- so the row has
+                // no source, and v_driver tells it apart from a constant
+                // tie-off by the statement it came from.
+                for (auto& w : writes) {
+                    // A system task's write is a write: the procedure that
+                    // contains one has reached a driver, and counting it as
+                    // an empty procedure blamed the walk for a construct it
+                    // now models.
+                    reached = true;
+                    recordSystemWrite(b, s, w, at, evalCtx);
                 }
-                else {
-                    row.srcType = typeOf(*src.sym);
-                    if (!src.whole)
-                        row.srcBits = std::make_pair(src.lo, src.hi);
-                    row.srcExact = src.exact;
-                }
-            }
-            row.dstType = typeOf(*dst.sym);
-            row.kind = kind;
-            row.construct = construct;
-            // Whether the operand reached the target through a condition rather
-            // than through the right-hand side. Its own column: appending it to
-            // `construct` made a consumer string-match a suffix to recover one of
-            // two orthogonal facts.
-            row.control = gatingEdge;
-            row.mapExact = mapExact;
-            row.file = at.file;
-            row.line = at.line;
-            if (src.sym)
-                namedSource.emplace(dst.sym, at.file, at.line);
-            out.push_back(std::move(row));
-        },
-        // One row per assignment statement, so a target written in several
-        // places stays several statements rather than one merged set. Only what
-        // is written: no branch conditions, because deciding which branch held
-        // is the reader's job and encoding it here would state it as fact.
-        [&](const Ref& dst, const std::vector<Ref>& operands, SourceRange where,
-            int64_t stmtSeq, bool blocking, int64_t droppedConstants,
-            bool inSubroutine, bool firstTarget) {
-            if (!dst.sym || inputPorts.count(dst.sym))
-                return;
-            // One statement, however many targets its left-hand side names:
-            // the second target of `{a, b} = ...` shares the first's ordinal,
-            // so "rows sharing (module, stmt) came from one statement" stays
-            // true for concatenated writes.
-            const int64_t stmtId = firstTarget ? beginStmt() : curStmt;
-            AssignRow arow;
-            arow.stmt = stmtId;
-            const Where at = locate(where.start(), procAt);
-            arow.line = at.line;
-            if (!relativePath(*dst.sym, prefix, arow.dst)) {
-                // The statement itself cannot be a row -- its target has no
-                // module-relative name -- but the write is recorded where
-                // every outward reference is, and so is everything it read.
-                //
-                // Returning before the operand loop threw the read side away
-                // entirely, uncounted: `always_ff @(posedge clk) b.rdy <=
-                // b.vld & b.ack;` -- a modport driver, which is what interface
-                // RTL mostly is -- exported one write-only row, and the two
-                // reads appeared in no table and in no total.
-                addHierRef(true, dst, kind, construct, at, evalCtx);
-                // The read side of the same statement. An operand outside the
-                // module joins the write in hier_ref; one inside it has no
-                // assignment row to hang from -- the target has no name -- so
-                // it goes to stmt_read, without which `payload` in
-                // `assign bus.vld = |payload;` read as though nothing used it.
-                addStmtReads(operands, prefix, kind, construct, at, evalCtx);
-                return;
-            }
-            if (!dst.whole)
-                arow.dstBits = std::make_pair(dst.lo, dst.hi);
-            arow.dstExact = dst.exact;
-            arow.kind = kind;
-            arow.construct = construct;
-            arow.file = at.file;
-            arow.proc = procIndex;
-            arow.seq = stmtSeq;
-            // NULL means "a continuous assignment", which is a property of
-            // the statement, not of whoever reached it. A `=` inside a called
-            // function is a blocking assignment however the function was
-            // invoked; keying this on the enclosing procedure alone gave the
-            // same line NULL from an `assign` and 1 from an `always_ff`.
-            arow.blocking =
-                (!inSubroutine && proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
-                    ? -1
-                    : (blocking ? 1 : 0);
-
-            std::vector<OperandRow> ops;
-            for (auto& r : operands) {
-                if (!r.sym)
-                    continue;
-                std::string rel;
-                if (!relativePath(*r.sym, prefix, rel)) {
-                    arow.dropped++;      // outside the module; cannot be shared
-                    addHierRef(false, r, kind, construct, at, evalCtx);
-                    continue;
-                }
-                OperandRow o;
-                o.name = std::move(rel);
-                if (!r.whole)
-                    o.bits = std::make_pair(r.lo, r.hi);
-                o.exact = r.exact;
-                ops.push_back(std::move(o));
-            }
-            // Constants never reach here -- they are filtered during collection
-            // -- so they are counted where that happens.
-            arow.dropped += droppedConstants;
-            writer.addAssignment(moduleId, arow, ops);
-            stats.assignments++;
-        },
-        // A wait's event, at its own statement -- which a task body reached by
-        // `include` puts in a different file from the procedure header.
-        [&](const Expression* e, const std::string& edge, SourceRange where) {
-            events.push_back(eventRow(e, edge, prefix, kind, construct,
-                                      locate(where.start(), procAt),
-                                      /*isWait=*/true, evalCtx));
-        },
-        // A statement that reads without writing anything nameable: an
-        // assertion. Its reads belong to the statement, not to a target.
-        [&](const std::vector<Ref>& operands, const std::string& what,
-            SourceRange where) {
-            beginStmt();
-            const Where at = locate(where.start(), procAt);
-            addStmtReads(operands, prefix, kind, what, at, evalCtx);
-        },
-        evalCtx);
+            },
+            evalCtx);
         walker.sensitivityTiming = sens.timingControl;
-
-        if (proc.analyzedSymbol->kind == SymbolKind::ProceduralBlock)
-            proc.analyzedSymbol->as<ProceduralBlockSymbol>().getBody().visit(walker);
-        else if (proc.analyzedSymbol->kind == SymbolKind::ContinuousAssign)
-            proc.analyzedSymbol->as<ContinuousAssignSymbol>().getAssignment().visit(walker);
-
-        // The statements whose every operand turned out to live outside this
-        // module: the target is driven, and this row is what says so.
-        for (auto& [key, row] : pendingNull) {
-            if (namedSource.count(key))
-                continue;
-            auto& [dstSym, keyFile, keyLine] = key;
-            const auto dk = std::make_pair(row.dstBits ? row.dstBits->first : uint64_t(0),
-                                           row.dstBits ? row.dstBits->second : uint64_t(0));
-            if (!seen.emplace(dstSym, nullptr, fileKey(keyFile), keyLine,
-                              dk.first, dk.second, uint64_t(0), uint64_t(0),
-                              row.control, row.dstExact, true,
-                              kindTag(row.kind), row.mapExact)
-                     .second)
-                continue;
-            out.push_back(row);
+        walker.budget = &b.callBudget;
+        walker.truncated = &b.truncatedCalls;
+        if (isContinuous) {
+            walker.pendingDelay = delayText(
+                sym.as<ContinuousAssignSymbol>().getDelay());
         }
 
-        writer.addProcEvents(moduleId, procIndex, events);
+        if (sym.kind == SymbolKind::ProceduralBlock)
+            sym.as<ProceduralBlockSymbol>().getBody().visit(walker);
+        else if (isContinuous)
+            sym.as<ContinuousAssignSymbol>().getAssignment().visit(walker);
 
-        // A procedure the analysis says drives something, but in which the walk
-        // found nothing, means the traversal did not see what the analysis did.
-        //
-        // Keyed on whether the walk *reached* anything rather than on rows
-        // appended: dedup spans the module and a generate loop gives each
-        // iteration its own analyzed procedure, so later iterations legitimately
-        // add no rows. Counting appended rows reported 510 such procedures on
-        // one SoC, every one of them a duplicate rather than a loss.
-        //
-        // It does not catch the case where slang rejects a statement so
-        // thoroughly that it reports no drivers either: the node is marked bad,
-        // the visitor skips bad nodes, a bad child taints its enclosing block,
-        // and the whole `always` leaves the export. Nothing here can see it,
-        // because the analysis and the traversal agree there is nothing.
-        //
-        // Only *invalid* RTL reaches that state -- a reversed slice on an
-        // ascending unpacked array is the case found, and Verilator and Icarus
-        // reject it too. Legal code that merely warns (a width truncation, a
-        // legal ascending slice) keeps its block. So the diagnostic is the
-        // signal, and since the one responsible is declared a *warning* rather
-        // than an error, warnings are counted and surfaced instead of being
-        // filtered out.
-        if (!reached && !proc.getDrivers().empty()) {
+        if (!reached && !proc.getDrivers().empty())
             stats.emptyProcedures++;
+        b.curProc = -1;
+        b.curStmt = -1;
+    }
+
+    /// The target of a system task's write: a real assign_target plus a
+    /// source-less dependency, so the argument has a driver and the
+    /// procedure is not mistaken for one that wrote nothing. A target
+    /// outside this instance is a hier_ref with access='write', as
+    /// everywhere else.
+    void recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
+                           const TplLoc& at, EvalContext& evalCtx) {
+        if (!r.sym)
+            return;
+        const int32_t netIdx = netFor(b, *r.sym);
+        if (netIdx < 0) {
+            // `$readmemh("f.hex", u.mem)` -- the task drives a memory in
+            // another instance. Recording only the reference left that
+            // memory with no driver at all, so a trace back from whatever
+            // reads it stopped dead one step later.
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            const int32_t href = addHierRef(b, true, r, at, evalCtx);
+            b.curStmt = saved;
+            if (href < 0)
+                return;
+            TplCrossDep d;
+            d.kind = "data";
+            d.sourceless = true;
+            d.stmt = stmt;
+            d.tgtHref = href;
+            d.tgtR = rangeOf(r);
+            b.t->crossDeps.push_back(std::move(d));
+            return;
+        }
+        TplStmtRef tr;
+        tr.stmt = stmt;
+        tr.ordinal = int64_t(b.t->targets.size());
+        tr.net = netIdx;
+        tr.r = rangeOf(r);
+        const int32_t targetIdx = int32_t(b.t->targets.size());
+        b.t->targets.push_back(std::move(tr));
+        TplDep d;
+        d.srcNet = -1;
+        d.tgtNet = netIdx;
+        d.stmt = stmt;
+        d.targetRef = targetIdx;
+        d.kind = "data";
+        d.tgtR = rangeOf(r);
+        b.t->deps.push_back(std::move(d));
+    }
+
+    /// One read of a statement, wherever it lands: an expr_ref for a net of
+    /// this instance, a hier_ref for anything outside it.
+    void recordRead(Build& b, int32_t stmt, const Ref& r, const std::string& role,
+                    const TplLoc& at, EvalContext& evalCtx) {
+        if (!r.sym)
+            return;
+        const int32_t netIdx = netFor(b, *r.sym);
+        if (netIdx < 0) {
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            addHierRef(b, false, r, at, evalCtx);
+            b.curStmt = saved;
+            return;
+        }
+        addExprRef(b, stmt, r, role, netIdx);
+    }
+
+    void addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
+                      const Expression* expr, const std::string& edge,
+                      const std::string& eventKind, const TplLoc& at,
+                      EvalContext& evalCtx,
+                      const std::function<int32_t()>& readStmt) {
+        int32_t netIdx = -1;
+        if (expr && (expr->kind == ExpressionKind::NamedValue ||
+                     expr->kind == ExpressionKind::HierarchicalValue)) {
+            auto& vs = expr->as<ValueExpressionBase>().symbol;
+            netIdx = netFor(b, vs);
+            if (netIdx < 0) {
+                Ref r;
+                r.sym = &vs;
+                r.origin = expr;
+                const int32_t saved = b.curStmt;
+                b.curStmt = stmtIdx;
+                addHierRef(b, false, r, at, evalCtx);
+                b.curStmt = saved;
+            }
+        }
+        else if (expr) {
+            // Not a plain reference (`@(posedge clks[2])`): net stays NULL
+            // and the reads are expr_ref rows on the owning statement.
+            std::vector<Ref> reads;
+            collectRefs(*expr, evalCtx, reads);
+            const int32_t s = readStmt();
+            const std::string role = eventKind == "wait" ? "wait" : "event";
+            for (auto& r : reads)
+                recordRead(b, s, r, role, at, evalCtx);
+        }
+        TplProcEvent e;
+        e.proc = procIdx;
+        e.stmt = stmtIdx;
+        e.net = netIdx;
+        e.eventKind = eventKind;
+        e.edgeKind = edge;
+        e.loc = at;
+        b.t->procEvents.push_back(std::move(e));
+    }
+
+    /// One target of one assignment statement, with its statement row on the
+    /// first target, its operand rows, and the dependencies that pair them.
+    void emitAssignment(Build& b, const Ref& dst,
+                        const std::vector<PairedSrc>& pairs,
+                        const std::vector<Ref>& gating, const TplLoc& at,
+                        int64_t seq, bool blocking, int64_t dropped,
+                        bool inSubroutine, bool firstTarget,
+                        const std::string& delay, bool isContinuous,
+                        const std::string& construct, EvalContext& evalCtx) {
+        int32_t stmt = b.curStmt;
+        if (firstTarget) {
+            const bool continuous = isContinuous && !inSubroutine;
+            stmt = newStmt(b, "assignment", construct,
+                           continuous ? "continuous"
+                                      : (blocking ? "blocking" : "nonblocking"),
+                           seq, delay, dropped, at);
+            // The control reads gate every target of the statement; recorded
+            // once, reused by each target's control dependencies. An outward
+            // condition is a hier_ref; its dependency onto each target is
+            // paired here and materialised when the reference resolves.
+            for (auto& g : gating) {
+                if (!g.sym)
+                    continue;
+                const int32_t netIdx = netFor(b, *g.sym);
+                if (netIdx < 0) {
+                    b.curControlRefs.push_back(-1);
+                    b.curControlHrefs.push_back(
+                        addHierRef(b, false, g, at, evalCtx));
+                }
+                else {
+                    b.curControlRefs.push_back(
+                        addExprRef(b, stmt, g, "control", netIdx));
+                    b.curControlHrefs.push_back(-1);
+                }
+                b.curControlSrcs.push_back(g);
+            }
+        }
+        if (stmt < 0)
+            return;
+
+        // The target row, or the outward write.
+        int32_t targetIdx = -1;
+        int32_t tgtHref = -1;
+        int32_t dstNet = netFor(b, *dst.sym);
+        if (dstNet < 0) {
+            tgtHref = addHierRef(b, true, dst, at, evalCtx);
+        }
+        else {
+            TplStmtRef tr;
+            tr.stmt = stmt;
+            tr.ordinal = b.targetOrdinal++;
+            tr.net = dstNet;
+            tr.r = rangeOf(dst);
+            targetIdx = int32_t(b.t->targets.size());
+            b.t->targets.push_back(std::move(tr));
+        }
+        const bool haveTarget = targetIdx >= 0 || tgtHref >= 0;
+
+        // Operands and data dependencies, paired -- never crossed. An end
+        // outside the instance keeps the pairing: the dependency is queued
+        // against the hier_ref and becomes a real cross-instance row once
+        // the reference resolves. Unresolvable stays a hier_ref alone --
+        // the honest record, never a fabricated edge.
+        bool anySource = false;
+        for (auto& p : pairs) {
+            if (!p.src.sym)
+                continue;
+            const int32_t srcNet = netFor(b, *p.src.sym);
+            int32_t operandIdx = -1;
+            int32_t srcHref = -1;
+            if (srcNet >= 0) {
+                TplStmtRef orow;
+                orow.stmt = stmt;
+                orow.ordinal = b.operandOrdinal++;
+                orow.net = srcNet;
+                orow.r = rangeOf(p.src);
+                operandIdx = int32_t(b.t->operands.size());
+                b.t->operands.push_back(std::move(orow));
+            }
+            else {
+                srcHref = addHierRef(b, false, p.src, at, evalCtx,
+                                     nullptr, &p.srcAsWritten);
+            }
+            if (!haveTarget)
+                continue;
+            anySource = anySource || srcNet >= 0 || srcHref >= 0;
+            if (srcNet >= 0 && targetIdx >= 0) {
+                TplDep d;
+                d.srcNet = srcNet;
+                d.tgtNet = dstNet;
+                d.stmt = stmt;
+                d.operandRef = operandIdx;
+                d.targetRef = targetIdx;
+                d.kind = "data";
+                d.srcR = rangeOf(p.src);
+                // The bits of the target THIS operand reaches, not the
+                // whole target: the `assign_target` row above still spans
+                // everything the statement writes.
+                d.tgtR = rangeOf(p.tgt);
+                d.mappingExact = p.mapExact ? 1 : 0;
+                b.t->deps.push_back(std::move(d));
+            }
+            else if (srcNet >= 0 || srcHref >= 0) {
+                TplCrossDep d;
+                d.kind = "data";
+                d.stmt = stmt;
+                d.srcNet = srcNet;
+                d.srcHref = srcHref;
+                d.tgtNet = dstNet;
+                d.tgtHref = tgtHref;
+                d.operandRef = operandIdx;
+                d.targetRef = targetIdx;
+                d.srcR = rangeOf(p.src);
+                d.tgtR = rangeOf(p.tgt);
+                d.mappingExact = p.mapExact ? 1 : 0;
+                b.t->crossDeps.push_back(std::move(d));
+            }
+        }
+        // `q <= 8'h0`: nothing at all reaches the target, and the
+        // null-source row records the driving statement. A target whose
+        // sources are all OUTWARD is not that -- its drivers are the
+        // cross-instance rows above, and claiming a constant here was a
+        // wrong fact, not a conservative one.
+        if (haveTarget && !anySource) {
+            if (targetIdx >= 0) {
+                TplDep d;
+                d.srcNet = -1;
+                d.tgtNet = dstNet;
+                d.stmt = stmt;
+                d.targetRef = targetIdx;
+                d.kind = "data";
+                d.tgtR = rangeOf(dst);
+                b.t->deps.push_back(std::move(d));
+            }
+            else {
+                // The target is in another instance: `assign u.x = 8'h5A;`.
+                // Gating the constant row on a LOCAL target left every
+                // outward constant write with no driver whatsoever, so a
+                // trace back from the far net said nothing wrote it.
+                TplCrossDep d;
+                d.kind = "data";
+                d.sourceless = true;
+                d.stmt = stmt;
+                d.tgtHref = tgtHref;
+                d.tgtR = rangeOf(dst);
+                b.t->crossDeps.push_back(std::move(d));
+            }
+        }
+        // Control dependencies: each recorded condition read reaches this
+        // target through its branch, whichever side of the boundary either
+        // end lives on.
+        if (haveTarget) {
+            for (size_t i = 0; i < b.curControlSrcs.size(); i++) {
+                auto& src = b.curControlSrcs[i];
+                const int32_t ctrlRef = b.curControlRefs[i];
+                const int32_t ctrlHref = b.curControlHrefs[i];
+                if (ctrlRef < 0 && ctrlHref < 0)
+                    continue;
+                if (ctrlRef >= 0 && targetIdx >= 0) {
+                    const int32_t srcNet = netFor(b, *src.sym);
+                    if (srcNet < 0)
+                        continue;
+                    TplDep d;
+                    d.srcNet = srcNet;
+                    d.tgtNet = dstNet;
+                    d.stmt = stmt;
+                    d.exprRef = ctrlRef;
+                    d.targetRef = targetIdx;
+                    d.kind = "control";
+                    d.srcR = rangeOf(src);
+                    d.tgtR = rangeOf(dst);
+                    d.mappingExact = 0;
+                    b.t->deps.push_back(std::move(d));
+                }
+                else {
+                    TplCrossDep d;
+                    d.kind = "control";
+                    d.stmt = stmt;
+                    d.srcNet = ctrlRef >= 0 ? netFor(b, *src.sym) : -1;
+                    d.srcHref = ctrlHref;
+                    d.tgtNet = dstNet;
+                    d.tgtHref = tgtHref;
+                    d.exprRef = ctrlRef;
+                    d.targetRef = targetIdx;
+                    d.srcR = rangeOf(src);
+                    d.tgtR = rangeOf(dst);
+                    d.mappingExact = 0;
+                    b.t->crossDeps.push_back(std::move(d));
+                }
+            }
         }
     }
 
-    /// `wire w = a & b;` -- a net declared with an initialiser.
-    ///
-    /// The LRM makes that a continuous assignment, but slang models it as a
-    /// net carrying an initialiser rather than as a `ContinuousAssign` symbol,
-    /// so it never reached the procedure walk and the net came out with no
-    /// driver at all. Nothing said so: `w` still appeared as a *source* in
-    /// whatever read it, so the export looked complete while the question
-    /// "what drives w" answered nothing.
-    ///
-    /// Recorded exactly as the equivalent `assign` is, because that is what it
-    /// is -- `continuous_assign`/`assign`, with a NULL-source row when the
-    /// initialiser reads nothing this module can name.
-    ///
-    /// Variable initialisers are deliberately not included: `logic [7:0] c = 0`
-    /// writes once at time zero and is not a driver in the same sense, and
-    /// recording it as one would put a continuous assignment on every counter
-    /// that happens to declare its reset value.
-    void emitNetInitialisers(const InstanceBodySymbol& body, const std::string& prefix,
-                             std::vector<EdgeRow>& out, SeenSet& seen, int64_t moduleId) {
-        EvalContext evalCtx(body);
-        int64_t seq = 0;
-        forEachDeclaration(body, [&](const Symbol& sym, const std::string& gen,
-                                     std::optional<ArgumentDirection>) {
-            if (sym.kind != SymbolKind::Net)
+    /// One call binding: the actual and the formal coupled by argument
+    /// direction. The formal is a subroutine-scope net (`bump.v`); the
+    /// body's own statements belong to the calling procedure, and are
+    /// walked once per call site so each carries its caller's gating.
+    void emitCallBinding(Build& b, const Ref& formal, const Ref& actual,
+                         bool reads, bool writes, bool oneToOne, bool bindable,
+                         const TplLoc& at, EvalContext& evalCtx) {
+        if (!formal.sym || !actual.sym)
+            return;
+        const int32_t formalNet = netFor(b, *formal.sym);
+        if (formalNet < 0)
+            return;
+        const int32_t stmt = bindable ? b.curStmt : -1;
+        const int32_t actualNet = netFor(b, *actual.sym);
+        if (actualNet < 0) {
+            // An outward actual still binds: the dependency pairs here and
+            // materialises when the reference resolves.
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            const int32_t href = addHierRef(b, writes, actual, at, evalCtx);
+            b.curStmt = saved;
+            if (href < 0)
                 return;
-            auto& net = sym.as<NetSymbol>();
+            if (reads) {
+                TplCrossDep d;
+                d.kind = "procedure";
+                d.stmt = stmt;
+                d.srcHref = href;
+                d.tgtNet = formalNet;
+                d.srcR = rangeOf(actual);
+                d.mappingExact = oneToOne ? 1 : 0;
+                b.t->crossDeps.push_back(std::move(d));
+            }
+            if (writes) {
+                TplCrossDep d;
+                d.kind = "procedure";
+                d.stmt = stmt;
+                d.srcNet = formalNet;
+                d.tgtHref = href;
+                d.tgtR = rangeOf(actual);
+                d.mappingExact = oneToOne ? 1 : 0;
+                b.t->crossDeps.push_back(std::move(d));
+            }
+            return;
+        }
+        if (reads) {
+            int32_t exprIdx = -1;
+            if (stmt >= 0)
+                exprIdx = addExprRef(b, stmt, actual, "call_argument", actualNet);
+            TplDep d;
+            d.srcNet = actualNet;
+            d.tgtNet = formalNet;
+            d.stmt = stmt;
+            d.exprRef = exprIdx;
+            d.kind = "procedure";
+            d.srcR = rangeOf(actual);
+            d.mappingExact = oneToOne ? 1 : 0;
+            b.t->deps.push_back(std::move(d));
+        }
+        if (writes) {
+            TplDep d;
+            d.srcNet = formalNet;
+            d.tgtNet = actualNet;
+            d.stmt = stmt;
+            d.kind = "procedure";
+            d.tgtR = rangeOf(actual);
+            d.mappingExact = oneToOne ? 1 : 0;
+            b.t->deps.push_back(std::move(d));
+        }
+    }
+
+    /// `wire w = a & b;` -- the LRM's continuous assignment spelled as a
+    /// declaration, through the same slot machinery as `assign`.
+    void buildNetInitialisers(Build& b, const InstanceBodySymbol& body) {
+        EvalContext evalCtx(body);
+        b.curProc = -1;
+        forEachOfKind<SymbolKind::Net, NetSymbol>(body, [&](const NetSymbol& net) {
             const Expression* init = net.getInitializer();
             if (!init)
                 return;
-            const Where at = locate(net.location);
-
-            // Through the same slot machinery as `assign`, because the LRM says
-            // the two ARE the same statement -- and this path used to bypass
-            // it: `wire [7:0] w = {a, b}` claimed `a` drives exactly all of w
-            // while `assign w2 = {a, b}` beside it recorded `a -> w2[7:4]`,
-            // and a called function's free reads were lost outright,
-            // uncounted. The net is the one target, whole and positional.
+            const TplLoc at = locate(net.location);
             std::vector<Slot> rhs;
             filteredConstants = 0;
             collectSlots(*init, evalCtx, 0, rhs);
             {
-                // Free reads of called functions. Flat windows are correct
-                // here, not a shortcut: there is exactly one target, so every
-                // read pairs with it regardless of window.
                 std::vector<Ref> callReads;
                 std::set<const SubroutineSymbol*> active;
                 collectCallReadsInto(*init, active, callReads);
@@ -2545,7 +2824,6 @@ private:
             const int64_t droppedConstants = filteredConstants;
             evalCtx.reset();
 
-            const std::string dstName = gen + std::string(sym.name);
             const uint64_t netWidth = bitWidthOf(net);
             Slot dstSlot;
             dstSlot.ref.sym = &net;
@@ -2556,128 +2834,54 @@ private:
             else {
                 dstSlot.hi = kNoWidth;
             }
-
-            // The declaration is the statement, so it opens one: an initialiser
-            // reading something outward puts a hier_ref row beside this
-            // assignment, and the two are one statement.
-            AssignRow arow;
-            arow.stmt = beginStmt();
-            arow.dst = dstName;
-            arow.kind = "continuous_assign";
-            arow.construct = "assign";
-            arow.file = at.file;
-            arow.line = at.line;
-            arow.proc = -1;    // no procedure: the declaration is the statement
-            arow.seq = seq++;
-            arow.blocking = -1;
-
-            struct Pair {
-                Ref dst, src;
-                bool mapExact;
-            };
-            std::vector<Pair> pairs;
-            std::vector<OperandRow> ops;
+            std::vector<PairedSrc> pairs;
             for (auto& srcSlot : rhs) {
                 if (!srcSlot.ref.sym)
                     continue;
                 uint64_t lo = 0, hi = 0;
                 if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
                     continue;
-                Pair p{narrowed(dstSlot, lo, hi), narrowed(srcSlot, lo, hi),
-                       dstSlot.positional && srcSlot.positional};
-                std::string rel;
-                if (!relativePath(*p.src.sym, prefix, rel)) {
-                    arow.dropped++;
-                    addHierRef(false, p.src, "continuous_assign", "assign", at,
-                               evalCtx);
-                    continue;
-                }
-                OperandRow o;
-                o.name = std::move(rel);
-                if (!p.src.whole)
-                    o.bits = std::make_pair(p.src.lo, p.src.hi);
-                o.exact = p.src.exact;
-                ops.push_back(std::move(o));
-                pairs.push_back(std::move(p));
+                pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
+                                          narrowed(dstSlot, lo, hi),
+                                          dstSlot.positional && srcSlot.positional,
+                                          srcSlot.ref});
             }
-            arow.dropped += droppedConstants;
-            writer.addAssignment(moduleId, arow, ops);
-            stats.assignments++;
-
-            EdgeRow base;
-            base.dst = dstName;
-            base.dstType = typeOf(net);
-            base.kind = "continuous_assign";
-            base.construct = "assign";
-            base.file = at.file;
-            base.line = at.line;
-
-            bool anySource = false;
-            for (auto& p : pairs) {
-                const auto dk = keyRange(p.dst);
-                const auto sk = keyRange(p.src);
-                if (!seen.emplace(&net, p.src.sym, fileKey(at.file), at.line,
-                                  dk.first, dk.second,
-                                  sk.first, sk.second,
-                                  false, p.dst.exact, p.src.exact,
-                                  kindTag("continuous_assign"), p.mapExact)
-                         .second) {
-                    anySource = true;
-                    continue;
-                }
-                EdgeRow row = base;
-                relativePath(*p.src.sym, prefix, row.src);
-                row.srcType = typeOf(*p.src.sym);
-                if (!p.src.whole)
-                    row.srcBits = std::make_pair(p.src.lo, p.src.hi);
-                row.srcExact = p.src.exact;
-                if (!p.dst.whole)
-                    row.dstBits = std::make_pair(p.dst.lo, p.dst.hi);
-                row.dstExact = p.dst.exact;
-                row.mapExact = p.mapExact;
-                anySource = true;
-                out.push_back(std::move(row));
-            }
-            // `wire w = 1'b0;` drives w as surely as `assign w = 1'b0;` does.
-            if (!anySource &&
-                seen.emplace(&net, nullptr, fileKey(at.file), at.line,
-                             uint64_t(0), uint64_t(0),
-                             uint64_t(0), uint64_t(0),
-                             false, true, true,
-                             kindTag("continuous_assign"), true)
-                    .second) {
-                out.push_back(std::move(base));
-            }
+            b.curScope = 0;
+            emitAssignment(b, dstSlot.ref, pairs, {}, at, /*seq=*/-1,
+                           /*blocking=*/false, droppedConstants,
+                           /*inSubroutine=*/false, /*firstTarget=*/true,
+                           std::string(), /*isContinuous=*/true, "assign",
+                           evalCtx);
+            b.curStmt = -1;
         });
     }
 
-    /// Gate, switch and UDP instances, as edges. `and (y, a, b)` is dataflow
-    /// at its most literal, and it was entirely absent: the walk knew module
-    /// instances only, so a netlist-style module exported empty and every
-    /// gate-driven net answered "no driver". No new table -- a primitive is
-    /// one edge per (input, output) pairing, with the construct naming the
-    /// gate: `gate:and`, `gate:nmos`, `udp:my_latch`.
-    void emitPrimitives(const InstanceBodySymbol& body, const std::string& prefix,
-                        std::vector<EdgeRow>& out, SeenSet& seen) {
+    /// Gate, switch and UDP instances: a tree node, a primitive row, and one
+    /// dependency per LRM (input, output) pairing.
+    void buildPrimitives(Build& b, const InstanceBodySymbol& body) {
         EvalContext evalCtx(body);
-        forEachPrimitive(body, [&](const PrimitiveInstanceSymbol& prim) {
+        forEachOfKind<SymbolKind::PrimitiveInstance, PrimitiveInstanceSymbol>(
+            body, [&](const PrimitiveInstanceSymbol& prim) {
             auto conns = prim.getPortConnections();
+            auto& def = prim.primitiveType;
+            TplPrim p;
+            p.scope = scopeForSymbol(b, prim);
+            std::string name = leafSegment(prim);
+            p.name = name.empty() ? "<unnamed>" : name;
+            p.primKind = def.primitiveKind == PrimitiveSymbol::UserDefined
+                             ? "udp"
+                             : def.primitiveKind == PrimitiveSymbol::BiDiSwitch
+                                   ? "switch"
+                                   : "gate";
+            p.defName = std::string(def.name);
+            p.loc = locate(prim.location);
+            const int32_t primIdx = int32_t(b.t->prims.size());
+            b.t->prims.push_back(std::move(p));
             if (conns.empty())
                 return;
-            auto& def = prim.primitiveType;
-            const std::string construct =
-                std::string(def.primitiveKind == PrimitiveSymbol::UserDefined
-                                ? "udp:"
-                                : "gate:") +
-                std::string(def.name);
-            const Where at = locate(prim.location);
 
-            // A terminal's direction. The built-in gates are variadic -- the
-            // definition's port list does not stretch to the instance's
-            // terminal count -- and the LRM fixes their shape instead: an
-            // n-input gate drives its first terminal, an n-output gate reads
-            // its last, and everything else (switches, UDPs) declares one
-            // direction per port.
+            // Terminal directions: the built-in gates are variadic, so the
+            // LRM fixes their shape; switches and UDPs declare per-port.
             const size_t n = conns.size();
             auto dirOf = [&](size_t i) {
                 switch (def.primitiveKind) {
@@ -2693,31 +2897,18 @@ private:
                 }
             };
 
-            // Each reference remembers which terminal it came from. A
-            // bidirectional terminal is both read and driven, and it must not
-            // pair with *itself* -- but comparing symbols to detect that was
-            // wrong twice over: `buf (sr[1], sr[0])` has one symbol on both
-            // terminals and is ordinary dataflow, and the guard discarded it
-            // and then, finding no input, claimed the gate drives `sr[1]` from
-            // nothing. Every stage of a gate-level shift register came out
-            // severed and mislabelled as a constant driver. The terminal index
-            // is what "the same terminal" actually means.
-            struct Term {
+            struct PrimTerm {
                 Ref ref;
                 size_t terminal;
             };
-            // A gate instantiation is the statement here. It writes no
-            // `assignment` row -- a gate is not a statement in that sense -- but
-            // a terminal attached to something outward still produces hier_ref
-            // rows, and those belong to this gate rather than to the gate on the
-            // line above.
-            beginStmt();
-            std::vector<Term> reads, writes;
-            auto take = [&](size_t i, std::vector<Term>& into, bool skipSelectors) {
+            b.curStmt = -1;
+            std::vector<PrimTerm> reads, writes;
+            auto take = [&](size_t i, std::vector<PrimTerm>& into,
+                            bool skipSelectors) {
                 std::vector<Ref> refs;
                 collectRefs(*conns[i], evalCtx, refs, skipSelectors);
                 for (auto& r : refs)
-                    into.push_back(Term{r, i});
+                    into.push_back(PrimTerm{r, i});
             };
             for (size_t i = 0; i < n; i++) {
                 if (!conns[i])
@@ -2727,13 +2918,10 @@ private:
                         take(i, reads, /*skipSelectors=*/false);
                         break;
                     case PrimitivePortDirection::InOut:
-                        // A tran terminal conducts both ways: it is read and
-                        // driven at once, so it lands in both sets and the
-                        // pairing below emits both directions.
                         take(i, reads, /*skipSelectors=*/true);
                         take(i, writes, /*skipSelectors=*/true);
                         break;
-                    default:    // Out, OutReg
+                    default:
                         take(i, writes, /*skipSelectors=*/true);
                         break;
                 }
@@ -2741,488 +2929,84 @@ private:
 
             for (auto& dstTerm : writes) {
                 const Ref& dst = dstTerm.ref;
-                std::string dstRel;
-                if (!relativePath(*dst.sym, prefix, dstRel)) {
-                    addHierRef(true, dst, "primitive", construct, at, evalCtx);
+                const int32_t dstNet = dst.sym ? netFor(b, *dst.sym) : -1;
+                if (dstNet < 0) {
+                    if (dst.sym)
+                        addHierRef(b, true, dst, b.t->prims.back().loc, evalCtx);
                     for (auto& srcTerm : reads) {
-                        if (srcTerm.terminal != dstTerm.terminal)
-                            addHierRef(false, srcTerm.ref, "primitive", construct, at, evalCtx);
+                        if (srcTerm.terminal != dstTerm.terminal && srcTerm.ref.sym)
+                            addHierRefIfOutward(b, srcTerm.ref, evalCtx);
                     }
                     continue;
                 }
-                // The dst half of the row is the same for every source this
-                // terminal pairs with, and the type text is a fresh heap
-                // string out of slang's type printer -- on a netlist-style
-                // module that is one allocation per (output, input) pair
-                // where one per output does.
-                EdgeRow base;
-                base.dst = dstRel;
-                base.dstType = typeOf(*dst.sym);
-                if (!dst.whole)
-                    base.dstBits = std::make_pair(dst.lo, dst.hi);
-                base.dstExact = dst.exact;
-                base.kind = "primitive";
-                base.construct = construct;
-                base.file = at.file;
-                base.line = at.line;
-
-                const auto dk = keyRange(dst);
-                // Whether this terminal has any input at all, which decides
-                // the null-source row below. Set only where a row is actually
-                // written: counting inputs that then turn out to live outside
-                // the module left a gate driven entirely by hierarchical
-                // references with no driver row of any kind.
                 bool anyInput = false;
                 for (auto& srcTerm : reads) {
-                    // One terminal does not feed itself. A tran's two ends are
-                    // both read and driven, and pairing an end with itself
-                    // would fabricate dataflow out of a single wire.
+                    // One terminal does not feed itself: a tran's two ends
+                    // are both read and driven, and pairing an end with
+                    // itself would fabricate dataflow out of a single wire.
                     if (srcTerm.terminal == dstTerm.terminal)
                         continue;
                     const Ref& src = srcTerm.ref;
-                    const auto sk = keyRange(src);
-                    if (!seen.emplace(dst.sym, src.sym, fileKey(at.file), at.line,
-                                      dk.first, dk.second,
-                                      sk.first, sk.second,
-                                      false, dst.exact, src.exact,
-                                      kindTag("primitive"), true)
-                             .second) {
-                        anyInput = true;   // already recorded, still an input
+                    const int32_t srcNet = src.sym ? netFor(b, *src.sym) : -1;
+                    if (srcNet < 0) {
+                        if (src.sym)
+                            addHierRefIfOutward(b, src, evalCtx);
                         continue;
                     }
-                    EdgeRow row = base;
-                    if (!relativePath(*src.sym, prefix, row.src)) {
-                        addHierRef(false, src, "primitive", construct, at, evalCtx);
-                        continue;
-                    }
-                    row.srcType = typeOf(*src.sym);
-                    if (!src.whole)
-                        row.srcBits = std::make_pair(src.lo, src.hi);
-                    row.srcExact = src.exact;
+                    TplDep d;
+                    d.srcNet = srcNet;
+                    d.tgtNet = dstNet;
+                    d.prim = primIdx;
+                    d.kind = "primitive";
+                    d.srcR = rangeOf(src);
+                    d.tgtR = rangeOf(dst);
+                    const bool oneBit =
+                        src.exact && dst.exact &&
+                        (src.whole ? bitWidthOf(*src.sym) == 1
+                                   : src.hi == src.lo) &&
+                        (dst.whole ? bitWidthOf(*dst.sym) == 1
+                                   : dst.hi == dst.lo);
+                    d.mappingExact = oneBit ? 1 : 0;
+                    b.t->deps.push_back(std::move(d));
                     anyInput = true;
-                    out.push_back(std::move(row));
                 }
-                // pullup(y) has no input terminal, and a gate whose inputs all
-                // live outside the module has none this row can name. Either
-                // way the null-source row names the gate as the driver,
-                // exactly as `q <= 8'h0` is named; without it the net reads as
-                // undriven.
-                if (!anyInput &&
-                    seen.emplace(dst.sym, nullptr, fileKey(at.file), at.line,
-                                 dk.first, dk.second,
-                                 uint64_t(0), uint64_t(0),
-                                 false, dst.exact, true,
-                                 kindTag("primitive"), true)
-                        .second) {
-                    out.push_back(std::move(base));
+                // pullup(y) has no input terminal; the null-source row names
+                // the gate as the driver, as `q <= 8'h0` is named.
+                if (!anyInput) {
+                    TplDep d;
+                    d.srcNet = -1;
+                    d.tgtNet = dstNet;
+                    d.prim = primIdx;
+                    d.kind = "primitive";
+                    d.tgtR = rangeOf(dst);
+                    b.t->deps.push_back(std::move(d));
                 }
             }
         });
     }
 
-    /// One child instance's port connections, in the parent's namespace.
-    ///
-    /// A connection expression is not always a plain net: a concatenation or a
-    /// slice ties several parent nets to one formal. One row per (formal, net)
-    /// pair keeps that honest rather than picking whichever net happens to be
-    /// first, which would silently drop the rest of a bus.
-    /// The single internal signal a formal stands for, when the connection
-    /// names it something else -- `.ext_one(inner)`. Empty when the formal and
-    /// the internal signal share a name, which is the ordinary case, and empty
-    /// when the formal covers several signals (`.ext_pair({hi, lo})`), where
-    /// slang gives each member its own port and there is no one answer.
-    static std::string internalName(const PortSymbol& port) {
-        const Symbol* sym = port.internalSymbol;
-        if (!sym) {
-            auto* inner = port.getInternalExpr();
-            if (!inner)
-                return {};
-            if (inner->kind != ExpressionKind::NamedValue &&
-                inner->kind != ExpressionKind::HierarchicalValue)
-                return {};
-            sym = &inner->as<ValueExpressionBase>().symbol;
-        }
-        if (sym->name.empty() || sym->name == port.name)
-            return {};
-        return std::string(sym->name);
+    void addHierRefIfOutward(Build& b, const Ref& r, EvalContext& evalCtx) {
+        std::string rel;
+        if (r.sym && !relativePath(*r.sym, b.prefix, rel))
+            addHierRef(b, false, r, TplLoc{}, evalCtx);
     }
 
-    /// The module's own interface port that `iface` arrived through, if it is
-    /// one. That is what a pass-through connection names, and the only spelling
-    /// of it that is true for every instance of the module.
-    static const InterfacePortSymbol* passedThrough(const InstanceBodySymbol& body,
-                                                    const Symbol* iface) {
-        if (!iface)
-            return nullptr;
-        for (auto& member : body.members()) {
-            if (member.kind != SymbolKind::InterfacePort)
-                continue;
-            auto& ip = member.as<InterfacePortSymbol>();
-            if (ip.getConnection().first == iface)
-                return &ip;
-        }
-        return nullptr;
-    }
+    // ------------------------------------------------ connection templates
 
-    void emitPorts(const InstanceSymbol& child, const std::string& childName,
-                   const std::string& prefix, std::vector<PortRow>& out,
-                   const InstanceBodySymbol& parentBody) {
-        // An element of an instance array shares the array's connection
-        // expression: `foo u [63:0] (.z(bus64))` gives every element the whole
-        // 64-bit bus, while each element's formal is one bit. Recording that as
-        // the connection width makes each element look width-mismatched.
-        // Measured before this check: 1011 "mismatches" on one SoC, every one of
-        // them an array element and none of them real. Left NULL instead, so the
-        // comparison is simply not offered where it has no meaning.
-        bool inArray = false;
-        if (auto* ps = child.getParentScope())
-            inArray = ps->asSymbol().kind == SymbolKind::InstanceArray;
-        // For evaluating the constant selects inside connection expressions.
-        EvalContext evalCtx(child);
-        // The instantiation's own location. It is the fallback, not the answer:
-        // a connection is written where *it* is written.
-        //
-        // An earlier version resolved this once per instance on the grounds
-        // that it is loop-invariant, which is true of the instantiation and
-        // false of the thing being recorded. Any instance wide enough to
-        // matter is written one port per line, so every connection reported
-        // the line of the `foo u_foo (` above it: a driver query pointed at
-        // the instantiation instead of at `.wb_rst_i(~rst_n)`, reading the
-        // text back gave the instantiation header, and no two ports of one
-        // instance could be told apart by position at all. On one SoC that
-        // was every multi-port instance without exception.
-        const Where instAt = locate(child.location);
-        for (auto* conn : child.getPortConnections()) {
-            if (!conn)
-                continue;
-            // One connection is one statement's worth of writing, and it is the
-            // unit a hier_ref from `.a(tb.glob)` belongs to. Two ports of one
-            // instance tied to two different outside signals would otherwise be
-            // told apart only by line, which on an instance written one port per
-            // line is exactly what does distinguish them -- and on one written
-            // on a single line, exactly what does not.
-            beginStmt();
-            // Where this connection is written. The expression is the only
-            // part of it slang keeps a location for; a port left unconnected
-            // has none, and falls back to the instantiation.
-            const Expression* connExpr = conn->getExpression();
-            const Where at = connExpr ? locate(connExpr->sourceRange.start(), instAt)
-                                      : instAt;
-            const std::string& file = at.file;
-            const uint32_t line = at.line;
-
-            // An interface port carries no net, but the *binding* is the alias
-            // that makes `child.bus.*` resolvable at all: the signals live in
-            // the interface instance on the parent side, and without this row
-            // they can be reached from neither direction. `.dbg` needs its
-            // simulated net table to derive the same fact; here it is one row.
-            if (conn->port.kind == SymbolKind::InterfacePort) {
-                auto& ip = conn->port.as<InterfacePortSymbol>();
-                auto [ifaceSym, modport] = conn->getIfaceConn();
-                PortRow row;
-                row.child = childName;
-                row.port = std::string(ip.name);
-                row.conn = PortConn::Interface;
-                if (ip.interfaceDef)
-                    row.outerType = std::string(ip.interfaceDef->name);
-                // The modport in force: the one the connection names, else the
-                // one the port declares.
-                if (modport)
-                    row.modport = std::string(modport->name);
-                else if (!ip.modport.empty())
-                    row.modport = std::string(ip.modport);
-                if (ifaceSym) {
-                    // The instance in the parent's namespace -- or, when the
-                    // parent is passing its *own* interface port down, that
-                    // port's name.
-                    //
-                    // The second case needs looking for. `getIfaceConn` answers
-                    // with the elaborated interface instance, which for a
-                    // pass-through lives above the parent and so has no
-                    // module-relative path; the row came out with a NULL outer
-                    // and the alias it exists to record was missing from both
-                    // sides. The parent's own port is what was written, and it
-                    // is the one spelling every instance of the parent shares.
-                    std::string outerRel;
-                    if (relativePath(*ifaceSym, prefix, outerRel)) {
-                        row.outer = std::move(outerRel);
-                    }
-                    else if (auto* through = passedThrough(parentBody, ifaceSym)) {
-                        row.outer = std::string(through->name);
-                    }
-                    else {
-                        // An array, either whole (`.b(arr)`) or indexed
-                        // (`.b(b[0])` out of the parent's own array port).
-                        // slang answers both with a synthesized
-                        // `InstanceArraySymbol` that is not a member of any
-                        // scope, so it has no path to be made relative to and
-                        // the row came out with no outer side at all -- which
-                        // is every element of every interface array.
-                        //
-                        // What was written is the answer, and it is already
-                        // module-relative: `arr`, `b[0]`. The index is part of
-                        // the name here, not a bit range, so it stays.
-                        row.outer = normalizedText(conn->getExpression(), sourceManager,
-                                                   /*stripTrailingSelect=*/false);
-                        // slang's connection expression stops at the port name
-                        // -- the element the connection selects is resolved
-                        // into the symbol instead -- so `.b(b[0])` and
-                        // `.b(b[1])` both read as `b`, and the two elements
-                        // became one place. The index comes back from the
-                        // symbol's own path, which is where slang renders it
-                        // in source numbering already.
-                        row.outer += arrayIndexSuffix(ifaceSym->getHierarchicalPath());
-                        if (row.outer.empty())
-                            stats.external++;
-                    }
-                }
-                row.file = file;
-                row.line = line;
-                out.push_back(std::move(row));
-                continue;
-            }
-            if (conn->port.kind != SymbolKind::Port)
-                continue;
-            auto& port = conn->port.as<PortSymbol>();
-            const Expression* expr = connExpr;
-
-            std::string dir;
-            switch (port.direction) {
-                case ArgumentDirection::In:    dir = "in";    break;
-                case ArgumentDirection::Out:   dir = "out";   break;
-                case ArgumentDirection::InOut: dir = "inout"; break;
-                default:                       dir = "ref";   break;
-            }
-
-            // The signal inside the child, when the connection names the
-            // formal something else. `module m(.ext_one(inner))` is `ext_one`
-            // out here and `inner` in every row the child's own module owns,
-            // so without this a consumer holding the internal name had no way
-            // back to the binding.
-            const std::string innerName = internalName(port);
-
-            if (!expr) {
-                // Left unconnected. Recorded rather than skipped: a floating
-                // output is a bug worth finding, and omitting the row would make
-                // "nobody connected it" indistinguishable from "the exporter did
-                // not get that far".
-                PortRow row;
-                row.child = childName;
-                row.port = std::string(port.name);
-                row.inner = innerName;
-                row.direction = dir;
-                row.conn = PortConn::Unconnected;
-                row.file = file;
-                row.line = line;
-                out.push_back(std::move(row));
-                continue;
-            }
-
-            // The width as *written*, looking through the implicit conversion
-            // slang inserts to make the connection fit the formal. Without
-            // that, this is always the port's own width and a mismatch can
-            // never be seen -- a column that always agrees detects nothing.
-            const Expression* widthExpr = expr;
-            while (widthExpr->kind == ExpressionKind::Conversion &&
-                   widthExpr->as<ConversionExpression>().isImplicit()) {
-                widthExpr = &widthExpr->as<ConversionExpression>().operand();
-            }
-            const int64_t exprWidth =
-                (!inArray && widthExpr->type && widthExpr->type->isIntegral())
-                    ? static_cast<int64_t>(widthExpr->type->getBitWidth())
-                    : -1;
-
-            // The nets the connection attaches to, without the selectors used
-            // to pick them: `.ready_i(readies[sel])` attaches `readies`, and
-            // `sel` is read to choose an element rather than wired to the port.
-            // The assignment path already separates the two; this one did not,
-            // and reported the index signal as connected.
-            std::vector<ConnRef> nets;
-            collectConnRefs(*expr, evalCtx, nets);
-            if (nets.empty()) {
-                // Tied off with not even a constant marker to carry -- a
-                // connection whose width could not be stated. Recorded rather
-                // than dropped, exactly as the markers are: absence would mean
-                // both "nobody connected it" and "the exporter did not get
-                // that far". (A statable constant now arrives as a marker
-                // through the loop below instead, with its window.)
-                PortRow row;
-                row.child = childName;
-                row.port = std::string(port.name);
-                row.inner = innerName;
-                row.direction = dir;
-                row.conn = PortConn::Constant;
-                row.outerWidth = exprWidth;
-                row.portExact = 1;   // the whole formal, trivially
-                row.file = file;
-                row.line = line;
-                out.push_back(std::move(row));
-                continue;
-            }
-            // Deduplicated on what will be stored: the same net attached twice
-            // with different bits (`.z({x[7:4], x[3:0]})`) is two attachments,
-            // not one -- and attached twice into different *windows*
-            // (`.q({2{r}})`) is two segments, which is why the window is part
-            // of the key: without it the replication's second copy vanished
-            // and the formal's high half read as fed by nothing.
-            std::set<std::tuple<const ValueSymbol*, uint64_t, uint64_t, bool, bool,
-                                bool, uint64_t, uint64_t>>
-                unique;
-            for (auto& cn : nets) {
-                const Ref& r = cn.ref;
-                const uint64_t klo = r.whole ? 0 : r.lo;
-                const uint64_t khi = r.whole ? 0 : r.hi;
-                if (!unique.emplace(r.sym, klo, khi, r.whole, cn.expression,
-                                    cn.windowExact, cn.winLo, cn.winHi)
-                         .second)
-                    continue;
-                PortRow row;
-                row.child = childName;
-                row.port = std::string(port.name);
-                row.inner = innerName;
-                row.direction = dir;
-                // Where in the formal this element lands, encoded as ranges
-                // are everywhere: NULL + exact=1 the whole formal, a range +
-                // exact=1 that slice, NULL + exact=0 somewhere unstatable (a
-                // width-changing conversion, an instance-array share).
-                const uint64_t formalWidth =
-                    (!inArray && expr->type) ? expr->type->getBitWidth() : 0;
-                if (!inArray && cn.windowExact && formalWidth) {
-                    if (!(cn.winLo == 0 && cn.winHi + 1 >= formalWidth))
-                        row.portBits = std::make_pair(cn.winLo, cn.winHi);
-                    row.portExact = 1;
-                }
-                else {
-                    row.portExact = 0;
-                }
-                if (!r.sym) {
-                    // A constant element of a structured connection:
-                    // `.q({hi, 3'b000, en})` ties formal bits 1..3 off, and the
-                    // row says so -- without it those bits had no row of any
-                    // kind, indistinguishable from an exporter gap. No outer
-                    // end, so map_exact stays NULL; the window above is real.
-                    row.conn = PortConn::Constant;
-                    row.outerWidth = exprWidth;
-                    row.file = file;
-                    row.line = line;
-                    out.push_back(std::move(row));
-                    continue;
-                }
-                std::string outerRel;
-                if (!relativePath(*r.sym, prefix, outerRel)) {
-                    // Tied to a signal outside this module. An output drives
-                    // it, an input samples it; inout is recorded as the write,
-                    // being the direction a trace cannot rediscover.
-                    const bool drives = port.direction == ArgumentDirection::Out ||
-                                        port.direction == ArgumentDirection::InOut;
-                    addHierRef(drives, r, "port", dir, at, evalCtx);
-                    // And a row saying the port *is* attached, with no `outer`
-                    // because the net has no name here. Skipping it entirely
-                    // made `.a(tb.glob)` indistinguishable from a port nobody
-                    // connected -- the same ambiguity the unconnected row above
-                    // exists to remove, reintroduced one branch later. What it
-                    // is tied to is in `hier_ref` at this file and line.
-                    // An operand of an expression stays kind 3 even when it
-                    // has no name here. Overwriting it with 5 made
-                    // `.a(tb.glob & b)` look like `.a(tb.glob)` -- an alias --
-                    // so every reader of `a` was attributed to `tb.glob`,
-                    // which is the misattribution kind 3 exists to prevent.
-                    // Kind 5 is for a whole connection that happens to be
-                    // unnameable; what it is tied to is in `hier_ref` either
-                    // way.
-                    row.conn = cn.expression ? PortConn::Expression
-                                             : PortConn::External;
-                    // The formal window stays -- `.q({tb.glob, lo})` still puts
-                    // the external tie in q's high half -- but map_exact is
-                    // NULL: this row has no outer end to correspond with, and
-                    // what it is tied to is in hier_ref.
-                    row.outerWidth = exprWidth;
-                    row.file = file;
-                    row.line = line;
-                    out.push_back(std::move(row));
-                    continue;
-                }
-                row.outer = std::move(outerRel);
-                row.outerType = typeOf(*r.sym);
-                row.outerWidth = exprWidth;
-                // An element of an instance array shares the whole array's
-                // connection expression, so its bits describe the array's tie
-                // rather than this element's slice of it. NULL with exact=0 --
-                // somewhere in the object -- is the honest reading, exactly as
-                // with outer_width above.
-                if (inArray) {
-                    row.outerExact = false;
-                }
-                else {
-                    if (!r.whole)
-                        row.outerBits = std::make_pair(r.lo, r.hi);
-                    row.outerExact = r.exact;
-                }
-                row.conn = cn.expression ? PortConn::Expression : PortConn::Net;
-                // Whether this row's outer bits map one-to-one onto its formal
-                // window -- the boundary twin of edge.map_exact, and decided by
-                // the same rule: a lone structural leaf filling its window.
-                // 0 is not doubt, it is range granularity; NULL (elsewhere) is
-                // "no outer end to correspond with".
-                row.mapExact = cn.positional && !inArray ? 1 : 0;
-                row.file = file;
-                row.line = line;
-                out.push_back(std::move(row));
-            }
-        }
-    }
-
-    /// One net a connection expression attaches: the base symbol, the bits the
-    /// selector chain picks, whether it was reached structurally or only read
-    /// inside a wider expression -- and WHERE in the formal it lands.
-    ///
-    /// The window is the port-boundary twin of the assignment walk's Slot: a
-    /// connection expression is a value aligned to the formal at the LSB, so an
-    /// element of `.q({hi, lo})` occupies a slice of `q` the same way an
-    /// element of `{a, b} = ...` occupies a slice of the target. Without it the
-    /// database knew hi and lo both attach to q and could not say hi is
-    /// q[7:4] -- module-internal edges carried per-bit precision that ended at
-    /// every instance boundary.
+    /// One net a connection expression attaches, with its window in the
+    /// formal -- the boundary twin of Slot. Ported from v9.
     struct ConnRef {
         Ref ref;
         bool expression = false;
-        /// Bits of the formal this element occupies, absolute from the LSB.
-        /// Meaningful only when windowExact; otherwise the position could not
-        /// be stated (an element under a width-changing conversion, an
-        /// instance-array share) and the row stores NULL with exact=0.
         uint64_t winLo = 0, winHi = 0;
         bool windowExact = false;
-        /// The element's own bits map one-to-one onto its window, so the pair
-        /// can be followed bit by bit. Same discipline as edge.map_exact: a
-        /// plain reference filling its window exactly, nothing else.
         bool positional = false;
     };
 
-    /// The value symbols a connection expression attaches to, each with its
-    /// bit range and its window in the formal.
-    ///
-    /// A structural connection -- a name, a select, a concatenation of those --
-    /// attaches its nets directly, and the selector *reads* (`readies[sel]`
-    /// reading `sel`) are not connections and are skipped. Anything else is an
-    /// expression: there is no net behind `.en(state == RUN)`, only signals the
-    /// expression samples, so those come back flagged, selector reads included,
-    /// for the consumer to treat as operands rather than wires.
-    ///
-    /// `base` is where this subexpression starts in the formal; `degraded`
-    /// poisons positions below a node whose width relationship is not
-    /// one-to-one, so nothing under it claims a window it does not have.
     static void collectConnRefs(const Expression& expr, EvalContext& ctx,
                                 std::vector<ConnRef>& out, uint64_t base = 0,
                                 bool degraded = false) {
         const uint64_t width = exprWidthOf(expr);
-        // An element that reads no storage -- a literal, a parameter, an
-        // all-constant expression -- still occupies its window, and dropping
-        // it left formal bits with no row of any kind: `.q({hi, 3'b000, en})`
-        // exported hi and en and said nothing at all about bits 1..3, which is
-        // indistinguishable from an exporter gap. conn_kind=1 exists precisely
-        // so a tie-off is recorded rather than absent; a marker with no symbol
-        // carries that through per element. The row builder recognises the
-        // null symbol and writes the Constant row.
         auto pushConstant = [&]() {
             ConnRef cr;
             if (!degraded && width) {
@@ -3246,10 +3030,6 @@ private:
                     cr.winLo = base;
                     cr.winHi = base + width - 1;
                     cr.windowExact = true;
-                    // Positional only for a lone structural leaf that fills its
-                    // window: `hi[3:0]` in a concat, a plain `x`. An expression
-                    // combines bits, and a leaf narrower than its window has
-                    // extension bits that are no bit of it.
                     cr.positional =
                         !isExpr && refs.size() == 1 && r.exact &&
                         (r.whole ? bitWidthOf(*r.sym) == width
@@ -3264,22 +3044,12 @@ private:
             case ExpressionKind::ElementSelect:
             case ExpressionKind::RangeSelect:
             case ExpressionKind::MemberAccess: {
-                // One structural leaf: slang's path analysis resolves the base
-                // symbol and the bits its static selects pick, which is what
-                // `.idx(stim[3:0])` means -- bits 0..3 of stim, not stim.
                 std::vector<Ref> refs;
                 collectRefs(expr, ctx, refs, /*skipSelectors=*/true);
-                // Reached only by descending structural nodes, so never an
-                // expression operand: the branch that produces those does not
-                // recurse.
                 push(refs, /*isExpr=*/false);
                 return;
             }
             case ExpressionKind::Concatenation: {
-                // Filled from the top: `{hi, lo}` puts hi in the high window.
-                // An element of unknown width makes every position below it
-                // unstatable, so the rest of the walk degrades rather than
-                // guesses.
                 auto ops = expr.as<ConcatenationExpression>().operands();
                 uint64_t cursor = base + width;
                 bool bad = degraded || width == 0;
@@ -3296,12 +3066,7 @@ private:
                 return;
             }
             case ExpressionKind::Replication: {
-                // `{2{two}}` wires `two` into the formal exactly as
-                // `{two, two}` does -- and into two *windows*, which is why the
-                // copies are expanded rather than the concat walked once: each
-                // copy is its own positionally exact segment, and folding them
-                // lost every copy after the first. The count is a constant and
-                // reads nothing.
+                // Each copy is its own positionally exact segment.
                 auto& rep = expr.as<ReplicationExpression>();
                 const uint64_t cw = exprWidthOf(rep.concat());
                 if (degraded || width == 0 || cw == 0 || width % cw != 0) {
@@ -3316,11 +3081,6 @@ private:
                 return;
             }
             case ExpressionKind::Conversion: {
-                // Width-preserving conversions are transparent. A widening or
-                // truncating one breaks the one-to-one between inside and
-                // outside -- extension bits are no bit of the operand, and a
-                // truncated element may not reach the formal at all -- so the
-                // subtree keeps its refs but loses its windows.
                 auto& conv = expr.as<ConversionExpression>();
                 const uint64_t iw = exprWidthOf(conv.operand());
                 collectConnRefs(conv.operand(), ctx, out,
@@ -3329,22 +3089,14 @@ private:
                 return;
             }
             case ExpressionKind::Assignment:
-                // An output or inout connection arrives wrapped in the
-                // assignment `bindLValue` builds around it, with an empty
-                // placeholder on the right; the lvalue is the connection.
-                // Without this case `.y(gy)` fell through to the expression
-                // branch and the plainest wire in the design read as an
-                // operand.
+                // An output connection arrives wrapped in the assignment
+                // bindLValue builds around it; the lvalue is the connection.
                 collectConnRefs(expr.as<AssignmentExpression>().left(), ctx, out,
                                 base, degraded);
                 return;
             default: {
                 std::vector<Ref> refs;
                 collectRefs(expr, ctx, refs);
-                // visitPaths stops at a call's arguments; the subroutine's own
-                // free reads still reach the port, so they are appended the way
-                // the assignment path appends them -- whole-object, since their
-                // bounds belong to expressions inside the callee.
                 std::set<const ValueSymbol*> have;
                 for (auto& r : refs)
                     have.insert(r.sym);
@@ -3357,143 +3109,87 @@ private:
                         refs.push_back(r);
                     }
                 }
-                // The window is real -- `{a & b, c}` computes a & b into the
-                // high half -- but nothing inside an expression is positional.
                 push(refs, /*isExpr=*/true);
                 return;
             }
         }
     }
 
-    /// The module body an instance-tree level was written in: its module row and
-    /// the hierarchical prefix its `child` names are relative to. Carried down
-    /// the walk because a generate block is a level of the tree without being a
-    /// body -- the instances inside it belong to the module that contains the
-    /// generate, and their `child` rows are named from there.
-    struct Body {
-        int64_t moduleId = 0;
-        std::string prefix;
-    };
-
-    /// The instance tree: one row per elaborated instance. This is the only
-    /// table that scales with the design rather than with the source, so it
-    /// carries nothing but identity.
-    void visitInstance(const InstanceSymbol& inst, int64_t parentRow,
-                       const std::string& parentPrefix, const Body& encl) {
-        int64_t moduleId = moduleIdFor(inst);
-        int64_t rowId = addLevel(std::string(inst.name), moduleId, parentRow,
-                                 inst, parentPrefix, encl);
-        visitScope(inst.body, rowId, inst.getHierarchicalPath(),
-                   Body{moduleId, inst.getHierarchicalPath()});
+    /// The children of one body and their connection templates. Children are
+    /// recorded in traversal order -- the stamping invariant -- with their
+    /// scope index and ONE path segment each (array elements carry their
+    /// `[i]` in the segment, exactly as the tree spells them).
+    void buildChildren(Build& b, const InstanceBodySymbol& body) {
+        std::unordered_map<const Symbol*, int32_t> childOf;
+        std::vector<const Symbol*> childSyms;
+        registerChildren(b, body, 0, childOf, childSyms);
+        // Connections second, template-wide and in child order (the order is
+        // part of the template): an interface binding may name a sibling
+        // registered after the binder.
+        for (size_t i = 0; i < b.t->children.size(); i++) {
+            if (b.t->children[i].kind == TplChild::Module && childSyms[i])
+                buildInstanceConns(b, childSyms[i]->as<InstanceSymbol>(),
+                                   b.t->children[i], childOf);
+        }
     }
 
-    /// One row of the instance tree, named relative to its parent.
-    ///
-    /// `encl` is the module body this level was written in, which is what makes
-    /// `instance.child` findable: the `child` row spells the name relative to
-    /// that body (`g[0].u_leaf`), while `name` here is one segment (`u_leaf`).
-    int64_t addLevel(std::string fallbackName, int64_t moduleId, int64_t parentRow,
-                     const Symbol& sym, const std::string& parentPrefix,
-                     const Body& encl) {
-        std::string name;
-        if (parentPrefix.empty() || !relativePath(sym, parentPrefix, name))
-            name = std::move(fallbackName);
-        if (!seenSiblings.insert({parentRow, name}).second)
-            stats.duplicatePaths++;
-        const int64_t rowId = ++instanceRow;
-        writer.addInstance(name, moduleId, parentRow, rowId, childIdFor(sym, encl));
-        stats.instances++;
-        return rowId;
-    }
-
-    /// The `child` row this instance expands, or 0 when there is none to name --
-    /// the root, and a generate block, which elaboration invented rather than
-    /// anyone writing it as an instantiation.
-    int64_t childIdFor(const Symbol& sym, const Body& encl) {
-        if (!encl.moduleId)
-            return 0;
-        auto byModule = childIdsByModule.find(encl.moduleId);
-        if (byModule == childIdsByModule.end())
-            return 0;
-        std::string rel;
-        if (encl.prefix.empty() || !relativePath(sym, encl.prefix, rel))
-            return 0;
-        auto it = byModule->second.find(rel);
-        return it == byModule->second.end() ? 0 : it->second;
-    }
-
-    /// The tree below one scope: child instances, primitives, and a level of
-    /// its own for every generate block.
-    ///
-    /// A generate block is a level because it is a path segment. Gluing it onto
-    /// the child's leaf name instead -- `g_lane[3].u_dp` in one row -- made a
-    /// name that is not one segment, and the documented resolution, one indexed
-    /// lookup per segment, stalled at the first generate level. It has no
-    /// module, so its `module` is NULL.
-    void visitScope(const Scope& scope, int64_t parentRow,
-                    const std::string& parentPrefix, const Body& encl) {
+    void registerChildren(Build& b, const Scope& scope, int32_t scopeIdx,
+                          std::unordered_map<const Symbol*, int32_t>& childOf,
+                          std::vector<const Symbol*>& childSyms) {
         for (auto& member : scope.members()) {
             switch (member.kind) {
-                case SymbolKind::Instance:
-                    visitInstance(member.as<InstanceSymbol>(), parentRow,
-                                  parentPrefix, encl);
-                    break;
-                case SymbolKind::PrimitiveInstance: {
-                    // A gate is an instantiation like any other. Leaving it out
-                    // made a netlist-style module read as instantiating
-                    // nothing, and its instance name unrecoverable.
-                    auto& prim = member.as<PrimitiveInstanceSymbol>();
-                    addLevel(std::string(prim.name), 0, parentRow, prim,
-                             parentPrefix, encl);
+                case SymbolKind::Instance: {
+                    auto& inst = member.as<InstanceSymbol>();
+                    TplChild c;
+                    c.scope = scopeIdx;
+                    c.name = leafSegment(inst);
+                    if (c.name.empty())
+                        c.name = "<unnamed>";
+                    c.kind = TplChild::Module;
+                    auto& cbody = inst.getCanonicalBody() ? *inst.getCanonicalBody()
+                                                          : inst.body;
+                    c.groupKey = groupKey(cbody);
+                    c.loc = locate(inst.location);
+                    childOf.emplace(&inst, int32_t(b.t->children.size()));
+                    childSyms.push_back(&inst);
+                    b.t->children.push_back(std::move(c));
                     break;
                 }
                 case SymbolKind::UninstantiatedDef: {
-                    // A black box is a real level of the hierarchy: something is
-                    // instantiated here and its definition is simply missing. It
-                    // had no row at all, so a path through it did not resolve and
-                    // the tree said nothing was instantiated -- the same answer a
-                    // module that instantiates nothing gives. `module` is NULL
-                    // because there is no module row to point at, and
-                    // `child.kind` is what says which kind of NULL this is.
                     auto& u = member.as<UninstantiatedDefSymbol>();
-                    addLevel(std::string(u.name), 0, parentRow, u, parentPrefix, encl);
+                    TplChild c;
+                    c.scope = scopeIdx;
+                    c.name = leafSegment(u);
+                    if (c.name.empty())
+                        c.name = "<unnamed>";
+                    c.kind = TplChild::Unresolved;
+                    c.defName = std::string(u.definitionName);
+                    c.loc = locate(u.location);
+                    stats.unresolved++;
+                    buildUnresolvedConns(b, u, c);
+                    childSyms.push_back(nullptr);
+                    b.t->children.push_back(std::move(c));
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
                     auto& block = member.as<GenerateBlockSymbol>();
                     if (block.isUninstantiated)
                         break;
-                    const int64_t rowId = addLevel(generateSegment(block), 0,
-                                                   parentRow, block, parentPrefix,
-                                                   encl);
-                    // The generate level keeps the *enclosing body* rather than
-                    // becoming one: the instantiations inside it are written in
-                    // that body, and their `child` rows are named from it.
-                    visitScope(block, rowId, block.getHierarchicalPath(), encl);
+                    registerChildren(b, block, scopeIndexOf(b, block, scopeIdx),
+                                     childOf, childSyms);
                     break;
                 }
-                case SymbolKind::GenerateBlockArray: {
-                    auto& arr = member.as<GenerateBlockArraySymbol>();
-                    std::string base(arr.name);
-                    if (base.empty())
-                        base = arr.getExternalName();
-                    for (auto& entry : arr.entries) {
-                        std::string segment = base;
-                        if (entry->kind == SymbolKind::GenerateBlock)
-                            segment += generateSegment(entry->as<GenerateBlockSymbol>());
-                        const int64_t rowId = addLevel(segment, 0, parentRow,
-                                                       entry->asSymbol(), parentPrefix,
-                                                       encl);
-                        visitScope(*entry, rowId,
-                                   entry->asSymbol().getHierarchicalPath(), encl);
+                case SymbolKind::GenerateBlockArray:
+                    for (auto& entry :
+                         member.as<GenerateBlockArraySymbol>().entries) {
+                        registerChildren(b, *entry,
+                                         scopeIndexOf(b, entry->asSymbol(), scopeIdx),
+                                         childOf, childSyms);
                     }
                     break;
-                }
                 case SymbolKind::InstanceArray:
-                    // The elements already carry `[i]` in their own names, so
-                    // the array is not a level of its own.
-                    visitScope(member.as<InstanceArraySymbol>(), parentRow,
-                               parentPrefix, encl);
+                    registerChildren(b, member.as<InstanceArraySymbol>(), scopeIdx,
+                                     childOf, childSyms);
                     break;
                 default:
                     break;
@@ -3501,41 +3197,931 @@ private:
         }
     }
 
+    int32_t scopeIndexOf(Build& b, const Symbol& sym, int32_t parent) {
+        if (auto it = b.scopeOf.find(&sym); it != b.scopeOf.end())
+            return it->second;
+        // A generate scope not seen by collectDeclarations (e.g. an array
+        // entry wrapper): create it now so the tree stays faithful.
+        std::string seg;
+        if (sym.kind == SymbolKind::GenerateBlock)
+            seg = generateSegment(sym.as<GenerateBlockSymbol>());
+        else
+            seg = std::string(sym.name);
+        return addScope(b, sym, parent, std::move(seg));
+    }
+
+    /// One resolved child's connection templates: the outside of each of its
+    /// terminals, as written here in the parent.
+    void buildInstanceConns(Build& b, const InstanceSymbol& child, TplChild& c,
+                            const std::unordered_map<const Symbol*, int32_t>& childOf) {
+        auto& childBody = child.getCanonicalBody() ? *child.getCanonicalBody()
+                                                   : child.body;
+        Template& childT = templates[groupKey(childBody)];
+        EvalContext evalCtx(child);
+        const TplLoc instAt = locate(child.location);
+        bool inArray = false;
+        if (auto* ps = child.getParentScope())
+            inArray = ps->asSymbol().kind == SymbolKind::InstanceArray;
+
+        std::unordered_map<int32_t, int64_t> segOrdinal;
+        for (auto* conn : child.getPortConnections()) {
+            if (!conn)
+                continue;
+            const Expression* connExpr = conn->getExpression();
+            const TplLoc at = connExpr
+                                  ? locate(connExpr->sourceRange.start(), instAt)
+                                  : instAt;
+            auto termIt = childT.termIndex.find(std::string(conn->port.name));
+            if (termIt == childT.termIndex.end())
+                continue;
+            const int32_t termIdx = termIt->second;
+            auto nextOrdinal = [&]() { return segOrdinal[termIdx]++; };
+
+            if (conn->port.kind == SymbolKind::InterfacePort) {
+                auto [ifaceSym, modport] = conn->getIfaceConn();
+                TplConn tc;
+                tc.kind = "interface";
+                tc.childTerm = termIdx;
+                tc.ordinal = nextOrdinal();
+                tc.loc = at;
+                if (ifaceSym) {
+                    if (auto it = childOf.find(ifaceSym); it != childOf.end()) {
+                        tc.ifaceChild = it->second;
+                    }
+                    else if (auto* through =
+                                 passedThrough(*b.body, ifaceSym)) {
+                        auto ownIt = b.t->termIndex.find(
+                            std::string(through->name));
+                        if (ownIt != b.t->termIndex.end())
+                            tc.ifaceOwnTerm = ownIt->second;
+                    }
+                    else {
+                        // An interface array element or another synthesized
+                        // shape: no per-occurrence object to point at.
+                        stats.external++;
+                    }
+                }
+                c.conns.push_back(std::move(tc));
+                continue;
+            }
+            if (conn->port.kind != SymbolKind::Port &&
+                conn->port.kind != SymbolKind::MultiPort)
+                continue;
+
+            if (!connExpr) {
+                TplConn tc;
+                tc.kind = "unconnected";
+                tc.childTerm = termIdx;
+                tc.ordinal = nextOrdinal();
+                tc.loc = at;
+                c.conns.push_back(std::move(tc));
+                continue;
+            }
+
+            std::vector<ConnRef> nets;
+            collectConnRefs(*connExpr, evalCtx, nets);
+            if (nets.empty()) {
+                TplConn tc;
+                tc.kind = "constant";
+                tc.childTerm = termIdx;
+                tc.ordinal = nextOrdinal();
+                tc.termExact = 1;   // the whole formal, trivially
+                tc.loc = at;
+                c.conns.push_back(std::move(tc));
+                continue;
+            }
+            const uint64_t formalWidth =
+                (!inArray && connExpr->type) ? connExpr->type->getBitWidth() : 0;
+            // The connection expression's type is not always the formal's: an
+            // output port narrower than the net it drives arrives as a plain
+            // assignment with no conversion node to degrade through, so the
+            // walk positions elements against the wrong width and claims a
+            // one-to-one mapping across a truncation. The declared terminal
+            // width is the authority; when the two disagree, every element's
+            // position is unstatable and no mapping is per-bit -- the same
+            // degradation a width-changing conversion already gets.
+            const int64_t declaredWidth = childT.terms[size_t(termIdx)].width;
+            const bool widthMismatch =
+                formalWidth && declaredWidth > 0 &&
+                uint64_t(declaredWidth) != formalWidth;
+            for (auto& cn : nets) {
+                TplConn tc;
+                tc.childTerm = termIdx;
+                tc.ordinal = nextOrdinal();
+                tc.loc = at;
+                // The formal window, encoded as ranges are everywhere.
+                if (!inArray && !widthMismatch && cn.windowExact && formalWidth) {
+                    if (!(cn.winLo == 0 && cn.winHi + 1 >= formalWidth))
+                        tc.termR.bits = std::make_pair(cn.winLo, cn.winHi);
+                    tc.termExact = 1;
+                }
+                else {
+                    tc.termExact = 0;
+                }
+                if (!cn.ref.sym) {
+                    tc.kind = "constant";
+                    c.conns.push_back(std::move(tc));
+                    continue;
+                }
+                const int32_t netIdx = netFor(b, *cn.ref.sym);
+                if (netIdx < 0) {
+                    // Tied to something with no name here. The row exists
+                    // either way; what it is tied to is in hier_ref.
+                    Ref r = cn.ref;
+                    const bool drives = conn->port.kind == SymbolKind::Port &&
+                                        (conn->port.as<PortSymbol>().direction ==
+                                             ArgumentDirection::Out ||
+                                         conn->port.as<PortSymbol>().direction ==
+                                             ArgumentDirection::InOut);
+                    const int32_t saved = b.curStmt;
+                    b.curStmt = -1;
+                    const int32_t href =
+                        addHierRef(b, drives, r, at, evalCtx, "connect");
+                    b.curStmt = saved;
+                    tc.kind = cn.expression ? "expression_operand"
+                                            : "external_reference";
+                    tc.hierRef = href;
+                    c.conns.push_back(std::move(tc));
+                    continue;
+                }
+                tc.parentNet = netIdx;
+                tc.kind = cn.expression ? "expression_operand" : "signal";
+                if (inArray) {
+                    // An element shares the whole array's connection
+                    // expression: somewhere in the object, honestly.
+                    tc.netExact = 0;
+                }
+                else {
+                    tc.netR = rangeOf(cn.ref);
+                    tc.netExact = cn.ref.exact ? 1 : 0;
+                }
+                tc.mappingExact = tc.kind == "expression_operand"
+                                      ? 0
+                                      : (cn.positional && !inArray &&
+                                                 !widthMismatch
+                                             ? 1
+                                             : 0);
+                c.conns.push_back(std::move(tc));
+            }
+        }
+    }
+
+    /// The parent's own interface port that `iface` arrived through, if any.
+    static const InterfacePortSymbol* passedThrough(const InstanceBodySymbol& body,
+                                                    const Symbol* iface) {
+        if (!iface)
+            return nullptr;
+        for (auto& member : body.members()) {
+            if (member.kind != SymbolKind::InterfacePort)
+                continue;
+            auto& ip = member.as<InterfacePortSymbol>();
+            if (ip.getConnection().first == iface)
+                return &ip;
+        }
+        return nullptr;
+    }
+
+    /// Terminals and connections of a black box: one terminal per named
+    /// connection, direction unknown, so `net_conn` has something to bind
+    /// and "connected to a black box" stays distinct from "unconnected".
+    void buildUnresolvedConns(Build& b, const UninstantiatedDefSymbol& u,
+                              TplChild& c) {
+        EvalContext evalCtx(*b.body);
+        auto names = u.getPortNames();
+        auto conns = u.getPortConnections();
+        for (size_t i = 0; i < conns.size(); i++) {
+            std::string portName = i < names.size() ? std::string(names[i])
+                                                    : std::string();
+            if (portName.empty())
+                portName = "<port" + std::to_string(i) + ">";
+            const int32_t termSlot = int32_t(c.unresolvedPorts.size());
+            c.unresolvedPorts.push_back(portName);
+            const AssertionExpr* raw = conns[i];
+            const Expression* expr = nullptr;
+            if (raw && raw->kind == AssertionExprKind::Simple)
+                expr = &raw->as<SimpleAssertionExpr>().expr;
+            // The port's type is unknowable, so slang wraps the actual in an
+            // InvalidExpression; the expression as written is its child. An
+            // empty `.extra()` stays empty.
+            while (expr && expr->kind == ExpressionKind::Invalid)
+                expr = expr->as<InvalidExpression>().child;
+            if (expr && expr->kind == ExpressionKind::EmptyArgument)
+                expr = nullptr;
+            const TplLoc at = locate(u.location);
+            if (!expr) {
+                TplConn tc;
+                tc.kind = "unconnected";
+                tc.childTerm = termSlot;
+                tc.loc = at;
+                c.conns.push_back(std::move(tc));
+                continue;
+            }
+            std::vector<ConnRef> nets;
+            collectConnRefs(*expr, evalCtx, nets);
+            if (nets.empty()) {
+                TplConn tc;
+                tc.kind = "constant";
+                tc.childTerm = termSlot;
+                tc.loc = at;
+                c.conns.push_back(std::move(tc));
+                continue;
+            }
+            int64_t ordinal = 0;
+            for (auto& cn : nets) {
+                TplConn tc;
+                tc.childTerm = termSlot;
+                tc.ordinal = ordinal++;
+                tc.loc = at;
+                // No formal knowledge: the terminal side stays NULL.
+                if (!cn.ref.sym) {
+                    tc.kind = "constant";
+                    c.conns.push_back(std::move(tc));
+                    continue;
+                }
+                const int32_t netIdx = netFor(b, *cn.ref.sym);
+                if (netIdx < 0) {
+                    const int32_t saved = b.curStmt;
+                    b.curStmt = -1;
+                    const int32_t href = addHierRef(b, false, cn.ref, at,
+                                                    evalCtx, "connect");
+                    b.curStmt = saved;
+                    tc.kind = cn.expression ? "expression_operand"
+                                            : "external_reference";
+                    tc.hierRef = href;
+                    c.conns.push_back(std::move(tc));
+                    continue;
+                }
+                tc.parentNet = netIdx;
+                tc.kind = cn.expression ? "expression_operand" : "signal";
+                tc.netR = rangeOf(cn.ref);
+                tc.netExact = cn.ref.exact ? 1 : 0;
+                tc.mappingExact = tc.kind == "expression_operand" ? 0 : -1;
+                c.conns.push_back(std::move(tc));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ modules
+
+    void internModuleRow(const DefinitionSymbol& def) {
+        if (moduleIds.count(&def))
+            return;
+        ModuleRow row;
+        row.id = int64_t(moduleIds.size()) + 1;
+        row.name = std::string(def.name);
+        switch (def.definitionKind) {
+            case DefinitionKind::Interface: row.definitionKind = "interface"; break;
+            case DefinitionKind::Program:   row.definitionKind = "program";   break;
+            default:                        row.definitionKind = "module";    break;
+        }
+        const TplLoc at = locate(def.location);
+        row.fileId = at.fileId;
+        row.line = at.line;
+        row.column = at.column;
+        moduleIds.emplace(&def, row.id);
+        writer.addModule(row);
+        stats.modules++;
+    }
+
+    // ----------------------------------------------------------- stamping
+
+    /// Everything one stamped occurrence needs to remember.
+    struct Bases {
+        int64_t net = 0, term = 0, proc = 0, stmt = 0, target = 0, operand = 0,
+                exprRef = 0, procEvent = 0, dep = 0, hierRef = 0;
+    };
+
+    struct ReplayJob {
+        int64_t rowId = 0;
+        int64_t instNode = 0;         // the occurrence the reference is in
+        const Template* t = nullptr;
+        size_t refIdx = 0;
+        Bases base;
+        std::vector<int64_t> ifaceBind; // term index -> bound iface inst id
+    };
+
+    /// One queued cross-instance dependency of one occurrence, written once
+    /// the occurrence's references resolve.
+    struct CrossJob {
+        const Template* t = nullptr;
+        size_t idx = 0;
+        Bases base;
+    };
+
+    void stampOccurrence(const InstanceSymbol& instSym, const std::string& key,
+                         const std::string& name, int64_t nodeId,
+                         int64_t parentNode, int64_t parentInst,
+                         int64_t ordinal, const TplLoc& instLoc,
+                         std::vector<int64_t> ifaceBind) {
+        (void)instSym;
+        Template& t = templates[key];
+
+        TreeNodeRow node;
+        node.id = nodeId;
+        node.parentNodeId = parentNode;
+        node.name = name;
+        node.nodeKind = parentNode == 0 ? "root" : "instance";
+        node.ordinal = ordinal;
+        writer.addTreeNode(node);
+
+        InstRow inst;
+        inst.id = nodeId;
+        inst.moduleId = t.moduleId;
+        inst.parentInstId = parentInst;
+        inst.parameterSignature = t.params;
+        inst.fileId = instLoc.fileId;
+        inst.line = instLoc.line;
+        inst.column = instLoc.column;
+        writer.addInst(inst);
+        stats.instances++;
+
+        stampBody(t, nodeId, std::move(ifaceBind));
+    }
+
+    /// Stamps one occurrence's template rows and recurses into its children.
+    void stampBody(Template& t, int64_t instId, std::vector<int64_t> ifaceBind) {
+        // Scope nodes: index 0 is the instance itself; the rest are
+        // generate levels, parents guaranteed to precede children.
+        std::vector<int64_t> scopeNode(t.scopes.size(), instId);
+        std::vector<int64_t> siblingOrdinal(t.scopes.size(), 0);
+        for (size_t i = 1; i < t.scopes.size(); i++) {
+            const int64_t id = ++nodeCounter;
+            const int32_t parent = t.scopes[i].parent;
+            const int64_t parentId = scopeNode[size_t(parent < 0 ? 0 : parent)];
+            TreeNodeRow node;
+            node.id = id;
+            node.parentNodeId = parentId;
+            node.name = t.scopes[i].name;
+            node.nodeKind = "generate";
+            node.ordinal = siblingOrdinal[size_t(parent < 0 ? 0 : parent)]++;
+            writer.addTreeNode(node);
+            noteChild(parentId, node.name, id);
+            scopeNode[i] = id;
+        }
+
+        Bases base;
+        base.net = netCounter;         netCounter += int64_t(t.nets.size());
+        base.term = termCounter;       termCounter += int64_t(t.terms.size());
+        base.proc = procCounter;       procCounter += int64_t(t.procedures.size());
+        base.stmt = stmtCounter;       stmtCounter += int64_t(t.stmts.size());
+        base.target = targetCounter;   targetCounter += int64_t(t.targets.size());
+        base.operand = operandCounter; operandCounter += int64_t(t.operands.size());
+        base.exprRef = exprRefCounter; exprRefCounter += int64_t(t.exprRefs.size());
+        base.procEvent = procEventCounter;
+        procEventCounter += int64_t(t.procEvents.size());
+        base.dep = depCounter;         depCounter += int64_t(t.deps.size());
+        base.hierRef = hierRefCounter; hierRefCounter += int64_t(t.hierRefs.size());
+
+        // Primitives are tree nodes; their ids come from the node counter.
+        std::vector<int64_t> primNode(t.prims.size(), 0);
+        for (size_t i = 0; i < t.prims.size(); i++) {
+            const int64_t id = ++nodeCounter;
+            const int64_t parentId = scopeNode[size_t(t.prims[i].scope)];
+            TreeNodeRow node;
+            node.id = id;
+            node.parentNodeId = parentId;
+            node.name = t.prims[i].name;
+            node.nodeKind = "primitive";
+            node.ordinal = siblingOrdinal[size_t(t.prims[i].scope)]++;
+            writer.addTreeNode(node);
+            noteChild(parentId, node.name, id);
+            PrimitiveRow p;
+            p.id = id;
+            p.instId = instId;
+            p.primitiveKind = t.prims[i].primKind;
+            p.definitionName = t.prims[i].defName;
+            p.fileId = t.prims[i].loc.fileId;
+            p.line = t.prims[i].loc.line;
+            p.column = t.prims[i].loc.column;
+            writer.addPrimitive(p);
+            primNode[i] = id;
+        }
+
+        for (size_t i = 0; i < t.nets.size(); i++) {
+            auto& n = t.nets[i];
+            NetRow row;
+            row.id = base.net + int64_t(i) + 1;
+            row.instId = instId;
+            row.scopeNodeId = scopeNode[size_t(n.scope)];
+            row.name = n.name;
+            row.declarationKind = n.declKind;
+            row.dataTypeId = n.dataTypeId;
+            row.width = n.width;
+            row.isImplicit = n.isImplicit;
+            row.fileId = n.loc.fileId;
+            row.line = n.loc.line;
+            row.column = n.loc.column;
+            writer.addNet(row);
+        }
+        stats.nets += int64_t(t.nets.size());
+
+        for (size_t i = 0; i < t.terms.size(); i++) {
+            auto& tm = t.terms[i];
+            TermRow row;
+            row.id = base.term + int64_t(i) + 1;
+            row.instId = instId;
+            row.name = tm.name;
+            row.terminalKind = tm.kind;
+            row.direction = tm.direction;
+            row.dataTypeId = tm.dataTypeId;
+            row.width = tm.width;
+            row.ordinal = int64_t(i);
+            row.isConst = tm.isConst;
+            row.modport = tm.modport;
+            row.fileId = tm.loc.fileId;
+            row.line = tm.loc.line;
+            row.column = tm.loc.column;
+            writer.addTerm(row);
+        }
+        stats.terms += int64_t(t.terms.size());
+
+        for (auto& m : t.termMaps) {
+            TermMapRow row;
+            row.termId = base.term + m.term + 1;
+            row.ordinal = m.ordinal;
+            row.netId = base.net + m.net + 1;
+            row.termBits = m.termR.bits;
+            row.termExact = m.termR.exact;
+            row.netBits = m.netR.bits;
+            row.netExact = m.netR.exact;
+            row.mappingExact = m.mappingExact;
+            writer.addTermMap(row);
+        }
+
+        for (size_t i = 0; i < t.procedures.size(); i++) {
+            auto& p = t.procedures[i];
+            ProcedureRow row;
+            row.id = base.proc + int64_t(i) + 1;
+            row.instId = instId;
+            row.scopeNodeId = scopeNode[size_t(p.scope)];
+            row.name = p.name;
+            row.procedureKind = p.kind;
+            row.ordinal = int64_t(i);
+            row.fileId = p.loc.fileId;
+            row.line = p.loc.line;
+            row.column = p.loc.column;
+            writer.addProcedure(row);
+        }
+        stats.procedures += int64_t(t.procedures.size());
+
+        for (size_t i = 0; i < t.stmts.size(); i++) {
+            auto& s = t.stmts[i];
+            StmtRow row;
+            row.id = base.stmt + int64_t(i) + 1;
+            row.instId = instId;
+            row.scopeNodeId = scopeNode[size_t(s.scope)];
+            row.procedureId = s.proc < 0 ? 0 : base.proc + s.proc + 1;
+            row.ordinal = int64_t(i);
+            row.sequence = s.sequence;
+            row.statementKind = s.kind;
+            row.construct = s.construct;
+            row.assignmentKind = s.assignKind;
+            row.delay = s.delay;
+            row.droppedOperandCount = s.dropped;
+            row.fileId = s.loc.fileId;
+            row.line = s.loc.line;
+            row.column = s.loc.column;
+            writer.addStmt(row);
+        }
+        stats.stmts += int64_t(t.stmts.size());
+
+        for (size_t i = 0; i < t.targets.size(); i++) {
+            auto& r = t.targets[i];
+            AssignTargetRow row;
+            row.id = base.target + int64_t(i) + 1;
+            row.stmtId = base.stmt + r.stmt + 1;
+            row.ordinal = r.ordinal;
+            row.netId = base.net + r.net + 1;
+            row.bits = r.r.bits;
+            row.exact = r.r.exact;
+            writer.addAssignTarget(row);
+        }
+        for (size_t i = 0; i < t.operands.size(); i++) {
+            auto& r = t.operands[i];
+            AssignOperandRow row;
+            row.id = base.operand + int64_t(i) + 1;
+            row.stmtId = base.stmt + r.stmt + 1;
+            row.ordinal = r.ordinal;
+            row.netId = base.net + r.net + 1;
+            row.bits = r.r.bits;
+            row.exact = r.r.exact;
+            writer.addAssignOperand(row);
+        }
+        for (size_t i = 0; i < t.exprRefs.size(); i++) {
+            auto& r = t.exprRefs[i];
+            ExprRefRow row;
+            row.id = base.exprRef + int64_t(i) + 1;
+            row.stmtId = base.stmt + r.stmt + 1;
+            row.ordinal = r.ordinal;
+            row.netId = base.net + r.net + 1;
+            row.role = r.role;
+            row.bits = r.r.bits;
+            row.exact = r.r.exact;
+            writer.addExprRef(row);
+        }
+        for (size_t i = 0; i < t.procEvents.size(); i++) {
+            auto& e = t.procEvents[i];
+            ProcEventRow row;
+            row.id = base.procEvent + int64_t(i) + 1;
+            row.procedureId = base.proc + e.proc + 1;
+            row.stmtId = e.stmt < 0 ? 0 : base.stmt + e.stmt + 1;
+            row.netId = e.net < 0 ? 0 : base.net + e.net + 1;
+            row.eventKind = e.eventKind;
+            row.edgeKind = e.edgeKind;
+            row.fileId = e.loc.fileId;
+            row.line = e.loc.line;
+            row.column = e.loc.column;
+            writer.addProcEvent(row);
+        }
+        for (size_t i = 0; i < t.deps.size(); i++) {
+            auto& d = t.deps[i];
+            NetDepRow row;
+            row.id = base.dep + int64_t(i) + 1;
+            row.sourceNetId = d.srcNet < 0 ? 0 : base.net + d.srcNet + 1;
+            row.targetNetId = base.net + d.tgtNet + 1;
+            row.stmtId = d.stmt < 0 ? 0 : base.stmt + d.stmt + 1;
+            row.assignOperandId = d.operandRef < 0 ? 0 : base.operand + d.operandRef + 1;
+            row.assignTargetId = d.targetRef < 0 ? 0 : base.target + d.targetRef + 1;
+            row.exprRefId = d.exprRef < 0 ? 0 : base.exprRef + d.exprRef + 1;
+            row.primitiveId = d.prim < 0 ? 0 : primNode[size_t(d.prim)];
+            row.dependencyKind = d.kind;
+            row.sourceBits = d.srcR.bits;
+            row.sourceExact = d.srcNet < 0 ? -1 : (d.srcR.exact ? 1 : 0);
+            row.targetBits = d.tgtR.bits;
+            row.targetExact = d.tgtR.exact;
+            row.mappingExact = d.mappingExact;
+            writer.addNetDep(row);
+        }
+        stats.deps += int64_t(t.deps.size());
+
+        // Hierarchical reference rows are written in the final pass, once
+        // every subtree they may land in exists; ids are fixed now because
+        // net_conn rows below may reference them. The queued cross-instance
+        // dependencies follow in the same pass, since their endpoints are
+        // those references' resolutions.
+        for (size_t i = 0; i < t.hierRefs.size(); i++) {
+            ReplayJob job;
+            job.rowId = base.hierRef + int64_t(i) + 1;
+            job.instNode = instId;
+            job.t = &t;
+            job.refIdx = i;
+            job.base = base;
+            job.ifaceBind = ifaceBind;
+            replayJobs.push_back(std::move(job));
+        }
+        for (size_t i = 0; i < t.crossDeps.size(); i++)
+            crossJobs.push_back(CrossJob{&t, i, base});
+        stats.hierRefs += int64_t(t.hierRefs.size());
+
+        // For hierarchical-reference replay: which template (and net base)
+        // this node stamped, so a resolved path can name a net by id.
+        nodeTemplate.emplace(instId, std::make_pair(&t, base.net));
+
+        // Children: allocate every child's node id first, so an interface
+        // binding to a later sibling has an id to point at.
+        std::vector<int64_t> childNode(t.children.size(), 0);
+        for (size_t i = 0; i < t.children.size(); i++)
+            childNode[i] = ++nodeCounter;
+
+        // Each child's incoming interface bindings -- and, per connection,
+        // the bound instance id its row carries. Computed here in the parent
+        // where the connections are written.
+        std::vector<std::vector<int64_t>> childIfaceBind(t.children.size());
+        std::vector<std::vector<int64_t>> connIfaceId(t.children.size());
+        for (size_t i = 0; i < t.children.size(); i++) {
+            auto& c = t.children[i];
+            if (c.kind != TplChild::Module)
+                continue;
+            auto& ct = templates[c.groupKey];
+            childIfaceBind[i].assign(ct.terms.size(), 0);
+            connIfaceId[i].assign(c.conns.size(), 0);
+            for (size_t k = 0; k < c.conns.size(); k++) {
+                auto& conn = c.conns[k];
+                if (conn.kind != "interface" || conn.childTerm < 0)
+                    continue;
+                int64_t bound = 0;
+                if (conn.ifaceChild >= 0)
+                    bound = childNode[size_t(conn.ifaceChild)];
+                else if (conn.ifaceOwnTerm >= 0 &&
+                         size_t(conn.ifaceOwnTerm) < ifaceBind.size())
+                    bound = ifaceBind[size_t(conn.ifaceOwnTerm)];
+                connIfaceId[i][k] = bound;
+                if (size_t(conn.childTerm) < childIfaceBind[i].size())
+                    childIfaceBind[i][size_t(conn.childTerm)] = bound;
+            }
+        }
+
+        // Stamp the children, then their connections (the rows need the
+        // child terminal ids, which exist once the child is stamped).
+        for (size_t i = 0; i < t.children.size(); i++) {
+            auto& c = t.children[i];
+            const int64_t parentId = scopeNode[size_t(c.scope)];
+            const int64_t ord = siblingOrdinal[size_t(c.scope)]++;
+            noteChild(parentId, c.name, childNode[i]);
+            if (c.kind == TplChild::Module) {
+                const int64_t termBase = termCounter;  // the child's terms start here
+                stampChildModule(c, childNode[i], parentId, instId, ord,
+                                 std::move(childIfaceBind[i]));
+                stampConns(c, /*childTermBase=*/termBase, base, connIfaceId[i]);
+            }
+            else {
+                stampUnresolved(c, childNode[i], parentId, instId, ord, base);
+            }
+        }
+    }
+
+    void stampChildModule(const TplChild& c, int64_t nodeId, int64_t parentNode,
+                          int64_t parentInst, int64_t ordinal,
+                          std::vector<int64_t> ifaceBind) {
+        Template& ct = templates[c.groupKey];
+        TreeNodeRow node;
+        node.id = nodeId;
+        node.parentNodeId = parentNode;
+        node.name = c.name;
+        node.nodeKind = "instance";
+        node.ordinal = ordinal;
+        writer.addTreeNode(node);
+
+        InstRow inst;
+        inst.id = nodeId;
+        inst.moduleId = ct.moduleId;
+        inst.parentInstId = parentInst;
+        inst.parameterSignature = ct.params;
+        inst.fileId = c.loc.fileId;
+        inst.line = c.loc.line;
+        inst.column = c.loc.column;
+        writer.addInst(inst);
+        stats.instances++;
+
+        stampBody(ct, nodeId, std::move(ifaceBind));
+    }
+
+    /// The connection rows of one child, in the parent's id space. The
+    /// child's terminal ids are its term base plus the template index --
+    /// terminals are stamped first in stampBody, so the base recorded before
+    /// recursion is exact.
+    void stampConns(const TplChild& c, int64_t childTermBase,
+                    const Bases& parentBase, const std::vector<int64_t>& ifaceIds) {
+        for (size_t k = 0; k < c.conns.size(); k++) {
+            auto& conn = c.conns[k];
+            NetConnRow row;
+            row.id = ++connCounter;
+            row.netId = conn.parentNet < 0 ? 0 : parentBase.net + conn.parentNet + 1;
+            row.termId = childTermBase + conn.childTerm + 1;
+            row.ordinal = conn.ordinal;
+            row.connectionKind = conn.kind;
+            row.netBits = conn.netR.bits;
+            row.netExact = conn.netExact;
+            row.termBits = conn.termR.bits;
+            row.termExact = conn.termExact;
+            row.mappingExact = conn.mappingExact;
+            if (conn.kind == "interface" && k < ifaceIds.size())
+                row.interfaceInstId = ifaceIds[k];
+            row.hierRefId = conn.hierRef < 0 ? 0
+                                             : parentBase.hierRef + conn.hierRef + 1;
+            row.fileId = conn.loc.fileId;
+            row.line = conn.loc.line;
+            row.column = conn.loc.column;
+            writer.addNetConn(row);
+            stats.conns++;
+        }
+    }
+
+    void stampUnresolved(const TplChild& c, int64_t nodeId,
+                         int64_t parentNode, int64_t parentInst, int64_t ordinal,
+                         const Bases& parentBase) {
+        TreeNodeRow node;
+        node.id = nodeId;
+        node.parentNodeId = parentNode;
+        node.name = c.name;
+        node.nodeKind = "unresolved";
+        node.ordinal = ordinal;
+        writer.addTreeNode(node);
+
+        InstRow inst;
+        inst.id = nodeId;
+        inst.parentInstId = parentInst;
+        inst.unresolvedDefinition = c.defName;
+        inst.fileId = c.loc.fileId;
+        inst.line = c.loc.line;
+        inst.column = c.loc.column;
+        writer.addInst(inst);
+        stats.instances++;
+
+        // One terminal per named connection, direction unknown.
+        std::vector<int64_t> termIds(c.unresolvedPorts.size(), 0);
+        for (size_t i = 0; i < c.unresolvedPorts.size(); i++) {
+            TermRow row;
+            row.id = ++termCounter;
+            row.instId = nodeId;
+            row.name = c.unresolvedPorts[i];
+            row.terminalKind = "signal";
+            row.ordinal = int64_t(i);
+            row.fileId = c.loc.fileId;
+            row.line = c.loc.line;
+            row.column = c.loc.column;
+            writer.addTerm(row);
+            termIds[i] = row.id;
+        }
+        stats.terms += int64_t(c.unresolvedPorts.size());
+
+        for (auto& conn : c.conns) {
+            NetConnRow row;
+            row.id = ++connCounter;
+            row.netId = conn.parentNet < 0 ? 0 : parentBase.net + conn.parentNet + 1;
+            row.termId = conn.childTerm >= 0 &&
+                                 size_t(conn.childTerm) < termIds.size()
+                             ? termIds[size_t(conn.childTerm)]
+                             : 0;
+            if (row.termId == 0)
+                continue;
+            row.ordinal = conn.ordinal;
+            row.connectionKind = conn.kind;
+            row.netBits = conn.netR.bits;
+            row.netExact = conn.netExact;
+            row.termBits = conn.termR.bits;
+            row.termExact = conn.termExact;
+            row.mappingExact = conn.mappingExact;
+            row.hierRefId = conn.hierRef < 0 ? 0
+                                             : parentBase.hierRef + conn.hierRef + 1;
+            row.fileId = conn.loc.fileId;
+            row.line = conn.loc.line;
+            row.column = conn.loc.column;
+            writer.addNetConn(row);
+            stats.conns++;
+        }
+    }
+
+    // ------------------------------------------------- hier_ref resolution
+
+    /// Registers a stamped node under its parent for path descent, and
+    /// counts the collision when the name is already taken -- a design that
+    /// did not fully elaborate can produce two siblings of one name, and a
+    /// path lookup in it is then ambiguous. The second node keeps its rows;
+    /// only the by-name map keeps the first.
+    void noteChild(int64_t parent, const std::string& name, int64_t id) {
+        if (!childByName[parent].emplace(name, id).second)
+            stats.duplicatePaths++;
+    }
+
+    /// Writes every hier_ref row, resolving the ones whose replay lands on a
+    /// stamped object -- then materialises the queued cross-instance
+    /// dependencies whose endpoints those resolutions are. The tree walk is
+    /// by name against childByName; the net by name against the target
+    /// group's template index -- both spellings the stamping itself
+    /// produced.
+    void resolveHierRefs() {
+        std::unordered_map<int64_t, int64_t> resolvedNet;  // hier_ref id -> net id
+        for (auto& job : replayJobs) {
+            const TplHierRef& ref = job.t->hierRefs[job.refIdx];
+            HierRefRow row;
+            row.id = job.rowId;
+            row.instId = job.instNode;
+            row.stmtId = ref.stmt < 0 ? 0 : job.base.stmt + ref.stmt + 1;
+            row.path = ref.path;
+            row.access = ref.access;
+            row.bits = ref.r.bits;
+            row.exact = ref.r.exact;
+            row.fileId = ref.loc.fileId;
+            row.line = ref.loc.line;
+            row.column = ref.loc.column;
+
+            int64_t node = 0;
+            switch (ref.resolve) {
+                case TplHierRef::Downward:
+                    node = descend(job.instNode, ref.segs);
+                    break;
+                case TplHierRef::Absolute:
+                    node = descend(0, ref.segs);
+                    break;
+                case TplHierRef::ViaIfaceTerm:
+                    if (ref.ifaceTerm >= 0 &&
+                        size_t(ref.ifaceTerm) < job.ifaceBind.size() &&
+                        job.ifaceBind[size_t(ref.ifaceTerm)] != 0)
+                        node = descend(job.ifaceBind[size_t(ref.ifaceTerm)],
+                                       ref.segs);
+                    break;
+                default:
+                    break;
+            }
+            if (node != 0) {
+                row.resolvedInstId = node;
+                if (!ref.netName.empty()) {
+                    auto tplIt = nodeTemplate.find(node);
+                    if (tplIt != nodeTemplate.end()) {
+                        auto& tt = *tplIt->second.first;
+                        auto nIt = tt.netIndex.find(ref.netName);
+                        if (nIt != tt.netIndex.end()) {
+                            row.resolvedNetId =
+                                tplIt->second.second + nIt->second + 1;
+                            resolvedNet.emplace(row.id, row.resolvedNetId);
+                        }
+                    }
+                }
+            }
+            writer.addHierRef(row);
+        }
+
+        // The cross-instance dependencies. An endpoint is a local net (base
+        // plus index) or a reference's resolution; a dependency any of whose
+        // referenced ends did not resolve is not written -- the hier_ref
+        // rows above are the honest record, and a fabricated edge would be
+        // a wrong one.
+        for (auto& job : crossJobs) {
+            const TplCrossDep& d = job.t->crossDeps[job.idx];
+            NetDepRow row;
+            row.id = 0;   // assigned below once the row is known writable
+            if (d.srcNet >= 0) {
+                row.sourceNetId = job.base.net + d.srcNet + 1;
+            }
+            else if (d.srcHref >= 0) {
+                row.sourceHierRefId = job.base.hierRef + d.srcHref + 1;
+                auto it = resolvedNet.find(row.sourceHierRefId);
+                if (it == resolvedNet.end())
+                    continue;
+                row.sourceNetId = it->second;
+            }
+            else if (!d.sourceless) {
+                continue;
+            }
+            if (d.tgtNet >= 0) {
+                row.targetNetId = job.base.net + d.tgtNet + 1;
+            }
+            else if (d.tgtHref >= 0) {
+                row.targetHierRefId = job.base.hierRef + d.tgtHref + 1;
+                auto it = resolvedNet.find(row.targetHierRefId);
+                if (it == resolvedNet.end())
+                    continue;
+                row.targetNetId = it->second;
+            }
+            else {
+                continue;
+            }
+            row.id = ++depCounter;
+            row.stmtId = d.stmt < 0 ? 0 : job.base.stmt + d.stmt + 1;
+            row.assignOperandId =
+                d.operandRef < 0 ? 0 : job.base.operand + d.operandRef + 1;
+            row.assignTargetId =
+                d.targetRef < 0 ? 0 : job.base.target + d.targetRef + 1;
+            row.exprRefId = d.exprRef < 0 ? 0 : job.base.exprRef + d.exprRef + 1;
+            row.dependencyKind = d.kind;
+            row.sourceBits = d.srcR.bits;
+            row.sourceExact = d.srcR.exact ? 1 : 0;
+            row.targetBits = d.tgtR.bits;
+            row.targetExact = d.tgtR.exact;
+            row.mappingExact = d.mappingExact;
+            writer.addNetDep(row);
+            stats.deps++;
+        }
+    }
+
+    int64_t descend(int64_t from, const std::vector<std::string>& segs) {
+        int64_t node = from;
+        for (auto& seg : segs) {
+            auto pIt = childByName.find(node);
+            if (pIt == childByName.end())
+                return 0;
+            auto cIt = pIt->second.find(seg);
+            if (cIt == pIt->second.end())
+                return 0;
+            node = cIt->second;
+        }
+        return node == from && from == 0 ? 0 : node;
+    }
+
+    // ------------------------------------------------------------ members
+
     Compilation& compilation;
     AnalysisManager& analysis;
     Writer& writer;
     const SourceManager& sourceManager;
     std::map<std::string, Group> groups;
     std::unordered_map<const InstanceSymbol*, std::string> instanceGroup;
-    std::set<std::pair<int64_t, std::string>> seenSiblings;
-    // The module being emitted accumulates its outward references here; one
-    // statement can surface the same reference through several collection
-    // passes, so the seen-set folds them to one row per (text, rw, line).
-    std::vector<HierRefRow> hierRefs;
-    std::vector<StmtReadRow> stmtReads;
-    /// The reference expressions already recorded for this module, by node.
-    /// Not by text: two references can share a spelling and be different
-    /// references, which is what a generate loop does to `b[g].sig`.
-    std::set<std::pair<const Expression*, bool>> hierSeen;
-    /// The statement being walked, as a per-module ordinal starting at 1; 0 is
-    /// "no statement", which stores as NULL. Bumped by beginStmt() at each
-    /// statement boundary and read by every row emitter, so the parts of one
-    /// statement -- its assignment, the outward targets it writes, the signals
-    /// it reads -- all carry the same number without threading it through the
-    /// walker's callback signatures.
-    int64_t curStmt = 0;
-    int64_t stmtCount = 0;
-    /// module row id -> (body-relative child name -> child row id). Filled while
-    /// emitting each module variant and read while expanding the instance tree,
-    /// which is what lets `instance.child` be written at all: the two walks are
-    /// separate passes over different things -- one over module bodies, one over
-    /// elaborated instances -- and this is the only thing that relates them.
-    std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>>
-        childIdsByModule;
-    std::unordered_map<std::string, uint32_t> fileKeyIds;
-    // As-written file spelling -> the absolute path its buffer came from.
+    std::map<std::string, Template> templates;
+    std::unordered_map<const DefinitionSymbol*, int64_t> moduleIds;
     std::unordered_map<std::string, std::string> fileOrigins;
-    int64_t instanceRow = 0;
+
+    // Global id counters; every table's ids are dense and process-issued.
+    int64_t nodeCounter = 0;
+    int64_t netCounter = 0;
+    int64_t termCounter = 0;
+    int64_t procCounter = 0;
+    int64_t stmtCounter = 0;
+    int64_t targetCounter = 0;
+    int64_t operandCounter = 0;
+    int64_t exprRefCounter = 0;
+    int64_t procEventCounter = 0;
+    int64_t depCounter = 0;
+    int64_t connCounter = 0;
+    int64_t hierRefCounter = 0;
+    int64_t rootOrdinal = 0;
+
+    std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>> childByName;
+    std::vector<ReplayJob> replayJobs;
+    std::vector<CrossJob> crossJobs;
+    /// node id -> (template, net id base) for net-name resolution at replay.
+    std::unordered_map<int64_t, std::pair<const Template*, int64_t>> nodeTemplate;
+
     Stats stats;
 };
 
