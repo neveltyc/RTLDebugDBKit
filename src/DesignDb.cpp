@@ -85,7 +85,7 @@ CREATE TABLE module(
     id              INTEGER PRIMARY KEY,
     name            TEXT NOT NULL,
     definition_kind TEXT NOT NULL
-        CHECK(definition_kind IN ('module','interface','program','checker')),
+        /*!*/CHECK(definition_kind IN ('module','interface','program','checker'))/*!*/,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
     column          INTEGER,
@@ -110,7 +110,7 @@ CREATE TABLE tree_node(
     parent_node_id INTEGER REFERENCES tree_node(id),
     name           TEXT NOT NULL,
     node_kind      TEXT NOT NULL
-        CHECK(node_kind IN ('root','instance','generate','primitive','unresolved')),
+        /*!*/CHECK(node_kind IN ('root','instance','generate','primitive','unresolved'))/*!*/,
     ordinal        INTEGER NOT NULL);
 
 -- One module instance occurrence. `id` IS the tree_node id -- one id space
@@ -144,7 +144,7 @@ CREATE TABLE inst(
 CREATE TABLE primitive(
     id              INTEGER PRIMARY KEY REFERENCES tree_node(id),
     inst_id         INTEGER NOT NULL REFERENCES inst(id),
-    primitive_kind  TEXT NOT NULL CHECK(primitive_kind IN ('gate','switch','udp')),
+    primitive_kind  TEXT NOT NULL /*!*/CHECK(primitive_kind IN ('gate','switch','udp'))/*!*/,
     definition_name TEXT NOT NULL,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
@@ -193,8 +193,8 @@ CREATE TABLE term(
     id            INTEGER PRIMARY KEY,
     inst_id       INTEGER NOT NULL REFERENCES inst(id),
     name          TEXT NOT NULL,
-    terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('signal','interface')),
-    direction     TEXT CHECK(direction IN ('input','output','inout','ref')),
+    terminal_kind TEXT NOT NULL /*!*/CHECK(terminal_kind IN ('signal','interface'))/*!*/,
+    direction     TEXT /*!*/CHECK(direction IN ('input','output','inout','ref'))/*!*/,
     data_type_id  INTEGER REFERENCES data_type(id),
     width         INTEGER,
     ordinal       INTEGER NOT NULL,
@@ -254,8 +254,8 @@ CREATE TABLE net_conn(
     term_id           INTEGER NOT NULL REFERENCES term(id),
     ordinal           INTEGER NOT NULL,
     connection_kind   TEXT NOT NULL
-        CHECK(connection_kind IN ('signal','constant','unconnected',
-                                  'expression_operand','interface','external_reference')),
+        /*!*/CHECK(connection_kind IN ('signal','constant','unconnected',
+                                  'expression_operand','interface','external_reference'))/*!*/,
     net_lo            INTEGER,
     net_hi            INTEGER,
     net_exact         INTEGER CHECK(net_exact IN (0,1)),
@@ -279,8 +279,8 @@ CREATE TABLE procedure(
     scope_node_id  INTEGER NOT NULL REFERENCES tree_node(id),
     name           TEXT,
     procedure_kind TEXT NOT NULL
-        CHECK(procedure_kind IN ('always','always_ff','always_comb','always_latch',
-                                 'initial','final','task','function')),
+        /*!*/CHECK(procedure_kind IN ('always','always_ff','always_comb','always_latch',
+                                 'initial','final','task','function'))/*!*/,
     ordinal        INTEGER NOT NULL,
     file_id        INTEGER REFERENCES file(id),
     line           INTEGER,
@@ -309,11 +309,11 @@ CREATE TABLE stmt(
     ordinal               INTEGER NOT NULL,
     sequence              INTEGER,
     statement_kind        TEXT NOT NULL
-        CHECK(statement_kind IN ('assignment','assertion','wait','call',
-                                 'system_task','event_control')),
+        /*!*/CHECK(statement_kind IN ('assignment','assertion','wait','call',
+                                 'system_task','event_control'))/*!*/,
     construct             TEXT,
     assignment_kind       TEXT
-        CHECK(assignment_kind IN ('continuous','blocking','nonblocking')),
+        /*!*/CHECK(assignment_kind IN ('continuous','blocking','nonblocking'))/*!*/,
     delay                 TEXT,
     dropped_operand_count INTEGER NOT NULL,
     file_id               INTEGER REFERENCES file(id),
@@ -363,8 +363,8 @@ CREATE TABLE expr_ref(
     ordinal  INTEGER NOT NULL,
     net_id   INTEGER NOT NULL REFERENCES net(id),
     role     TEXT NOT NULL
-        CHECK(role IN ('control','assertion','wait','event',
-                       'call_argument','system_task')),
+        /*!*/CHECK(role IN ('control','assertion','wait','event',
+                       'call_argument','system_task'))/*!*/,
     lo       INTEGER,
     hi       INTEGER,
     is_exact INTEGER NOT NULL CHECK(is_exact IN (0,1)),
@@ -385,8 +385,8 @@ CREATE TABLE proc_event(
     procedure_id INTEGER NOT NULL REFERENCES procedure(id),
     stmt_id      INTEGER REFERENCES stmt(id),
     net_id       INTEGER REFERENCES net(id),
-    event_kind   TEXT NOT NULL CHECK(event_kind IN ('sensitivity','wait')),
-    edge_kind    TEXT CHECK(edge_kind IN ('posedge','negedge','both')),
+    event_kind   TEXT NOT NULL /*!*/CHECK(event_kind IN ('sensitivity','wait'))/*!*/,
+    edge_kind    TEXT /*!*/CHECK(edge_kind IN ('posedge','negedge','both'))/*!*/,
     file_id      INTEGER REFERENCES file(id),
     line         INTEGER,
     column       INTEGER);
@@ -444,7 +444,7 @@ CREATE TABLE net_dep(
     source_hier_ref_id INTEGER REFERENCES hier_ref(id),
     target_hier_ref_id INTEGER REFERENCES hier_ref(id),
     dependency_kind    TEXT NOT NULL
-        CHECK(dependency_kind IN ('data','control','primitive','procedure')),
+        /*!*/CHECK(dependency_kind IN ('data','control','primitive','procedure'))/*!*/,
     source_lo          INTEGER,
     source_hi          INTEGER,
     source_exact       INTEGER CHECK(source_exact IN (0,1)),
@@ -467,7 +467,7 @@ CREATE TABLE hier_ref(
     inst_id          INTEGER NOT NULL REFERENCES inst(id),
     stmt_id          INTEGER REFERENCES stmt(id),
     path             TEXT NOT NULL,
-    access           TEXT NOT NULL CHECK(access IN ('read','write','connect')),
+    access           TEXT NOT NULL /*!*/CHECK(access IN ('read','write','connect'))/*!*/,
     resolved_inst_id INTEGER REFERENCES inst(id),
     resolved_net_id  INTEGER REFERENCES net(id),
     lo               INTEGER,
@@ -1206,11 +1206,22 @@ JOIN net n ON n.id = o.net_id;
 // journal grows without bound.
 constexpr int64_t kBatch = 20000;
 
+/// Text is bound with SQLITE_STATIC, not SQLITE_TRANSIENT.
+///
+/// TRANSIENT asks SQLite to copy, which is a malloc, a strlen and a memcpy
+/// for every string of every row -- and these tables are mostly text
+/// columns repeated millions of times. STATIC only requires the buffer to
+/// outlive the step, and every caller here binds a member of a row struct
+/// held by const reference across the bind/step pair, so it does. The
+/// interning and provenance writers keep TRANSIENT: they run once per
+/// distinct string, not once per row, and some are handed a view whose
+/// owner they cannot see.
 void bindOptText(sqlite3_stmt* s, int i, const std::string& v) {
     if (v.empty())
         sqlite3_bind_null(s, i);
     else
-        sqlite3_bind_text(s, i, v.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, i, v.c_str(), static_cast<int>(v.size()),
+                          SQLITE_STATIC);
 }
 
 void bindOptId(sqlite3_stmt* s, int i, int64_t id) {
@@ -1283,7 +1294,7 @@ void bindOptWidth(sqlite3_stmt* s, int i, int64_t width) {
 
 } // namespace
 
-Writer::Writer(const std::string& path) {
+Writer::Writer(const std::string& path, bool checkConstraints) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
     if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
@@ -1314,7 +1325,29 @@ Writer::Writer(const std::string& path) {
         exec("PRAGMA cache_size=-262144");   // 256 MiB, not pages
         exec("PRAGMA temp_store=MEMORY");
         exec("PRAGMA locking_mode=EXCLUSIVE");
-        exec(kSchema);
+        // The enum CHECK clauses are marked in kSchema so they can be left
+        // out. They are the single most expensive thing in the write path
+        // -- SQLite evaluates a string IN-list for every row -- and the
+        // verifier re-derives the same domains from the finished file, so
+        // the default is to spend that time on the export instead.
+        if (checkConstraints) {
+            std::string ddl(kSchema);
+            size_t at = 0;
+            while ((at = ddl.find("/*!*/", at)) != std::string::npos)
+                ddl.erase(at, 5);
+            exec(ddl.c_str());
+        }
+        else {
+            std::string ddl(kSchema);
+            size_t open = 0;
+            while ((open = ddl.find("/*!*/", open)) != std::string::npos) {
+                size_t close = ddl.find("/*!*/", open + 5);
+                if (close == std::string::npos)
+                    break;
+                ddl.erase(open, close + 5 - open);
+            }
+            exec(ddl.c_str());
+        }
 
         prepare("INSERT INTO module VALUES(?,?,?,?,?,?)", &ins[InsModule]);
         prepare("INSERT INTO tree_node VALUES(?,?,?,?,?)", &ins[InsTreeNode]);
@@ -1492,8 +1525,10 @@ void Writer::addModule(const ModuleRow& r) {
     auto* s = ins[InsModule];
     sqlite3_reset(s);
     sqlite3_bind_int64(s, 1, r.id);
-    sqlite3_bind_text(s, 2, r.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, r.definitionKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, r.name.c_str(), static_cast<int>(r.name.size()),
+                      SQLITE_STATIC);
+    sqlite3_bind_text(s, 3, r.definitionKind.c_str(), static_cast<int>(r.definitionKind.size()),
+                      SQLITE_STATIC);
     bindLoc(s, 4, r.fileId, r.line, r.column);
     step(s);
     bumped();
@@ -1505,8 +1540,9 @@ void Writer::addTreeNode(const TreeNodeRow& r) {
     sqlite3_bind_int64(s, 1, r.id);
     bindOptId(s, 2, r.parentNodeId);
     sqlite3_bind_text(s, 3, r.name.data(), static_cast<int>(r.name.size()),
-                      SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, r.nodeKind.c_str(), -1, SQLITE_TRANSIENT);
+                      SQLITE_STATIC);
+    sqlite3_bind_text(s, 4, r.nodeKind.c_str(), static_cast<int>(r.nodeKind.size()),
+                      SQLITE_STATIC);
     sqlite3_bind_int64(s, 5, r.ordinal);
     step(s);
     bumped();
@@ -1530,8 +1566,10 @@ void Writer::addPrimitive(const PrimitiveRow& r) {
     sqlite3_reset(s);
     sqlite3_bind_int64(s, 1, r.id);
     sqlite3_bind_int64(s, 2, r.instId);
-    sqlite3_bind_text(s, 3, r.primitiveKind.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, r.definitionName.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, r.primitiveKind.c_str(), static_cast<int>(r.primitiveKind.size()),
+                      SQLITE_STATIC);
+    sqlite3_bind_text(s, 4, r.definitionName.c_str(), static_cast<int>(r.definitionName.size()),
+                      SQLITE_STATIC);
     bindLoc(s, 5, r.fileId, r.line, r.column);
     step(s);
     bumped();
@@ -1544,8 +1582,9 @@ void Writer::addNet(const NetRow& r) {
     sqlite3_bind_int64(s, 2, r.instId);
     sqlite3_bind_int64(s, 3, r.scopeNodeId);
     sqlite3_bind_text(s, 4, r.name.data(), static_cast<int>(r.name.size()),
-                      SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 5, r.declarationKind.c_str(), -1, SQLITE_TRANSIENT);
+                      SQLITE_STATIC);
+    sqlite3_bind_text(s, 5, r.declarationKind.c_str(), static_cast<int>(r.declarationKind.size()),
+                      SQLITE_STATIC);
     bindOptId(s, 6, r.dataTypeId);
     bindOptWidth(s, 7, r.width);
     sqlite3_bind_int(s, 8, r.isImplicit ? 1 : 0);
@@ -1560,8 +1599,9 @@ void Writer::addTerm(const TermRow& r) {
     sqlite3_bind_int64(s, 1, r.id);
     sqlite3_bind_int64(s, 2, r.instId);
     sqlite3_bind_text(s, 3, r.name.data(), static_cast<int>(r.name.size()),
-                      SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, r.terminalKind.c_str(), -1, SQLITE_TRANSIENT);
+                      SQLITE_STATIC);
+    sqlite3_bind_text(s, 4, r.terminalKind.c_str(), static_cast<int>(r.terminalKind.size()),
+                      SQLITE_STATIC);
     bindOptText(s, 5, r.direction);
     bindOptId(s, 6, r.dataTypeId);
     bindOptWidth(s, 7, r.width);
@@ -1593,7 +1633,8 @@ void Writer::addNetConn(const NetConnRow& r) {
     bindOptId(s, 2, r.netId);
     sqlite3_bind_int64(s, 3, r.termId);
     sqlite3_bind_int64(s, 4, r.ordinal);
-    sqlite3_bind_text(s, 5, r.connectionKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 5, r.connectionKind.c_str(), static_cast<int>(r.connectionKind.size()),
+                      SQLITE_STATIC);
     // A row with no net end has no net range and nothing to correspond with
     // -- the NULL discipline enforced at the one chokepoint every emitter
     // goes through, so a tie-off can never read as "the whole of nothing,
@@ -1622,7 +1663,8 @@ void Writer::addProcedure(const ProcedureRow& r) {
     sqlite3_bind_int64(s, 2, r.instId);
     sqlite3_bind_int64(s, 3, r.scopeNodeId);
     bindOptText(s, 4, r.name);
-    sqlite3_bind_text(s, 5, r.procedureKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 5, r.procedureKind.c_str(), static_cast<int>(r.procedureKind.size()),
+                      SQLITE_STATIC);
     sqlite3_bind_int64(s, 6, r.ordinal);
     bindLoc(s, 7, r.fileId, r.line, r.column);
     step(s);
@@ -1643,7 +1685,8 @@ void Writer::addStmt(const StmtRow& r) {
         sqlite3_bind_null(s, 6);
     else
         sqlite3_bind_int64(s, 6, r.sequence);
-    sqlite3_bind_text(s, 7, r.statementKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 7, r.statementKind.c_str(), static_cast<int>(r.statementKind.size()),
+                      SQLITE_STATIC);
     bindOptText(s, 8, r.construct);
     bindOptText(s, 9, r.assignmentKind);
     bindOptText(s, 10, r.delay);
@@ -1684,7 +1727,8 @@ void Writer::addExprRef(const ExprRefRow& r) {
     sqlite3_bind_int64(s, 2, r.stmtId);
     sqlite3_bind_int64(s, 3, r.ordinal);
     sqlite3_bind_int64(s, 4, r.netId);
-    sqlite3_bind_text(s, 5, r.role.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 5, r.role.c_str(), static_cast<int>(r.role.size()),
+                      SQLITE_STATIC);
     bindRange(s, 6, r.bits, r.exact);
     step(s);
     bumped();
@@ -1697,7 +1741,8 @@ void Writer::addProcEvent(const ProcEventRow& r) {
     sqlite3_bind_int64(s, 2, r.procedureId);
     bindOptId(s, 3, r.stmtId);
     bindOptId(s, 4, r.netId);
-    sqlite3_bind_text(s, 5, r.eventKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 5, r.eventKind.c_str(), static_cast<int>(r.eventKind.size()),
+                      SQLITE_STATIC);
     bindOptText(s, 6, r.edgeKind);
     bindLoc(s, 7, r.fileId, r.line, r.column);
     step(s);
@@ -1717,7 +1762,8 @@ void Writer::addNetDep(const NetDepRow& r) {
     bindOptId(s, 8, r.primitiveId);
     bindOptId(s, 9, r.sourceHierRefId);
     bindOptId(s, 10, r.targetHierRefId);
-    sqlite3_bind_text(s, 11, r.dependencyKind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 11, r.dependencyKind.c_str(), static_cast<int>(r.dependencyKind.size()),
+                      SQLITE_STATIC);
     // A row with no source has no source end to describe, so every column
     // describing one is NULL -- enforced here rather than in every emitter.
     // Before this discipline, `assign q = 1'b0` carried src_exact=1 and
@@ -1743,8 +1789,9 @@ void Writer::addHierRef(const HierRefRow& r) {
     sqlite3_bind_int64(s, 2, r.instId);
     bindOptId(s, 3, r.stmtId);
     sqlite3_bind_text(s, 4, r.path.data(), static_cast<int>(r.path.size()),
-                      SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 5, r.access.c_str(), -1, SQLITE_TRANSIENT);
+                      SQLITE_STATIC);
+    sqlite3_bind_text(s, 5, r.access.c_str(), static_cast<int>(r.access.size()),
+                      SQLITE_STATIC);
     bindOptId(s, 6, r.resolvedInstId);
     bindOptId(s, 7, r.resolvedNetId);
     bindRange(s, 8, r.bits, r.exact);

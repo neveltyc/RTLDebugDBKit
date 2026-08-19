@@ -43,6 +43,7 @@ whatever drives it.
 | `-o <file.db>` | Output database. |
 | `--diag [N]` | Print elaboration diagnostics — all of them, or the first N. |
 | `--timing` | Report how long each phase took. |
+| `--check-constraints` | Keep the enum-domain `CHECK` clauses in the schema, so a bad value is refused as it is written. Off by default: a string `IN`-list is evaluated per row and costs more than the rest of the insert put together, while `verify-designdb.py` derives the same domains from the finished file. |
 | `-q` | Only report problems. |
 
 Bare paths are taken as source files.
@@ -92,9 +93,9 @@ with statements times fan-out. `scripts/export-real-designs.sh` reproduces
 this table against a local checkout of the designs.
 
 The shape holds well past these: a 320k-line design elaborating to 145k
-instances exports in about 7 seconds and 324 MB, with `--timing` showing
-where that goes — roughly 15% in slang, 12% in the walk, and the rest
-inside SQLite writing 4.8M rows and building the indexes.
+instances and 4.8M rows exports in about 4 seconds and 324 MB. `--timing`
+breaks that down — roughly a quarter in slang, a sixth in the walk, and the
+rest inside SQLite writing rows and building indexes.
 
 Elaboration cost is slang's: memory scales with the number of elaborated
 instances, so a very large flat design wants `--top` on a subtree.
