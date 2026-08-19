@@ -17,6 +17,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/ast/Compilation.h"
@@ -47,8 +48,36 @@ struct Options {
     std::string top;
     std::string output = "design.db";
     bool quiet = false;
-    int showDiags = 0;   // print the first N elaboration diagnostics
+    // 0 = off, -1 = every diagnostic, N > 0 = the first N. Unlimited is the
+    // default for --diag: the counts above already say how many there are,
+    // and a cap meant "run with --diag to see them" showed a fraction of
+    // them -- on a large design, 15 errors out of 829.
+    int showDiags = 0;
     bool singleUnit = false;
+    /// Report how long each phase took. Which phase dominates is not
+    /// guessable from the outside -- on a large design the export spends
+    /// most of its time inside SQLite, not in the walk -- and knowing that
+    /// is what tells an optimisation attempt where to go.
+    bool timing = false;
+};
+
+/// Phase timer: prints on destruction so a phase is timed by scope.
+struct Phase {
+    const char* name;
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    Phase(const char* name, bool on) :
+        name(name), on(on), t0(std::chrono::steady_clock::now()) {}
+    ~Phase() { stop(); }
+    /// For a phase whose result outlives the scope it is timed in.
+    void stop() {
+        if (!on)
+            return;
+        on = false;
+        std::fprintf(stderr, "[timing] %-14s %6.0f ms\n", name,
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t0).count());
+    }
 };
 
 void usage() {
@@ -68,7 +97,8 @@ void usage() {
         "                   leading defines file reaches every later file (VCS and\n"
         "                   Verilator behave this way; slang defaults to per-file units)\n"
         "  -q               only report errors\n"
-        "  --diag [N]       print the first N elaboration diagnostics (default 20)\n"
+        "  --timing         report how long each phase took\n"
+        "  --diag [N]       print elaboration diagnostics (all of them; N caps it)\n"
         "\n"
         "Bare paths are taken as source files.");
 }
@@ -256,8 +286,9 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         if (a == "-h" || a == "--help") { usage(); std::exit(0); }
         else if (a == "-q") opt.quiet = true;
         else if (a == "--single-unit") opt.singleUnit = true;
+        else if (a == "--timing") opt.timing = true;
         else if (a == "--diag") {
-            opt.showDiags = 20;
+            opt.showDiags = -1;
             if (i + 1 < argc && std::isdigit((unsigned char)argv[i + 1][0]))
                 opt.showDiags = std::atoi(argv[++i]);
         }
@@ -347,7 +378,8 @@ int main(int argc, char** argv) {
                 loader.addFiles(f);
         }
 
-        auto trees = loader.loadAndParseSources(optionBag);
+        std::vector<std::shared_ptr<syntax::SyntaxTree>> trees;
+        { Phase p("parse", opt.timing); trees = loader.loadAndParseSources(optionBag); }
         if (!loader.getErrors().empty()) {
             // A source that was named and could not be read means the export is
             // not of the design that was asked for. Continuing would produce a
@@ -372,7 +404,9 @@ int main(int argc, char** argv) {
         // a syntax error is recovered from by the parser and its salvaged
         // fragments are exported, so without this a malformed source produced a
         // database indistinguishable from a correct one, silently.
+        Phase elab("elaborate", opt.timing);
         auto& diags = compilation.getAllDiagnostics();
+        elab.stop();
         size_t numErrors = 0;
         size_t numWarnings = 0;
         for (auto& d : diags) {
@@ -394,7 +428,7 @@ int main(int argc, char** argv) {
             engine.addClient(client);
             int shown = 0;
             for (auto& d : diags) {
-                if (shown++ >= opt.showDiags)
+                if (opt.showDiags > 0 && shown++ >= opt.showDiags)
                     break;
                 engine.issue(d);   // warnings included: one can delete a block
             }
@@ -450,7 +484,7 @@ int main(int argc, char** argv) {
         }
 
         analysis::AnalysisManager analysis;
-        analysis.analyze(compilation);
+        { Phase p("analyze", opt.timing); analysis.analyze(compilation); }
         auto astats = analysis.getStats();
         if (!fatal && astats.numScopes == 0) {
             // analyze() returns silently when the compilation is fatally
@@ -517,9 +551,10 @@ int main(int argc, char** argv) {
             writer.addSourceFile(path, digest);
         }
 
-        stats = designdb::extract(compilation, analysis, writer);
+        { Phase p("extract+write", opt.timing);
+          stats = designdb::extract(compilation, analysis, writer); }
 
-        writer.finish();
+        { Phase p("index+views", opt.timing); writer.finish(); }
 
         // Status and versions are written after finish() so the data and
         // indexes are complete before the meta seal lands.  setMeta()

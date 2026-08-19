@@ -498,27 +498,36 @@ CREATE INDEX net_conn_by_net        ON net_conn(net_id);
 -- this net drive across the boundary" is an indexed seek for a locally
 -- named connection and a full net_conn scan for an outward tie -- the one
 -- path the resolved-reference arcs actually take.
-CREATE INDEX net_conn_by_href       ON net_conn(hier_ref_id);
+CREATE INDEX net_conn_by_href       ON net_conn(hier_ref_id)
+    WHERE hier_ref_id IS NOT NULL;
 CREATE INDEX procedure_by_inst      ON procedure(inst_id, ordinal);
 CREATE INDEX stmt_by_inst           ON stmt(inst_id, ordinal);
-CREATE INDEX stmt_by_procedure      ON stmt(procedure_id, sequence);
+CREATE INDEX stmt_by_procedure      ON stmt(procedure_id, sequence)
+    WHERE procedure_id IS NOT NULL;
 CREATE INDEX assign_target_by_net   ON assign_target(net_id);
 CREATE INDEX assign_operand_by_net  ON assign_operand(net_id);
 CREATE INDEX expr_ref_by_net        ON expr_ref(net_id);
 CREATE INDEX proc_event_by_procedure ON proc_event(procedure_id);
-CREATE INDEX proc_event_by_net      ON proc_event(net_id);
+CREATE INDEX proc_event_by_net      ON proc_event(net_id)
+    WHERE net_id IS NOT NULL;
 CREATE INDEX net_dep_by_source      ON net_dep(source_net_id);
 CREATE INDEX net_dep_by_target      ON net_dep(target_net_id);
 CREATE INDEX net_dep_by_stmt        ON net_dep(stmt_id);
-CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id);
+CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id)
+    WHERE assign_operand_id IS NOT NULL;
 CREATE INDEX net_dep_by_target_ref  ON net_dep(assign_target_id);
-CREATE INDEX net_dep_by_expr_ref    ON net_dep(expr_ref_id);
-CREATE INDEX net_dep_by_primitive   ON net_dep(primitive_id);
-CREATE INDEX net_dep_by_source_href ON net_dep(source_hier_ref_id);
-CREATE INDEX net_dep_by_target_href ON net_dep(target_hier_ref_id);
+CREATE INDEX net_dep_by_expr_ref    ON net_dep(expr_ref_id)
+    WHERE expr_ref_id IS NOT NULL;
+CREATE INDEX net_dep_by_primitive   ON net_dep(primitive_id)
+    WHERE primitive_id IS NOT NULL;
+CREATE INDEX net_dep_by_source_href ON net_dep(source_hier_ref_id)
+    WHERE source_hier_ref_id IS NOT NULL;
+CREATE INDEX net_dep_by_target_href ON net_dep(target_hier_ref_id)
+    WHERE target_hier_ref_id IS NOT NULL;
 CREATE INDEX hier_ref_by_inst       ON hier_ref(inst_id);
 CREATE INDEX hier_ref_by_stmt       ON hier_ref(stmt_id);
-CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id);
+CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id)
+    WHERE resolved_net_id IS NOT NULL;
 )SQL";
 
 // The stable query interface: twelve views, the v10 consumption contract.
@@ -1289,8 +1298,22 @@ Writer::Writer(const std::string& path) {
         // The database is a build artifact: if the process dies it is rebuilt
         // from source, so paying for durability buys nothing and costs a large
         // fraction of the write time.
+        //
+        // The cache default is 2 MiB, which on a large export meant evicting
+        // and re-reading pages continuously while writing, and again while
+        // sorting each index. Sorting is also what temp_store decides;
+        // leaving it on disk wrote every index's content twice. Together
+        // these take about a third off the index build.
+        //
+        // page_size is deliberately left alone. 16 KiB pages are ~1% faster
+        // on a large design and no smaller, while costing 3.6x on a small
+        // one -- a minimum-size page is a poor trade for a schema whose
+        // usual database has a few thousand rows.
         exec("PRAGMA journal_mode=OFF");
         exec("PRAGMA synchronous=OFF");
+        exec("PRAGMA cache_size=-262144");   // 256 MiB, not pages
+        exec("PRAGMA temp_store=MEMORY");
+        exec("PRAGMA locking_mode=EXCLUSIVE");
         exec(kSchema);
 
         prepare("INSERT INTO module VALUES(?,?,?,?,?,?)", &ins[InsModule]);
