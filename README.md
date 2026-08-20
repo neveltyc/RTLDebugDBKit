@@ -55,9 +55,9 @@ can read it.
 
 | Group | Tables |
 |---|---|
-| Hierarchy | `module` (the source definition), `tree_node` (the elaborated tree, one id space), `inst` (each module instance occurrence, with its parameter signature), `primitive` (gates, switches, UDPs) |
+| Hierarchy | `module` (the source definition), `tree_node` (the elaborated tree, one id space), `inst` (each module instance occurrence, with its parameter signature) + `inst_param` (that signature made queryable), `prim` (gates, switches, UDPs) |
 | Objects | `net` (every connectable object of every instance, implicit nets flagged), `term` + `term_map` (each instance's terminals and what they stand for inside) |
-| Dataflow | `net_dep` — net-to-net dependencies, one row per statement occurrence, each naming the operand, target, condition, call or primitive it came from; `procedure`, `stmt`, `assign_target`, `assign_operand`, `expr_ref`, `proc_event` — the statement layer those rows point into |
+| Dataflow | `net_dep` — net-to-net dependencies, one row per statement occurrence, each naming the operand, target, condition, call or primitive it came from; `proc`, `stmt`, `stmt_target`, `assign_operand`, `expr_ref`, `proc_event` — the statement layer those rows point into |
 | Boundaries | `net_conn` — what the parent wired to each terminal, segment by segment with bit windows; `hier_ref` — references that leave an instance, as written *and* resolved to the target instance and net where slang could |
 | Provenance | `src_file` (every file slang read, with its SHA-256), `meta` (schema version, tool, top) |
 

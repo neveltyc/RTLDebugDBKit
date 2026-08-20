@@ -140,6 +140,30 @@ namespace designdb {
 /// in a new way. `stmt.stmt_kind`, `net_dep.dep_kind` and the
 /// driver/load kinds each gain `alias`; that is a value-domain change, so
 /// the version moves even though no column does.
+///
+/// v12 is mostly a naming pass, and moves the version because renames are
+/// contract changes. One classic abbreviation per word, every identifier,
+/// no more tables-say-`inst` / views-say-`instance` split: `src_file`,
+/// `prim`, `proc`, and the view family `v_db_info`/`v_term`/`v_term_map`/
+/// `v_net_conn`/`v_net_dep`/`v_stmt*`. The two sides of a terminal stop
+/// sharing column names -- `net_conn` wears `outer_*` (the actual, VPI's
+/// highConn), `term_map` wears `inner_*` (vpiLowConn). `assign_target`
+/// becomes `stmt_target`: it holds the lvalue of a release and a system
+/// task's write as well as an assignment's, so it was never assignment-
+/// only (`assign_operand`, which is, keeps its name).
+///
+/// Riding along, because the version was already moving: an unresolved
+/// SOURCE reference is written as a `net_dep` (NULL source net, the
+/// reference on the source end) and surfaces as `driver_kind='external'`,
+/// so a target fed only from a package variable or an upward name is no
+/// longer silently undriven; `force`/`release` are recorded (construct
+/// `force`/`proc_assign`, and `stmt_kind='release'`) instead of a force
+/// masquerading as a plain blocking assignment; an external tie carries a
+/// `map_exact`, so its crossing traces bit by bit; and `prim_kind='switch'`
+/// covers the LRM's whole switch family, not just what slang labels
+/// bidirectional. Additive, so no reader must change: `inst_param` makes
+/// the parameter signature queryable, and `v_net_attachment` is a
+/// thirteenth view -- one row per relation touching a net.
 inline constexpr int SchemaVersion = 12;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
@@ -309,7 +333,7 @@ struct StmtRow {
 };
 
 /// One assignment target reference (LHS).
-struct AssignTargetRow {
+struct StmtTargetRow {
     int64_t id = 0;
     int64_t stmtId = 0;
     int64_t ordinal = 0;
@@ -363,7 +387,7 @@ struct NetDepRow {
     int64_t targetNetId = 0;
     int64_t stmtId = 0;
     int64_t assignOperandId = 0;
-    int64_t assignTargetId = 0;
+    int64_t stmtTargetId = 0;
     int64_t exprRefId = 0;
     int64_t primitiveId = 0;
     int64_t sourceHierRefId = 0;
@@ -444,7 +468,7 @@ public:
     void addNetConn(const NetConnRow& r);
     void addProcedure(const ProcedureRow& r);
     void addStmt(const StmtRow& r);
-    void addAssignTarget(const AssignTargetRow& r);
+    void addStmtTarget(const StmtTargetRow& r);
     void addAssignOperand(const AssignOperandRow& r);
     void addExprRef(const ExprRefRow& r);
     void addProcEvent(const ProcEventRow& r);
@@ -467,7 +491,7 @@ private:
     enum Ins {
         InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
         InsTerm, InsTermMap, InsNetConn, InsProcedure, InsStmt,
-        InsAssignTarget, InsAssignOperand, InsExprRef, InsProcEvent,
+        InsStmtTarget, InsAssignOperand, InsExprRef, InsProcEvent,
         InsNetDep, InsHierRef,
         InsCount
     };

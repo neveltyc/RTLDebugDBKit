@@ -38,7 +38,11 @@ parent, scope, node). Words with no classic abbreviation are not given an
 invented one (operand, ordinal, sequence, signature, width).
 
 Table renames: `source_file → src_file`, `primitive → prim`,
-`procedure → proc`. View renames: `v_database_info → v_db_info`,
+`procedure → proc`, and `assign_target → stmt_target` — it holds a
+release's lvalue and a system task's write target as well as an
+assignment's, so it was never assignment-only (`assign_operand`, which
+is, keeps its name; the FK column `net_dep.stmt_target_id` becomes
+`stmt_target_id`). View renames: `v_database_info → v_db_info`,
 `v_terminal → v_term`, `v_terminal_map → v_term_map`,
 `v_net_connection → v_net_conn`, `v_net_dependency → v_net_dep`,
 `v_statement* → v_stmt*`.
@@ -180,8 +184,8 @@ resolution of hierarchical references) is computed per occurrence.
 | | `net_conn` | one segment of a terminal's outside |
 | statements | `proc` | one always/initial/final block |
 | | `stmt` | one statement or statement-level construct |
-| | `assign_target` | one left-hand-side reference |
-| | `assign_operand` | one right-hand-side reference |
+| | `stmt_target` | one statement's target reference (LHS, release, system write) |
+| | `assign_operand` | one assignment right-hand-side reference |
 | | `expr_ref` | one non-operand read, classified by role |
 | | `proc_event` | one edge event triggered or waited on |
 | dataflow | `net_dep` | one net-to-net dependency occurrence |
@@ -364,15 +368,19 @@ assignment delays land on their own statement. `dropped_operand_count` is
 operands not recorded: compile-time constants, and references that could not
 be stored as a path.
 
-**`assign_target` / `assign_operand`** — the statement's left- and right-
-hand references, (stmt_id, ordinal)-unique, in written order. Operands
-belong to the STATEMENT, not to a target: which operand feeds which target
-is `net_dep`'s answer, and pairing them here is exactly the cross product v7
+**`stmt_target` / `assign_operand`** — the statement's target and its
+right-hand references, (stmt_id, ordinal)-unique, in written order.
+`stmt_target` is any statement's target, not only an assignment's — a
+release names its lvalue here (fed by no dependency: releasing is not
+driving, so the rows answer "where does the force end", never "who drives
+this"), and a system task names its write target here — which is why it
+is not `assign_target`. `assign_operand` keeps its name: an operand is an
+assignment RHS read and nothing else produces one. Operands belong to the
+STATEMENT, not to a target: which operand feeds which target is
+`net_dep`'s answer, and pairing them here is exactly the cross product v7
 removed. A read occurring twice is two rows. A target outside the instance
 is not here — it is a `hier_ref` with `access='write'` on the same
-statement. A `release` row's lvalues are targets too — named, and
-deliberately fed by no dependency: releasing is not driving, and the rows
-answer "where does the force end", never "who drives this".
+statement.
 
 **`expr_ref`** — every statement read that is not an assignment operand,
 classified: `control` (a branch condition over the statement — including one that
@@ -410,10 +418,10 @@ never the four-way cross product. `dep_kind`, and what must be set
 
 | kind | means | names |
 |---|---|---|
-| `data` | an assignment moves it | `stmt_id`, and per end either the local reference (`assign_target_id` / `assign_operand_id`) or the hierarchical one (`tgt_hier_ref_id` / `src_hier_ref_id`) — exactly one of the two per end. `src_net_id` NULL *with no source reference of either kind* is a constant driver (`q <= 8'h0`); the row still names the statement, and every src column is NULL with it. `src_net_id` NULL *with* `src_hier_ref_id` is an **external** driver: the reference did not resolve to a net row, the spelled window survives, and `v_driver` says `'external'`. |
-| `control` | it reaches the target through a branch condition | `stmt_id`, the condition as `expr_ref_id` (role `control`) or `src_hier_ref_id`, the target as `assign_target_id` or `tgt_hier_ref_id`; `map_exact` 0 — a condition gates, it does not map |
+| `data` | an assignment moves it | `stmt_id`, and per end either the local reference (`stmt_target_id` / `assign_operand_id`) or the hierarchical one (`tgt_hier_ref_id` / `src_hier_ref_id`) — exactly one of the two per end. `src_net_id` NULL *with no source reference of either kind* is a constant driver (`q <= 8'h0`); the row still names the statement, and every src column is NULL with it. `src_net_id` NULL *with* `src_hier_ref_id` is an **external** driver: the reference did not resolve to a net row, the spelled window survives, and `v_driver` says `'external'`. |
+| `control` | it reaches the target through a branch condition | `stmt_id`, the condition as `expr_ref_id` (role `control`) or `src_hier_ref_id`, the target as `stmt_target_id` or `tgt_hier_ref_id`; `map_exact` 0 — a condition gates, it does not map |
 | `primitive` | a gate/switch/UDP couples them | `prim_id`, per LRM (input, output) pairing; scalar-to-scalar couplings are per-bit |
-| `alias` | an `alias` statement binds them into one object | `stmt_id`, and both an `assign_target_id` and an `assign_operand_id`, since every name an alias binds is written and read at once. One row per ordered pair: `alias a = b = c;` binds every pair mutually rather than in a chain, so it is six rows, not two. `map_exact` is 1 — an alias is bit for bit by definition — unless a side could not be narrowed. |
+| `alias` | an `alias` statement binds them into one object | `stmt_id`, and both an `stmt_target_id` and an `assign_operand_id`, since every name an alias binds is written and read at once. One row per ordered pair: `alias a = b = c;` binds every pair mutually rather than in a chain, so it is six rows, not two. `map_exact` is 1 — an alias is bit for bit by definition — unless a side could not be narrowed. |
 | `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) or `src_hier_ref_id` on the reading side |
 
 A dependency can cross by name on the target side with no source at all:
@@ -598,7 +606,7 @@ the fact, `v_driver`/`v_load` are the composition.
 **`v_net_dep`** — one row per dependency: `dep_id,
 src_net_id, src_inst_id, src_name, src_lo, src_hi,
 src_exact, tgt_net_id, tgt_inst_id, tgt_name, tgt_lo,
-tgt_hi, tgt_exact, stmt_id, assign_operand_id, assign_target_id,
+tgt_hi, tgt_exact, stmt_id, assign_operand_id, stmt_target_id,
 expr_ref_id, prim_id, src_hier_ref_id,
 tgt_hier_ref_id, dep_kind, map_exact, file_path, src_path,
 src_line, src_col`. Location is the statement's, or the

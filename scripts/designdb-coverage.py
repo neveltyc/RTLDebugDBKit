@@ -52,7 +52,7 @@ def share(part, whole):
 
 TABLES = ("module", "tree_node", "inst", "inst_param", "prim", "net", "term",
           "term_map",
-          "net_conn", "proc", "stmt", "assign_target", "assign_operand",
+          "net_conn", "proc", "stmt", "stmt_target", "assign_operand",
           "expr_ref", "proc_event", "net_dep", "hier_ref", "data_type", "file",
           "src_file")
 
@@ -74,7 +74,7 @@ inexact = {}
 for tbl, col in (("net_dep", "src_exact"), ("net_dep", "tgt_exact"),
                  ("net_conn", "outer_exact"), ("net_conn", "term_exact"),
                  ("term_map", "term_exact"), ("term_map", "inner_exact"),
-                 ("assign_target", "is_exact"), ("assign_operand", "is_exact"),
+                 ("stmt_target", "is_exact"), ("assign_operand", "is_exact"),
                  ("expr_ref", "is_exact"), ("hier_ref", "is_exact")):
     total = scalar(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" IS NOT NULL')
     n = scalar(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" = 0')
