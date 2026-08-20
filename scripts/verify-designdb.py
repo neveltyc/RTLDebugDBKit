@@ -92,7 +92,7 @@ for tbl, col, values, nullable in (
       "task", "function"), False),
     ("stmt", "stmt_kind",
      ("assignment", "assertion", "wait", "call", "system_task", "event_control",
-      "alias"), False),
+      "alias", "release"), False),
     ("stmt", "assign_kind", ("continuous", "blocking", "nonblocking"), True),
     ("expr_ref", "role",
      ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
@@ -278,6 +278,30 @@ check(one("""
     SELECT count(*) FROM stmt
     WHERE (stmt_kind = 'assignment') != (assign_kind IS NOT NULL)""") == 0,
       "assign_kind is set exactly on assignments")
+# A release names what it lets go of and touches nothing else: at least
+# one lvalue (a target row, or a hier_ref for a name outside the
+# instance), no operands, and no dependency anywhere near it -- releasing
+# is not driving, and a multiple-driver query must never see one.
+check(one("""
+    SELECT count(*) FROM stmt s WHERE s.stmt_kind='release'
+      AND s.construct NOT IN ('release','deassign')""") == 0,
+      "a release row says which spelling it was")
+check(one("""
+    SELECT count(*) FROM stmt s WHERE s.stmt_kind='release'
+      AND NOT EXISTS (SELECT 1 FROM assign_target t WHERE t.stmt_id = s.id)
+      AND NOT EXISTS (SELECT 1 FROM hier_ref h WHERE h.stmt_id = s.id)""") == 0,
+      "a release names what it lets go of")
+check(one("""
+    SELECT count(*) FROM stmt s WHERE s.stmt_kind='release'
+      AND (EXISTS (SELECT 1 FROM assign_operand o WHERE o.stmt_id = s.id)
+        OR EXISTS (SELECT 1 FROM net_dep d WHERE d.stmt_id = s.id))""") == 0,
+      "and drives and reads nothing")
+check(one("""
+    SELECT count(*) FROM net_dep d
+    JOIN assign_target t ON t.id = d.assign_target_id
+    JOIN stmt s ON s.id = t.stmt_id
+    WHERE s.stmt_kind='release'""") == 0,
+      "no dependency borrows a release's target")
 # One direction only: a continuous assignment is never inside a procedure,
 # but a procedure-less blocking/nonblocking row is legal -- a function body
 # reached from an `assign` keeps its own `=`, and executes in no procedure.
@@ -435,7 +459,9 @@ check(one("""
       "an alias statement is module-level and names itself")
 check(one("""
     SELECT count(*) FROM assign_target a
-    WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_target_id = a.id)
+    JOIN stmt s ON s.id = a.stmt_id
+    WHERE s.stmt_kind != 'release'
+      AND NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_target_id = a.id)
       AND NOT EXISTS (SELECT 1 FROM hier_ref h
                       WHERE h.stmt_id = a.stmt_id AND h.access = 'read')""") == 0,
       "every assignment target has a dependency or an unresolved outward read")
@@ -809,6 +835,22 @@ def net_id(inst_name, net_name):
 
 
 if mode == "constructs":
+    # force/release: the force is a blocking assignment whose construct
+    # word marks the hijack, the release is its own statement kind naming
+    # the signal it lets go of -- and neither pollutes the driver count:
+    # the force drives (as the constant it assigns), the release never.
+    check(one("""
+        SELECT count(*) FROM v_stmt s
+        JOIN v_stmt_target t ON t.stmt_id = s.stmt_id
+        WHERE s.stmt_kind='assignment' AND s.construct='force'
+          AND s.assign_kind='blocking' AND t.net_name='stim'""") == 1,
+          "the force is marked as one, on the signal it hijacks")
+    check(one("""
+        SELECT count(*) FROM v_stmt s
+        JOIN v_stmt_target t ON t.stmt_id = s.stmt_id
+        WHERE s.stmt_kind='release' AND s.construct='release'
+          AND t.net_name='stim'""") == 1,
+          "and the release says where the hijack ends")
     # Self-feedback survives, and arithmetic is range-level: cnt <= cnt + 1.
     check(one("""
         SELECT count(*) FROM v_net_dep

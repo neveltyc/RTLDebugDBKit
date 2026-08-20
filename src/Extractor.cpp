@@ -1062,7 +1062,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         const Ref& dst, const std::vector<PairedSrc>& pairs,
         const std::vector<Ref>& gating, SourceRange where, int64_t seq,
         bool blocking, int64_t dropped, bool inSubroutine, bool firstTarget,
-        const std::string& delay)>;
+        const std::string& delay, const char* constructWord)>;
     /// A call site's actual bound to its formal, by argument direction.
     /// `bindable` is false when the call sits in a control expression, which
     /// belongs to no statement this schema records.
@@ -1099,6 +1099,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// The delay control in force for statements below a `#d` timed statement,
     /// and for a continuous assign's own delay.
     std::string pendingDelay;
+    /// The construct word an enclosing `force`/procedural `assign` stamps
+    /// on its assignment; null outside one.
+    const char* constructOverride = nullptr;
     std::vector<Ref> gating;
     int64_t seq = 0;
     std::set<const SubroutineSymbol*> activeSubs;
@@ -1351,7 +1354,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // positional as a mapping gets.
             emitTarget(dst, {PairedSrc{dst, dst, true, dst}}, gating, expr.sourceRange,
                        seq++, true, 0, subDepth > 0, /*firstTarget=*/true,
-                       pendingDelay);
+                       pendingDelay, constructOverride);
         }
         visitDefault(expr);
     }
@@ -1432,6 +1435,29 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                             expr.sourceRange);
             }
         }
+    }
+
+    void handle(const ProceduralAssignStatement& s) {
+        // `force a = b` and procedural `assign a = b` move data exactly as
+        // a blocking assignment does, and until now produced exactly the
+        // same row -- a hijacked signal's driver could not be told from
+        // the logic it overrode. The construct word is the marker;
+        // `WHERE construct='force'` is the debug query this exists for.
+        const char* saved = constructOverride;
+        constructOverride = s.isForce ? "force" : "proc_assign";
+        visitDefault(s);
+        constructOverride = saved;
+    }
+
+    void handle(const ProceduralDeassignStatement& s) {
+        // `release`/`deassign` drive nothing and read nothing -- but each
+        // is the other half of a force, and leaving no row made "where
+        // does the hijack end" unanswerable. The statement records its
+        // lvalues and deliberately no dependency.
+        std::vector<Ref> writes;
+        collectRefs(s.lvalue, eval, writes, /*skipSelectors=*/true);
+        emitRead({}, {}, writes, "release",
+                 s.isRelease ? "release" : "deassign", seq++, s.sourceRange);
     }
 
     void handle(const AssignmentExpression& expr) {
@@ -1516,7 +1542,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             }
             emitTarget(dstSlot.ref, pairs, gating, expr.sourceRange, stmtSeq,
                        expr.isBlocking(), droppedConstants, subDepth > 0,
-                       firstTarget, delay);
+                       firstTarget, delay, constructOverride);
             firstTarget = false;
         }
 
@@ -2351,14 +2377,17 @@ private:
             [&](const Ref& dst, const std::vector<PairedSrc>& pairs,
                 const std::vector<Ref>& gating, SourceRange where, int64_t seq,
                 bool blocking, int64_t dropped, bool inSubroutine,
-                bool firstTarget, const std::string& delay) {
+                bool firstTarget, const std::string& delay,
+                const char* constructWord) {
                 reached = true;
                 if (!dst.sym || inputPorts.count(dst.sym))
                     return;
                 const TplLoc at = locate(where.start(), procAt);
                 emitAssignment(b, dst, pairs, gating, at, seq, blocking,
                                dropped, inSubroutine, firstTarget, delay,
-                               isContinuous, construct, evalCtx);
+                               isContinuous,
+                               constructWord ? constructWord : construct,
+                               evalCtx);
             },
             // ---- a call site's actual bound to its formal
             [&](const Ref& formal, const Ref& actual, bool reads, bool writes,
@@ -2409,9 +2438,14 @@ private:
                     // A system task's write is a write: the procedure that
                     // contains one has reached a driver, and counting it as
                     // an empty procedure blamed the walk for a construct it
-                    // now models.
+                    // now models. A release is the opposite: it names its
+                    // lvalue and drives nothing, so it gets a target row
+                    // and deliberately no dependency.
                     reached = true;
-                    recordSystemWrite(b, s, w, at, evalCtx);
+                    if (stmtKind == "release")
+                        recordReleaseTarget(b, s, w, at, evalCtx);
+                    else
+                        recordSystemWrite(b, s, w, at, evalCtx);
                 }
             },
             evalCtx);
@@ -2432,6 +2466,30 @@ private:
             stats.emptyProcedures++;
         b.curProc = -1;
         b.curStmt = -1;
+    }
+
+    /// The lvalue a release/deassign lets go of: a real assign_target row
+    /// -- or a hier_ref with access='write' for a name outside this
+    /// instance -- and deliberately NO dependency. Nothing is driven; the
+    /// row answers "where does the force end", never "who drives this".
+    void recordReleaseTarget(Build& b, int32_t stmt, const Ref& r,
+                             const TplLoc& at, EvalContext& evalCtx) {
+        if (!r.sym)
+            return;
+        const int32_t netIdx = netFor(b, *r.sym);
+        if (netIdx < 0) {
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            addHierRef(b, true, r, at, evalCtx);
+            b.curStmt = saved;
+            return;
+        }
+        TplStmtRef tr;
+        tr.stmt = stmt;
+        tr.ordinal = b.targetOrdinal++;
+        tr.net = netIdx;
+        tr.r = rangeOf(r);
+        b.t->targets.push_back(std::move(tr));
     }
 
     /// The target of a system task's write: a real assign_target plus a
