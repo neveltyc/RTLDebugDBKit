@@ -4134,10 +4134,14 @@ private:
         }
 
         // The cross-instance dependencies. An endpoint is a local net (base
-        // plus index) or a reference's resolution; a dependency any of whose
-        // referenced ends did not resolve is not written -- the hier_ref
-        // rows above are the honest record, and a fabricated edge would be
-        // a wrong one.
+        // plus index) or a reference's resolution. The TARGET must resolve:
+        // target_net_id is NOT NULL, and guessing a written object would be
+        // a wrong fact. The SOURCE may not: a package variable or an upward
+        // name is a real driver this export has no net row for, and v10/v11
+        // dropping the whole row made "driven through an unresolvable name"
+        // indistinguishable from "undriven". The row is now written with a
+        // NULL source net and the reference on the source end; v_driver
+        // reports it as 'external'.
         for (auto& job : crossJobs) {
             const TplCrossDep& d = job.t->crossDeps[job.idx];
             NetDepRow row;
@@ -4148,9 +4152,8 @@ private:
             else if (d.srcHref >= 0) {
                 row.sourceHierRefId = job.base.hierRef + d.srcHref + 1;
                 auto it = resolvedNet.find(row.sourceHierRefId);
-                if (it == resolvedNet.end())
-                    continue;
-                row.sourceNetId = it->second;
+                if (it != resolvedNet.end())
+                    row.sourceNetId = it->second;
             }
             else if (!d.sourceless) {
                 continue;
