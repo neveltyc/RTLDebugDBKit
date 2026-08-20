@@ -6,7 +6,7 @@
 # build that links proves the slang pin resolves; this proves the exporter
 # still writes rows -- and that the rows keep every contract the schema
 # documents: the subtype bijections, the ownership rules, the provenance
-# matrix behind net_dep, the range discipline, and the twelve stable views
+# matrix behind net_dep, the range discipline, and the thirteen stable views
 # with their exact columns and row formulas. CI runs it against examples/ on
 # every platform binary it builds, so the mode branches assert only what
 # those small designs must produce, not exact counts.
@@ -240,6 +240,27 @@ check(one("""
         GROUP BY parent_node_id, name HAVING count(*) > 1)""") ==
       int(one("SELECT value FROM meta WHERE key='duplicate_path_count'")),
       "sibling name collisions match duplicate_path_count")
+
+# ------------------------------------------------- parameter round-trip
+# inst_param is param_signature made queryable, and must stay the SAME
+# normalisation: reassembling each occurrence's pairs in ordinal order
+# must reproduce the signature byte for byte -- and be absent exactly
+# when the signature is. Reassembled in Python, where the order is
+# guaranteed rather than an aggregate's accident.
+sigs = dict(con.execute("SELECT id, COALESCE(param_signature, '') FROM inst"))
+recon = {}
+for iid, pname, pvalue in con.execute(
+        "SELECT inst_id, name, value FROM inst_param ORDER BY inst_id, ordinal"):
+    prev = recon.get(iid, "")
+    recon[iid] = (prev + "," if prev else "") + f"{pname}={pvalue}"
+bad_sigs = [iid for iid, sig in sigs.items() if recon.get(iid, "") != sig]
+check(not bad_sigs, "inst_param reassembles every param_signature",
+      f"{len(bad_sigs)} instance(s) disagree, first id "
+      f"{bad_sigs[0] if bad_sigs else 0}")
+check(one("""
+    SELECT count(*) FROM inst_param p
+    WHERE NOT EXISTS (SELECT 1 FROM inst i WHERE i.id = p.inst_id)""") == 0,
+      "no parameter row floats free of an instance")
 
 # ------------------------------------------------------------- ownership
 check(one("""
@@ -594,7 +615,7 @@ for k in ("error_count", "unresolved_count", "empty_procedure_count",
 print("ok: v_db_info agrees with meta and casts its counts")
 
 # --------------------------------------------------------- view contract
-# The twelve stable views: existence, exact columns in exact order, and row
+# The thirteen stable views: existence, exact columns in exact order, and row
 # formulas. v_conn_arc is scaffolding, not contract, and is deliberately
 # absent from this list.
 VIEW_COLUMNS = {
@@ -664,6 +685,9 @@ VIEW_COLUMNS = {
     "v_stmt_operand": [
         "operand_id", "stmt_id", "ordinal", "net_id", "net_name",
         "operand_lo", "operand_hi", "operand_exact"],
+    "v_net_attachment": [
+        "net_id", "inst_id", "net_name", "attachment_kind", "other_id",
+        "lo", "hi", "exact", "stmt_id"],
 }
 for view, want in VIEW_COLUMNS.items():
     row = con.execute(
@@ -675,7 +699,7 @@ for view, want in VIEW_COLUMNS.items():
     if got != want:
         sys.exit(f"{view} columns diverge from the contract:\n"
                  f"  want {want}\n  got  {got}")
-print("ok: the twelve stable views exist with their contracted columns")
+print("ok: the thirteen stable views exist with their contracted columns")
 
 # Fact views: one view row is one base row.
 for view, base in (
@@ -731,6 +755,26 @@ want = (one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
 if n_load != want:
     sys.exit(f"v_load has {n_load} rows, branch sum says {want}")
 print("ok: v_driver and v_load reconcile with their branch formulas")
+
+n_att = one("SELECT count(*) FROM v_net_attachment")
+want = (one("SELECT count(*) FROM term_map")
+        + one("SELECT count(*) FROM net_conn WHERE outer_net_id IS NOT NULL")
+        + one("SELECT count(*) FROM assign_target")
+        + one("SELECT count(*) FROM assign_operand")
+        + one("SELECT count(*) FROM expr_ref")
+        + one("SELECT count(*) FROM proc_event WHERE net_id IS NOT NULL")
+        + one("SELECT count(*) FROM net_dep")
+        + one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
+        + one("SELECT count(*) FROM hier_ref WHERE resolved_net_id IS NOT NULL"))
+if n_att != want:
+    sys.exit(f"v_net_attachment has {n_att} rows, branch sum says {want}")
+print("ok: v_net_attachment reconciles with its branch formula")
+check(one("""
+    SELECT count(*) FROM v_net_attachment
+    WHERE attachment_kind NOT IN ('terminal_inside','actual_outside',
+        'written_by','read_by','condition','statement_read','event',
+        'dep_in','dep_out','named_from_outside')""") == 0,
+      "attachment_kind stays in its vocabulary")
 
 check(one("""
     SELECT count(*) FROM v_driver
@@ -806,7 +850,8 @@ check(one("""
 # used, and tracing a clock took minutes.
 for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
                   ("v_net_dep", "tgt_net_id"),
-                  ("v_net_conn", "outer_net_id")):
+                  ("v_net_conn", "outer_net_id"),
+                  ("v_net_attachment", "net_id")):
     plan = con.execute(
         f"EXPLAIN QUERY PLAN SELECT * FROM {view} WHERE {col} = 1").fetchall()
     scanned = [r[3] for r in plan

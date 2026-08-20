@@ -187,6 +187,15 @@ struct InstRow {
     uint32_t column = 0;
 };
 
+/// One elaborated parameter value of one occurrence -- param_signature made
+/// queryable. Same normalisation, same order, same over-split.
+struct InstParamRow {
+    int64_t instId = 0;
+    int64_t ordinal = 0;          // declaration order, as the signature has it
+    std::string name;
+    std::string value;
+};
+
 /// One gate, switch or UDP instance. `id` is the same value as its tree_node id.
 struct PrimitiveRow {
     int64_t id = 0;
@@ -427,6 +436,7 @@ public:
     void addModule(const ModuleRow& r);
     void addTreeNode(const TreeNodeRow& r);
     void addInst(const InstRow& r);
+    void addInstParam(const InstParamRow& r);
     void addPrimitive(const PrimitiveRow& r);
     void addNet(const NetRow& r);
     void addTerm(const TermRow& r);
@@ -455,9 +465,10 @@ private:
     void bumped();
 
     enum Ins {
-        InsModule, InsTreeNode, InsInst, InsPrimitive, InsNet, InsTerm,
-        InsTermMap, InsNetConn, InsProcedure, InsStmt, InsAssignTarget,
-        InsAssignOperand, InsExprRef, InsProcEvent, InsNetDep, InsHierRef,
+        InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
+        InsTerm, InsTermMap, InsNetConn, InsProcedure, InsStmt,
+        InsAssignTarget, InsAssignOperand, InsExprRef, InsProcEvent,
+        InsNetDep, InsHierRef,
         InsCount
     };
 
