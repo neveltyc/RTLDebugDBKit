@@ -71,7 +71,7 @@ real SoC is about 2× the folded file size.
 **[doc/designdb-schema.md](doc/designdb-schema.md) is the field reference** —
 every table and column, the bit-range encoding, the naming rules, what the
 schema deliberately does not record, and the known limits. Consumers start at
-its **stable query interface**: twelve views (`v_tree_node`, `v_net`,
+its **stable query interface**: thirteen views (`v_tree_node`, `v_net`,
 `v_driver`, `v_load`, `v_stmt`, …) whose columns, NULL rules and row
 granularity are the versioned contract.
 
