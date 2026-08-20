@@ -136,6 +136,18 @@ CREATE TABLE inst(
     line                  INTEGER,
     col                   INTEGER);
 
+-- param_signature made queryable: one row per elaborated parameter value,
+-- declaration order, localparams and type parameters included -- the same
+-- normalisation the signature is built from, and the verifier holds the
+-- two representations equal. "Every instance with WIDTH=8" was a LIKE
+-- over the signature (and matched XWIDTH=8); now it is an indexed seek.
+CREATE TABLE inst_param(
+    inst_id  INTEGER NOT NULL REFERENCES inst(id),
+    ordinal  INTEGER NOT NULL,
+    name     TEXT NOT NULL,
+    value    TEXT NOT NULL,
+    PRIMARY KEY(inst_id, ordinal));
+
 -- One gate, switch or UDP instance. `id` IS the tree_node id. Not a module
 -- instance (it has no body, no ports, no parameters) and not a statement
 -- (nothing was assigned); its dataflow is `net_dep` rows with
@@ -505,6 +517,7 @@ CREATE INDEX tree_node_by_parent    ON tree_node(parent_node_id, ordinal);
 CREATE INDEX tree_node_by_name      ON tree_node(parent_node_id, name);
 CREATE INDEX inst_by_parent         ON inst(parent_inst_id);
 CREATE INDEX inst_by_module         ON inst(module_id);
+CREATE INDEX inst_param_by_name     ON inst_param(name, value);
 CREATE INDEX prim_by_inst      ON prim(inst_id);
 CREATE INDEX net_by_inst            ON net(inst_id, name);
 CREATE INDEX net_by_scope           ON net(scope_node_id, name);
@@ -548,7 +561,7 @@ CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id)
     WHERE resolved_net_id IS NOT NULL;
 )SQL";
 
-// The stable query interface: twelve views, the v10 consumption contract.
+// The stable query interface: thirteen views, the consumption contract.
 // Their existence, column sets, column semantics, NULL rules and row
 // granularity are what a consumer may rely on; changing any of those bumps
 // the schema version, changing only how one is computed does not.
@@ -1281,6 +1294,73 @@ SELECT
     o.is_exact AS operand_exact
 FROM assign_operand o
 JOIN net n ON n.id = o.net_id;
+
+-- Everything touching one net, one row per attachment: the structural
+-- adjacency that v_driver/v_load answer directionally, answered flatly --
+-- "what hangs off this net". attachment_kind names the relation and
+-- other_id that relation's own row or object:
+--
+--   terminal_inside     term_map: the net stands behind a terminal of its
+--                       own instance. other_id = the terminal.
+--   actual_outside      net_conn: the net is wired to a child's terminal.
+--                       other_id = that terminal.
+--   written_by          assign_target. other_id = the target row.
+--   read_by             assign_operand. other_id = the operand row.
+--   condition           expr_ref with role='control'. other_id = the ref.
+--   statement_read      every other expr_ref role. other_id = the ref.
+--   event               proc_event: a procedure triggers or waits on it.
+--                       other_id = the procedure.
+--   dep_in / dep_out    net_dep, by end. other_id = the dependency.
+--   named_from_outside  a resolved hier_ref lands on it. other_id = it.
+--
+-- lo/hi/exact are THIS net's window in the attachment (whole, exact, for
+-- an event); stmt_id is set where a statement exists. Each branch is one
+-- base selection, reconcilable by count, and a point query by net_id
+-- seeks on every branch -- the verifier holds both.
+CREATE VIEW v_net_attachment AS
+SELECT m.inner_net_id AS net_id, n.inst_id AS inst_id, n.name AS net_name,
+       'terminal_inside' AS attachment_kind, m.term_id AS other_id,
+       m.inner_lo AS lo, m.inner_hi AS hi, m.inner_exact AS exact,
+       NULL AS stmt_id
+FROM term_map m JOIN net n ON n.id = m.inner_net_id
+UNION ALL
+SELECT c.outer_net_id, n.inst_id, n.name, 'actual_outside', c.term_id,
+       c.outer_lo, c.outer_hi, c.outer_exact, NULL
+FROM net_conn c JOIN net n ON n.id = c.outer_net_id
+WHERE c.outer_net_id IS NOT NULL
+UNION ALL
+SELECT a.net_id, n.inst_id, n.name, 'written_by', a.id,
+       a.lo, a.hi, a.is_exact, a.stmt_id
+FROM assign_target a JOIN net n ON n.id = a.net_id
+UNION ALL
+SELECT o.net_id, n.inst_id, n.name, 'read_by', o.id,
+       o.lo, o.hi, o.is_exact, o.stmt_id
+FROM assign_operand o JOIN net n ON n.id = o.net_id
+UNION ALL
+SELECT e.net_id, n.inst_id, n.name,
+       CASE WHEN e.role = 'control' THEN 'condition'
+            ELSE 'statement_read' END, e.id,
+       e.lo, e.hi, e.is_exact, e.stmt_id
+FROM expr_ref e JOIN net n ON n.id = e.net_id
+UNION ALL
+SELECT pe.net_id, n.inst_id, n.name, 'event', pe.proc_id,
+       NULL, NULL, 1, pe.stmt_id
+FROM proc_event pe JOIN net n ON n.id = pe.net_id
+WHERE pe.net_id IS NOT NULL
+UNION ALL
+SELECT d.tgt_net_id, n.inst_id, n.name, 'dep_in', d.id,
+       d.tgt_lo, d.tgt_hi, d.tgt_exact, d.stmt_id
+FROM net_dep d JOIN net n ON n.id = d.tgt_net_id
+UNION ALL
+SELECT d.src_net_id, n.inst_id, n.name, 'dep_out', d.id,
+       d.src_lo, d.src_hi, d.src_exact, d.stmt_id
+FROM net_dep d JOIN net n ON n.id = d.src_net_id
+WHERE d.src_net_id IS NOT NULL
+UNION ALL
+SELECT h.resolved_net_id, n.inst_id, n.name, 'named_from_outside', h.id,
+       h.lo, h.hi, h.is_exact, h.stmt_id
+FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+WHERE h.resolved_net_id IS NOT NULL;
 )SQL";
 
 // Rows per transaction. Committing per row is orders of magnitude slower;
@@ -1434,6 +1514,7 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
         prepare("INSERT INTO module VALUES(?,?,?,?,?,?)", &ins[InsModule]);
         prepare("INSERT INTO tree_node VALUES(?,?,?,?,?)", &ins[InsTreeNode]);
         prepare("INSERT INTO inst VALUES(?,?,?,?,?,?,?,?)", &ins[InsInst]);
+        prepare("INSERT INTO inst_param VALUES(?,?,?,?)", &ins[InsInstParam]);
         prepare("INSERT INTO prim VALUES(?,?,?,?,?,?,?)", &ins[InsPrimitive]);
         prepare("INSERT INTO net VALUES(?,?,?,?,?,?,?,?,?,?,?)", &ins[InsNet]);
         prepare("INSERT INTO term VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsTerm]);
@@ -1639,6 +1720,19 @@ void Writer::addInst(const InstRow& r) {
     bindOptText(s, 4, r.parameterSignature);
     bindOptText(s, 5, r.unresolvedDefinition);
     bindLoc(s, 6, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addInstParam(const InstParamRow& r) {
+    auto* s = ins[InsInstParam];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.instId);
+    sqlite3_bind_int64(s, 2, r.ordinal);
+    sqlite3_bind_text(s, 3, r.name.data(), static_cast<int>(r.name.size()),
+                      SQLITE_STATIC);
+    sqlite3_bind_text(s, 4, r.value.data(), static_cast<int>(r.value.size()),
+                      SQLITE_STATIC);
     step(s);
     bumped();
 }

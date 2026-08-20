@@ -346,24 +346,34 @@ void collectEdgeEvents(const TimingControl* t,
 /// One group's parameter values, as stable text: declaration order, values in
 /// full precision (ConstantValue::toString abbreviates above 128 bits, which
 /// folded distinct parameterisations).
-std::string parameterText(const InstanceBodySymbol& body) {
-    std::string out;
+std::vector<std::pair<std::string, std::string>>
+parameterPairs(const InstanceBodySymbol& body) {
+    std::vector<std::pair<std::string, std::string>> out;
     for (auto& member : body.members()) {
-        if (!out.empty() && (member.kind == SymbolKind::Parameter ||
-                             member.kind == SymbolKind::TypeParameter))
-            out += ',';
         if (member.kind == SymbolKind::Parameter) {
             auto& p = member.as<ParameterSymbol>();
-            out += std::string(p.name);
-            out += '=';
-            out += p.getValue().toString(SVInt::MAX_BITS);
+            out.emplace_back(std::string(p.name),
+                             p.getValue().toString(SVInt::MAX_BITS));
         }
         else if (member.kind == SymbolKind::TypeParameter) {
             auto& tp = member.as<TypeParameterSymbol>();
-            out += std::string(tp.name);
-            out += '=';
-            out += tp.targetType.getType().toString();
+            out.emplace_back(std::string(tp.name),
+                             tp.targetType.getType().toString());
         }
+    }
+    return out;
+}
+
+/// The signature is the pairs, joined -- one normalisation, two
+/// representations, and the verifier holds them equal per occurrence.
+std::string parameterText(const InstanceBodySymbol& body) {
+    std::string out;
+    for (auto& [name, value] : parameterPairs(body)) {
+        if (!out.empty())
+            out += ',';
+        out += name;
+        out += '=';
+        out += value;
     }
     return out;
 }
@@ -1008,6 +1018,7 @@ struct TplChild {
 struct Template {
     int64_t moduleId = 0;
     std::string params;
+    std::vector<std::pair<std::string, std::string>> paramPairs;
     std::vector<TplScope> scopes;
     std::vector<TplNet> nets;
     std::vector<TplTerm> terms;
@@ -1669,6 +1680,7 @@ public:
             auto& t = templates[key];
             t.moduleId = moduleIds[&group.body->getDefinition()];
             t.params = group.params;
+            t.paramPairs = group.paramPairs;
             buildTemplate(t, *group.body);
         }
 
@@ -1694,6 +1706,7 @@ private:
     struct Group {
         std::string name;
         std::string params;
+        std::vector<std::pair<std::string, std::string>> paramPairs;
         const InstanceBodySymbol* body = nullptr;
     };
 
@@ -1716,6 +1729,7 @@ private:
         auto& g = groups[key];
         if (g.name.empty()) {
             g.name = std::string(body.getDefinition().name);
+            g.paramPairs = parameterPairs(body);
             g.params = parameterText(body);
         }
         offer(g, body);
@@ -3718,6 +3732,9 @@ private:
         inst.line = instLoc.line;
         inst.column = instLoc.column;
         writer.addInst(inst);
+        for (size_t pi = 0; pi < t.paramPairs.size(); pi++)
+            writer.addInstParam({nodeId, int64_t(pi), t.paramPairs[pi].first,
+                                 t.paramPairs[pi].second});
         stats.instances++;
 
         stampBody(t, nodeId, std::move(ifaceBind));
@@ -4036,6 +4053,9 @@ private:
         inst.line = c.loc.line;
         inst.column = c.loc.column;
         writer.addInst(inst);
+        for (size_t pi = 0; pi < ct.paramPairs.size(); pi++)
+            writer.addInstParam({nodeId, int64_t(pi), ct.paramPairs[pi].first,
+                                 ct.paramPairs[pi].second});
         stats.instances++;
 
         stampBody(ct, nodeId, std::move(ifaceBind));

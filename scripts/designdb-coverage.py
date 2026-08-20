@@ -50,7 +50,8 @@ def share(part, whole):
     return round(100.0 * part / whole, 2) if whole else 0.0
 
 
-TABLES = ("module", "tree_node", "inst", "prim", "net", "term", "term_map",
+TABLES = ("module", "tree_node", "inst", "inst_param", "prim", "net", "term",
+          "term_map",
           "net_conn", "proc", "stmt", "assign_target", "assign_operand",
           "expr_ref", "proc_event", "net_dep", "hier_ref", "data_type", "file",
           "src_file")
