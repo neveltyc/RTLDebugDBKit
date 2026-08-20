@@ -402,11 +402,14 @@ CREATE TABLE proc_event(
 --
 --   data       an assignment moves it: stmt_id, and per end either the
 --              local reference (assign_operand_id / assign_target_id) or
---              the resolved hierarchical one (src_hier_ref_id /
---              tgt_hier_ref_id). src_net_id NULL with no source
---              reference of either kind is a constant driver (`q <= 8'h0`)
---              -- the row still names the statement, which is what a driver
---              query reports; every source_* column is NULL with it.
+--              the hierarchical one (src_hier_ref_id / tgt_hier_ref_id).
+--              src_net_id NULL with no source reference of either kind is
+--              a constant driver (`q <= 8'h0`) -- the row still names the
+--              statement, which is what a driver query reports; every
+--              src_* column is NULL with it. src_net_id NULL WITH
+--              src_hier_ref_id is an external driver: the reference did
+--              not resolve to a net row, the source range survives, and
+--              v_driver reports 'external'.
 --   control    it reaches the target through a branch condition: stmt_id,
 --              the condition's expr_ref_id (role='control') or
 --              src_hier_ref_id, and the target's reference as above.
@@ -425,9 +428,12 @@ CREATE TABLE proc_event(
 -- an operand/target row. The pairing is made where the statement was
 -- walked, one row per (source element, target element) that share bits --
 -- never by joining hier_ref to operands on stmt_id afterwards, which would
--- resurrect the cross product v7 removed. An unresolved reference produces
--- no dependency: the hier_ref text is the honest record, and a guessed
--- edge would be a wrong one.
+-- resurrect the cross product v7 removed. An unresolved TARGET reference
+-- produces no dependency: tgt_net_id is NOT NULL, and a guessed written
+-- object would be a wrong fact. An unresolved SOURCE reference keeps its
+-- row -- src_net_id NULL, src_hier_ref_id set -- because dropping it made
+-- "driven through a name this export cannot resolve" indistinguishable
+-- from "undriven", which is a wrong fact of the quieter kind.
 --
 -- src_net_id/tgt_net_id repeat what the referenced rows already
 -- know. Deliberate, verified redundancy: this table is the driver/load
@@ -936,6 +942,18 @@ FROM arc;
 --                       drives the internal net at range granularity.
 --   constant            a tie-off or a constant RHS: driver_net_id NULL,
 --                       and every driver_* column NULL with it.
+--   external            the source is a reference this export has no net
+--                       row for -- a package variable, an upward name from
+--                       a shared body. The signal IS driven; driver_net_id
+--                       is NULL because the driver has no row, not because
+--                       it does not exist, and src_hier_ref_id on the
+--                       dependency names the reference (path, location,
+--                       resolution NULL). The driver window survives: the
+--                       referenced object's bits are real even when
+--                       unnamed here. Kept apart from 'constant' so
+--                       "tied off" and "driven from outside the model"
+--                       stay different answers -- the silence this kind
+--                       replaces reported such targets as undriven.
 --   alias               an alias statement binds the two nets into one
 --                       object. It has no direction, so both nets appear
 --                       as each other's driver and each other's load; the
@@ -978,6 +996,7 @@ SELECT
     d.src_hi                 AS driver_hi,
     d.src_exact              AS driver_exact,
     CASE WHEN d.src_net_id IS NOT NULL THEN d.dep_kind
+         WHEN d.src_hier_ref_id IS NOT NULL THEN 'external'
          WHEN s.stmt_kind = 'system_task' THEN 'system_task'
          ELSE 'constant' END AS driver_kind,
     d.id                     AS dep_id,
@@ -1820,11 +1839,14 @@ void Writer::addNetDep(const NetDepRow& r) {
     bindOptId(s, 10, r.targetHierRefId);
     sqlite3_bind_text(s, 11, r.dependencyKind.c_str(), static_cast<int>(r.dependencyKind.size()),
                       SQLITE_STATIC);
-    // A row with no source has no source end to describe, so every column
-    // describing one is NULL -- enforced here rather than in every emitter.
-    // Before this discipline, `assign q = 1'b0` carried src_exact=1 and
-    // map_exact=1: a per-bit mapping onto a driver that does not exist.
-    if (r.sourceNetId == 0) {
+    // A row with no source END has no source range to describe, so every
+    // column describing one is NULL -- enforced here rather than in every
+    // emitter. Before this discipline, `assign q = 1'b0` carried
+    // src_exact=1 and map_exact=1: a per-bit mapping onto a driver that
+    // does not exist. A source that exists but resolves to no net row (an
+    // 'external' reference) keeps its range: the range describes the
+    // referenced object's bits, which are real even when unnamed here.
+    if (r.sourceNetId == 0 && r.sourceHierRefId == 0) {
         bindRangeTri(s, 12, std::nullopt, -1);
         bindRange(s, 15, r.targetBits, r.targetExact);
         sqlite3_bind_null(s, 18);

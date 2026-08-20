@@ -24,7 +24,7 @@ import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias")
+         "unresolved", "xmr", "alias", "external")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
@@ -321,15 +321,19 @@ check(one("""
         WHEN 'data' THEN d.stmt_id IS NULL
              OR d.expr_ref_id IS NOT NULL OR d.prim_id IS NOT NULL
              OR (d.assign_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
-             OR (d.src_net_id IS NULL AND (d.assign_operand_id IS NOT NULL
-                  OR d.src_hier_ref_id IS NOT NULL))
+             -- A NULL source net beside an operand row is a contradiction;
+             -- beside a source reference it is an 'external' driver, and
+             -- beside neither it is a constant. All three are legal shapes.
+             OR (d.src_net_id IS NULL AND d.assign_operand_id IS NOT NULL)
              OR (d.src_net_id IS NOT NULL AND
                  (d.assign_operand_id IS NULL) = (d.src_hier_ref_id IS NULL))
         WHEN 'control' THEN d.stmt_id IS NULL
              -- A condition always has a source: without this, a control row
              -- with src_net_id NULL passed every check and surfaced in
-             -- v_driver as a CONSTANT tie-off on a gated signal.
-             OR d.src_net_id IS NULL
+             -- v_driver as a CONSTANT tie-off on a gated signal. The source
+             -- may be a reference that resolved to no net ('external'), but
+             -- it must exist as a row of one of the two kinds.
+             OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
              OR d.assign_operand_id IS NOT NULL OR d.prim_id IS NOT NULL
              OR (d.expr_ref_id IS NULL) = (d.src_hier_ref_id IS NULL)
              OR (d.assign_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
@@ -348,7 +352,7 @@ check(one("""
              OR d.map_exact IS NULL
         WHEN 'procedure' THEN d.prim_id IS NOT NULL
              OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
-             OR d.src_net_id IS NULL
+             OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
              -- The reading side names where the actual came from, exactly
              -- as the doc promises: an argument reference or a resolved
              -- outward one. The write-back direction (formal -> actual) has
@@ -358,8 +362,8 @@ check(one("""
       "net_dep provenance columns match dep_kind")
 check(one("""
     SELECT count(*) FROM net_dep d JOIN hier_ref h ON h.id = d.src_hier_ref_id
-    WHERE h.resolved_net_id IS NULL OR h.resolved_net_id != d.src_net_id""") == 0,
-      "a hierarchical source copies its reference's resolution")
+    WHERE h.resolved_net_id IS NOT d.src_net_id""") == 0,
+      "a hierarchical source copies its reference's resolution, NULL included")
 # The reference a dependency crossed through is the one its own statement
 # made. Sharing rows across statements -- a task body walked once per call
 # site, a condition gating several statements -- left the second statement
@@ -377,9 +381,10 @@ check(one("""
       "a hierarchical target copies its reference's resolution")
 check(one("""
     SELECT count(*) FROM net_dep d
-    WHERE d.src_net_id IS NULL AND (d.src_lo IS NOT NULL
+    WHERE d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL
+      AND (d.src_lo IS NOT NULL
        OR d.src_exact IS NOT NULL OR d.map_exact IS NOT NULL)""") == 0,
-      "a constant dependency describes no source end")
+      "a source-less dependency describes no source end")
 check(one("""
     SELECT count(*) FROM net_dep d JOIN assign_operand o ON o.id = d.assign_operand_id
     WHERE o.net_id != d.src_net_id OR o.stmt_id != d.stmt_id""") == 0,
@@ -695,8 +700,25 @@ print("ok: v_driver and v_load reconcile with their branch formulas")
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE (driver_net_id IS NULL)
-          != (driver_kind IN ('constant','terminal','system_task'))""") == 0,
-      "driver-less rows are exactly constants, terminals and system tasks")
+          != (driver_kind IN ('constant','terminal','system_task',
+                              'external'))""") == 0,
+      "net-less rows are exactly constant/terminal/system_task/external")
+# An external driver is real but nameless HERE: no net row, so no name --
+# yet unlike a constant it keeps its window, because the referenced
+# object's bits exist. Its reference must have stayed unresolved (a
+# resolved one would have carried the net id and the plain kind), and
+# every unresolved-source dependency must surface as exactly one of them.
+check(one("""
+    SELECT count(*) FROM v_driver v
+    JOIN net_dep d ON d.id = v.dep_id
+    JOIN hier_ref h ON h.id = d.src_hier_ref_id
+    WHERE v.driver_kind = 'external'
+      AND (v.driver_name IS NOT NULL OR h.resolved_net_id IS NOT NULL)""") == 0,
+      "an external driver names no net and its reference stayed unresolved")
+check(one("SELECT count(*) FROM v_driver WHERE driver_kind='external'") ==
+      one("""SELECT count(*) FROM net_dep
+             WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL"""),
+      "external drivers are exactly the unresolved-source dependencies")
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind IN ('constant', 'terminal', 'system_task')
@@ -730,7 +752,8 @@ check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind NOT IN ('data','control','primitive','procedure',
                               'connection','connection_expression','constant',
-                              'terminal','system_task','alias')""") == 0,
+                              'terminal','system_task','alias',
+                              'external')""") == 0,
       "driver_kind stays in its vocabulary")
 check(one("""
     SELECT count(*) FROM v_load
@@ -766,7 +789,7 @@ if mode:
     want_top = {"constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
                 "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
-                "alias": "alias_top"}[mode]
+                "alias": "alias_top", "external": "external_top"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1394,5 +1417,35 @@ if mode == "alias":
         SELECT count(*) FROM f JOIN v_net ON net_id = f.n
         WHERE net_name IN ('right','third','out_side')""") == 3,
           "and a trace from one side reaches the others")
+
+if mode == "external":
+    # A package variable has no net row -- a package is not an occurrence
+    # -- so the reference stays unresolved and the dependency carries a
+    # NULL source net. Before v12 these rows were dropped, and every
+    # target here reported undriven.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='external' AND signal_name='q'""") == 1,
+          "the masked output is driven through the package variable")
+    check(one("""
+        SELECT count(*) FROM v_driver v JOIN net_dep d ON d.id = v.dep_id
+        JOIN hier_ref h ON h.id = d.src_hier_ref_id
+        WHERE v.driver_kind='external' AND v.signal_name='nib'
+          AND h.path='ext_pkg::mask' AND h.resolved_net_id IS NULL
+          AND v.driver_lo=0 AND v.driver_hi=3 AND v.driver_exact=1""") == 1,
+          "the windowed read keeps its window on the external driver")
+    check(one("""
+        SELECT count(*) FROM net_dep
+        WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL
+          AND dep_kind='control'""") >= 1,
+          "an unresolved condition still gates as a control dependency")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='external' AND signal_name='g'""") >= 1,
+          "so the package-gated target shows its external control")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name IN ('q','nib') AND driver_kind='constant'""") == 0,
+          "and no external source is misreported as a constant")
 
 print("OK")
