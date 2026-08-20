@@ -59,7 +59,7 @@ can read it.
 | Objects | `net` (every connectable object of every instance, implicit nets flagged), `term` + `term_map` (each instance's terminals and what they stand for inside) |
 | Dataflow | `net_dep` — net-to-net dependencies, one row per statement occurrence, each naming the operand, target, condition, call or primitive it came from; `procedure`, `stmt`, `assign_target`, `assign_operand`, `expr_ref`, `proc_event` — the statement layer those rows point into |
 | Boundaries | `net_conn` — what the parent wired to each terminal, segment by segment with bit windows; `hier_ref` — references that leave an instance, as written *and* resolved to the target instance and net where slang could |
-| Provenance | `source_file` (every file slang read, with its SHA-256), `meta` (schema version, tool, top) |
+| Provenance | `src_file` (every file slang read, with its SHA-256), `meta` (schema version, tool, top) |
 
 The model is **instance-level**: rows hang off the elaborated occurrence, so
 "who drives bit 3 of *this* instance's `q`" is one indexed lookup and a fan-in
@@ -72,12 +72,12 @@ real SoC is about 2× the folded file size.
 every table and column, the bit-range encoding, the naming rules, what the
 schema deliberately does not record, and the known limits. Consumers start at
 its **stable query interface**: twelve views (`v_tree_node`, `v_net`,
-`v_driver`, `v_load`, `v_statement`, …) whose columns, NULL rules and row
+`v_driver`, `v_load`, `v_stmt`, …) whose columns, NULL rules and row
 granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v11:
+Release build, macOS arm64, against public designs, schema v12:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|

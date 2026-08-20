@@ -290,7 +290,7 @@ std::string assertionWord(AssertionKind kind) {
     }
 }
 
-/// The procedure_kind word for a procedural block.
+/// The proc_kind word for a procedural block.
 std::string procedureWord(const Symbol& sym) {
     if (sym.kind != SymbolKind::ProceduralBlock)
         return "always";
@@ -776,7 +776,7 @@ void forEachInstance(const Scope& scope, F&& fn) {
     forEachOfKind<SymbolKind::Instance, InstanceSymbol>(scope, fn);
 }
 
-/// The declaration_kind word for a net or variable.
+/// The decl_kind word for a net or variable.
 std::string declarationKindOf(const Symbol& sym) {
     if (sym.kind != SymbolKind::Net)
         return "variable";
@@ -979,7 +979,7 @@ struct TplCrossDep {
 };
 
 struct TplConn {
-    std::string kind;        // net_conn.connection_kind
+    std::string kind;        // net_conn.conn_kind
     int32_t parentNet = -1;  // index into the PARENT template's nets
     int32_t childTerm = -1;  // index into the child template's terms
     int64_t ordinal = 0;     // segment ordinal within that terminal
@@ -1041,7 +1041,7 @@ struct Template {
 /// Both ends are narrowed to the overlap, not just the source. Keeping the
 /// target whole while narrowing the source is what made
 /// `assign swap = {c[3:0], c[7:4]}` export two dependencies each claiming
-/// all eight bits of swap with mapping_exact=1 -- a four-bit source cannot
+/// all eight bits of swap with map_exact=1 -- a four-bit source cannot
 /// map one-to-one onto an eight-bit target, so the row was not merely
 /// coarse but impossible, and it said the bytes were not swapped.
 struct PairedSrc {

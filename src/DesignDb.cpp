@@ -29,9 +29,9 @@ namespace {
 //   * Tables are singular_snake_case. `_id` appears exactly where a column
 //     holds another table's primary key (`inst.module_id` -> module.id), and
 //     nowhere else -- an attribute is never dressed as a key.
-//   * A bit range is prefixed with the end it describes (`source_lo`,
-//     `target_hi`, `term_exact`); a single-range table spells its own range
-//     bare (`lo`/`hi`/`is_exact`). `mapping_exact` always describes the
+//   * A bit range is prefixed with the end it describes (`src_lo`,
+//     `tgt_hi`, `term_exact`); a single-range table spells its own range
+//     bare (`lo`/`hi`/`is_exact`). `map_exact` always describes the
 //     correspondence BETWEEN two ends, never either end's own range.
 //   * Kinds and directions are their words (`'input'`, `'constant'`,
 //     `'always_ff'`), never integer codes. Three values never deserved the
@@ -54,20 +54,20 @@ namespace {
 constexpr const char* kSchema = R"SQL(
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
 
-CREATE TABLE source_file(
+CREATE TABLE src_file(
     id      INTEGER PRIMARY KEY,
     path    TEXT UNIQUE,
     digest  TEXT);
 
 -- `path` is the spelling the rows carry -- as written in the filelist or on
--- the command line -- while `source_file.path` is absolute. The two genuinely
--- differ, so `source_file_id` joins them: without it a consumer checking
+-- the command line -- while `src_file.path` is absolute. The two genuinely
+-- differ, so `src_file_id` joins them: without it a consumer checking
 -- digests had to match spellings by basename, which breaks on the first
 -- design with two files of one name.
 CREATE TABLE file(
     id             INTEGER PRIMARY KEY,
     path           TEXT UNIQUE,
-    source_file_id INTEGER REFERENCES source_file(id));
+    src_file_id    INTEGER REFERENCES src_file(id));
 
 -- Repeated type text, interned -- the one intern table v10 keeps. A packed
 -- struct or enum prints as its entire member list, far larger than the row
@@ -78,17 +78,17 @@ CREATE TABLE data_type(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
 
 -- A source definition: what was written, not what it elaborated into. The
 -- parameter values a body elaborated with are per-occurrence facts and live
--- on `inst.parameter_signature` -- v9 folded them into module identity, v10
+-- on `inst.param_signature` -- v9 folded them into module identity, v10
 -- puts identity where the source has it. (name, file_id, line) is the
 -- definition's own identity; two libraries may define one name.
 CREATE TABLE module(
     id              INTEGER PRIMARY KEY,
     name            TEXT NOT NULL,
-    definition_kind TEXT NOT NULL
-        /*!*/CHECK(definition_kind IN ('module','interface','program','checker'))/*!*/,
+    def_kind        TEXT NOT NULL
+        /*!*/CHECK(def_kind IN ('module','interface','program','checker'))/*!*/,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
-    column          INTEGER,
+    col             INTEGER,
     UNIQUE(name, file_id, line));
 
 -- The hierarchy tree, one node per level, one path segment per node --
@@ -122,7 +122,7 @@ CREATE TABLE tree_node(
 -- one hop because every ownership check walks it. The verifier holds the two
 -- encodings equal.
 --
--- `parameter_signature` is the elaborated parameter values, normalised, in
+-- `param_signature` is the elaborated parameter values, normalised, in
 -- declaration order, localparams included (it over-splits, never
 -- under-splits). Instances of one module with one signature share a body and
 -- carry identical rows -- the sharing v9 stored once, v10 stamps out.
@@ -130,25 +130,25 @@ CREATE TABLE inst(
     id                    INTEGER PRIMARY KEY REFERENCES tree_node(id),
     module_id             INTEGER REFERENCES module(id),
     parent_inst_id        INTEGER REFERENCES inst(id),
-    parameter_signature   TEXT,
-    unresolved_definition TEXT,
+    param_signature       TEXT,
+    unresolved_def        TEXT,
     file_id               INTEGER REFERENCES file(id),
     line                  INTEGER,
-    column                INTEGER);
+    col                   INTEGER);
 
 -- One gate, switch or UDP instance. `id` IS the tree_node id. Not a module
 -- instance (it has no body, no ports, no parameters) and not a statement
 -- (nothing was assigned); its dataflow is `net_dep` rows with
--- primitive_id set. Expression operators (`&`, `+`, `?:`) are not
+-- prim_id set. Expression operators (`&`, `+`, `?:`) are not
 -- primitives -- they stay inside their statement's own rows.
-CREATE TABLE primitive(
+CREATE TABLE prim(
     id              INTEGER PRIMARY KEY REFERENCES tree_node(id),
     inst_id         INTEGER NOT NULL REFERENCES inst(id),
-    primitive_kind  TEXT NOT NULL /*!*/CHECK(primitive_kind IN ('gate','switch','udp'))/*!*/,
-    definition_name TEXT NOT NULL,
+    prim_kind       TEXT NOT NULL /*!*/CHECK(prim_kind IN ('gate','switch','udp'))/*!*/,
+    def_name        TEXT NOT NULL,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
-    column          INTEGER);
+    col             INTEGER);
 
 -- One connectable object in one instance: a net or a variable -- anything
 -- that can be driven, read or wired. Parameters, type parameters and
@@ -161,22 +161,22 @@ CREATE TABLE primitive(
 -- Their scope_node_id is the nearest tree_node, since a subroutine is not a
 -- hierarchy level.
 --
--- declaration_kind is the net type's own word (`wire`, `wand`, `trireg`,
+-- decl_kind is the net type's own word (`wire`, `wand`, `trireg`,
 -- ...) or `variable`. is_implicit=1 marks a net slang created for an
 -- undeclared identifier under the active `default_nettype`; its
--- declaration_kind is that nettype, and its location is the first use.
+-- decl_kind is that nettype, and its location is the first use.
 CREATE TABLE net(
     id               INTEGER PRIMARY KEY,
     inst_id          INTEGER NOT NULL REFERENCES inst(id),
     scope_node_id    INTEGER NOT NULL REFERENCES tree_node(id),
     name             TEXT NOT NULL,
-    declaration_kind TEXT NOT NULL,
+    decl_kind        TEXT NOT NULL,
     data_type_id     INTEGER REFERENCES data_type(id),
     width            INTEGER,
     is_implicit      INTEGER NOT NULL CHECK(is_implicit IN (0,1)),
     file_id          INTEGER REFERENCES file(id),
     line             INTEGER,
-    column           INTEGER);
+    col              INTEGER);
 
 -- One terminal: a port on an instance's boundary. The root instance's
 -- terminals are the design's top-level ports; a child's are the pins its
@@ -193,7 +193,7 @@ CREATE TABLE term(
     id            INTEGER PRIMARY KEY,
     inst_id       INTEGER NOT NULL REFERENCES inst(id),
     name          TEXT NOT NULL,
-    terminal_kind TEXT NOT NULL /*!*/CHECK(terminal_kind IN ('signal','interface'))/*!*/,
+    term_kind     TEXT NOT NULL /*!*/CHECK(term_kind IN ('signal','interface'))/*!*/,
     direction     TEXT /*!*/CHECK(direction IN ('input','output','inout','ref'))/*!*/,
     data_type_id  INTEGER REFERENCES data_type(id),
     width         INTEGER,
@@ -202,7 +202,7 @@ CREATE TABLE term(
     modport       TEXT,
     file_id       INTEGER REFERENCES file(id),
     line          INTEGER,
-    column        INTEGER);
+    col           INTEGER);
 
 -- The INSIDE of a terminal: which nets of its own instance it stands for,
 -- one row per segment. An ANSI port is one whole-to-whole row; a non-ANSI
@@ -214,22 +214,22 @@ CREATE TABLE term(
 CREATE TABLE term_map(
     term_id       INTEGER NOT NULL REFERENCES term(id),
     ordinal       INTEGER NOT NULL,
-    net_id        INTEGER NOT NULL REFERENCES net(id),
+    inner_net_id  INTEGER NOT NULL REFERENCES net(id),
     term_lo       INTEGER,
     term_hi       INTEGER,
     term_exact    INTEGER NOT NULL CHECK(term_exact IN (0,1)),
-    net_lo        INTEGER,
-    net_hi        INTEGER,
-    net_exact     INTEGER NOT NULL CHECK(net_exact IN (0,1)),
-    mapping_exact INTEGER NOT NULL CHECK(mapping_exact IN (0,1)),
+    inner_lo      INTEGER,
+    inner_hi      INTEGER,
+    inner_exact   INTEGER NOT NULL CHECK(inner_exact IN (0,1)),
+    map_exact     INTEGER NOT NULL CHECK(map_exact IN (0,1)),
     PRIMARY KEY(term_id, ordinal));
 
 -- The OUTSIDE of a terminal: what the parent connected to it, one row per
 -- atomic segment -- each concatenation element and each replication copy is
 -- its own row with its own window of the formal, so `.q({2{r}})` is two
--- rows whose windows tile q. connection_kind decides which columns apply:
+-- rows whose windows tile q. conn_kind decides which columns apply:
 --
---   signal              net_id names a net of the PARENT instance.
+--   signal              outer_net_id names a net of the PARENT instance.
 --   constant            a tie-off; no net, but the window is kept so the
 --                       formal's bits tile rather than leaving a gap that
 --                       reads as an exporter bug.
@@ -237,54 +237,54 @@ CREATE TABLE term_map(
 --                       would also mean "the exporter did not get this far".
 --   expression_operand  the actual is an expression; this row is one net it
 --                       reads. `.en(state == RUN)` samples state but does
---                       not alias it to en -- mapping_exact is 0 by
+--                       not alias it to en -- map_exact is 0 by
 --                       construction.
---   interface           interface_inst_id names the bound interface
+--   interface           outer_intf_inst_id names the bound interface
 --                       instance. No dataflow arc pretends to cross here.
 --   external_reference  tied to something with no name in the parent
---                       (`.p(u.g[7:4])`); hier_ref_id says what, and the
---                       arc crosses once that reference resolves.
+--                       (`.p(u.g[7:4])`); outer_hier_ref_id says what, and
+--                       the arc crosses once that reference resolves.
 --
 -- Range discipline: columns describing an end that does not exist are NULL
 -- -- a constant has no net end, an interface binding has no bit domain --
 -- so a tie-off never reads as "the whole of nothing, exactly".
 CREATE TABLE net_conn(
-    id                INTEGER PRIMARY KEY,
-    net_id            INTEGER REFERENCES net(id),
-    term_id           INTEGER NOT NULL REFERENCES term(id),
-    ordinal           INTEGER NOT NULL,
-    connection_kind   TEXT NOT NULL
-        /*!*/CHECK(connection_kind IN ('signal','constant','unconnected',
+    id                 INTEGER PRIMARY KEY,
+    outer_net_id       INTEGER REFERENCES net(id),
+    term_id            INTEGER NOT NULL REFERENCES term(id),
+    ordinal            INTEGER NOT NULL,
+    conn_kind          TEXT NOT NULL
+        /*!*/CHECK(conn_kind IN ('signal','constant','unconnected',
                                   'expression_operand','interface','external_reference'))/*!*/,
-    net_lo            INTEGER,
-    net_hi            INTEGER,
-    net_exact         INTEGER CHECK(net_exact IN (0,1)),
-    term_lo           INTEGER,
-    term_hi           INTEGER,
-    term_exact        INTEGER CHECK(term_exact IN (0,1)),
-    mapping_exact     INTEGER CHECK(mapping_exact IN (0,1)),
-    interface_inst_id INTEGER REFERENCES inst(id),
-    hier_ref_id       INTEGER REFERENCES hier_ref(id),
-    file_id           INTEGER REFERENCES file(id),
-    line              INTEGER,
-    column            INTEGER,
+    outer_lo           INTEGER,
+    outer_hi           INTEGER,
+    outer_exact        INTEGER CHECK(outer_exact IN (0,1)),
+    term_lo            INTEGER,
+    term_hi            INTEGER,
+    term_exact         INTEGER CHECK(term_exact IN (0,1)),
+    map_exact          INTEGER CHECK(map_exact IN (0,1)),
+    outer_intf_inst_id INTEGER REFERENCES inst(id),
+    outer_hier_ref_id  INTEGER REFERENCES hier_ref(id),
+    file_id            INTEGER REFERENCES file(id),
+    line               INTEGER,
+    col                INTEGER,
     UNIQUE(term_id, ordinal));
 
 -- One procedure: an always/initial/final block, or a task/function body.
 -- v9 named these with a bare per-module integer that was not a key in any
 -- table; this is the object that integer was gesturing at.
-CREATE TABLE procedure(
+CREATE TABLE proc(
     id             INTEGER PRIMARY KEY,
     inst_id        INTEGER NOT NULL REFERENCES inst(id),
     scope_node_id  INTEGER NOT NULL REFERENCES tree_node(id),
     name           TEXT,
-    procedure_kind TEXT NOT NULL
-        /*!*/CHECK(procedure_kind IN ('always','always_ff','always_comb','always_latch',
+    proc_kind      TEXT NOT NULL
+        /*!*/CHECK(proc_kind IN ('always','always_ff','always_comb','always_latch',
                                  'initial','final','task','function'))/*!*/,
     ordinal        INTEGER NOT NULL,
     file_id        INTEGER REFERENCES file(id),
     line           INTEGER,
-    column         INTEGER);
+    col            INTEGER);
 
 -- One statement, or one statement-level construct. The statement is the
 -- object; its targets, operands and other reads are child rows -- v9's
@@ -293,8 +293,8 @@ CREATE TABLE procedure(
 -- all. Here it is one row regardless.
 --
 -- sequence is execution order within the procedure, NULL exactly when
--- procedure_id is NULL (a continuous assign has no execution order).
--- assignment_kind is NULL for non-assignments. delay is the delay control's
+-- proc_id is NULL (a continuous assign has no execution order).
+-- assign_kind is NULL for non-assignments. delay is the delay control's
 -- normalised source text (`#3`, `#(rise, fall)`), not a number this tool
 -- pretended to evaluate; NULL when there is none.
 --
@@ -305,20 +305,20 @@ CREATE TABLE stmt(
     id                    INTEGER PRIMARY KEY,
     inst_id               INTEGER NOT NULL REFERENCES inst(id),
     scope_node_id         INTEGER NOT NULL REFERENCES tree_node(id),
-    procedure_id          INTEGER REFERENCES procedure(id),
+    proc_id               INTEGER REFERENCES proc(id),
     ordinal               INTEGER NOT NULL,
     sequence              INTEGER,
-    statement_kind        TEXT NOT NULL
-        /*!*/CHECK(statement_kind IN ('assignment','assertion','wait','call',
+    stmt_kind             TEXT NOT NULL
+        /*!*/CHECK(stmt_kind IN ('assignment','assertion','wait','call',
                                  'system_task','event_control','alias'))/*!*/,
     construct             TEXT,
-    assignment_kind       TEXT
-        /*!*/CHECK(assignment_kind IN ('continuous','blocking','nonblocking'))/*!*/,
+    assign_kind           TEXT
+        /*!*/CHECK(assign_kind IN ('continuous','blocking','nonblocking'))/*!*/,
     delay                 TEXT,
     dropped_operand_count INTEGER NOT NULL,
     file_id               INTEGER REFERENCES file(id),
     line                  INTEGER,
-    column                INTEGER);
+    col                   INTEGER);
 
 -- One target reference of an assignment (LHS), in written order. A target
 -- whose net lies outside the instance is not here -- it is a `hier_ref`
@@ -382,14 +382,14 @@ CREATE TABLE expr_ref(
 -- role='event', never both.
 CREATE TABLE proc_event(
     id           INTEGER PRIMARY KEY,
-    procedure_id INTEGER NOT NULL REFERENCES procedure(id),
+    proc_id      INTEGER NOT NULL REFERENCES proc(id),
     stmt_id      INTEGER REFERENCES stmt(id),
     net_id       INTEGER REFERENCES net(id),
     event_kind   TEXT NOT NULL /*!*/CHECK(event_kind IN ('sensitivity','wait'))/*!*/,
     edge_kind    TEXT /*!*/CHECK(edge_kind IN ('posedge','negedge','both'))/*!*/,
     file_id      INTEGER REFERENCES file(id),
     line         INTEGER,
-    column       INTEGER);
+    col          INTEGER);
 
 -- One net-to-net dependency occurrence -- the adjacency list v_driver and
 -- v_load index, and the provenance record v9's deduplicated `edge` erased.
@@ -398,26 +398,26 @@ CREATE TABLE proc_event(
 -- x->a and y->b, each naming its operand and target rows -- never the
 -- four-way cross product.
 --
--- dependency_kind, and what must be set for each (verifier-enforced):
+-- dep_kind, and what must be set for each (verifier-enforced):
 --
 --   data       an assignment moves it: stmt_id, and per end either the
 --              local reference (assign_operand_id / assign_target_id) or
---              the resolved hierarchical one (source_hier_ref_id /
---              target_hier_ref_id). source_net_id NULL with no source
+--              the resolved hierarchical one (src_hier_ref_id /
+--              tgt_hier_ref_id). src_net_id NULL with no source
 --              reference of either kind is a constant driver (`q <= 8'h0`)
 --              -- the row still names the statement, which is what a driver
 --              query reports; every source_* column is NULL with it.
 --   control    it reaches the target through a branch condition: stmt_id,
 --              the condition's expr_ref_id (role='control') or
---              source_hier_ref_id, and the target's reference as above.
---              mapping_exact is 0 -- a condition gates, it does not map.
---   primitive  a gate/switch/UDP couples them: primitive_id, per LRM
+--              src_hier_ref_id, and the target's reference as above.
+--              map_exact is 0 -- a condition gates, it does not map.
+--   primitive  a gate/switch/UDP couples them: prim_id, per LRM
 --              (input, output) pairing.
 --   procedure  a call binds them: actual to formal by argument direction,
 --              and formal back to a written actual. stmt_id is the calling
 --              statement (NULL for a call in a control expression); the
 --              actual's read is expr_ref_id (role='call_argument') or
---              source_hier_ref_id.
+--              src_hier_ref_id.
 --
 -- A dependency whose end lies in ANOTHER instance -- `assign q = u.x;`,
 -- a write through an interface port -- carries the resolved net id like
@@ -429,29 +429,29 @@ CREATE TABLE proc_event(
 -- no dependency: the hier_ref text is the honest record, and a guessed
 -- edge would be a wrong one.
 --
--- source_net_id/target_net_id repeat what the referenced rows already
+-- src_net_id/tgt_net_id repeat what the referenced rows already
 -- know. Deliberate, verified redundancy: this table is the driver/load
 -- index, and the verifier holds the copies equal.
 CREATE TABLE net_dep(
     id                 INTEGER PRIMARY KEY,
-    source_net_id      INTEGER REFERENCES net(id),
-    target_net_id      INTEGER NOT NULL REFERENCES net(id),
+    src_net_id         INTEGER REFERENCES net(id),
+    tgt_net_id         INTEGER NOT NULL REFERENCES net(id),
     stmt_id            INTEGER REFERENCES stmt(id),
     assign_operand_id  INTEGER REFERENCES assign_operand(id),
     assign_target_id   INTEGER REFERENCES assign_target(id),
     expr_ref_id        INTEGER REFERENCES expr_ref(id),
-    primitive_id       INTEGER REFERENCES primitive(id),
-    source_hier_ref_id INTEGER REFERENCES hier_ref(id),
-    target_hier_ref_id INTEGER REFERENCES hier_ref(id),
-    dependency_kind    TEXT NOT NULL
-        /*!*/CHECK(dependency_kind IN ('data','control','primitive','procedure','alias'))/*!*/,
-    source_lo          INTEGER,
-    source_hi          INTEGER,
-    source_exact       INTEGER CHECK(source_exact IN (0,1)),
-    target_lo          INTEGER,
-    target_hi          INTEGER,
-    target_exact       INTEGER NOT NULL CHECK(target_exact IN (0,1)),
-    mapping_exact      INTEGER CHECK(mapping_exact IN (0,1)));
+    prim_id            INTEGER REFERENCES prim(id),
+    src_hier_ref_id    INTEGER REFERENCES hier_ref(id),
+    tgt_hier_ref_id    INTEGER REFERENCES hier_ref(id),
+    dep_kind           TEXT NOT NULL
+        /*!*/CHECK(dep_kind IN ('data','control','primitive','procedure','alias'))/*!*/,
+    src_lo             INTEGER,
+    src_hi             INTEGER,
+    src_exact          INTEGER CHECK(src_exact IN (0,1)),
+    tgt_lo             INTEGER,
+    tgt_hi             INTEGER,
+    tgt_exact          INTEGER NOT NULL CHECK(tgt_exact IN (0,1)),
+    map_exact          INTEGER CHECK(map_exact IN (0,1)));
 
 -- One reference that leaves the instance: an XMR, an interface member, a
 -- package item. The path is stored as written (normalised), AND -- new in
@@ -475,7 +475,7 @@ CREATE TABLE hier_ref(
     is_exact         INTEGER NOT NULL CHECK(is_exact IN (0,1)),
     file_id          INTEGER REFERENCES file(id),
     line             INTEGER,
-    column           INTEGER);
+    col              INTEGER);
 )SQL";
 
 // UNIQUE constraints already index (stmt_id, ordinal) on the three statement
@@ -492,43 +492,43 @@ CREATE INDEX tree_node_by_parent    ON tree_node(parent_node_id, ordinal);
 CREATE INDEX tree_node_by_name      ON tree_node(parent_node_id, name);
 CREATE INDEX inst_by_parent         ON inst(parent_inst_id);
 CREATE INDEX inst_by_module         ON inst(module_id);
-CREATE INDEX primitive_by_inst      ON primitive(inst_id);
+CREATE INDEX prim_by_inst      ON prim(inst_id);
 CREATE INDEX net_by_inst            ON net(inst_id, name);
 CREATE INDEX net_by_scope           ON net(scope_node_id, name);
 CREATE INDEX term_by_inst           ON term(inst_id, ordinal);
 CREATE INDEX term_by_inst_name      ON term(inst_id, name);
-CREATE INDEX term_map_by_net        ON term_map(net_id);
-CREATE INDEX net_conn_by_net        ON net_conn(net_id);
+CREATE INDEX term_map_by_net        ON term_map(inner_net_id);
+CREATE INDEX net_conn_by_net        ON net_conn(outer_net_id);
 -- The reverse of hier_ref's advertised back-pointer. Without it, "what does
 -- this net drive across the boundary" is an indexed seek for a locally
 -- named connection and a full net_conn scan for an outward tie -- the one
 -- path the resolved-reference arcs actually take.
-CREATE INDEX net_conn_by_href       ON net_conn(hier_ref_id)
-    WHERE hier_ref_id IS NOT NULL;
-CREATE INDEX procedure_by_inst      ON procedure(inst_id, ordinal);
+CREATE INDEX net_conn_by_href       ON net_conn(outer_hier_ref_id)
+    WHERE outer_hier_ref_id IS NOT NULL;
+CREATE INDEX proc_by_inst      ON proc(inst_id, ordinal);
 CREATE INDEX stmt_by_inst           ON stmt(inst_id, ordinal);
-CREATE INDEX stmt_by_procedure      ON stmt(procedure_id, sequence)
-    WHERE procedure_id IS NOT NULL;
+CREATE INDEX stmt_by_proc      ON stmt(proc_id, sequence)
+    WHERE proc_id IS NOT NULL;
 CREATE INDEX assign_target_by_net   ON assign_target(net_id);
 CREATE INDEX assign_operand_by_net  ON assign_operand(net_id);
 CREATE INDEX expr_ref_by_net        ON expr_ref(net_id);
-CREATE INDEX proc_event_by_procedure ON proc_event(procedure_id);
+CREATE INDEX proc_event_by_proc ON proc_event(proc_id);
 CREATE INDEX proc_event_by_net      ON proc_event(net_id)
     WHERE net_id IS NOT NULL;
-CREATE INDEX net_dep_by_source      ON net_dep(source_net_id);
-CREATE INDEX net_dep_by_target      ON net_dep(target_net_id);
+CREATE INDEX net_dep_by_src      ON net_dep(src_net_id);
+CREATE INDEX net_dep_by_tgt      ON net_dep(tgt_net_id);
 CREATE INDEX net_dep_by_stmt        ON net_dep(stmt_id);
 CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id)
     WHERE assign_operand_id IS NOT NULL;
-CREATE INDEX net_dep_by_target_ref  ON net_dep(assign_target_id);
+CREATE INDEX net_dep_by_tgt_ref  ON net_dep(assign_target_id);
 CREATE INDEX net_dep_by_expr_ref    ON net_dep(expr_ref_id)
     WHERE expr_ref_id IS NOT NULL;
-CREATE INDEX net_dep_by_primitive   ON net_dep(primitive_id)
-    WHERE primitive_id IS NOT NULL;
-CREATE INDEX net_dep_by_source_href ON net_dep(source_hier_ref_id)
-    WHERE source_hier_ref_id IS NOT NULL;
-CREATE INDEX net_dep_by_target_href ON net_dep(target_hier_ref_id)
-    WHERE target_hier_ref_id IS NOT NULL;
+CREATE INDEX net_dep_by_primitive   ON net_dep(prim_id)
+    WHERE prim_id IS NOT NULL;
+CREATE INDEX net_dep_by_src_href ON net_dep(src_hier_ref_id)
+    WHERE src_hier_ref_id IS NOT NULL;
+CREATE INDEX net_dep_by_tgt_href ON net_dep(tgt_hier_ref_id)
+    WHERE tgt_hier_ref_id IS NOT NULL;
 CREATE INDEX hier_ref_by_inst       ON hier_ref(inst_id);
 CREATE INDEX hier_ref_by_stmt       ON hier_ref(stmt_id);
 CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id)
@@ -544,8 +544,8 @@ CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id)
 // Ground rules, revised from v8 for the instance-level model:
 //
 //   * A FACT view's row is one base-table row -- v_tree_node, v_net,
-//     v_terminal, v_terminal_map, v_net_connection, v_net_dependency,
-//     v_statement, v_statement_target, v_statement_operand -- and the
+//     v_term, v_term_map, v_net_conn, v_net_dep,
+//     v_stmt, v_stmt_target, v_stmt_operand -- and the
 //     verifier checks count(view) == count(base). Every internal join is
 //     against a primary key, so nothing fans out.
 //   * v_driver and v_load are COMPOSITE: UNION ALL branches discriminated by
@@ -573,7 +573,7 @@ constexpr const char* kViews = R"SQL(
 -- one SELECT with no key-value handling. Counts are CAST so a consumer gets
 -- integers, not the TEXT the key-value table stores. The view only reshapes;
 -- required-key enforcement stays in the verifier.
-CREATE VIEW v_database_info AS
+CREATE VIEW v_db_info AS
 SELECT
     CAST(MAX(CASE WHEN key = 'schema_version'
                   THEN value END) AS INTEGER) AS schema_version,
@@ -594,185 +594,185 @@ SELECT
 FROM meta;
 
 -- One row per tree_node. The subtype columns are NULL by node_kind, and that
--- is the contract: root/instance/unresolved have instance_id (and module_id
--- unless unresolved); primitive and generate have instance_id NULL. For a
--- primitive, parent_instance_id is the instance whose body wrote it and
--- definition_name is the gate/UDP name; for an unresolved node,
--- definition_name is the unresolvable spelling. Location is the
+-- is the contract: root/instance/unresolved have inst_id (and module_id
+-- unless unresolved); primitive and generate have inst_id NULL. For a
+-- primitive, parent_inst_id is the instance whose body wrote it and
+-- def_name is the gate/UDP name; for an unresolved node,
+-- def_name is the unresolvable spelling. Location is the
 -- instantiation site; the root and generate levels have none.
 CREATE VIEW v_tree_node AS
 SELECT
-    n.id             AS node_id,
-    n.parent_node_id AS parent_node_id,
-    n.name           AS node_name,
-    n.node_kind      AS node_kind,
-    n.ordinal        AS ordinal,
-    i.id             AS instance_id,
-    COALESCE(i.parent_inst_id, p.inst_id) AS parent_instance_id,
-    i.module_id      AS module_id,
-    m.name           AS module_name,
-    i.parameter_signature AS parameter_signature,
-    COALESCE(p.definition_name, i.unresolved_definition) AS definition_name,
-    f.path           AS file_path,
-    sf.path          AS source_path,
-    COALESCE(i.line, p.line)         AS source_line,
-    COALESCE(i."column", p."column") AS source_column
+    n.id                                   AS node_id,
+    n.parent_node_id                       AS parent_node_id,
+    n.name                                 AS node_name,
+    n.node_kind                            AS node_kind,
+    n.ordinal                              AS ordinal,
+    i.id                                   AS inst_id,
+    COALESCE(i.parent_inst_id, p.inst_id)  AS parent_inst_id,
+    i.module_id                            AS module_id,
+    m.name                                 AS module_name,
+    i.param_signature                      AS param_signature,
+    COALESCE(p.def_name, i.unresolved_def) AS def_name,
+    f.path                                 AS file_path,
+    sf.path                                AS src_path,
+    COALESCE(i.line, p.line)               AS src_line,
+    COALESCE(i.col, p.col)                 AS src_col
 FROM tree_node n
 LEFT JOIN inst i         ON i.id = n.id
-LEFT JOIN primitive p    ON p.id = n.id
+LEFT JOIN prim p    ON p.id = n.id
 LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN file f         ON f.id = COALESCE(i.file_id, p.file_id)
-LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- One row per net: a connectable object of one concrete instance. No
 -- direction column -- direction belongs to terminals, and a net's port-ness
--- is one v_terminal_map join away. file_path is the spelling as written in
--- the filelist, source_path the absolute path it resolved to; they answer
+-- is one v_term_map join away. file_path is the spelling as written in
+-- the filelist, src_path the absolute path it resolved to; they answer
 -- different questions and neither substitutes for the other.
 CREATE VIEW v_net AS
 SELECT
-    nt.id               AS net_id,
-    nt.inst_id          AS instance_id,
-    i.module_id         AS module_id,
-    m.name              AS module_name,
-    i.parameter_signature AS parameter_signature,
-    nt.scope_node_id    AS scope_node_id,
-    nt.name             AS net_name,
-    nt.declaration_kind AS declaration_kind,
-    dt.text             AS data_type,
-    nt.width            AS width,
-    nt.is_implicit      AS is_implicit,
-    f.path              AS file_path,
-    sf.path             AS source_path,
-    nt.line             AS source_line,
-    nt."column"         AS source_column
+    nt.id             AS net_id,
+    nt.inst_id        AS inst_id,
+    i.module_id       AS module_id,
+    m.name            AS module_name,
+    i.param_signature AS param_signature,
+    nt.scope_node_id  AS scope_node_id,
+    nt.name           AS net_name,
+    nt.decl_kind      AS decl_kind,
+    dt.text           AS data_type,
+    nt.width          AS width,
+    nt.is_implicit    AS is_implicit,
+    f.path            AS file_path,
+    sf.path           AS src_path,
+    nt.line           AS src_line,
+    nt.col            AS src_col
 FROM net nt
 JOIN inst i              ON i.id = nt.inst_id
 LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN data_type dt   ON dt.id = nt.data_type_id
 LEFT JOIN file f         ON f.id = nt.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- One row per terminal. direction NULL is an interface terminal or a
--- terminal of an unresolved instance -- terminal_kind and the owning
+-- terminal of an unresolved instance -- term_kind and the owning
 -- instance's node_kind say which.
-CREATE VIEW v_terminal AS
+CREATE VIEW v_term AS
 SELECT
-    t.id            AS terminal_id,
-    t.inst_id       AS instance_id,
-    i.module_id     AS module_id,
-    m.name          AS module_name,
-    t.name          AS terminal_name,
-    t.terminal_kind AS terminal_kind,
-    t.direction     AS direction,
-    dt.text         AS data_type,
-    t.width         AS width,
-    t.ordinal       AS ordinal,
-    t.is_const      AS is_const,
-    t.modport       AS modport,
-    f.path          AS file_path,
-    sf.path         AS source_path,
-    t.line          AS source_line,
-    t."column"      AS source_column
+    t.id        AS term_id,
+    t.inst_id   AS inst_id,
+    i.module_id AS module_id,
+    m.name      AS module_name,
+    t.name      AS term_name,
+    t.term_kind AS term_kind,
+    t.direction AS direction,
+    dt.text     AS data_type,
+    t.width     AS width,
+    t.ordinal   AS ordinal,
+    t.is_const  AS is_const,
+    t.modport   AS modport,
+    f.path      AS file_path,
+    sf.path     AS src_path,
+    t.line      AS src_line,
+    t.col       AS src_col
 FROM term t
 JOIN inst i              ON i.id = t.inst_id
 LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN data_type dt   ON dt.id = t.data_type_id
 LEFT JOIN file f         ON f.id = t.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- One row per term_map segment: the inside of a terminal.
-CREATE VIEW v_terminal_map AS
+CREATE VIEW v_term_map AS
 SELECT
-    mp.term_id       AS terminal_id,
-    t.inst_id        AS terminal_instance_id,
-    t.name           AS terminal_name,
-    mp.ordinal       AS mapping_ordinal,
-    mp.net_id        AS internal_net_id,
-    n.name           AS internal_net_name,
-    mp.term_lo       AS terminal_lo,
-    mp.term_hi       AS terminal_hi,
-    mp.term_exact    AS terminal_exact,
-    mp.net_lo        AS net_lo,
-    mp.net_hi        AS net_hi,
-    mp.net_exact     AS net_exact,
-    mp.mapping_exact AS mapping_exact
+    mp.term_id      AS term_id,
+    t.inst_id       AS term_inst_id,
+    t.name          AS term_name,
+    mp.ordinal      AS map_ordinal,
+    mp.inner_net_id AS inner_net_id,
+    n.name          AS inner_net_name,
+    mp.term_lo      AS term_lo,
+    mp.term_hi      AS term_hi,
+    mp.term_exact   AS term_exact,
+    mp.inner_lo     AS inner_lo,
+    mp.inner_hi     AS inner_hi,
+    mp.inner_exact  AS inner_exact,
+    mp.map_exact    AS map_exact
 FROM term_map mp
 JOIN term t ON t.id = mp.term_id
-JOIN net n  ON n.id = mp.net_id;
+JOIN net n  ON n.id = mp.inner_net_id;
 
 -- One row per net_conn segment: the outside of a terminal, exactly as
 -- written in the parent. Deliberately NOT composed with term_map -- this
 -- view is the fact, v_driver/v_load are the composition.
-CREATE VIEW v_net_connection AS
+CREATE VIEW v_net_conn AS
 SELECT
-    c.id                AS connection_id,
-    c.net_id            AS net_id,
-    pn.inst_id          AS net_instance_id,
-    pn.name             AS net_name,
-    c.term_id           AS terminal_id,
-    t.inst_id           AS terminal_instance_id,
-    t.name              AS terminal_name,
-    t.direction         AS direction,
-    c.connection_kind   AS connection_kind,
-    c.ordinal           AS ordinal,
-    c.net_lo            AS net_lo,
-    c.net_hi            AS net_hi,
-    c.net_exact         AS net_exact,
-    c.term_lo           AS terminal_lo,
-    c.term_hi           AS terminal_hi,
-    c.term_exact        AS terminal_exact,
-    c.mapping_exact     AS mapping_exact,
-    c.interface_inst_id AS interface_instance_id,
-    c.hier_ref_id       AS hier_ref_id,
-    f.path              AS file_path,
-    sf.path             AS source_path,
-    c.line              AS source_line,
-    c."column"          AS source_column
+    c.id                 AS conn_id,
+    c.outer_net_id       AS outer_net_id,
+    pn.inst_id           AS outer_inst_id,
+    pn.name              AS outer_net_name,
+    c.term_id            AS term_id,
+    t.inst_id            AS term_inst_id,
+    t.name               AS term_name,
+    t.direction          AS direction,
+    c.conn_kind          AS conn_kind,
+    c.ordinal            AS ordinal,
+    c.outer_lo           AS outer_lo,
+    c.outer_hi           AS outer_hi,
+    c.outer_exact        AS outer_exact,
+    c.term_lo            AS term_lo,
+    c.term_hi            AS term_hi,
+    c.term_exact         AS term_exact,
+    c.map_exact          AS map_exact,
+    c.outer_intf_inst_id AS outer_intf_inst_id,
+    c.outer_hier_ref_id  AS outer_hier_ref_id,
+    f.path               AS file_path,
+    sf.path              AS src_path,
+    c.line               AS src_line,
+    c.col                AS src_col
 FROM net_conn c
 JOIN term t              ON t.id = c.term_id
-LEFT JOIN net pn         ON pn.id = c.net_id
+LEFT JOIN net pn         ON pn.id = c.outer_net_id
 LEFT JOIN file f         ON f.id = c.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- One row per net_dep: a statement- or primitive-level dependency
 -- occurrence, not deduplicated across statements. Location is the
 -- statement's, or the primitive's for a primitive arc.
-CREATE VIEW v_net_dependency AS
+CREATE VIEW v_net_dep AS
 SELECT
-    d.id              AS dependency_id,
-    d.source_net_id   AS source_net_id,
-    sn.inst_id        AS source_instance_id,
-    sn.name           AS source_name,
-    d.source_lo       AS source_lo,
-    d.source_hi       AS source_hi,
-    d.source_exact    AS source_exact,
-    d.target_net_id   AS target_net_id,
-    tn.inst_id        AS target_instance_id,
-    tn.name           AS target_name,
-    d.target_lo       AS target_lo,
-    d.target_hi       AS target_hi,
-    d.target_exact    AS target_exact,
-    d.stmt_id         AS statement_id,
-    d.assign_operand_id AS assign_operand_id,
-    d.assign_target_id  AS assign_target_id,
-    d.expr_ref_id     AS expression_reference_id,
-    d.primitive_id    AS primitive_id,
-    d.source_hier_ref_id AS source_hier_ref_id,
-    d.target_hier_ref_id AS target_hier_ref_id,
-    d.dependency_kind AS dependency_kind,
-    d.mapping_exact   AS mapping_exact,
-    f.path            AS file_path,
-    sf.path           AS source_path,
-    COALESCE(s.line, p.line)         AS source_line,
-    COALESCE(s."column", p."column") AS source_column
+    d.id                     AS dep_id,
+    d.src_net_id             AS src_net_id,
+    sn.inst_id               AS src_inst_id,
+    sn.name                  AS src_name,
+    d.src_lo                 AS src_lo,
+    d.src_hi                 AS src_hi,
+    d.src_exact              AS src_exact,
+    d.tgt_net_id             AS tgt_net_id,
+    tn.inst_id               AS tgt_inst_id,
+    tn.name                  AS tgt_name,
+    d.tgt_lo                 AS tgt_lo,
+    d.tgt_hi                 AS tgt_hi,
+    d.tgt_exact              AS tgt_exact,
+    d.stmt_id                AS stmt_id,
+    d.assign_operand_id      AS assign_operand_id,
+    d.assign_target_id       AS assign_target_id,
+    d.expr_ref_id            AS expr_ref_id,
+    d.prim_id                AS prim_id,
+    d.src_hier_ref_id        AS src_hier_ref_id,
+    d.tgt_hier_ref_id        AS tgt_hier_ref_id,
+    d.dep_kind               AS dep_kind,
+    d.map_exact              AS map_exact,
+    f.path                   AS file_path,
+    sf.path                  AS src_path,
+    COALESCE(s.line, p.line) AS src_line,
+    COALESCE(s.col, p.col)   AS src_col
 FROM net_dep d
-JOIN net tn              ON tn.id = d.target_net_id
-LEFT JOIN net sn         ON sn.id = d.source_net_id
+JOIN net tn              ON tn.id = d.tgt_net_id
+LEFT JOIN net sn         ON sn.id = d.src_net_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
-LEFT JOIN primitive p    ON p.id = d.primitive_id
+LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
-LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- NOT part of the stable contract. The composition v_driver and v_load
 -- project: one row per overlapping (net_conn segment, term_map segment)
@@ -790,7 +790,7 @@ CREATE VIEW v_conn_arc AS
 -- net_conn_by_net. On a design whose clock reaches a few thousand nets, a
 -- trace walks one such query per hop.
 --
--- The two cases are disjoint on `c.net_id IS NULL` -- which is exactly what
+-- The two cases are disjoint on `c.outer_net_id IS NULL` -- which is exactly what
 -- COALESCE tests -- so splitting there leaves outer_net_id a plain column
 -- reference in each branch and the indexes usable again. The second branch
 -- keeps the LEFT JOIN: a constant tie-off has neither a net nor a
@@ -798,82 +798,82 @@ CREATE VIEW v_conn_arc AS
 -- the inner net.
 WITH seg AS (
     SELECT
-        c.id            AS connection_id,
-        c.connection_kind AS connection_kind,
-        c.net_id        AS outer_net_id,
-        c.net_lo        AS c_net_lo,
-        c.net_hi        AS c_net_hi,
-        c.net_exact     AS c_net_exact,
-        c.term_lo       AS c_lo,
-        c.term_hi       AS c_hi,
-        c.term_exact    AS c_term_exact,
-        c.mapping_exact AS c_map,
-        c.file_id       AS file_id,
-        c.line          AS line,
-        c."column"      AS col,
-        t.id            AS term_id,
-        t.inst_id       AS term_inst_id,
-        t.direction     AS direction,
-        mp.net_id       AS inner_net_id,
-        mp.term_lo      AS m_lo,
-        mp.term_hi      AS m_hi,
-        mp.term_exact   AS m_term_exact,
-        mp.net_lo       AS m_net_lo,
-        mp.net_hi       AS m_net_hi,
-        mp.net_exact    AS m_net_exact,
-        mp.mapping_exact AS m_map
+        c.id                                   AS conn_id,
+        c.conn_kind                            AS conn_kind,
+        c.outer_net_id                         AS outer_net_id,
+        c.outer_lo                             AS c_net_lo,
+        c.outer_hi                             AS c_net_hi,
+        c.outer_exact                          AS c_net_exact,
+        c.term_lo                              AS c_lo,
+        c.term_hi                              AS c_hi,
+        c.term_exact                           AS c_term_exact,
+        c.map_exact                            AS c_map,
+        c.file_id                              AS file_id,
+        c.line                                 AS line,
+        c.col                                  AS col,
+        t.id                                   AS term_id,
+        t.inst_id                              AS term_inst_id,
+        t.direction                            AS direction,
+        mp.inner_net_id                        AS inner_net_id,
+        mp.term_lo                             AS m_lo,
+        mp.term_hi                             AS m_hi,
+        mp.term_exact                          AS m_term_exact,
+        mp.inner_lo                            AS m_net_lo,
+        mp.inner_hi                            AS m_net_hi,
+        mp.inner_exact                         AS m_net_exact,
+        mp.map_exact                           AS m_map
     FROM net_conn c
     JOIN term t      ON t.id = c.term_id
     JOIN term_map mp ON mp.term_id = c.term_id
-    LEFT JOIN hier_ref hr ON hr.id = c.hier_ref_id
-    WHERE c.connection_kind IN ('signal', 'expression_operand', 'constant',
+    LEFT JOIN hier_ref hr ON hr.id = c.outer_hier_ref_id
+    WHERE c.conn_kind IN ('signal', 'expression_operand', 'constant',
                                 'external_reference')
-      AND (c.connection_kind != 'external_reference'
+      AND (c.conn_kind != 'external_reference'
            OR hr.resolved_net_id IS NOT NULL)
-      AND (c.connection_kind != 'expression_operand'
-           OR c.net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
+      AND (c.conn_kind != 'expression_operand'
+           OR c.outer_net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
       AND (c.term_lo IS NULL OR mp.term_hi IS NULL OR c.term_lo <= mp.term_hi)
       AND (mp.term_lo IS NULL OR c.term_hi IS NULL OR mp.term_lo <= c.term_hi)
-      AND c.net_id IS NOT NULL
+      AND c.outer_net_id IS NOT NULL
     UNION ALL
     SELECT
-        c.id            AS connection_id,
-        c.connection_kind AS connection_kind,
-        hr.resolved_net_id AS outer_net_id,
-        hr.lo           AS c_net_lo,
-        hr.hi           AS c_net_hi,
-        hr.is_exact     AS c_net_exact,
-        c.term_lo       AS c_lo,
-        c.term_hi       AS c_hi,
-        c.term_exact    AS c_term_exact,
-        c.mapping_exact AS c_map,
-        c.file_id       AS file_id,
-        c.line          AS line,
-        c."column"      AS col,
-        t.id            AS term_id,
-        t.inst_id       AS term_inst_id,
-        t.direction     AS direction,
-        mp.net_id       AS inner_net_id,
-        mp.term_lo      AS m_lo,
-        mp.term_hi      AS m_hi,
-        mp.term_exact   AS m_term_exact,
-        mp.net_lo       AS m_net_lo,
-        mp.net_hi       AS m_net_hi,
-        mp.net_exact    AS m_net_exact,
-        mp.mapping_exact AS m_map
+        c.id                                   AS conn_id,
+        c.conn_kind                            AS conn_kind,
+        hr.resolved_net_id                     AS outer_net_id,
+        hr.lo                                  AS c_net_lo,
+        hr.hi                                  AS c_net_hi,
+        hr.is_exact                            AS c_net_exact,
+        c.term_lo                              AS c_lo,
+        c.term_hi                              AS c_hi,
+        c.term_exact                           AS c_term_exact,
+        c.map_exact                            AS c_map,
+        c.file_id                              AS file_id,
+        c.line                                 AS line,
+        c.col                                  AS col,
+        t.id                                   AS term_id,
+        t.inst_id                              AS term_inst_id,
+        t.direction                            AS direction,
+        mp.inner_net_id                        AS inner_net_id,
+        mp.term_lo                             AS m_lo,
+        mp.term_hi                             AS m_hi,
+        mp.term_exact                          AS m_term_exact,
+        mp.inner_lo                            AS m_net_lo,
+        mp.inner_hi                            AS m_net_hi,
+        mp.inner_exact                         AS m_net_exact,
+        mp.map_exact                           AS m_map
     FROM net_conn c
     JOIN term t      ON t.id = c.term_id
     JOIN term_map mp ON mp.term_id = c.term_id
-    LEFT JOIN hier_ref hr ON hr.id = c.hier_ref_id
-    WHERE c.connection_kind IN ('signal', 'expression_operand', 'constant',
+    LEFT JOIN hier_ref hr ON hr.id = c.outer_hier_ref_id
+    WHERE c.conn_kind IN ('signal', 'expression_operand', 'constant',
                                 'external_reference')
-      AND (c.connection_kind != 'external_reference'
+      AND (c.conn_kind != 'external_reference'
            OR hr.resolved_net_id IS NOT NULL)
-      AND (c.connection_kind != 'expression_operand'
-           OR c.net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
+      AND (c.conn_kind != 'expression_operand'
+           OR c.outer_net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
       AND (c.term_lo IS NULL OR mp.term_hi IS NULL OR c.term_lo <= mp.term_hi)
       AND (mp.term_lo IS NULL OR c.term_hi IS NULL OR mp.term_lo <= c.term_hi)
-      AND c.net_id IS NULL
+      AND c.outer_net_id IS NULL
 ),
 arc AS (
     SELECT seg.*,
@@ -884,39 +884,39 @@ arc AS (
              WHEN m_hi IS NULL THEN c_hi
              ELSE MIN(c_hi, m_hi) END AS ihi,
         (COALESCE(c_map, 0) = 1 AND COALESCE(c_term_exact, 0) = 1
-             AND m_term_exact = 1) AS outer_chain,
+             AND m_term_exact = 1)    AS outer_chain,
         (m_map = 1 AND COALESCE(c_term_exact, 0) = 1
-             AND m_term_exact = 1) AS inner_chain,
+             AND m_term_exact = 1)    AS inner_chain,
         (m_lo IS NOT NULL OR m_hi IS NOT NULL) AS m_narrows,
         (c_lo IS NOT NULL OR c_hi IS NOT NULL) AS c_narrows
     FROM seg
 )
 SELECT
-    connection_id, connection_kind, term_id, term_inst_id, direction,
+    conn_id, conn_kind, term_id, term_inst_id, direction,
     outer_net_id, inner_net_id,
     CASE WHEN outer_net_id IS NULL THEN NULL
          WHEN outer_chain AND c_net_exact = 1 AND ilo IS NOT NULL
               THEN COALESCE(c_net_lo, 0) + ilo - COALESCE(c_lo, 0)
-         ELSE c_net_lo END AS outer_lo,
+         ELSE c_net_lo END          AS outer_lo,
     CASE WHEN outer_net_id IS NULL THEN NULL
          WHEN outer_chain AND c_net_exact = 1 AND ihi IS NOT NULL
               THEN COALESCE(c_net_lo, 0) + ihi - COALESCE(c_lo, 0)
-         ELSE c_net_hi END AS outer_hi,
+         ELSE c_net_hi END          AS outer_hi,
     CASE WHEN outer_net_id IS NULL THEN NULL
          WHEN outer_chain OR NOT m_narrows THEN c_net_exact
-         ELSE 0 END AS outer_exact,
+         ELSE 0 END                 AS outer_exact,
     CASE WHEN inner_chain AND m_net_exact = 1 AND ilo IS NOT NULL
               THEN COALESCE(m_net_lo, 0) + ilo - COALESCE(m_lo, 0)
-         ELSE m_net_lo END AS inner_lo,
+         ELSE m_net_lo END          AS inner_lo,
     CASE WHEN inner_chain AND m_net_exact = 1 AND ihi IS NOT NULL
               THEN COALESCE(m_net_lo, 0) + ihi - COALESCE(m_lo, 0)
-         ELSE m_net_hi END AS inner_hi,
+         ELSE m_net_hi END          AS inner_hi,
     CASE WHEN inner_chain OR NOT c_narrows THEN m_net_exact
-         ELSE 0 END AS inner_exact,
+         ELSE 0 END                 AS inner_exact,
     CASE WHEN outer_net_id IS NULL THEN NULL
-         WHEN connection_kind IN ('expression_operand', 'external_reference')
+         WHEN conn_kind IN ('expression_operand', 'external_reference')
               THEN 0
-         ELSE (c_map AND m_map) END AS mapping_exact,
+         ELSE (c_map AND m_map) END AS map_exact,
     file_id, line, col
 FROM arc;
 
@@ -949,72 +949,72 @@ FROM arc;
 --                       -- but the source is a file or a plusarg, outside
 --                       anything this schema names, so driver_net_id is
 --                       NULL like a constant's and the kind keeps the two
---                       apart. statement_id names the call.
+--                       apart. stmt_id names the call.
 --   terminal            the design boundary: a root input/inout/ref
 --                       terminal drives the net it stands for. No driver
 --                       net exists -- the world outside is the driver --
---                       and terminal_id names the pin, so "undriven" and
+--                       and term_id names the pin, so "undriven" and
 --                       "reaches the boundary" stay distinct answers.
---                       Every driver_* column is NULL, mapping_exact with
+--                       Every driver_* column is NULL, map_exact with
 --                       them: there is no end to describe or correspond
 --                       with, and the whole point of the null-source
 --                       discipline is that a range beside a driver that
 --                       does not exist is a claim about nothing. The
---                       terminal's own window is in v_terminal_map.
+--                       terminal's own window is in v_term_map.
 --
 -- An unconnected terminal contributes no row.
 CREATE VIEW v_driver AS
 SELECT
-    d.target_net_id  AS signal_net_id,
-    tn.inst_id       AS signal_instance_id,
-    tn.name          AS signal_name,
-    d.target_lo      AS signal_lo,
-    d.target_hi      AS signal_hi,
-    d.target_exact   AS signal_exact,
-    d.source_net_id  AS driver_net_id,
-    sn.inst_id       AS driver_instance_id,
-    sn.name          AS driver_name,
-    d.source_lo      AS driver_lo,
-    d.source_hi      AS driver_hi,
-    d.source_exact   AS driver_exact,
-    CASE WHEN d.source_net_id IS NOT NULL THEN d.dependency_kind
-         WHEN s.statement_kind = 'system_task' THEN 'system_task'
+    d.tgt_net_id             AS signal_net_id,
+    tn.inst_id               AS signal_inst_id,
+    tn.name                  AS signal_name,
+    d.tgt_lo                 AS signal_lo,
+    d.tgt_hi                 AS signal_hi,
+    d.tgt_exact              AS signal_exact,
+    d.src_net_id             AS driver_net_id,
+    sn.inst_id               AS driver_inst_id,
+    sn.name                  AS driver_name,
+    d.src_lo                 AS driver_lo,
+    d.src_hi                 AS driver_hi,
+    d.src_exact              AS driver_exact,
+    CASE WHEN d.src_net_id IS NOT NULL THEN d.dep_kind
+         WHEN s.stmt_kind = 'system_task' THEN 'system_task'
          ELSE 'constant' END AS driver_kind,
-    d.id             AS dependency_id,
-    NULL             AS connection_id,
-    d.stmt_id        AS statement_id,
-    d.primitive_id   AS primitive_id,
-    NULL             AS terminal_id,
-    d.mapping_exact  AS mapping_exact,
-    f.path           AS file_path,
-    sf.path          AS source_path,
-    COALESCE(s.line, p.line)         AS source_line,
-    COALESCE(s."column", p."column") AS source_column
+    d.id                     AS dep_id,
+    NULL                     AS conn_id,
+    d.stmt_id                AS stmt_id,
+    d.prim_id                AS prim_id,
+    NULL                     AS term_id,
+    d.map_exact              AS map_exact,
+    f.path                   AS file_path,
+    sf.path                  AS src_path,
+    COALESCE(s.line, p.line) AS src_line,
+    COALESCE(s.col, p.col)   AS src_col
 FROM net_dep d
-JOIN net tn              ON tn.id = d.target_net_id
-LEFT JOIN net sn         ON sn.id = d.source_net_id
+JOIN net tn              ON tn.id = d.tgt_net_id
+LEFT JOIN net sn         ON sn.id = d.src_net_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
-LEFT JOIN primitive p    ON p.id = d.primitive_id
+LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
     a.inner_net_id, innet.inst_id, innet.name,
     a.inner_lo, a.inner_hi, a.inner_exact,
     a.outer_net_id, outnet.inst_id, outnet.name,
     a.outer_lo, a.outer_hi, a.outer_exact,
-    CASE a.connection_kind
+    CASE a.conn_kind
          WHEN 'expression_operand' THEN 'connection_expression'
          WHEN 'constant'           THEN 'constant'
          ELSE 'connection' END,
-    NULL, a.connection_id, NULL, NULL, NULL,
-    a.mapping_exact,
+    NULL, a.conn_id, NULL, NULL, NULL,
+    a.map_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
 LEFT JOIN net outnet     ON outnet.id = a.outer_net_id
 LEFT JOIN file f         ON f.id = a.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
 UNION ALL
 SELECT
@@ -1023,38 +1023,38 @@ SELECT
     a.inner_net_id, innet.inst_id, innet.name,
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
-    NULL, a.connection_id, NULL, NULL, NULL,
-    a.mapping_exact,
+    NULL, a.conn_id, NULL, NULL, NULL,
+    a.map_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
 JOIN net outnet          ON outnet.id = a.outer_net_id
 LEFT JOIN file f         ON f.id = a.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('output', 'inout', 'ref')
-  AND a.connection_kind IN ('signal', 'external_reference')
+  AND a.conn_kind IN ('signal', 'external_reference')
 UNION ALL
 SELECT
-    m.net_id, n.inst_id, n.name,
-    m.net_lo, m.net_hi, m.net_exact,
+    m.inner_net_id, n.inst_id, n.name,
+    m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id,
     NULL,
-    f.path, sf.path, t.line, t."column"
+    f.path, sf.path, t.line, t.col
 FROM term_map m
 JOIN term t              ON t.id = m.term_id
 JOIN tree_node r         ON r.id = t.inst_id AND r.node_kind = 'root'
-JOIN net n               ON n.id = m.net_id
+JOIN net n               ON n.id = m.inner_net_id
 LEFT JOIN file f         ON f.id = t.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE t.direction IN ('input', 'inout', 'ref');
 
 -- Every recorded read of signal_net, one row each -- v9's generalised load
 -- semantics carried to the instance level, plus the crossing. load_kind:
 --
 --   dataflow      a net_dep row: the signal feeds a target (data, control,
---                 primitive or procedure -- join net_dep on dependency_id
+--                 primitive or procedure -- join net_dep on dep_id
 --                 for which).
 --   connection    the crossing reads it: a parent net feeding an
 --                 input/inout/ref terminal, an internal net feeding an
@@ -1069,7 +1069,7 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 --                 load_* are all NULL -- a real reader, no nameable target.
 --   terminal      the design boundary: a root output/inout/ref terminal
 --                 reads the net it stands for. load_* are NULL and
---                 terminal_id names the pin, so "unused" and "reaches the
+--                 term_id names the pin, so "unused" and "reaches the
 --                 boundary" stay distinct answers.
 --
 -- One read, one row: an expr_ref or assign_operand that a net_dep row
@@ -1077,37 +1077,37 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 -- NOT EXISTS guards are that rule, and the verifier re-derives the counts.
 CREATE VIEW v_load AS
 SELECT
-    d.source_net_id AS signal_net_id,
-    sn.inst_id      AS signal_instance_id,
-    sn.name         AS signal_name,
-    d.source_lo     AS signal_lo,
-    d.source_hi     AS signal_hi,
-    d.source_exact  AS signal_exact,
-    d.target_net_id AS load_net_id,
-    tn.inst_id      AS load_instance_id,
-    tn.name         AS load_name,
-    d.target_lo     AS load_lo,
-    d.target_hi     AS load_hi,
-    d.target_exact  AS load_exact,
-    CASE WHEN d.dependency_kind = 'alias' THEN 'alias'
+    d.src_net_id             AS signal_net_id,
+    sn.inst_id               AS signal_inst_id,
+    sn.name                  AS signal_name,
+    d.src_lo                 AS signal_lo,
+    d.src_hi                 AS signal_hi,
+    d.src_exact              AS signal_exact,
+    d.tgt_net_id             AS load_net_id,
+    tn.inst_id               AS load_inst_id,
+    tn.name                  AS load_name,
+    d.tgt_lo                 AS load_lo,
+    d.tgt_hi                 AS load_hi,
+    d.tgt_exact              AS load_exact,
+    CASE WHEN d.dep_kind = 'alias' THEN 'alias'
          ELSE 'dataflow' END AS load_kind,
-    d.id            AS dependency_id,
-    NULL            AS connection_id,
-    d.stmt_id       AS statement_id,
-    s.procedure_id  AS procedure_id,
-    NULL            AS terminal_id,
-    d.mapping_exact AS mapping_exact,
-    f.path          AS file_path,
-    sf.path         AS source_path,
-    COALESCE(s.line, p.line)         AS source_line,
-    COALESCE(s."column", p."column") AS source_column
+    d.id                     AS dep_id,
+    NULL                     AS conn_id,
+    d.stmt_id                AS stmt_id,
+    s.proc_id                AS proc_id,
+    NULL                     AS term_id,
+    d.map_exact              AS map_exact,
+    f.path                   AS file_path,
+    sf.path                  AS src_path,
+    COALESCE(s.line, p.line) AS src_line,
+    COALESCE(s.col, p.col)   AS src_col
 FROM net_dep d
-JOIN net sn              ON sn.id = d.source_net_id
-JOIN net tn              ON tn.id = d.target_net_id
+JOIN net sn              ON sn.id = d.src_net_id
+JOIN net tn              ON tn.id = d.tgt_net_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
-LEFT JOIN primitive p    ON p.id = d.primitive_id
+LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
     a.outer_net_id, outnet.inst_id, outnet.name,
@@ -1115,14 +1115,14 @@ SELECT
     a.inner_net_id, innet.inst_id, innet.name,
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
-    NULL, a.connection_id, NULL, NULL, NULL,
-    a.mapping_exact,
+    NULL, a.conn_id, NULL, NULL, NULL,
+    a.map_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net outnet          ON outnet.id = a.outer_net_id
 JOIN net innet           ON innet.id = a.inner_net_id
 LEFT JOIN file f         ON f.id = a.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
 UNION ALL
 SELECT
@@ -1131,28 +1131,28 @@ SELECT
     a.outer_net_id, outnet.inst_id, outnet.name,
     a.outer_lo, a.outer_hi, a.outer_exact,
     'connection',
-    NULL, a.connection_id, NULL, NULL, NULL,
-    a.mapping_exact,
+    NULL, a.conn_id, NULL, NULL, NULL,
+    a.map_exact,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
 JOIN net outnet          ON outnet.id = a.outer_net_id
 LEFT JOIN file f         ON f.id = a.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('output', 'inout', 'ref')
-  AND a.connection_kind IN ('signal', 'external_reference')
+  AND a.conn_kind IN ('signal', 'external_reference')
 UNION ALL
 SELECT
     pe.net_id, n.inst_id, n.name,
     NULL, NULL, 1,
     NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
-    NULL, NULL, pe.stmt_id, pe.procedure_id, NULL, NULL,
-    f.path, sf.path, pe.line, pe."column"
+    NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL,
+    f.path, sf.path, pe.line, pe.col
 FROM proc_event pe
 JOIN net n               ON n.id = pe.net_id
 LEFT JOIN file f         ON f.id = pe.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
     e.net_id, n.inst_id, n.name,
@@ -1161,13 +1161,13 @@ SELECT
     CASE e.role WHEN 'wait' THEN 'wait'
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
-    NULL, NULL, e.stmt_id, s.procedure_id, NULL, NULL,
-    f.path, sf.path, s.line, s."column"
+    NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL,
+    f.path, sf.path, s.line, s.col
 FROM expr_ref e
 JOIN net n               ON n.id = e.net_id
 JOIN stmt s              ON s.id = e.stmt_id
 LEFT JOIN file f         ON f.id = s.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE e.role IN ('assertion', 'wait', 'event', 'system_task')
    OR NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.expr_ref_id = e.id)
 UNION ALL
@@ -1176,77 +1176,77 @@ SELECT
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
-    NULL, NULL, o.stmt_id, s.procedure_id, NULL, NULL,
-    f.path, sf.path, s.line, s."column"
+    NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL,
+    f.path, sf.path, s.line, s.col
 FROM assign_operand o
 JOIN net n               ON n.id = o.net_id
 JOIN stmt s              ON s.id = o.stmt_id
 LEFT JOIN file f         ON f.id = s.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_operand_id = o.id)
 UNION ALL
 SELECT
-    m.net_id, n.inst_id, n.name,
-    m.net_lo, m.net_hi, m.net_exact,
+    m.inner_net_id, n.inst_id, n.name,
+    m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id, NULL,
-    f.path, sf.path, t.line, t."column"
+    f.path, sf.path, t.line, t.col
 FROM term_map m
 JOIN term t              ON t.id = m.term_id
 JOIN tree_node r         ON r.id = t.inst_id AND r.node_kind = 'root'
-JOIN net n               ON n.id = m.net_id
+JOIN net n               ON n.id = m.inner_net_id
 LEFT JOIN file f         ON f.id = t.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE t.direction IN ('output', 'inout', 'ref');
 
 -- One row per stmt: the statement object. Targets and operands are
--- v_statement_target / v_statement_operand rows keyed on statement_id --
+-- v_stmt_target / v_stmt_operand rows keyed on stmt_id --
 -- one statement is ONE row here no matter how many targets it writes.
-CREATE VIEW v_statement AS
+CREATE VIEW v_stmt AS
 SELECT
-    s.id              AS statement_id,
-    s.inst_id         AS instance_id,
-    i.module_id       AS module_id,
-    m.name            AS module_name,
-    s.scope_node_id   AS scope_node_id,
-    s.procedure_id    AS procedure_id,
-    s.ordinal         AS ordinal,
-    s.sequence        AS sequence,
-    s.statement_kind  AS statement_kind,
-    s.construct       AS construct,
-    s.assignment_kind AS assignment_kind,
-    s.delay           AS delay,
+    s.id                    AS stmt_id,
+    s.inst_id               AS inst_id,
+    i.module_id             AS module_id,
+    m.name                  AS module_name,
+    s.scope_node_id         AS scope_node_id,
+    s.proc_id               AS proc_id,
+    s.ordinal               AS ordinal,
+    s.sequence              AS sequence,
+    s.stmt_kind             AS stmt_kind,
+    s.construct             AS construct,
+    s.assign_kind           AS assign_kind,
+    s.delay                 AS delay,
     s.dropped_operand_count AS dropped_operand_count,
-    f.path            AS file_path,
-    sf.path           AS source_path,
-    s.line            AS source_line,
-    s."column"        AS source_column
+    f.path                  AS file_path,
+    sf.path                 AS src_path,
+    s.line                  AS src_line,
+    s.col                   AS src_col
 FROM stmt s
 JOIN inst i              ON i.id = s.inst_id
 LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN file f         ON f.id = s.file_id
-LEFT JOIN source_file sf ON sf.id = f.source_file_id;
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- One row per assign_target.
-CREATE VIEW v_statement_target AS
+CREATE VIEW v_stmt_target AS
 SELECT
     a.id       AS target_id,
-    a.stmt_id  AS statement_id,
+    a.stmt_id  AS stmt_id,
     a.ordinal  AS ordinal,
     a.net_id   AS net_id,
     n.name     AS net_name,
-    a.lo       AS target_lo,
-    a.hi       AS target_hi,
-    a.is_exact AS target_exact
+    a.lo       AS tgt_lo,
+    a.hi       AS tgt_hi,
+    a.is_exact AS tgt_exact
 FROM assign_target a
 JOIN net n ON n.id = a.net_id;
 
 -- One row per assign_operand.
-CREATE VIEW v_statement_operand AS
+CREATE VIEW v_stmt_operand AS
 SELECT
     o.id       AS operand_id,
-    o.stmt_id  AS statement_id,
+    o.stmt_id  AS stmt_id,
     o.ordinal  AS ordinal,
     o.net_id   AS net_id,
     n.name     AS net_name,
@@ -1408,13 +1408,13 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
         prepare("INSERT INTO module VALUES(?,?,?,?,?,?)", &ins[InsModule]);
         prepare("INSERT INTO tree_node VALUES(?,?,?,?,?)", &ins[InsTreeNode]);
         prepare("INSERT INTO inst VALUES(?,?,?,?,?,?,?,?)", &ins[InsInst]);
-        prepare("INSERT INTO primitive VALUES(?,?,?,?,?,?,?)", &ins[InsPrimitive]);
+        prepare("INSERT INTO prim VALUES(?,?,?,?,?,?,?)", &ins[InsPrimitive]);
         prepare("INSERT INTO net VALUES(?,?,?,?,?,?,?,?,?,?,?)", &ins[InsNet]);
         prepare("INSERT INTO term VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsTerm]);
         prepare("INSERT INTO term_map VALUES(?,?,?,?,?,?,?,?,?,?)", &ins[InsTermMap]);
         prepare("INSERT INTO net_conn VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetConn]);
-        prepare("INSERT INTO procedure VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcedure]);
+        prepare("INSERT INTO proc VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcedure]);
         prepare("INSERT INTO stmt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsStmt]);
         prepare("INSERT INTO assign_target VALUES(?,?,?,?,?,?,?)",
                 &ins[InsAssignTarget]);
@@ -1505,7 +1505,7 @@ void Writer::setMeta(std::string_view key, std::string_view value) {
 
 void Writer::addSourceFile(const std::string& path, const std::string& digest) {
     sqlite3_stmt* s = nullptr;
-    prepare("INSERT OR IGNORE INTO source_file(path,digest) VALUES(?,?)", &s);
+    prepare("INSERT OR IGNORE INTO src_file(path,digest) VALUES(?,?)", &s);
     sqlite3_bind_text(s, 1, path.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, digest.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(s);
@@ -1520,13 +1520,13 @@ void Writer::linkSourceFiles(
     const std::unordered_map<std::string, std::string>& origins) {
     // The id comes from the subquery, not from a map this class maintains
     // alongside the table. The map had to be kept consistent with insert order
-    // by hand, and any source_file row inserted without going through
+    // by hand, and any src_file row inserted without going through
     // addSourceFile would have broken the join silently. A row with no match
     // -- a synthesized buffer, which is not a file and was never hashed --
     // yields NULL, which is what "no origin" already means in this column.
     sqlite3_stmt* s = nullptr;
-    prepare("UPDATE file SET source_file_id="
-            "(SELECT id FROM source_file WHERE path = ?1) WHERE path = ?2", &s);
+    prepare("UPDATE file SET src_file_id="
+            "(SELECT id FROM src_file WHERE path = ?1) WHERE path = ?2", &s);
     for (auto& [asWritten, full] : origins) {
         sqlite3_reset(s);
         sqlite3_bind_text(s, 1, full.c_str(), -1, SQLITE_TRANSIENT);
