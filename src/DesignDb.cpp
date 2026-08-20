@@ -299,8 +299,14 @@ CREATE TABLE proc(
 -- pretended to evaluate; NULL when there is none.
 --
 -- What is deliberately NOT here, unchanged from v9: no branch-condition
--- text, no clocked flag, no source text. `force` records as a blocking
--- assignment; `release` leaves no row.
+-- text, no clocked flag, no source text.
+--
+-- `force` records as a blocking assignment whose construct says 'force'
+-- (a procedural `assign` says 'proc_assign') -- the dataflow is a
+-- blocking assignment's, and the word is what lets a debugger find the
+-- hijack. `release`/`deassign` record as stmt_kind='release' with the
+-- lvalue as a target row and deliberately NO dependency: nothing is
+-- driven, and the row answers "where does the force end".
 CREATE TABLE stmt(
     id                    INTEGER PRIMARY KEY,
     inst_id               INTEGER NOT NULL REFERENCES inst(id),
@@ -310,7 +316,8 @@ CREATE TABLE stmt(
     sequence              INTEGER,
     stmt_kind             TEXT NOT NULL
         /*!*/CHECK(stmt_kind IN ('assignment','assertion','wait','call',
-                                 'system_task','event_control','alias'))/*!*/,
+                                 'system_task','event_control','alias',
+                                 'release'))/*!*/,
     construct             TEXT,
     assign_kind           TEXT
         /*!*/CHECK(assign_kind IN ('continuous','blocking','nonblocking'))/*!*/,
