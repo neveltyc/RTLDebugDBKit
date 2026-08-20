@@ -517,7 +517,16 @@ check(one("""
         WHEN 'constant' THEN c.outer_net_id IS NOT NULL OR c.map_exact IS NOT NULL
         WHEN 'unconnected' THEN c.outer_net_id IS NOT NULL OR c.map_exact IS NOT NULL
         WHEN 'interface' THEN c.outer_net_id IS NOT NULL
-        WHEN 'external_reference' THEN c.outer_net_id IS NOT NULL OR c.outer_hier_ref_id IS NULL
+        WHEN 'external_reference' THEN c.outer_net_id IS NOT NULL
+             OR c.outer_hier_ref_id IS NULL
+             -- Like 'signal': a tie against a resolved formal states its
+             -- mapping; only an unresolved instance's terminal has no
+             -- formal end to correspond with.
+             OR (c.map_exact IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM term t JOIN tree_node n
+                                 ON n.id = t.inst_id
+                                 WHERE t.id = c.term_id
+                                   AND n.node_kind = 'unresolved'))
         ELSE 1 END""") == 0,
       "connection columns match conn_kind")
 
@@ -1298,6 +1307,17 @@ if mode == "xmr":
         WHERE t.node_name='u_sink' AND d.signal_name='p'
           AND d.driver_kind='connection' AND d.driver_name='g'""") == 1,
           "and the resolved tie drives the formal across the boundary")
+    # v11 left external ties without a mapping, so this arc reported 0
+    # even though both windows are exact -- the tie is a positional
+    # element with a per-bit correspondence, and now says so.
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_tree_node t ON t.node_id = d.signal_inst_id
+        WHERE t.node_name='u_sink' AND d.signal_name='p'
+          AND d.driver_kind='connection' AND d.driver_name='g'
+          AND d.driver_lo=4 AND d.driver_hi=7 AND d.driver_exact=1
+          AND d.map_exact=1""") == 1,
+          "bit for bit: the external tie is traceable at bit granularity")
     check(one("""
         SELECT count(*) FROM v_driver d
         JOIN v_tree_node t ON t.node_id = d.signal_inst_id

@@ -920,7 +920,7 @@ SELECT
     CASE WHEN inner_chain OR NOT c_narrows THEN m_net_exact
          ELSE 0 END                 AS inner_exact,
     CASE WHEN outer_net_id IS NULL THEN NULL
-         WHEN conn_kind IN ('expression_operand', 'external_reference')
+         WHEN conn_kind = 'expression_operand'
               THEN 0
          ELSE (c_map AND m_map) END AS map_exact,
     file_id, line, col
@@ -1710,14 +1710,20 @@ void Writer::addNetConn(const NetConnRow& r) {
     sqlite3_bind_int64(s, 4, r.ordinal);
     sqlite3_bind_text(s, 5, r.connectionKind.c_str(), static_cast<int>(r.connectionKind.size()),
                       SQLITE_STATIC);
-    // A row with no net end has no net range and nothing to correspond with
-    // -- the NULL discipline enforced at the one chokepoint every emitter
-    // goes through, so a tie-off can never read as "the whole of nothing,
-    // exactly".
+    // A row with no net end has no net range -- the NULL discipline
+    // enforced at the one chokepoint every emitter goes through, so a
+    // tie-off can never read as "the whole of nothing, exactly". An
+    // external tie is the exception for the MAPPING alone: its outer end
+    // exists (the hier_ref names it), so the correspondence with the
+    // formal is a real fact even though the outer range lives on the
+    // reference row rather than here.
     if (r.netId == 0) {
         bindRangeTri(s, 6, std::nullopt, -1);
         bindRangeTri(s, 9, r.termBits, r.termExact);
-        sqlite3_bind_null(s, 12);
+        if (r.hierRefId == 0)
+            sqlite3_bind_null(s, 12);
+        else
+            bindTri(s, 12, r.mappingExact);
     }
     else {
         bindRangeTri(s, 6, r.netBits, r.netExact);

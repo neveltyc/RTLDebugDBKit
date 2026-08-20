@@ -3452,6 +3452,17 @@ private:
                     tc.kind = cn.expression ? "expression_operand"
                                             : "external_reference";
                     tc.hierRef = href;
+                    // An external tie has a formal to measure against like
+                    // any other connection to a resolved child, so it
+                    // states its mapping by the same rule -- v11 left it
+                    // NULL and the crossing arc reported 0 even where both
+                    // windows were exact, which is what kept those ties
+                    // untraceable bit by bit.
+                    if (!cn.expression)
+                        tc.mappingExact = cn.positional && !inArray &&
+                                                  !widthMismatch
+                                              ? 1
+                                              : 0;
                     c.conns.push_back(std::move(tc));
                     continue;
                 }
