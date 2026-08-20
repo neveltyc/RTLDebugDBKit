@@ -229,6 +229,17 @@ for tbl in ("net", "procedure", "stmt"):
           f"{tbl}.scope_node_id lies inside its own instance")
 check(one("SELECT count(*) FROM tree_node WHERE instr(name, '.') > 0") == 0,
       "every tree node name is a single path segment")
+# Siblings sharing (parent, name) are exactly what duplicate_path_count
+# admits to: the exporter counts every node after the first in a group,
+# so the tree must show sum(n - 1) collisions -- no more, no fewer. A
+# mismatch means the count and the tree disagree about how ambiguous a
+# path lookup is.
+check(one("""
+    SELECT COALESCE(SUM(n - 1), 0) FROM (
+        SELECT count(*) AS n FROM tree_node
+        GROUP BY parent_node_id, name HAVING count(*) > 1)""") ==
+      int(one("SELECT value FROM meta WHERE key='duplicate_path_count'")),
+      "sibling name collisions match duplicate_path_count")
 
 # ------------------------------------------------------------- ownership
 check(one("""
