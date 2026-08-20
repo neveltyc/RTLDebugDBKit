@@ -138,7 +138,13 @@ row.
 **`tree_node`** — `id, parent_node_id, name, node_kind, ordinal`. One path
 segment per node, `[i]` included for array elements (`u[0]`, `lane[3]`), so
 resolving `a.b[0].c` is one indexed lookup per segment against
-(parent_node_id, name) and no path strings are stored. `ordinal` is the
+(parent_node_id, name) and no path strings are stored. An anonymous gate
+(`buf (y, a);`, the usual spelling in cell models) has no segment of its
+own in the source, so it gets a synthesised one — `$buf$0`: `$`-prefixed
+so it cannot collide with an identifier the source could have written,
+counted per scope so siblings differ. Without it every anonymous gate
+answered to the name of the instance holding it, and (parent_node_id,
+name) stopped being a lookup. `ordinal` is the
 order among siblings. `node_kind`:
 
 * `root` — a top instance; has an `inst` row, no parent.
@@ -446,6 +452,13 @@ of it on every export. Ground rules:
 * `v_conn_arc` exists in the file but is NOT contract: it is the scaffolding
   the two composite views share, may change or vanish without a version
   bump, and consumers must not query it.
+* Point queries seek. `v_driver` and `v_load` by `signal_net_id`,
+  `v_net_dependency` by `target_net_id`, `v_net_connection` by `net_id`
+  use an index, never a base-table scan — the closure is the consumer's,
+  one point query per hop, so a scan per hop would be a scan per net in
+  the cone. The verifier asserts the query plan itself; a change to how a
+  view is computed that regresses this fails the export rather than
+  shipping a database that answers slowly.
 * Explicit column lists, never `SELECT *`; no transitive closure — a
   fan-in cone is the consumer's recursive query, one step per row here.
 
@@ -583,7 +596,13 @@ substitutes for the other.
   execution order inside a procedure. Neither is an identity.
 * Every id is issued by the exporter in one pass; 0 is never an id. The
   REFERENCES clauses are enforced by the verifier's `foreign_key_check`,
-  not per-insert.
+  not per-insert — and the enum CHECK clauses are, by default, not in the
+  shipped file at all: a string IN-list evaluated per row costs more than
+  the rest of the insert, so the exporter writes them only under
+  `--check-constraints`, and the verifier re-derives every domain from the
+  finished file either way. The value domains are contract; their CHECK
+  spelling is not. Read the domains from this document, never from
+  `.schema`.
 
 ## Provenance
 
@@ -591,9 +610,17 @@ substitutes for the other.
 SHA-256, so a consumer can tell the database and the RTL diverged instead of
 answering from stale data. `file` holds the spellings rows carry — as
 written in the filelist — joined to their source_file. `meta` is the seal;
-its required keys are the `v_database_info` columns plus `tool`.
+its required keys are the `v_database_info` columns plus `tool`, except
+`top` — the space-separated names of the elaborated top instances — which
+is absent when the design elaborates none.
 `analysis_status` is `complete | partial | hierarchy_only` and must agree
-with the counts beside it. `unresolved_count` counts unresolved
+with the counts beside it: errors, skipped procedures, duplicated paths
+(two siblings answering one (parent, name) pair, so a path lookup stops
+resolving uniquely) and truncated call expansions make `partial`.
+Unresolved instantiations deliberately do not — a design instantiating a
+vendor macro it has no source for is as complete as this tool can make
+it, and the count is there for a consumer that judges otherwise.
+`unresolved_count` counts unresolved
 instantiation *sites* (one per written instantiation, however many
 occurrences stamp out); the per-occurrence picture is
 `tree_node.node_kind='unresolved'`. `config_digest` fingerprints the inputs;
