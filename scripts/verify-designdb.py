@@ -717,14 +717,39 @@ print("ok: every fact view's row count equals its base table's")
 
 # Composite views: the row count is the sum of the branches, each branch
 # re-derived here from the base tables.
-arcs_in = one("""
-    SELECT count(*) FROM v_conn_arc a
-    WHERE a.direction IN ('input','inout','ref')""")
-arcs_out = one("""
-    SELECT count(*) FROM v_conn_arc a
-    WHERE a.direction IN ('output','inout','ref')
-      AND a.conn_kind IN ('signal', 'external_reference')
-      AND a.outer_net_id IS NOT NULL""")
+#
+# The crossing branches (arcs_*) reconcile against the (net_conn, term_map)
+# overlap COMPUTED HERE FROM THE BASE TABLES, not against v_conn_arc. Those
+# two are the composition itself, so deriving the expected arc count from
+# them would let a fault inside v_conn_arc inflate the view and the formula
+# together and pass -- the seam the doc names. The predicate below is
+# v_conn_arc's seg membership stated once (its two branches share it,
+# differing only on outer_net_id NULL-ness), and it references only base
+# tables. A separate check then pins v_conn_arc's own row count to it, so a
+# join or filter regression inside the view fails even though v_driver and
+# v_load would still self-reconcile.
+SEG = """
+    FROM net_conn c
+    JOIN term t      ON t.id = c.term_id
+    JOIN term_map mp ON mp.term_id = c.term_id
+    LEFT JOIN hier_ref hr ON hr.id = c.outer_hier_ref_id
+    WHERE c.conn_kind IN ('signal','expression_operand','constant',
+                          'external_reference')
+      AND (c.conn_kind != 'external_reference' OR hr.resolved_net_id IS NOT NULL)
+      AND (c.conn_kind != 'expression_operand'
+           OR c.outer_net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
+      AND (c.term_lo IS NULL OR mp.term_hi IS NULL OR c.term_lo <= mp.term_hi)
+      AND (mp.term_lo IS NULL OR c.term_hi IS NULL OR mp.term_lo <= c.term_hi)
+"""
+OUTER_PRESENT = "(c.outer_net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)"
+# The seam-closing check: the view emits exactly the base-table overlap, no
+# row more or fewer.
+check(one("SELECT count(*) FROM v_conn_arc") == one(f"SELECT count(*) {SEG}"),
+      "v_conn_arc is exactly the net_conn/term_map overlap")
+arcs_in = one(f"SELECT count(*) {SEG} AND t.direction IN ('input','inout','ref')")
+arcs_out = one(f"""SELECT count(*) {SEG}
+    AND t.direction IN ('output','inout','ref')
+    AND c.conn_kind IN ('signal','external_reference') AND {OUTER_PRESENT}""")
 term_in = one("""
     SELECT count(*) FROM term_map m JOIN term t ON t.id = m.term_id
     JOIN tree_node r ON r.id = t.inst_id AND r.node_kind = 'root'
@@ -738,9 +763,8 @@ want = one("SELECT count(*) FROM net_dep") + arcs_in + arcs_out + term_in
 if n_driver != want:
     sys.exit(f"v_driver has {n_driver} rows, branch sum says {want}")
 
-arcs_in_load = one("""
-    SELECT count(*) FROM v_conn_arc a
-    WHERE a.direction IN ('input','inout','ref') AND a.outer_net_id IS NOT NULL""")
+arcs_in_load = one(f"""SELECT count(*) {SEG}
+    AND t.direction IN ('input','inout','ref') AND {OUTER_PRESENT}""")
 n_load = one("SELECT count(*) FROM v_load")
 want = (one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
         + arcs_in_load + arcs_out + term_out
