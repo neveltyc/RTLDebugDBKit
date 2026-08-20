@@ -1302,9 +1302,16 @@ JOIN net n ON n.id = o.net_id;
 --
 --   terminal_inside     term_map: the net stands behind a terminal of its
 --                       own instance. other_id = the terminal.
---   actual_outside      net_conn: the net is wired to a child's terminal.
+--   actual_outside      net_conn: the net is wired to a child's terminal,
+--                       whether named directly (outer_net_id) or reached
+--                       through a resolved external tie (`.p(u.g[7:4])`).
 --                       other_id = that terminal.
---   written_by          assign_target. other_id = the target row.
+--   written_by          assign_target of an assignment or system-task
+--                       write. other_id = the target row.
+--   release_target      assign_target of a `release`/`deassign`. Same
+--                       storage, but the statement drives NOTHING -- kept
+--                       a separate kind so "what writes this net" excludes
+--                       it, exactly as no net_dep does.
 --   read_by             assign_operand. other_id = the operand row.
 --   condition           expr_ref with role='control'. other_id = the ref.
 --   statement_read      every other expr_ref role. other_id = the ref.
@@ -1329,9 +1336,24 @@ SELECT c.outer_net_id, n.inst_id, n.name, 'actual_outside', c.term_id,
 FROM net_conn c JOIN net n ON n.id = c.outer_net_id
 WHERE c.outer_net_id IS NOT NULL
 UNION ALL
-SELECT a.net_id, n.inst_id, n.name, 'written_by', a.id,
+-- The far side of a resolved external tie: the same wiring fact as a plain
+-- signal connection, but the net lives in another instance and the window
+-- lives on the hier_ref. Without this branch the crossing a `.p(u.g[7:4])`
+-- makes showed up only as named_from_outside, and "which child pin does
+-- this net feed" answered nothing for exactly the ties v12 taught to arc.
+SELECT h.resolved_net_id, n.inst_id, n.name, 'actual_outside', c.term_id,
+       h.lo, h.hi, h.is_exact, NULL
+FROM net_conn c
+JOIN hier_ref h ON h.id = c.outer_hier_ref_id
+JOIN net n ON n.id = h.resolved_net_id
+WHERE h.resolved_net_id IS NOT NULL
+UNION ALL
+SELECT a.net_id, n.inst_id, n.name,
+       CASE WHEN s.stmt_kind = 'release' THEN 'release_target'
+            ELSE 'written_by' END, a.id,
        a.lo, a.hi, a.is_exact, a.stmt_id
 FROM assign_target a JOIN net n ON n.id = a.net_id
+JOIN stmt s ON s.id = a.stmt_id
 UNION ALL
 SELECT o.net_id, n.inst_id, n.name, 'read_by', o.id,
        o.lo, o.hi, o.is_exact, o.stmt_id
