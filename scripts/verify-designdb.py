@@ -759,6 +759,9 @@ print("ok: v_driver and v_load reconcile with their branch formulas")
 n_att = one("SELECT count(*) FROM v_net_attachment")
 want = (one("SELECT count(*) FROM term_map")
         + one("SELECT count(*) FROM net_conn WHERE outer_net_id IS NOT NULL")
+        + one("""SELECT count(*) FROM net_conn c JOIN hier_ref h
+                 ON h.id = c.outer_hier_ref_id
+                 WHERE h.resolved_net_id IS NOT NULL""")
         + one("SELECT count(*) FROM assign_target")
         + one("SELECT count(*) FROM assign_operand")
         + one("SELECT count(*) FROM expr_ref")
@@ -772,9 +775,23 @@ print("ok: v_net_attachment reconciles with its branch formula")
 check(one("""
     SELECT count(*) FROM v_net_attachment
     WHERE attachment_kind NOT IN ('terminal_inside','actual_outside',
-        'written_by','read_by','condition','statement_read','event',
-        'dep_in','dep_out','named_from_outside')""") == 0,
+        'written_by','release_target','read_by','condition','statement_read',
+        'event','dep_in','dep_out','named_from_outside')""") == 0,
       "attachment_kind stays in its vocabulary")
+# The bug two correct commits made together: release stores its lvalue as
+# an assign_target (commit 6) and every assign_target became written_by
+# (commit 8), so a release read as a writer -- of a net it drives NOTHING
+# of, the whole point of giving it its own statement kind. A written_by
+# must never trace back to a release.
+check(one("""
+    SELECT count(*) FROM v_net_attachment a JOIN stmt s ON s.id = a.stmt_id
+    WHERE a.attachment_kind = 'written_by' AND s.stmt_kind = 'release'""") == 0,
+      "no release is mislabelled as a writer")
+check(one("""
+    SELECT count(*) FROM v_net_attachment a JOIN stmt s ON s.id = a.stmt_id
+    WHERE a.attachment_kind = 'release_target'
+      AND s.stmt_kind != 'release'""") == 0,
+      "and release_target is exactly the releases")
 
 check(one("""
     SELECT count(*) FROM v_driver
@@ -896,6 +913,13 @@ if mode == "constructs":
         WHERE s.stmt_kind='release' AND s.construct='release'
           AND t.net_name='stim'""") == 1,
           "and the release says where the hijack ends")
+    # v_net_attachment must show the release as its own kind, never as a
+    # writer: stim's attachments include a release_target and no written_by
+    # from the release statement.
+    check(one("""
+        SELECT count(*) FROM v_net_attachment a JOIN v_net n ON n.net_id = a.net_id
+        WHERE n.net_name='stim' AND a.attachment_kind='release_target'""") == 1,
+          "the release hangs off stim as a release_target, not a writer")
     # Self-feedback survives, and arithmetic is range-level: cnt <= cnt + 1.
     check(one("""
         SELECT count(*) FROM v_net_dep
@@ -1424,6 +1448,17 @@ if mode == "xmr":
         WHERE t.node_name='u_sink' AND d.signal_name='p'
           AND d.driver_kind='constant'""") == 1,
           "the constant tiling the rest of that formal is still recorded")
+    # The far side of the tie is a flat attachment too: g feeds u_sink's p
+    # terminal through the resolved reference, so v_net_attachment answers
+    # "which pin does g feed" the same way it would for a plain connection.
+    check(one("""
+        SELECT count(*) FROM v_net_attachment a
+        JOIN v_net n ON n.net_id = a.net_id
+        JOIN v_term t ON t.term_id = a.other_id
+        JOIN v_tree_node tn ON tn.node_id = t.inst_id
+        WHERE n.net_name='g' AND a.attachment_kind='actual_outside'
+          AND t.term_name='p' AND tn.node_name='u_sink'""") == 1,
+          "the resolved external tie shows g feeding u_sink.p as an attachment")
     # A condition gating a statement that writes nothing this instance
     # names is still a read of that signal.
     check(one("""
