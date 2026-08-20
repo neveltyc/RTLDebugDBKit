@@ -485,6 +485,11 @@ CREATE TABLE hier_ref(
 // target, load = by source, provenance = by each reference id.
 constexpr const char* kIndexes = R"SQL(
 CREATE INDEX tree_node_by_parent    ON tree_node(parent_node_id, ordinal);
+-- The documented access path: resolving `a.b[0].c` is one lookup per
+-- segment against (parent, name). Without this the by-parent index seeks
+-- the parent and then scans its children for the name -- invisible on a
+-- deep tree, linear per segment on a flat one with thousands of siblings.
+CREATE INDEX tree_node_by_name      ON tree_node(parent_node_id, name);
 CREATE INDEX inst_by_parent         ON inst(parent_inst_id);
 CREATE INDEX inst_by_module         ON inst(module_id);
 CREATE INDEX primitive_by_inst      ON primitive(inst_id);
