@@ -1176,6 +1176,19 @@ if mode == "udp":
         SELECT count(*) FROM prim WHERE prim_kind='switch'
           AND def_name='tranif1'""") == 1,
           "the switch is a primitive of its own kind")
+    # The LRM's whole switch family, not just what slang labels BiDiSwitch:
+    # the resistive variants and the MOS switches used to read as gates.
+    check(one("""
+        SELECT count(*) FROM prim WHERE prim_kind='switch'
+          AND def_name IN ('rtran','nmos')""") == 2,
+          "rtran and nmos are switches too")
+    check(one("""
+        SELECT count(*) FROM v_net_dep d
+        JOIN prim p ON p.id = d.prim_id
+        WHERE p.def_name='rtran'
+          AND ((d.src_name='ra' AND d.tgt_name='rb')
+            OR (d.src_name='rb' AND d.tgt_name='ra'))""") == 2,
+          "and the resistive switch still conducts both ways")
     check(one("""
         SELECT count(*) FROM prim WHERE prim_kind='gate'""") >= 1,
           "the buffer stays a gate")

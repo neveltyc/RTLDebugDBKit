@@ -15,9 +15,14 @@ primitive latch_p(output reg q, input d, input en);
 endprimitive
 
 module udps(input logic d, input logic en, output wire q, output wire z,
-            inout wire a, inout wire b, output wire w);
+            inout wire a, inout wire b, output wire w,
+            inout wire ra, inout wire rb, output wire m);
     latch_p u_l (q, d, en);
     tranif1 u_t (a, b, en);
+    // A resistive switch and a MOS switch: slang registers both as plain
+    // Fixed gates, so prim_kind='switch' used to miss them.
+    rtran   u_r (ra, rb);
+    nmos    u_n (m, d, en);
     buf     u_b (z, q);
     anon_gates u_anon (.a(d), .b(en), .y(w));
 endmodule

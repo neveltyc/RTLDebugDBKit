@@ -3037,11 +3037,16 @@ private:
                 name = "$" + std::string(def.name) + "$" + std::to_string(n++);
             }
             p.name = name;
+            // slang labels only tran/tranif* as BiDiSwitch; the resistive
+            // variants and the whole MOS family register as Fixed like any
+            // gate, so prim_kind='switch' silently missed rtran and nmos.
+            // The LRM's own switch list (28.7-28.8) decides instead.
+            static const std::set<std::string_view> kSwitches = {
+                "nmos", "pmos", "rnmos", "rpmos", "cmos", "rcmos",
+                "tran", "rtran", "tranif0", "tranif1", "rtranif0", "rtranif1"};
             p.primKind = def.primitiveKind == PrimitiveSymbol::UserDefined
                              ? "udp"
-                             : def.primitiveKind == PrimitiveSymbol::BiDiSwitch
-                                   ? "switch"
-                                   : "gate";
+                             : kSwitches.count(def.name) ? "switch" : "gate";
             p.defName = std::string(def.name);
             p.loc = locate(prim.location);
             const int32_t primIdx = int32_t(b.t->prims.size());
