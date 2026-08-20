@@ -1719,8 +1719,36 @@ private:
             g.body = &body;
     }
 
+    /// The key that decides which occurrences share a template: (definition
+    /// identity, parameter values). NOT the definition NAME -- two libraries
+    /// may define one name (which is why `module` keys on (name, file,
+    /// line), not name), and a name+params string would fold their distinct
+    /// bodies into one group, then stamp every occurrence of both from
+    /// whichever body was analysed. The source location is the definition's
+    /// stable identity; a raw pointer would be unique too but would make the
+    /// module-id assignment order (a walk over `groups`, sorted by this key)
+    /// depend on the address, and the export must be reproducible. Every
+    /// component is length-prefixed, so a string parameter whose value holds
+    /// a delimiter cannot alias a different split -- the old bare
+    /// `name=value` join could.
     std::string groupKey(const InstanceBodySymbol& body) const {
-        return std::string(body.getDefinition().name) + '\n' + parameterText(body);
+        auto& def = body.getDefinition();
+        Where w = whereOf(def.location, sourceManager);
+        std::string key;
+        auto add = [&](std::string_view s) {
+            key += std::to_string(s.size());
+            key += ':';
+            key += s;
+        };
+        add(def.name);
+        add(w.file);
+        add(std::to_string(w.line));
+        add(std::to_string(w.column));
+        for (auto& [name, value] : parameterPairs(body)) {
+            add(name);
+            add(value);
+        }
+        return key;
     }
 
     void collect(const InstanceSymbol& inst) {
