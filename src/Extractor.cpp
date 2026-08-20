@@ -900,7 +900,7 @@ struct TplStmt {
     TplLoc loc;
 };
 
-struct TplStmtRef {          // assign_target and assign_operand share the shape
+struct TplStmtRef {          // stmt_target and assign_operand share the shape
     int32_t stmt = 0;
     int64_t ordinal = 0;
     int32_t net = 0;
@@ -2510,7 +2510,7 @@ private:
         b.curStmt = -1;
     }
 
-    /// The lvalue a release/deassign lets go of: a real assign_target row
+    /// The lvalue a release/deassign lets go of: a real stmt_target row
     /// -- or a hier_ref with access='write' for a name outside this
     /// instance -- and deliberately NO dependency. Nothing is driven; the
     /// row answers "where does the force end", never "who drives this".
@@ -2534,7 +2534,7 @@ private:
         b.t->targets.push_back(std::move(tr));
     }
 
-    /// The target of a system task's write: a real assign_target plus a
+    /// The target of a system task's write: a real stmt_target plus a
     /// source-less dependency, so the argument has a driver and the
     /// procedure is not mistaken for one that wrote nothing. A target
     /// outside this instance is a hier_ref with access='write', as
@@ -2734,7 +2734,7 @@ private:
                 d.kind = "data";
                 d.srcR = rangeOf(p.src);
                 // The bits of the target THIS operand reaches, not the
-                // whole target: the `assign_target` row above still spans
+                // whole target: the `stmt_target` row above still spans
                 // everything the statement writes.
                 d.tgtR = rangeOf(p.tgt);
                 d.mappingExact = p.mapExact ? 1 : 0;
@@ -3917,14 +3917,14 @@ private:
 
         for (size_t i = 0; i < t.targets.size(); i++) {
             auto& r = t.targets[i];
-            AssignTargetRow row;
+            StmtTargetRow row;
             row.id = base.target + int64_t(i) + 1;
             row.stmtId = base.stmt + r.stmt + 1;
             row.ordinal = r.ordinal;
             row.netId = base.net + r.net + 1;
             row.bits = r.r.bits;
             row.exact = r.r.exact;
-            writer.addAssignTarget(row);
+            writer.addStmtTarget(row);
         }
         for (size_t i = 0; i < t.operands.size(); i++) {
             auto& r = t.operands[i];
@@ -3971,7 +3971,7 @@ private:
             row.targetNetId = base.net + d.tgtNet + 1;
             row.stmtId = d.stmt < 0 ? 0 : base.stmt + d.stmt + 1;
             row.assignOperandId = d.operandRef < 0 ? 0 : base.operand + d.operandRef + 1;
-            row.assignTargetId = d.targetRef < 0 ? 0 : base.target + d.targetRef + 1;
+            row.stmtTargetId = d.targetRef < 0 ? 0 : base.target + d.targetRef + 1;
             row.exprRefId = d.exprRef < 0 ? 0 : base.exprRef + d.exprRef + 1;
             row.primitiveId = d.prim < 0 ? 0 : primNode[size_t(d.prim)];
             row.dependencyKind = d.kind;
@@ -4297,7 +4297,7 @@ private:
             row.stmtId = d.stmt < 0 ? 0 : job.base.stmt + d.stmt + 1;
             row.assignOperandId =
                 d.operandRef < 0 ? 0 : job.base.operand + d.operandRef + 1;
-            row.assignTargetId =
+            row.stmtTargetId =
                 d.targetRef < 0 ? 0 : job.base.target + d.targetRef + 1;
             row.exprRefId = d.exprRef < 0 ? 0 : job.base.exprRef + d.exprRef + 1;
             row.dependencyKind = d.kind;

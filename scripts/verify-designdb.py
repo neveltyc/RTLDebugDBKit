@@ -115,7 +115,7 @@ for tbl, cols in (
     ("term", ("is_const",)),
     ("term_map", ("term_exact", "inner_exact", "map_exact")),
     ("net_conn", ("outer_exact", "term_exact", "map_exact")),
-    ("assign_target", ("is_exact",)),
+    ("stmt_target", ("is_exact",)),
     ("assign_operand", ("is_exact",)),
     ("expr_ref", ("is_exact",)),
     ("net_dep", ("src_exact", "tgt_exact", "map_exact")),
@@ -138,7 +138,7 @@ for tbl, lo, hi, exact in (
     ("term_map", "inner_lo", "inner_hi", "inner_exact"),
     ("net_conn", "outer_lo", "outer_hi", "outer_exact"),
     ("net_conn", "term_lo", "term_hi", "term_exact"),
-    ("assign_target", "lo", "hi", "is_exact"),
+    ("stmt_target", "lo", "hi", "is_exact"),
     ("assign_operand", "lo", "hi", "is_exact"),
     ("expr_ref", "lo", "hi", "is_exact"),
     ("net_dep", "src_lo", "src_hi", "src_exact"),
@@ -275,7 +275,7 @@ check(one("""
     JOIN inst child ON child.id = t.inst_id
     WHERE n.inst_id != child.parent_inst_id""") == 0,
       "a connection's net belongs to the terminal's parent instance")
-for tbl in ("assign_target", "assign_operand", "expr_ref"):
+for tbl in ("stmt_target", "assign_operand", "expr_ref"):
     check(one(f"""
         SELECT count(*) FROM "{tbl}" x
         JOIN stmt s ON s.id = x.stmt_id JOIN net n ON n.id = x.net_id
@@ -309,7 +309,7 @@ check(one("""
       "a release row says which spelling it was")
 check(one("""
     SELECT count(*) FROM stmt s WHERE s.stmt_kind='release'
-      AND NOT EXISTS (SELECT 1 FROM assign_target t WHERE t.stmt_id = s.id)
+      AND NOT EXISTS (SELECT 1 FROM stmt_target t WHERE t.stmt_id = s.id)
       AND NOT EXISTS (SELECT 1 FROM hier_ref h WHERE h.stmt_id = s.id)""") == 0,
       "a release names what it lets go of")
 check(one("""
@@ -319,7 +319,7 @@ check(one("""
       "and drives and reads nothing")
 check(one("""
     SELECT count(*) FROM net_dep d
-    JOIN assign_target t ON t.id = d.assign_target_id
+    JOIN stmt_target t ON t.id = d.stmt_target_id
     JOIN stmt s ON s.id = t.stmt_id
     WHERE s.stmt_kind='release'""") == 0,
       "no dependency borrows a release's target")
@@ -365,7 +365,7 @@ check(one("""
     WHERE CASE d.dep_kind
         WHEN 'data' THEN d.stmt_id IS NULL
              OR d.expr_ref_id IS NOT NULL OR d.prim_id IS NOT NULL
-             OR (d.assign_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
+             OR (d.stmt_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
              -- A NULL source net beside an operand row is a contradiction;
              -- beside a source reference it is an 'external' driver, and
              -- beside neither it is a constant. All three are legal shapes.
@@ -381,22 +381,22 @@ check(one("""
              OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
              OR d.assign_operand_id IS NOT NULL OR d.prim_id IS NOT NULL
              OR (d.expr_ref_id IS NULL) = (d.src_hier_ref_id IS NULL)
-             OR (d.assign_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
+             OR (d.stmt_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
              -- NULL-safe: `NULL != 0` is NULL, so the plain comparison read
              -- as "0 or NULL" and let an unset mapping through.
              OR d.map_exact IS NOT 0
         WHEN 'primitive' THEN d.prim_id IS NULL OR d.stmt_id IS NOT NULL
-             OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
+             OR d.stmt_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
              OR d.expr_ref_id IS NOT NULL OR d.src_hier_ref_id IS NOT NULL
              OR d.tgt_hier_ref_id IS NOT NULL
         WHEN 'alias' THEN d.stmt_id IS NULL OR d.src_net_id IS NULL
-             OR d.assign_target_id IS NULL OR d.assign_operand_id IS NULL
+             OR d.stmt_target_id IS NULL OR d.assign_operand_id IS NULL
              OR d.expr_ref_id IS NOT NULL OR d.prim_id IS NOT NULL
              OR d.src_hier_ref_id IS NOT NULL
              OR d.tgt_hier_ref_id IS NOT NULL
              OR d.map_exact IS NULL
         WHEN 'procedure' THEN d.prim_id IS NOT NULL
-             OR d.assign_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
+             OR d.stmt_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
              OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
              -- The reading side names where the actual came from, exactly
              -- as the doc promises: an argument reference or a resolved
@@ -435,7 +435,7 @@ check(one("""
     WHERE o.net_id != d.src_net_id OR o.stmt_id != d.stmt_id""") == 0,
       "net_dep's operand copy agrees with the operand row")
 check(one("""
-    SELECT count(*) FROM net_dep d JOIN assign_target t ON t.id = d.assign_target_id
+    SELECT count(*) FROM net_dep d JOIN stmt_target t ON t.id = d.stmt_target_id
     WHERE t.net_id != d.tgt_net_id OR t.stmt_id != d.stmt_id""") == 0,
       "net_dep's target copy agrees with the target row")
 check(one("""
@@ -479,10 +479,10 @@ check(one("""
       AND (proc_id IS NOT NULL OR construct != 'alias')""") == 0,
       "an alias statement is module-level and names itself")
 check(one("""
-    SELECT count(*) FROM assign_target a
+    SELECT count(*) FROM stmt_target a
     JOIN stmt s ON s.id = a.stmt_id
     WHERE s.stmt_kind != 'release'
-      AND NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_target_id = a.id)
+      AND NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.stmt_target_id = a.id)
       AND NOT EXISTS (SELECT 1 FROM hier_ref h
                       WHERE h.stmt_id = a.stmt_id AND h.access = 'read')""") == 0,
       "every assignment target has a dependency or an unresolved outward read")
@@ -655,7 +655,7 @@ VIEW_COLUMNS = {
         "src_lo", "src_hi", "src_exact", "tgt_net_id",
         "tgt_inst_id", "tgt_name", "tgt_lo", "tgt_hi",
         "tgt_exact", "stmt_id", "assign_operand_id",
-        "assign_target_id", "expr_ref_id", "prim_id",
+        "stmt_target_id", "expr_ref_id", "prim_id",
         "src_hier_ref_id", "tgt_hier_ref_id",
         "dep_kind", "map_exact", "file_path", "src_path",
         "src_line", "src_col"],
@@ -706,7 +706,7 @@ for view, base in (
     ("v_tree_node", "tree_node"), ("v_net", "net"), ("v_term", "term"),
     ("v_term_map", "term_map"), ("v_net_conn", "net_conn"),
     ("v_net_dep", "net_dep"), ("v_stmt", "stmt"),
-    ("v_stmt_target", "assign_target"),
+    ("v_stmt_target", "stmt_target"),
     ("v_stmt_operand", "assign_operand"),
 ):
     nv = one(f'SELECT count(*) FROM "{view}"')
@@ -762,7 +762,7 @@ want = (one("SELECT count(*) FROM term_map")
         + one("""SELECT count(*) FROM net_conn c JOIN hier_ref h
                  ON h.id = c.outer_hier_ref_id
                  WHERE h.resolved_net_id IS NOT NULL""")
-        + one("SELECT count(*) FROM assign_target")
+        + one("SELECT count(*) FROM stmt_target")
         + one("SELECT count(*) FROM assign_operand")
         + one("SELECT count(*) FROM expr_ref")
         + one("SELECT count(*) FROM proc_event WHERE net_id IS NOT NULL")
@@ -779,7 +779,7 @@ check(one("""
         'event','dep_in','dep_out','named_from_outside')""") == 0,
       "attachment_kind stays in its vocabulary")
 # The bug two correct commits made together: release stores its lvalue as
-# an assign_target (commit 6) and every assign_target became written_by
+# an stmt_target (commit 6) and every stmt_target became written_by
 # (commit 8), so a release read as a writer -- of a net it drives NOTHING
 # of, the whole point of giving it its own statement kind. A written_by
 # must never trace back to a release.
@@ -948,7 +948,7 @@ if mode == "constructs":
         WHERE assign_kind='continuous' AND proc_id IS NULL""") >= 2,
           "net initialisers are procedure-less continuous assignments")
     check(one("""
-        SELECT count(*) FROM assign_target a JOIN net n ON n.id=a.net_id
+        SELECT count(*) FROM stmt_target a JOIN net n ON n.id=a.net_id
         WHERE n.name='w'""") >= 1, "the net initialiser's target (w)")
     # The call chain: d -> bump.v at the call, bump.v -> q in the body.
     check(one("""
@@ -1028,7 +1028,7 @@ if mode == "constructs":
     # Concatenated assignment: one statement, two targets, no crossing.
     pair = con.execute("""
         SELECT s.id FROM stmt s
-        WHERE (SELECT count(*) FROM assign_target a WHERE a.stmt_id=s.id) = 2
+        WHERE (SELECT count(*) FROM stmt_target a WHERE a.stmt_id=s.id) = 2
         LIMIT 1""").fetchone()
     check(pair is not None, "a concatenated write is one statement, two targets")
     sid = pair[0]

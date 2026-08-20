@@ -342,7 +342,7 @@ CREATE TABLE stmt(
 -- One target reference of an assignment (LHS), in written order. A target
 -- whose net lies outside the instance is not here -- it is a `hier_ref`
 -- with access='write' on the same stmt_id.
-CREATE TABLE assign_target(
+CREATE TABLE stmt_target(
     id       INTEGER PRIMARY KEY,
     stmt_id  INTEGER NOT NULL REFERENCES stmt(id),
     ordinal  INTEGER NOT NULL,
@@ -420,7 +420,7 @@ CREATE TABLE proc_event(
 -- dep_kind, and what must be set for each (verifier-enforced):
 --
 --   data       an assignment moves it: stmt_id, and per end either the
---              local reference (assign_operand_id / assign_target_id) or
+--              local reference (assign_operand_id / stmt_target_id) or
 --              the hierarchical one (src_hier_ref_id / tgt_hier_ref_id).
 --              src_net_id NULL with no source reference of either kind is
 --              a constant driver (`q <= 8'h0`) -- the row still names the
@@ -463,7 +463,7 @@ CREATE TABLE net_dep(
     tgt_net_id         INTEGER NOT NULL REFERENCES net(id),
     stmt_id            INTEGER REFERENCES stmt(id),
     assign_operand_id  INTEGER REFERENCES assign_operand(id),
-    assign_target_id   INTEGER REFERENCES assign_target(id),
+    stmt_target_id   INTEGER REFERENCES stmt_target(id),
     expr_ref_id        INTEGER REFERENCES expr_ref(id),
     prim_id            INTEGER REFERENCES prim(id),
     src_hier_ref_id    INTEGER REFERENCES hier_ref(id),
@@ -535,7 +535,7 @@ CREATE INDEX proc_by_inst      ON proc(inst_id, ordinal);
 CREATE INDEX stmt_by_inst           ON stmt(inst_id, ordinal);
 CREATE INDEX stmt_by_proc      ON stmt(proc_id, sequence)
     WHERE proc_id IS NOT NULL;
-CREATE INDEX assign_target_by_net   ON assign_target(net_id);
+CREATE INDEX stmt_target_by_net   ON stmt_target(net_id);
 CREATE INDEX assign_operand_by_net  ON assign_operand(net_id);
 CREATE INDEX expr_ref_by_net        ON expr_ref(net_id);
 CREATE INDEX proc_event_by_proc ON proc_event(proc_id);
@@ -546,7 +546,7 @@ CREATE INDEX net_dep_by_tgt      ON net_dep(tgt_net_id);
 CREATE INDEX net_dep_by_stmt        ON net_dep(stmt_id);
 CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id)
     WHERE assign_operand_id IS NOT NULL;
-CREATE INDEX net_dep_by_tgt_ref  ON net_dep(assign_target_id);
+CREATE INDEX net_dep_by_tgt_ref  ON net_dep(stmt_target_id);
 CREATE INDEX net_dep_by_expr_ref    ON net_dep(expr_ref_id)
     WHERE expr_ref_id IS NOT NULL;
 CREATE INDEX net_dep_by_primitive   ON net_dep(prim_id)
@@ -781,7 +781,7 @@ SELECT
     d.tgt_exact              AS tgt_exact,
     d.stmt_id                AS stmt_id,
     d.assign_operand_id      AS assign_operand_id,
-    d.assign_target_id       AS assign_target_id,
+    d.stmt_target_id       AS stmt_target_id,
     d.expr_ref_id            AS expr_ref_id,
     d.prim_id                AS prim_id,
     d.src_hier_ref_id        AS src_hier_ref_id,
@@ -1267,7 +1267,7 @@ LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN file f         ON f.id = s.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
--- One row per assign_target.
+-- One row per stmt_target.
 CREATE VIEW v_stmt_target AS
 SELECT
     a.id       AS target_id,
@@ -1278,7 +1278,7 @@ SELECT
     a.lo       AS tgt_lo,
     a.hi       AS tgt_hi,
     a.is_exact AS tgt_exact
-FROM assign_target a
+FROM stmt_target a
 JOIN net n ON n.id = a.net_id;
 
 -- One row per assign_operand.
@@ -1306,9 +1306,9 @@ JOIN net n ON n.id = o.net_id;
 --                       whether named directly (outer_net_id) or reached
 --                       through a resolved external tie (`.p(u.g[7:4])`).
 --                       other_id = that terminal.
---   written_by          assign_target of an assignment or system-task
+--   written_by          stmt_target of an assignment or system-task
 --                       write. other_id = the target row.
---   release_target      assign_target of a `release`/`deassign`. Same
+--   release_target      stmt_target of a `release`/`deassign`. Same
 --                       storage, but the statement drives NOTHING -- kept
 --                       a separate kind so "what writes this net" excludes
 --                       it, exactly as no net_dep does.
@@ -1352,7 +1352,7 @@ SELECT a.net_id, n.inst_id, n.name,
        CASE WHEN s.stmt_kind = 'release' THEN 'release_target'
             ELSE 'written_by' END, a.id,
        a.lo, a.hi, a.is_exact, a.stmt_id
-FROM assign_target a JOIN net n ON n.id = a.net_id
+FROM stmt_target a JOIN net n ON n.id = a.net_id
 JOIN stmt s ON s.id = a.stmt_id
 UNION ALL
 SELECT o.net_id, n.inst_id, n.name, 'read_by', o.id,
@@ -1545,8 +1545,8 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 &ins[InsNetConn]);
         prepare("INSERT INTO proc VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcedure]);
         prepare("INSERT INTO stmt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsStmt]);
-        prepare("INSERT INTO assign_target VALUES(?,?,?,?,?,?,?)",
-                &ins[InsAssignTarget]);
+        prepare("INSERT INTO stmt_target VALUES(?,?,?,?,?,?,?)",
+                &ins[InsStmtTarget]);
         prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?,?,?)",
                 &ins[InsAssignOperand]);
         prepare("INSERT INTO expr_ref VALUES(?,?,?,?,?,?,?,?)", &ins[InsExprRef]);
@@ -1900,8 +1900,8 @@ void Writer::addStmt(const StmtRow& r) {
     bumped();
 }
 
-void Writer::addAssignTarget(const AssignTargetRow& r) {
-    auto* s = ins[InsAssignTarget];
+void Writer::addStmtTarget(const StmtTargetRow& r) {
+    auto* s = ins[InsStmtTarget];
     sqlite3_reset(s);
     sqlite3_bind_int64(s, 1, r.id);
     sqlite3_bind_int64(s, 2, r.stmtId);
@@ -1961,7 +1961,7 @@ void Writer::addNetDep(const NetDepRow& r) {
     sqlite3_bind_int64(s, 3, r.targetNetId);
     bindOptId(s, 4, r.stmtId);
     bindOptId(s, 5, r.assignOperandId);
-    bindOptId(s, 6, r.assignTargetId);
+    bindOptId(s, 6, r.stmtTargetId);
     bindOptId(s, 7, r.exprRefId);
     bindOptId(s, 8, r.primitiveId);
     bindOptId(s, 9, r.sourceHierRefId);
