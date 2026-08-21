@@ -81,14 +81,12 @@ order among siblings. `node_kind`:
 * `primitive` — a gate, switch or UDP; has a `prim` row.
 * `unresolved` — an instantiation whose definition slang could not find;
   has an `inst` row with `module_id` NULL and `unresolved_def` set.
-  A trace really does stop here, and that is different from stopping at a
-  gate — which is why the kinds are distinct words.
+  A trace stops here, which is distinct from stopping at a gate.
 * `package` — a package, a pseudo-occurrence above the roots: an `inst`
   row with `parent_inst_id` NULL and a `module` of `def_kind='package'`,
-  its variables `net` rows. It is not in the elaborated tree the way an
-  instance is — it has no parent and instantiates nothing — but giving it
-  the same object rows is what lets a `pkg::x` reference resolve to a real
-  net. See *Packages*.
+  its variables `net` rows. It is not in the elaborated tree — it has no
+  parent and instantiates nothing — but the object rows let a `pkg::x`
+  reference resolve to a real net. See *Packages*.
 
 The verifier holds the bijections: instance-like kinds (`root`, `instance`,
 `unresolved`, `package`) have `inst` rows and no others do; `primitive`
@@ -130,9 +128,8 @@ statement's rows.
 variables, of the instance body and its generate scopes, and — because a
 dependency end is an id and an id must exist — subroutine formals, locals
 and block variables, named by their scope-relative dotted path (`bump.v`,
-`g[0].sig`). Parameters, type parameters and specparams are *not* here: they
-are not connectivity, and folding them into the object list made every
-"signals of this scope" query filter them back out. `decl_kind` is
+`g[0].sig`). Parameters, type parameters and specparams are *not* here:
+they are not connectivity. `decl_kind` is
 the net type's own word (`wire`, `wand`, `trireg`, a user-defined nettype's
 name) or `variable`. `is_implicit=1` marks a net slang created for an
 undeclared identifier under the active `` `default_nettype ``; its location
@@ -171,7 +168,7 @@ which outer column is set — the kind first, then its pointer:
 | conn_kind | outer end | |
 |---|---|---|
 | `signal` | `outer_net_id` | a net of the parent instance |
-| `constant` | — | a tie-off; the term window is kept so the formal's bits tile rather than leaving a gap indistinguishable from an exporter bug |
+| `constant` | — | a tie-off; the term window is kept so the formal's bits tile without a gap |
 | `unconnected` | — | recorded, not omitted: absence would also mean "the exporter did not get this far" |
 | `expression_operand` | `outer_net_id` or `outer_hier_ref_id` | the actual is an expression; this row is one net it reads. `.en(state == RUN)` samples `state` but does not alias it to `en`; `map_exact` is 0 by construction |
 | `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. NULL when the binding has no per-occurrence object (an interface array element). No dataflow arc pretends to cross an interface binding |
@@ -205,10 +202,8 @@ always_ff @(posedge clk) begin
 end
 ```
 
-records the body's write twice, once under `g1` and once under `g2`.
-Walking the body once instead was cheaper and wrong: the write inherited
-only the first call site's condition, so `g2` never reached the target and
-the answer depended on which call the walk happened to reach first.
+records the body's write twice, once under `g1` and once under `g2` — each
+call carries its own gating.
 
 Recursion is bounded by an active-call guard, so a self-calling task is
 expanded once, not forever. Fan-out is bounded by a per-module budget: the
@@ -278,10 +273,8 @@ invisible to every load query. `net_id` is NULL when the expression is not
 a plain net; the reads then live as `expr_ref` rows with role `event`.
 
 An *implicit* list (`always @*`, `always_comb`, `always_latch`) gets no
-event rows: its sensitivity IS the read set, which the dataflow rows
-already carry, and duplicating it would report every combinational read
-twice — once as `dataflow` and once as `sensitivity`. Which event is the
-clock is deliberately not decided here.
+event rows: its sensitivity is the read set the dataflow rows already
+carry. The clock is not identified.
 
 ### Dataflow
 
@@ -302,33 +295,26 @@ never the four-way cross product. `dep_kind`, and what must be set
 | `alias` | an `alias` statement binds them into one object | `stmt_id`, and both an `stmt_target_id` and an `assign_operand_id`, since every name an alias binds is written and read at once. One row per ordered pair: `alias a = b = c;` binds every pair mutually rather than in a chain, so it is six rows, not two. `map_exact` is 1 — an alias is bit for bit by definition — unless a side could not be narrowed. |
 | `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) or `src_hier_ref_id` on the reading side |
 
-A dependency can cross by name on the target side with no source at all:
-`assign u.x = 8'h5A;` and `$readmemh("f.hex", u.mem)` both drive an object
-in another instance from something this schema cannot name. Those record a
-source-less dependency against the resolved target, so the far net has a
-driver — `constant` or `system_task` — instead of appearing never to have
-been written.
+A dependency can cross by name on the target side with no source:
+`assign u.x = 8'h5A;` and `$readmemh("f.hex", u.mem)` drive an object in
+another instance from a source this schema does not name. They record a
+source-less dependency against the resolved target, `dep_kind='data'`, and
+`v_driver` reports the far net's driver as `constant` or `system_task`.
 
 **Dataflow that crosses by name.** `assign q = u.x;` and a modport write
-are dataflow like any other, and they are recorded like any other: the
-dependency carries the resolved net at both ends and names the `hier_ref`
-row the reference went through instead of a local operand/target row. The
-pairing is made where the statement was walked — one row per (source
-element, target element) that share bits — never by joining `hier_ref` to
-operands on `stmt_id` afterwards, which would be a cross product again.
+carry the resolved net at both ends and name the `hier_ref` row the
+reference went through in place of a local operand/target row. The pairing
+is made where the statement was walked — one row per (source element,
+target element) that share bits.
 
-The two ends part ways on failure. An unresolved TARGET reference
-produces no dependency: `tgt_net_id` is NOT NULL, and a guessed written
-object would be a loud wrong fact. An unresolved SOURCE reference keeps
-its row — `src_net_id` NULL, `src_hier_ref_id` set — because dropping it
-would make "driven through a name this export cannot resolve"
-indistinguishable from "undriven", a wrong fact of the quieter kind. It
-surfaces in `v_driver` as `driver_kind='external'`.
+On failure the two ends differ. An unresolved TARGET produces no
+dependency, since `tgt_net_id` is NOT NULL. An unresolved SOURCE keeps its
+row — `src_net_id` NULL, `src_hier_ref_id` set — and surfaces in
+`v_driver` as `driver_kind='external'`; this distinguishes a signal driven
+through an unresolvable name from an undriven one.
 
-`src_net_id`/`tgt_net_id` repeat what the referenced rows already
-know. That is deliberate, *verified* redundancy — this table is the
-driver/load index, and the verifier holds the copies equal — not two
-independent sources of truth.
+`src_net_id`/`tgt_net_id` repeat the referenced rows' net ids; the verifier
+holds the copies equal.
 
 ### Leaving the instance
 
@@ -357,13 +343,12 @@ when the export can replay the reference —
 * package items (`pkg::mask`): resolved to the package's net (see
   *Packages*), the same for a bare name imported from the package;
 * upward references and interface-array bindings: NULL. The one analysed
-  body speaks for occurrences whose surroundings may differ, and a guess
-  stored as fact is the one thing the columns must never hold.
+  body speaks for occurrences whose surroundings may differ, so the target
+  is not resolved per occurrence.
 
-NULL `resolved_*` is "not resolved here", never a fabricated object, and
-not silence: a dependency whose source went through an unresolved reference
-is still written, and surfaces in `v_driver` as `'external'` with this row
-as its identity.
+NULL `resolved_*` means not resolved here. A dependency whose source went
+through an unresolved reference is still written and surfaces in `v_driver`
+as `'external'`, naming this row.
 
 ## Bit ranges
 
@@ -379,28 +364,23 @@ offsets straight onto declared indices mislabels every signal not declared
 * present bits with `exact=0` — an upper bound, not the bits actually
   touched (a dynamic selector).
 
-`map_exact` is never a restatement of the two sides' own `exact` flags:
-those describe each end's range, this describes the correspondence BETWEEN
-the ends. `q = a + b` knows both ranges exactly and still cannot say which
-bit of `a` reaches which bit of `q`, because a carry crosses them. 0 is not
-doubt — the dependency is real — it is range granularity. NULL is "no
-second end to correspond with" (a constant, an unconnected pin).
+`map_exact` describes the correspondence BETWEEN the two ends, not either
+end's own range. `q = a + b` has both ranges exact yet no per-bit
+correspondence, because a carry crosses them: `map_exact=0` there is range
+granularity, not doubt about the dependency. NULL means no second end to
+correspond with (a constant, an unconnected pin).
 
-Columns describing an end that does not exist are NULL together: a tie-off
-never reads as "the whole of nothing, exactly". One exception:
-an `'external'` dependency's source end exists — the reference names it —
-so its window and `map_exact` survive beside a NULL `src_net_id`.
+Columns describing an end that does not exist are NULL together. The one
+exception: an `'external'` dependency's source end exists — the reference
+names it — so its window and `map_exact` are set beside a NULL
+`src_net_id`.
 
 **Reading a dynamic index.** `out = mem[raddr]` is ONE dependency row —
 `mem` is one net however wide — with `src_lo/src_hi` NULL and
-`src_exact=0`: somewhere in `mem`, upper bound the whole of it. That is
-the honest static answer, not a defect; the address is not lost either —
-`raddr` is an ordinary operand with its own data dependency onto `out`
-(an address selects like a mux select does). A tracer that treats
-`exact=0` as "prune or widen consciously" keeps its cone honest: widening
-through `mem` legitimately admits every writer of `mem`, and the
-`exact=0` flag is the marker telling it that this is the step where
-precision was lost.
+`src_exact=0`: somewhere in `mem`, upper bound the whole of it. The address
+is a separate operand: `raddr` has its own data dependency onto `out`. A
+tracer following `exact=0` through `mem` admits every writer of `mem`; the
+flag marks the hop where bit precision is lost.
 
 ## The stable query interface
 
@@ -471,8 +451,8 @@ outer_net_id, outer_inst_id, outer_net_name, term_id, term_inst_id,
 term_name, direction, conn_kind, ordinal, outer_lo, outer_hi,
 outer_exact, term_lo, term_hi, term_exact, map_exact,
 outer_intf_inst_id, outer_hier_ref_id, file_path, src_path, src_line,
-src_col`. Deliberately NOT composed with `term_map` — this view is
-the fact, `v_driver`/`v_load` are the composition.
+src_col`. Not composed with `term_map`; `v_driver`/`v_load` are the
+composition.
 
 **`v_net_dep`** — one row per dependency: `dep_id,
 src_net_id, src_inst_id, src_name, src_lo, src_hi,
@@ -508,30 +488,23 @@ src_path, src_line, src_col`. `driver_kind`:
 * `connection_expression` — the actual is an expression; each net it reads
   drives the internal net at range granularity.
 * `constant` — a tie-off or constant right-hand side: `driver_net_id` NULL
-  and every driver column NULL with it. The statement or connection is
-  still named — that is what a driver query reports.
+  and every driver column NULL with it; `stmt_id` or `conn_id` names its
+  origin.
 * `external` — the source is a reference this export has no net row for:
-  an upward name from a shared body, an interface-array binding. The signal
-  IS driven; `driver_net_id` is NULL because the driver has no row, not
-  because it does not exist, and the dependency's `src_hier_ref_id` names
-  the reference — path, location, resolution NULL. Unlike a constant, the
-  driver window survives: the referenced object's bits are real even when
-  unnamed here. Kept apart from `constant` so "tied off" and "driven from
-  outside the model" stay different answers.
-* `alias` — an `alias` statement binds the two nets into one object.
-  Both directions exist, so each is the other's driver and the other's
-  load. The kind is what keeps it out of a multiple-driver count.
+  an upward name from a shared body, an interface-array binding.
+  `driver_net_id` is NULL and the dependency's `src_hier_ref_id` names the
+  reference (path, location, resolution NULL). Unlike a constant, the
+  driver window is set: the referenced object's bits are known.
+* `alias` — an `alias` statement binds the two nets into one object. Both
+  directions exist, so each is the other's driver and the other's load;
+  the kind excludes it from a multiple-driver count.
 * `system_task` — a system task wrote the argument. `driver_net_id` is
   NULL, as for a constant, because the source is a file or a plusarg
-  rather than a net; `stmt_id` names the call. Kept apart from
-  `constant` so "is this tied off?" and "is this loaded at startup?" are
-  different answers.
+  rather than a net; `stmt_id` names the call.
 * `terminal` — the design boundary. A root instance's input/inout/ref
   terminal drives the net it stands for: `driver_net_id` is NULL (the
   world outside the export is the driver) and `term_id` names the pin.
-  Without it, a top-level input's net reported no driver at all, and a
-  consumer could not tell "nothing drives this" from "this is where the
-  design ends" — two answers that mean opposite things.
+  It separates a net that reaches the boundary from one nothing drives.
 
 An unconnected terminal contributes no row.
 
@@ -547,11 +520,11 @@ it), `connection` (the crossing reads it; `load_net` is the far side),
 whose statement has no local target — including the *condition* gating
 such a statement, which no dependency can carry), `terminal` (a root output/inout/ref
 terminal reads the net it stands for — the boundary counterpart of
-v_driver's `terminal`). The last four have `load_*` NULL: a real reader
-with no nameable target. One read, one row: a reference already carried
-into `dataflow` by a dependency is not repeated as `statement`. The netlist
-analogy decides membership: a clock net's loads include the flop clock
-pins, so sensitivity is a load.
+v_driver's `terminal`). The last four have `load_*` NULL: a reader with no
+nameable target. One read, one row: a reference already carried into
+`dataflow` by a dependency is not repeated as `statement`. Membership
+follows the netlist model — a clock net's loads include the flop clock
+pins, so a sensitivity is a load.
 
 **`v_stmt`** — one row per statement: `stmt_id, inst_id,
 module_id, module_name, scope_node_id, proc_id, ordinal, sequence,
@@ -622,10 +595,9 @@ ordinal, sequence, signature, width).
   vpiLowConn). Direction words never name structure: an `inout` pin's
   outer net drives AND loads the inner one, so driver/load vocabulary
   belongs to `v_driver`/`v_load`, which derive it per port direction.
-* Kinds, directions and roles are their words. The words are a wire format:
-  they come from this schema, not from slang's enum printer, so a slang
-  upgrade cannot change the vocabulary underneath a consumer. Enum values
-  and meta keys are data, not identifiers: they stay full words.
+* Kinds, directions and roles are their words. The words are a wire format
+  fixed by this schema, not slang's enum printer. Enum values and meta keys
+  are data, not identifiers: they stay full words.
 * `ordinal` is position in a declaration or extraction list; `sequence` is
   execution order inside a procedure. Neither is an identity.
 
@@ -648,42 +620,38 @@ EDA standards already name:
   shipped file at all: a string IN-list evaluated per row costs more than
   the rest of the insert, so the exporter writes them only under
   `--check-constraints`, and the verifier re-derives every domain from the
-  finished file either way. The value domains are contract; their CHECK
-  spelling is not. Read the domains from this document, never from
-  `.schema`.
+  finished file either way. The value domains are contract and are listed
+  in this document; their CHECK spelling in the file is not.
 
 ## Provenance
 
 `src_file` holds every file slang actually read, absolute path and
-SHA-256, so a consumer can tell the database and the RTL diverged instead of
-answering from stale data. `file` holds the spellings rows carry — as
-written in the filelist — joined to their src_file. `meta` is the seal;
-its required keys are the `v_db_info` columns plus `tool`, except
-`top` — the space-separated names of the elaborated top instances — which
-is absent when the design elaborates none.
-`analysis_status` is `complete | partial | hierarchy_only` and must agree
-with the counts beside it: errors, skipped procedures, duplicated paths
-(two siblings answering one (parent, name) pair, so a path lookup stops
-resolving uniquely) and truncated call expansions make `partial`.
-Unresolved instantiations deliberately do not — a design instantiating a
-vendor macro it has no source for is as complete as this tool can make
-it, and the count is there for a consumer that judges otherwise.
-`unresolved_count` counts unresolved
+SHA-256, so a consumer can tell whether the database and the RTL diverged.
+`file` holds the spellings rows carry — as written in the filelist —
+joined to their src_file. `meta` is the seal; its required keys are the
+`v_db_info` columns plus `tool`, except `top` — the space-separated names
+of the elaborated top instances — which is absent when the design
+elaborates none.
+`analysis_status` is `complete | partial | hierarchy_only` and agrees with
+the counts beside it: errors, skipped procedures, duplicated paths (two
+siblings sharing one (parent, name) pair, so a path lookup stops resolving
+uniquely) and truncated call expansions make `partial`. Unresolved
+instantiations do not. `unresolved_count` counts unresolved
 instantiation *sites* (one per written instantiation, however many
 occurrences stamp out); the per-occurrence picture is
 `tree_node.node_kind='unresolved'`. `config_digest` fingerprints the inputs;
 two exports with one digest saw the same filelist, defines and flags.
 
-## What is deliberately not here
+## What is not here
 
 * No clock domains, no `clocked` flag, no election of "the" clock. That
-  needs constraints this tool does not read; a consumer that knows gets
-  both events of `@(posedge clk or negedge rst_n)` and can say.
+  needs constraints this tool does not read; both events of
+  `@(posedge clk or negedge rst_n)` are recorded, and the choice is the
+  reader's.
 * No branch-condition truth tables on statements. Which assignment "was in
-  effect" is not evaluable from a waveform by SQL, and encoding the
-  judgement as data would produce confident wrong answers. The conditions
-  ARE recorded — as `control` dependencies with their expression
-  references — the reasoning belongs to the reader.
+  effect" is not evaluable from a waveform by SQL. The conditions are
+  recorded — as `control` dependencies with their expression references —
+  and the evaluation is the reader's.
 * No source text. The file, line and column are here; the text is in the
   file.
 * No expression trees, no temporaries. `assign y = (a & b) | c` is three
@@ -693,10 +661,9 @@ two exports with one digest saw the same filelist, defines and flags.
 * A system task that writes an argument — `$readmemh` into a memory,
   `$sscanf` or `$value$plusargs` into a variable, `$cast` into its
   destination — records a target and a source-less dependency, surfacing
-  in `v_driver` as `system_task`. The signal is genuinely driven; the
-  source is a file or a plusarg, which is outside anything this schema
-  names. It is not a `constant`, and the kinds are separate so a consumer
-  cannot mistake one for the other.
+  in `v_driver` as `system_task`. The signal is driven; the source is a
+  file or a plusarg, outside anything this schema names, and the kind is
+  distinct from `constant`.
 * `force` records as a blocking assignment marked `construct='force'`
   (procedural `assign`, `'proc_assign'`) — the hijack is findable with
   one WHERE, and its dataflow stays a blocking assignment's.
@@ -753,8 +720,8 @@ two exports with one digest saw the same filelist, defines and flags.
 
 ## Interfaces
 
-An interface is not a special case in this schema — that is the point.
-An interface instance goes through the same template/stamp pipeline as a
+An interface is not a special case in this schema. An interface instance
+goes through the same template/stamp pipeline as a
 module: a `tree_node` plus an `inst` (its `module` row says
 `def_kind='interface'`), its variables are `net` rows, its procedures and
 statements their ordinary rows. What differs is the boundary:
@@ -772,14 +739,13 @@ statements their ordinary rows. What differs is the boundary:
   interface meet at those nets, which is where a trace crosses.
 
 So "what drives `axi_if.master`'s `vld`" is `v_driver` on the interface
-instance's own net — the interface occurrence is a first-class place, not
-a bundle of wires spliced into its users.
+instance's own net.
 
 ## Packages
 
 A package is a *pseudo-occurrence*: not part of the elaborated tree — it
 has no parent and instantiates nothing — but given the same object rows as
-one, so its state is a place a trace can reach. It is a `tree_node` with
+one. It is a `tree_node` with
 `node_kind='package'` (`parent_node_id` NULL, above the roots), a matching
 `inst` with `parent_inst_id` NULL and a `module` of `def_kind='package'`,
 and each package variable is a `net` under it.
@@ -795,16 +761,16 @@ its package. Two modules reading one package variable meet on its net,
 exactly as two modules on one interface meet on the interface's net.
 
 Only package *variables* become nets. A package of nothing but
-`localparam`, `typedef` and functions is a node with no nets — real, and
-correctly empty. `$unit` compilation-unit items are not stamped yet and
+`localparam`, `typedef` and functions is a node with no nets. `$unit`
+compilation-unit items are not stamped yet and
 stay `external`. A package variable's initializer is not a driver (the LRM
 rule for variables), so the exporter walks no package-internal dataflow;
 its drivers and loads are the modules that reference it.
 
 ## Tracing across inout, tran and alias
 
-Bidirectional structure is stored as what it is — arcs both ways — and
-three habits keep a walk over it honest:
+Bidirectional structure is stored as arcs both ways. Three rules for a
+walk over it:
 
 * **Recursion terminates by dedup, not by direction.** A recursive CTE
   with `UNION` (never `UNION ALL`) carries a visited set for free; a
@@ -815,10 +781,10 @@ three habits keep a walk over it honest:
   pair shares `stmt_id`. Treat rows with one provenance id as one
   undirected edge when the question is "what is electrically one node",
   and as two directed arcs when it is "which way may data flow".
-* **Kinds keep counts honest.** `alias` is excluded from multiple-driver
-  counts by its kind; an inout bus with N modules on it genuinely has N
-  potential drivers, and the schema reports exactly that — the resolution
-  of who wins is simulation, not structure.
+* **Kinds keep counts right.** `alias` is excluded from multiple-driver
+  counts by its kind; an inout bus with N modules on it has N potential
+  drivers, and the schema reports that. Resolving which one wins is
+  simulation, not structure.
 
 ## Tracing across calls
 
@@ -838,8 +804,6 @@ other's — `{g1, a}` and `{g2, b}`, never `{g1, b}`. This is context
 sensitivity by call string, the shape static analysis calls *k*-CFA, done
 at query time over tags rather than baked into the stored graph.
 
-What it does not do: give each site its own formal *net*. The shared net is
-still one row; the tags are what let a careful consumer tell the two calls
-apart. A consumer that ignores `call_site_id` sees the graph without the
-call-site distinction, which is well-formed — just less precise across
-calls.
+The shared formal is still one net row; `call_site_id` is the tag that
+tells the calls apart. A consumer that ignores it sees the graph without
+the call-site distinction — well-formed, less precise across calls.
