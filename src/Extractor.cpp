@@ -2,6 +2,7 @@
 // released under the BSD 3-Clause License (see LICENSE)
 
 #include "Extractor.h"
+#include "extract/DeclIndex.h"
 #include "extract/Ref.h"
 #include "extract/SourceLocator.h"
 #include "extract/StatementWalker.h"
@@ -259,8 +260,10 @@ private:
         Template* t = nullptr;
         const InstanceBodySymbol* body = nullptr;
         std::string prefix;
-        std::unordered_map<const Symbol*, int32_t> netOf;
-        std::unordered_map<const Symbol*, int32_t> scopeOf;
+        /// The declaration index for this body. Owns what used to be
+        /// netOf/scopeOf, and is the only thing here that hands out net
+        /// and scope indices.
+        DeclIndex* decl = nullptr;
         std::unordered_map<const SubroutineSymbol*, int32_t> procOf;
         /// (reference expression, is-write, statement) -> hierRefs index.
         /// Keyed by node so a generate loop's four elaborations of one
@@ -291,121 +294,6 @@ private:
         int64_t callBudget = kCallExpansionBudget;
         int64_t truncatedCalls = 0;
     };
-
-    /// The net index for a symbol of this body, creating the row on first
-    /// sight. Everything the dataflow touches must be a net row -- a
-    /// dependency end is an id, and an id must exist -- so subroutine
-    /// formals, locals and block variables are added lazily with their
-    /// scope-relative dotted names.
-    ///
-    /// A symbol inside a CHILD instance is not a net of this one, even
-    /// though its path extends this body's -- `u_cnt.cnt` is the child's
-    /// net, which has a row of its own under the child. v9 stored the dotted
-    /// spelling as a local name because the folded model had nothing to
-    /// point at; the instance model does, so a downward reference goes to
-    /// hier_ref and resolves to the real object.
-    int32_t netFor(Build& b, const ValueSymbol& sym) {
-        if (auto it = b.netOf.find(&sym); it != b.netOf.end())
-            return it->second;
-        std::string rel;
-        if (!relativePath(sym, b.prefix, rel))
-            return -1;
-        for (const Scope* s = sym.getParentScope(); s;) {
-            auto& owner = s->asSymbol();
-            if (owner.kind == SymbolKind::InstanceBody) {
-                if (&owner != &b.body->asSymbol())
-                    return -1;
-                break;
-            }
-            s = owner.getParentScope();
-        }
-        TplNet net;
-        net.scope = 0;
-        net.name = std::move(rel);
-        net.declKind = declarationKindOf(sym);
-        net.dataTypeId = writer.internDataType(typeOf(sym));
-        if (sym.getType().isIntegral())
-            net.width = static_cast<int64_t>(sym.getType().getBitWidth());
-        if (sym.kind == SymbolKind::Net)
-            net.isImplicit = sym.as<NetSymbol>().isImplicit;
-        net.loc = locator.locate(sym.location);
-        const int32_t idx = int32_t(b.t->nets.size());
-        b.t->netIndex.emplace(net.name, idx);
-        b.t->nets.push_back(std::move(net));
-        b.netOf.emplace(&sym, idx);
-        return idx;
-    }
-
-    /// Declared nets and variables of the body and its generate scopes,
-    /// eagerly, so a declared-but-unused signal is still a row -- those are
-    /// exactly the ones worth asking about. scope indices follow the
-    /// generate tree built alongside.
-    void collectDeclarations(Build& b, const Scope& scope, int32_t scopeIdx) {
-        for (auto& member : scope.members()) {
-            switch (member.kind) {
-                case SymbolKind::Variable:
-                case SymbolKind::Net: {
-                    if (member.name.empty())
-                        break;
-                    auto& vs = member.as<ValueSymbol>();
-                    const int32_t idx = netFor(b, vs);
-                    if (idx >= 0)
-                        b.t->nets[size_t(idx)].scope = scopeIdx;
-                    break;
-                }
-                case SymbolKind::GenerateBlock: {
-                    auto& block = member.as<GenerateBlockSymbol>();
-                    if (block.isUninstantiated)
-                        break;
-                    const int32_t idx = addScope(b, block, scopeIdx,
-                                                 generateSegment(block));
-                    collectDeclarations(b, block, idx);
-                    break;
-                }
-                case SymbolKind::GenerateBlockArray: {
-                    auto& arr = member.as<GenerateBlockArraySymbol>();
-                    std::string base(arr.name);
-                    if (base.empty())
-                        base = arr.getExternalName();
-                    for (auto& entry : arr.entries) {
-                        std::string segment = base;
-                        if (entry->kind == SymbolKind::GenerateBlock)
-                            segment += generateSegment(
-                                entry->as<GenerateBlockSymbol>());
-                        const int32_t idx = addScope(b, entry->asSymbol(),
-                                                     scopeIdx, segment);
-                        collectDeclarations(b, *entry, idx);
-                    }
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
-    }
-
-    int32_t addScope(Build& b, const Symbol& sym, int32_t parent,
-                     std::string name) {
-        const int32_t idx = int32_t(b.t->scopes.size());
-        b.t->scopes.push_back(TplScope{parent, std::move(name)});
-        b.scopeOf.emplace(&sym, idx);
-        return idx;
-    }
-
-    int32_t scopeForSymbol(Build& b, const Symbol& sym) {
-        // Climb to the nearest scope the template modelled: a generate block
-        // or the body itself. Statement blocks and subroutines fold onto it.
-        const Scope* s = sym.getParentScope();
-        while (s) {
-            auto& owner = s->asSymbol();
-            if (auto it = b.scopeOf.find(&owner); it != b.scopeOf.end())
-                return it->second;
-            if (&owner == &b.body->asSymbol())
-                return 0;
-            s = owner.getParentScope();
-        }
-        return 0;
-    }
 
     // ----------------------------------------------------- statement rows
 
@@ -665,14 +553,17 @@ private:
     // ----------------------------------------------------- template build
 
     void buildTemplate(Template& t, const InstanceBodySymbol& body) {
+        // The index first: its constructor establishes scope 0, and nothing
+        // below can name a net or a scope until it exists.
+        DeclIndex decl(t, body, body.getHierarchicalPath(), locator, writer);
+
         Build b;
         b.t = &t;
         b.body = &body;
         b.prefix = body.getHierarchicalPath();
-        t.scopes.push_back(TplScope{-1, std::string()});
-        b.scopeOf.emplace(&body.asSymbol(), 0);
+        b.decl = &decl;
 
-        collectDeclarations(b, body, 0);
+        b.decl->collectDeclarations(body, 0);
         buildTermMaps(b, body);
 
         if (auto* scope = analysis.getAnalyzedScope(body)) {
@@ -719,7 +610,7 @@ private:
                 auto& p = portSym->as<PortSymbol>();
                 if (p.internalSymbol && ValueSymbol::isKind(p.internalSymbol->kind)) {
                     const int32_t netIdx =
-                        netFor(b, p.internalSymbol->as<ValueSymbol>());
+                        b.decl->netFor(p.internalSymbol->as<ValueSymbol>());
                     addSeg(netIdx, TplRange{}, TplRange{}, true);
                 }
                 else if (auto* inner = p.getInternalExpr()) {
@@ -728,7 +619,7 @@ private:
                     for (auto& cn : segs) {
                         if (!cn.ref.sym)
                             continue;
-                        const int32_t netIdx = netFor(b, *cn.ref.sym);
+                        const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
                         if (netIdx < 0)
                             continue;
                         TplRange termR;
@@ -770,7 +661,7 @@ private:
                     else {
                         termR.exact = false;
                     }
-                    addSeg(netFor(b, vs), termR, TplRange{}, mapping);
+                    addSeg(b.decl->netFor(vs), termR, TplRange{}, mapping);
                 }
             }
             // InterfacePort: no nets behind it, no map rows.
@@ -793,14 +684,14 @@ private:
         int32_t procIdx = -1;
         if (!isContinuous) {
             TplProcedure p;
-            p.scope = scopeForSymbol(b, sym);
+            p.scope = b.decl->scopeForSymbol(sym);
             p.kind = construct == "assign" ? "always" : construct;
             p.loc = procAt;
             procIdx = int32_t(b.t->procedures.size());
             b.t->procedures.push_back(std::move(p));
         }
         b.curProc = procIdx;
-        b.curScope = scopeForSymbol(b, sym);
+        b.curScope = b.decl->scopeForSymbol(sym);
         b.curStmt = -1;
 
         auto& sens = proc.getSensitivityList();
@@ -958,7 +849,7 @@ private:
                              const TplLoc& at, EvalContext& evalCtx) {
         if (!r.sym)
             return;
-        const int32_t netIdx = netFor(b, *r.sym);
+        const int32_t netIdx = b.decl->netFor(*r.sym);
         if (netIdx < 0) {
             const int32_t saved = b.curStmt;
             b.curStmt = stmt;
@@ -983,7 +874,7 @@ private:
                            const TplLoc& at, EvalContext& evalCtx) {
         if (!r.sym)
             return;
-        const int32_t netIdx = netFor(b, *r.sym);
+        const int32_t netIdx = b.decl->netFor(*r.sym);
         if (netIdx < 0) {
             // `$readmemh("f.hex", u.mem)` -- the task drives a memory in
             // another instance. Recording only the reference left that
@@ -1029,7 +920,7 @@ private:
                     const TplLoc& at, EvalContext& evalCtx) {
         if (!r.sym)
             return;
-        const int32_t netIdx = netFor(b, *r.sym);
+        const int32_t netIdx = b.decl->netFor(*r.sym);
         if (netIdx < 0) {
             const int32_t saved = b.curStmt;
             b.curStmt = stmt;
@@ -1049,7 +940,7 @@ private:
         if (expr && (expr->kind == ExpressionKind::NamedValue ||
                      expr->kind == ExpressionKind::HierarchicalValue)) {
             auto& vs = expr->as<ValueExpressionBase>().symbol;
-            netIdx = netFor(b, vs);
+            netIdx = b.decl->netFor(vs);
             if (netIdx < 0) {
                 Ref r;
                 r.sym = &vs;
@@ -1103,7 +994,7 @@ private:
             for (auto& g : gating) {
                 if (!g.sym)
                     continue;
-                const int32_t netIdx = netFor(b, *g.sym);
+                const int32_t netIdx = b.decl->netFor(*g.sym);
                 if (netIdx < 0) {
                     b.curControlRefs.push_back(-1);
                     b.curControlHrefs.push_back(
@@ -1123,7 +1014,7 @@ private:
         // The target row, or the outward write.
         int32_t targetIdx = -1;
         int32_t tgtHref = -1;
-        int32_t dstNet = netFor(b, *dst.sym);
+        int32_t dstNet = b.decl->netFor(*dst.sym);
         if (dstNet < 0) {
             tgtHref = addHierRef(b, true, dst, at, evalCtx);
         }
@@ -1147,7 +1038,7 @@ private:
         for (auto& p : pairs) {
             if (!p.src.sym)
                 continue;
-            const int32_t srcNet = netFor(b, *p.src.sym);
+            const int32_t srcNet = b.decl->netFor(*p.src.sym);
             int32_t operandIdx = -1;
             int32_t srcHref = -1;
             if (srcNet >= 0) {
@@ -1243,7 +1134,7 @@ private:
                 if (ctrlRef < 0 && ctrlHref < 0)
                     continue;
                 if (ctrlRef >= 0 && targetIdx >= 0) {
-                    const int32_t srcNet = netFor(b, *src.sym);
+                    const int32_t srcNet = b.decl->netFor(*src.sym);
                     if (srcNet < 0)
                         continue;
                     TplDep d;
@@ -1263,7 +1154,7 @@ private:
                     TplCrossDep d;
                     d.kind = "control";
                     d.stmt = stmt;
-                    d.srcNet = ctrlRef >= 0 ? netFor(b, *src.sym) : -1;
+                    d.srcNet = ctrlRef >= 0 ? b.decl->netFor(*src.sym) : -1;
                     d.srcHref = ctrlHref;
                     d.tgtNet = dstNet;
                     d.tgtHref = tgtHref;
@@ -1288,11 +1179,11 @@ private:
                          const TplLoc& at, EvalContext& evalCtx) {
         if (!formal.sym || !actual.sym)
             return;
-        const int32_t formalNet = netFor(b, *formal.sym);
+        const int32_t formalNet = b.decl->netFor(*formal.sym);
         if (formalNet < 0)
             return;
         const int32_t stmt = bindable ? b.curStmt : -1;
-        const int32_t actualNet = netFor(b, *actual.sym);
+        const int32_t actualNet = b.decl->netFor(*actual.sym);
         if (actualNet < 0) {
             // An outward actual still binds: the dependency pairs here and
             // materialises when the reference resolves.
@@ -1451,7 +1342,7 @@ private:
                     continue;
                 Side sd;
                 sd.ref = got[0];
-                sd.net = netFor(b, *sd.ref.sym);
+                sd.net = b.decl->netFor(*sd.ref.sym);
                 if (sd.net < 0) {
                     // Nothing in this instance to bind; the reference is
                     // the record, as everywhere else.
@@ -1514,7 +1405,7 @@ private:
             auto conns = prim.getPortConnections();
             auto& def = prim.primitiveType;
             TplPrim p;
-            p.scope = scopeForSymbol(b, prim);
+            p.scope = b.decl->scopeForSymbol(prim);
             // A gate may be written without an instance name -- `buf (y, a);`
             // is legal and usual in cell models. Such a symbol has no name of
             // its own, so its hierarchical path ends at its PARENT, and
@@ -1598,7 +1489,7 @@ private:
 
             for (auto& dstTerm : writes) {
                 const Ref& dst = dstTerm.ref;
-                const int32_t dstNet = dst.sym ? netFor(b, *dst.sym) : -1;
+                const int32_t dstNet = dst.sym ? b.decl->netFor(*dst.sym) : -1;
                 if (dstNet < 0) {
                     if (dst.sym)
                         addHierRef(b, true, dst, b.t->prims.back().loc, evalCtx);
@@ -1616,7 +1507,7 @@ private:
                     if (srcTerm.terminal == dstTerm.terminal)
                         continue;
                     const Ref& src = srcTerm.ref;
-                    const int32_t srcNet = src.sym ? netFor(b, *src.sym) : -1;
+                    const int32_t srcNet = src.sym ? b.decl->netFor(*src.sym) : -1;
                     if (srcNet < 0) {
                         if (src.sym)
                             addHierRefIfOutward(b, src, evalCtx);
@@ -1846,7 +1737,7 @@ private:
                     auto& block = member.as<GenerateBlockSymbol>();
                     if (block.isUninstantiated)
                         break;
-                    registerChildren(b, block, scopeIndexOf(b, block, scopeIdx),
+                    registerChildren(b, block, b.decl->scopeIndexOf(block, scopeIdx),
                                      childOf, childSyms);
                     break;
                 }
@@ -1854,7 +1745,7 @@ private:
                     for (auto& entry :
                          member.as<GenerateBlockArraySymbol>().entries) {
                         registerChildren(b, *entry,
-                                         scopeIndexOf(b, entry->asSymbol(), scopeIdx),
+                                         b.decl->scopeIndexOf(entry->asSymbol(), scopeIdx),
                                          childOf, childSyms);
                     }
                     break;
@@ -1866,19 +1757,6 @@ private:
                     break;
             }
         }
-    }
-
-    int32_t scopeIndexOf(Build& b, const Symbol& sym, int32_t parent) {
-        if (auto it = b.scopeOf.find(&sym); it != b.scopeOf.end())
-            return it->second;
-        // A generate scope not seen by collectDeclarations (e.g. an array
-        // entry wrapper): create it now so the tree stays faithful.
-        std::string seg;
-        if (sym.kind == SymbolKind::GenerateBlock)
-            seg = generateSegment(sym.as<GenerateBlockSymbol>());
-        else
-            seg = std::string(sym.name);
-        return addScope(b, sym, parent, std::move(seg));
     }
 
     /// One resolved child's connection templates: the outside of each of its
@@ -1994,7 +1872,7 @@ private:
                     c.conns.push_back(std::move(tc));
                     continue;
                 }
-                const int32_t netIdx = netFor(b, *cn.ref.sym);
+                const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
                 if (netIdx < 0) {
                     // Tied to something with no name here. The row exists
                     // either way; what it is tied to is in hier_ref.
@@ -2120,7 +1998,7 @@ private:
                     c.conns.push_back(std::move(tc));
                     continue;
                 }
-                const int32_t netIdx = netFor(b, *cn.ref.sym);
+                const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
                 if (netIdx < 0) {
                     const int32_t saved = b.curStmt;
                     b.curStmt = -1;
