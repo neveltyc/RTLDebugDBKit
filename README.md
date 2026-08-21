@@ -136,7 +136,14 @@ provides.
 
 ```
 CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
-src/                    main.cpp (CLI + filelist parsing), Extractor, DesignDb
+src/                    main.cpp (CLI + filelist parsing), Extractor (the
+                        two-pass export), DesignDb (the writer)
+src/sql/                the DDL: Schema, Indexes, Views
+src/extract/            the export, in layers. Ref/SymbolText/Template are the
+                        vocabulary (header-only); SourceLocator, DeclIndex and
+                        StatementWalker the services over it; TemplateBuilder
+                        (+ _Conn) is pass 1 and Stamper pass 2, each behind a
+                        one-function interface
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
 examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
@@ -144,8 +151,14 @@ examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
                         level-sensitive events, interfaces, assertions,
                         generate arrays, non-ANSI ports, net aliases, a
                         deliberate black box -- exported and asserted by CI
+examples/options/       not a construct fixture: two files, two tops, a macro
+                        defined in one and used in the other, and a header
+                        reachable only through +incdir+ -- so --single-unit,
+                        +define+ and the config digest have something to be
+                        wrong about. Used by refactor-equivalence.sh
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
+                        refactor-equivalence.sh (two binaries, same rows?),
                         designdb-coverage.py (what an export had to approximate),
                         export-real-designs.sh (the measurements table, from a
                         local checkout of the public designs),

@@ -81,7 +81,10 @@ endif()
 add_executable(rtl-designdb
   src/main.cpp
   src/DesignDb.cpp
-  src/Extractor.cpp)
+  src/Extractor.cpp
+  src/extract/TemplateBuilder.cpp
+  src/extract/TemplateBuilder_Conn.cpp
+  src/extract/Stamper.cpp)
 
 target_include_directories(rtl-designdb PRIVATE src)
 target_link_libraries(rtl-designdb PRIVATE slang::slang designdb_sqlite)
