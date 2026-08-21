@@ -290,7 +290,7 @@ std::string assertionWord(AssertionKind kind) {
     }
 }
 
-/// The procedure_kind word for a procedural block.
+/// The proc_kind word for a procedural block.
 std::string procedureWord(const Symbol& sym) {
     if (sym.kind != SymbolKind::ProceduralBlock)
         return "always";
@@ -346,24 +346,34 @@ void collectEdgeEvents(const TimingControl* t,
 /// One group's parameter values, as stable text: declaration order, values in
 /// full precision (ConstantValue::toString abbreviates above 128 bits, which
 /// folded distinct parameterisations).
-std::string parameterText(const InstanceBodySymbol& body) {
-    std::string out;
+std::vector<std::pair<std::string, std::string>>
+parameterPairs(const InstanceBodySymbol& body) {
+    std::vector<std::pair<std::string, std::string>> out;
     for (auto& member : body.members()) {
-        if (!out.empty() && (member.kind == SymbolKind::Parameter ||
-                             member.kind == SymbolKind::TypeParameter))
-            out += ',';
         if (member.kind == SymbolKind::Parameter) {
             auto& p = member.as<ParameterSymbol>();
-            out += std::string(p.name);
-            out += '=';
-            out += p.getValue().toString(SVInt::MAX_BITS);
+            out.emplace_back(std::string(p.name),
+                             p.getValue().toString(SVInt::MAX_BITS));
         }
         else if (member.kind == SymbolKind::TypeParameter) {
             auto& tp = member.as<TypeParameterSymbol>();
-            out += std::string(tp.name);
-            out += '=';
-            out += tp.targetType.getType().toString();
+            out.emplace_back(std::string(tp.name),
+                             tp.targetType.getType().toString());
         }
+    }
+    return out;
+}
+
+/// The signature is the pairs, joined -- one normalisation, two
+/// representations, and the verifier holds them equal per occurrence.
+std::string parameterText(const InstanceBodySymbol& body) {
+    std::string out;
+    for (auto& [name, value] : parameterPairs(body)) {
+        if (!out.empty())
+            out += ',';
+        out += name;
+        out += '=';
+        out += value;
     }
     return out;
 }
@@ -776,7 +786,7 @@ void forEachInstance(const Scope& scope, F&& fn) {
     forEachOfKind<SymbolKind::Instance, InstanceSymbol>(scope, fn);
 }
 
-/// The declaration_kind word for a net or variable.
+/// The decl_kind word for a net or variable.
 std::string declarationKindOf(const Symbol& sym) {
     if (sym.kind != SymbolKind::Net)
         return "variable";
@@ -890,7 +900,7 @@ struct TplStmt {
     TplLoc loc;
 };
 
-struct TplStmtRef {          // assign_target and assign_operand share the shape
+struct TplStmtRef {          // stmt_target and assign_operand share the shape
     int32_t stmt = 0;
     int64_t ordinal = 0;
     int32_t net = 0;
@@ -979,7 +989,7 @@ struct TplCrossDep {
 };
 
 struct TplConn {
-    std::string kind;        // net_conn.connection_kind
+    std::string kind;        // net_conn.conn_kind
     int32_t parentNet = -1;  // index into the PARENT template's nets
     int32_t childTerm = -1;  // index into the child template's terms
     int64_t ordinal = 0;     // segment ordinal within that terminal
@@ -1008,6 +1018,7 @@ struct TplChild {
 struct Template {
     int64_t moduleId = 0;
     std::string params;
+    std::vector<std::pair<std::string, std::string>> paramPairs;
     std::vector<TplScope> scopes;
     std::vector<TplNet> nets;
     std::vector<TplTerm> terms;
@@ -1041,7 +1052,7 @@ struct Template {
 /// Both ends are narrowed to the overlap, not just the source. Keeping the
 /// target whole while narrowing the source is what made
 /// `assign swap = {c[3:0], c[7:4]}` export two dependencies each claiming
-/// all eight bits of swap with mapping_exact=1 -- a four-bit source cannot
+/// all eight bits of swap with map_exact=1 -- a four-bit source cannot
 /// map one-to-one onto an eight-bit target, so the row was not merely
 /// coarse but impossible, and it said the bytes were not swapped.
 struct PairedSrc {
@@ -1062,7 +1073,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         const Ref& dst, const std::vector<PairedSrc>& pairs,
         const std::vector<Ref>& gating, SourceRange where, int64_t seq,
         bool blocking, int64_t dropped, bool inSubroutine, bool firstTarget,
-        const std::string& delay)>;
+        const std::string& delay, const char* constructWord)>;
     /// A call site's actual bound to its formal, by argument direction.
     /// `bindable` is false when the call sits in a control expression, which
     /// belongs to no statement this schema records.
@@ -1099,6 +1110,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// The delay control in force for statements below a `#d` timed statement,
     /// and for a continuous assign's own delay.
     std::string pendingDelay;
+    /// The construct word an enclosing `force`/procedural `assign` stamps
+    /// on its assignment; null outside one.
+    const char* constructOverride = nullptr;
     std::vector<Ref> gating;
     int64_t seq = 0;
     std::set<const SubroutineSymbol*> activeSubs;
@@ -1351,7 +1365,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // positional as a mapping gets.
             emitTarget(dst, {PairedSrc{dst, dst, true, dst}}, gating, expr.sourceRange,
                        seq++, true, 0, subDepth > 0, /*firstTarget=*/true,
-                       pendingDelay);
+                       pendingDelay, constructOverride);
         }
         visitDefault(expr);
     }
@@ -1432,6 +1446,29 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                             expr.sourceRange);
             }
         }
+    }
+
+    void handle(const ProceduralAssignStatement& s) {
+        // `force a = b` and procedural `assign a = b` move data exactly as
+        // a blocking assignment does, and until now produced exactly the
+        // same row -- a hijacked signal's driver could not be told from
+        // the logic it overrode. The construct word is the marker;
+        // `WHERE construct='force'` is the debug query this exists for.
+        const char* saved = constructOverride;
+        constructOverride = s.isForce ? "force" : "proc_assign";
+        visitDefault(s);
+        constructOverride = saved;
+    }
+
+    void handle(const ProceduralDeassignStatement& s) {
+        // `release`/`deassign` drive nothing and read nothing -- but each
+        // is the other half of a force, and leaving no row made "where
+        // does the hijack end" unanswerable. The statement records its
+        // lvalues and deliberately no dependency.
+        std::vector<Ref> writes;
+        collectRefs(s.lvalue, eval, writes, /*skipSelectors=*/true);
+        emitRead({}, {}, writes, "release",
+                 s.isRelease ? "release" : "deassign", seq++, s.sourceRange);
     }
 
     void handle(const AssignmentExpression& expr) {
@@ -1516,7 +1553,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             }
             emitTarget(dstSlot.ref, pairs, gating, expr.sourceRange, stmtSeq,
                        expr.isBlocking(), droppedConstants, subDepth > 0,
-                       firstTarget, delay);
+                       firstTarget, delay, constructOverride);
             firstTarget = false;
         }
 
@@ -1643,6 +1680,7 @@ public:
             auto& t = templates[key];
             t.moduleId = moduleIds[&group.body->getDefinition()];
             t.params = group.params;
+            t.paramPairs = group.paramPairs;
             buildTemplate(t, *group.body);
         }
 
@@ -1668,6 +1706,7 @@ private:
     struct Group {
         std::string name;
         std::string params;
+        std::vector<std::pair<std::string, std::string>> paramPairs;
         const InstanceBodySymbol* body = nullptr;
     };
 
@@ -1680,8 +1719,36 @@ private:
             g.body = &body;
     }
 
+    /// The key that decides which occurrences share a template: (definition
+    /// identity, parameter values). NOT the definition NAME -- two libraries
+    /// may define one name (which is why `module` keys on (name, file,
+    /// line), not name), and a name+params string would fold their distinct
+    /// bodies into one group, then stamp every occurrence of both from
+    /// whichever body was analysed. The source location is the definition's
+    /// stable identity; a raw pointer would be unique too but would make the
+    /// module-id assignment order (a walk over `groups`, sorted by this key)
+    /// depend on the address, and the export must be reproducible. Every
+    /// component is length-prefixed, so a string parameter whose value holds
+    /// a delimiter cannot alias a different split -- the old bare
+    /// `name=value` join could.
     std::string groupKey(const InstanceBodySymbol& body) const {
-        return std::string(body.getDefinition().name) + '\n' + parameterText(body);
+        auto& def = body.getDefinition();
+        Where w = whereOf(def.location, sourceManager);
+        std::string key;
+        auto add = [&](std::string_view s) {
+            key += std::to_string(s.size());
+            key += ':';
+            key += s;
+        };
+        add(def.name);
+        add(w.file);
+        add(std::to_string(w.line));
+        add(std::to_string(w.column));
+        for (auto& [name, value] : parameterPairs(body)) {
+            add(name);
+            add(value);
+        }
+        return key;
     }
 
     void collect(const InstanceSymbol& inst) {
@@ -1690,6 +1757,7 @@ private:
         auto& g = groups[key];
         if (g.name.empty()) {
             g.name = std::string(body.getDefinition().name);
+            g.paramPairs = parameterPairs(body);
             g.params = parameterText(body);
         }
         offer(g, body);
@@ -2351,14 +2419,17 @@ private:
             [&](const Ref& dst, const std::vector<PairedSrc>& pairs,
                 const std::vector<Ref>& gating, SourceRange where, int64_t seq,
                 bool blocking, int64_t dropped, bool inSubroutine,
-                bool firstTarget, const std::string& delay) {
+                bool firstTarget, const std::string& delay,
+                const char* constructWord) {
                 reached = true;
                 if (!dst.sym || inputPorts.count(dst.sym))
                     return;
                 const TplLoc at = locate(where.start(), procAt);
                 emitAssignment(b, dst, pairs, gating, at, seq, blocking,
                                dropped, inSubroutine, firstTarget, delay,
-                               isContinuous, construct, evalCtx);
+                               isContinuous,
+                               constructWord ? constructWord : construct,
+                               evalCtx);
             },
             // ---- a call site's actual bound to its formal
             [&](const Ref& formal, const Ref& actual, bool reads, bool writes,
@@ -2409,9 +2480,14 @@ private:
                     // A system task's write is a write: the procedure that
                     // contains one has reached a driver, and counting it as
                     // an empty procedure blamed the walk for a construct it
-                    // now models.
+                    // now models. A release is the opposite: it names its
+                    // lvalue and drives nothing, so it gets a target row
+                    // and deliberately no dependency.
                     reached = true;
-                    recordSystemWrite(b, s, w, at, evalCtx);
+                    if (stmtKind == "release")
+                        recordReleaseTarget(b, s, w, at, evalCtx);
+                    else
+                        recordSystemWrite(b, s, w, at, evalCtx);
                 }
             },
             evalCtx);
@@ -2434,7 +2510,31 @@ private:
         b.curStmt = -1;
     }
 
-    /// The target of a system task's write: a real assign_target plus a
+    /// The lvalue a release/deassign lets go of: a real stmt_target row
+    /// -- or a hier_ref with access='write' for a name outside this
+    /// instance -- and deliberately NO dependency. Nothing is driven; the
+    /// row answers "where does the force end", never "who drives this".
+    void recordReleaseTarget(Build& b, int32_t stmt, const Ref& r,
+                             const TplLoc& at, EvalContext& evalCtx) {
+        if (!r.sym)
+            return;
+        const int32_t netIdx = netFor(b, *r.sym);
+        if (netIdx < 0) {
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            addHierRef(b, true, r, at, evalCtx);
+            b.curStmt = saved;
+            return;
+        }
+        TplStmtRef tr;
+        tr.stmt = stmt;
+        tr.ordinal = b.targetOrdinal++;
+        tr.net = netIdx;
+        tr.r = rangeOf(r);
+        b.t->targets.push_back(std::move(tr));
+    }
+
+    /// The target of a system task's write: a real stmt_target plus a
     /// source-less dependency, so the argument has a driver and the
     /// procedure is not mistaken for one that wrote nothing. A target
     /// outside this instance is a hier_ref with access='write', as
@@ -2634,7 +2734,7 @@ private:
                 d.kind = "data";
                 d.srcR = rangeOf(p.src);
                 // The bits of the target THIS operand reaches, not the
-                // whole target: the `assign_target` row above still spans
+                // whole target: the `stmt_target` row above still spans
                 // everything the statement writes.
                 d.tgtR = rangeOf(p.tgt);
                 d.mappingExact = p.mapExact ? 1 : 0;
@@ -2979,11 +3079,16 @@ private:
                 name = "$" + std::string(def.name) + "$" + std::to_string(n++);
             }
             p.name = name;
+            // slang labels only tran/tranif* as BiDiSwitch; the resistive
+            // variants and the whole MOS family register as Fixed like any
+            // gate, so prim_kind='switch' silently missed rtran and nmos.
+            // The LRM's own switch list (28.7-28.8) decides instead.
+            static const std::set<std::string_view> kSwitches = {
+                "nmos", "pmos", "rnmos", "rpmos", "cmos", "rcmos",
+                "tran", "rtran", "tranif0", "tranif1", "rtranif0", "rtranif1"};
             p.primKind = def.primitiveKind == PrimitiveSymbol::UserDefined
                              ? "udp"
-                             : def.primitiveKind == PrimitiveSymbol::BiDiSwitch
-                                   ? "switch"
-                                   : "gate";
+                             : kSwitches.count(def.name) ? "switch" : "gate";
             p.defName = std::string(def.name);
             p.loc = locate(prim.location);
             const int32_t primIdx = int32_t(b.t->prims.size());
@@ -3452,6 +3557,17 @@ private:
                     tc.kind = cn.expression ? "expression_operand"
                                             : "external_reference";
                     tc.hierRef = href;
+                    // An external tie has a formal to measure against like
+                    // any other connection to a resolved child, so it
+                    // states its mapping by the same rule -- v11 left it
+                    // NULL and the crossing arc reported 0 even where both
+                    // windows were exact, which is what kept those ties
+                    // untraceable bit by bit.
+                    if (!cn.expression)
+                        tc.mappingExact = cn.positional && !inArray &&
+                                                  !widthMismatch
+                                              ? 1
+                                              : 0;
                     c.conns.push_back(std::move(tc));
                     continue;
                 }
@@ -3644,6 +3760,9 @@ private:
         inst.line = instLoc.line;
         inst.column = instLoc.column;
         writer.addInst(inst);
+        for (size_t pi = 0; pi < t.paramPairs.size(); pi++)
+            writer.addInstParam({nodeId, int64_t(pi), t.paramPairs[pi].first,
+                                 t.paramPairs[pi].second});
         stats.instances++;
 
         stampBody(t, nodeId, std::move(ifaceBind));
@@ -3798,14 +3917,14 @@ private:
 
         for (size_t i = 0; i < t.targets.size(); i++) {
             auto& r = t.targets[i];
-            AssignTargetRow row;
+            StmtTargetRow row;
             row.id = base.target + int64_t(i) + 1;
             row.stmtId = base.stmt + r.stmt + 1;
             row.ordinal = r.ordinal;
             row.netId = base.net + r.net + 1;
             row.bits = r.r.bits;
             row.exact = r.r.exact;
-            writer.addAssignTarget(row);
+            writer.addStmtTarget(row);
         }
         for (size_t i = 0; i < t.operands.size(); i++) {
             auto& r = t.operands[i];
@@ -3852,7 +3971,7 @@ private:
             row.targetNetId = base.net + d.tgtNet + 1;
             row.stmtId = d.stmt < 0 ? 0 : base.stmt + d.stmt + 1;
             row.assignOperandId = d.operandRef < 0 ? 0 : base.operand + d.operandRef + 1;
-            row.assignTargetId = d.targetRef < 0 ? 0 : base.target + d.targetRef + 1;
+            row.stmtTargetId = d.targetRef < 0 ? 0 : base.target + d.targetRef + 1;
             row.exprRefId = d.exprRef < 0 ? 0 : base.exprRef + d.exprRef + 1;
             row.primitiveId = d.prim < 0 ? 0 : primNode[size_t(d.prim)];
             row.dependencyKind = d.kind;
@@ -3962,6 +4081,9 @@ private:
         inst.line = c.loc.line;
         inst.column = c.loc.column;
         writer.addInst(inst);
+        for (size_t pi = 0; pi < ct.paramPairs.size(); pi++)
+            writer.addInstParam({nodeId, int64_t(pi), ct.paramPairs[pi].first,
+                                 ct.paramPairs[pi].second});
         stats.instances++;
 
         stampBody(ct, nodeId, std::move(ifaceBind));
@@ -4134,10 +4256,14 @@ private:
         }
 
         // The cross-instance dependencies. An endpoint is a local net (base
-        // plus index) or a reference's resolution; a dependency any of whose
-        // referenced ends did not resolve is not written -- the hier_ref
-        // rows above are the honest record, and a fabricated edge would be
-        // a wrong one.
+        // plus index) or a reference's resolution. The TARGET must resolve:
+        // target_net_id is NOT NULL, and guessing a written object would be
+        // a wrong fact. The SOURCE may not: a package variable or an upward
+        // name is a real driver this export has no net row for, and v10/v11
+        // dropping the whole row made "driven through an unresolvable name"
+        // indistinguishable from "undriven". The row is now written with a
+        // NULL source net and the reference on the source end; v_driver
+        // reports it as 'external'.
         for (auto& job : crossJobs) {
             const TplCrossDep& d = job.t->crossDeps[job.idx];
             NetDepRow row;
@@ -4148,9 +4274,8 @@ private:
             else if (d.srcHref >= 0) {
                 row.sourceHierRefId = job.base.hierRef + d.srcHref + 1;
                 auto it = resolvedNet.find(row.sourceHierRefId);
-                if (it == resolvedNet.end())
-                    continue;
-                row.sourceNetId = it->second;
+                if (it != resolvedNet.end())
+                    row.sourceNetId = it->second;
             }
             else if (!d.sourceless) {
                 continue;
@@ -4172,7 +4297,7 @@ private:
             row.stmtId = d.stmt < 0 ? 0 : job.base.stmt + d.stmt + 1;
             row.assignOperandId =
                 d.operandRef < 0 ? 0 : job.base.operand + d.operandRef + 1;
-            row.assignTargetId =
+            row.stmtTargetId =
                 d.targetRef < 0 ? 0 : job.base.target + d.targetRef + 1;
             row.exprRefId = d.exprRef < 0 ? 0 : job.base.exprRef + d.exprRef + 1;
             row.dependencyKind = d.kind;

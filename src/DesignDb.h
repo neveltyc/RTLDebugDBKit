@@ -74,7 +74,7 @@ namespace designdb {
 /// the correspondence between the ends. `q = a + b` knows both ranges exactly and
 /// still cannot say which bit reaches which, because a carry crosses them.
 ///
-/// v8 added the stable query interface: seven views (v_database_info,
+/// v8 added the stable query interface: seven views (v_db_info,
 /// v_tree_node, v_signal, v_port_connection, v_dependency, v_driver, v_load)
 /// that resolve the intern tables and spell out the NULL conventions, so an
 /// ordinary consumer never joins `name`/`type`/`file` or decodes `conn_kind`
@@ -106,7 +106,7 @@ namespace designdb {
 /// v_load became every recorded read of a signal (dataflow / sensitivity /
 /// wait / statement, discriminated by load_kind -- the flop clock pins of a
 /// netlist database are loads of the clock net, and so are ours), and the
-/// statement layer gained v_statement and v_statement_operand, the half of
+/// statement layer gained v_stmt and v_stmt_operand, the half of
 /// the edge/assignment dual projection that had no interface.
 ///
 /// v10 unfolds the model. Rows hang off the elaborated instance occurrence,
@@ -119,7 +119,7 @@ namespace designdb {
 /// dedup, every dependency naming the operand, target, expression reference,
 /// primitive or call it came from. `module` returns to being the source
 /// definition; the parameter values a body elaborated with live on each
-/// `inst.parameter_signature`. The `name` intern table is gone (names are
+/// `inst.param_signature`. The `name` intern table is gone (names are
 /// TEXT on their object rows; only `data_type` still interns), the 0-5 and
 /// 0-3 integer codes are gone (kinds and directions are their words), and
 /// every relation is by object id, never by (module, name) string pairing.
@@ -137,10 +137,34 @@ namespace designdb {
 /// its own kind rather than a pair of continuous assignments, because it
 /// is not one -- an alias has no direction and no driver, and counting it
 /// among the assignments would have made every multiple-driver query wrong
-/// in a new way. `stmt.statement_kind`, `net_dep.dependency_kind` and the
+/// in a new way. `stmt.stmt_kind`, `net_dep.dep_kind` and the
 /// driver/load kinds each gain `alias`; that is a value-domain change, so
 /// the version moves even though no column does.
-inline constexpr int SchemaVersion = 11;
+///
+/// v12 is mostly a naming pass, and moves the version because renames are
+/// contract changes. One classic abbreviation per word, every identifier,
+/// no more tables-say-`inst` / views-say-`instance` split: `src_file`,
+/// `prim`, `proc`, and the view family `v_db_info`/`v_term`/`v_term_map`/
+/// `v_net_conn`/`v_net_dep`/`v_stmt*`. The two sides of a terminal stop
+/// sharing column names -- `net_conn` wears `outer_*` (the actual, VPI's
+/// highConn), `term_map` wears `inner_*` (vpiLowConn). `assign_target`
+/// becomes `stmt_target`: it holds the lvalue of a release and a system
+/// task's write as well as an assignment's, so it was never assignment-
+/// only (`assign_operand`, which is, keeps its name).
+///
+/// Riding along, because the version was already moving: an unresolved
+/// SOURCE reference is written as a `net_dep` (NULL source net, the
+/// reference on the source end) and surfaces as `driver_kind='external'`,
+/// so a target fed only from a package variable or an upward name is no
+/// longer silently undriven; `force`/`release` are recorded (construct
+/// `force`/`proc_assign`, and `stmt_kind='release'`) instead of a force
+/// masquerading as a plain blocking assignment; an external tie carries a
+/// `map_exact`, so its crossing traces bit by bit; and `prim_kind='switch'`
+/// covers the LRM's whole switch family, not just what slang labels
+/// bidirectional. Additive, so no reader must change: `inst_param` makes
+/// the parameter signature queryable, and `v_net_attachment` is a
+/// thirteenth view -- one row per relation touching a net.
+inline constexpr int SchemaVersion = 12;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -185,6 +209,15 @@ struct InstRow {
     int64_t fileId = 0;           // the instantiation site; 0 for the root
     uint32_t line = 0;
     uint32_t column = 0;
+};
+
+/// One elaborated parameter value of one occurrence -- param_signature made
+/// queryable. Same normalisation, same order, same over-split.
+struct InstParamRow {
+    int64_t instId = 0;
+    int64_t ordinal = 0;          // declaration order, as the signature has it
+    std::string name;
+    std::string value;
 };
 
 /// One gate, switch or UDP instance. `id` is the same value as its tree_node id.
@@ -300,7 +333,7 @@ struct StmtRow {
 };
 
 /// One assignment target reference (LHS).
-struct AssignTargetRow {
+struct StmtTargetRow {
     int64_t id = 0;
     int64_t stmtId = 0;
     int64_t ordinal = 0;
@@ -354,7 +387,7 @@ struct NetDepRow {
     int64_t targetNetId = 0;
     int64_t stmtId = 0;
     int64_t assignOperandId = 0;
-    int64_t assignTargetId = 0;
+    int64_t stmtTargetId = 0;
     int64_t exprRefId = 0;
     int64_t primitiveId = 0;
     int64_t sourceHierRefId = 0;
@@ -408,7 +441,7 @@ public:
     /// database and the RTL have diverged instead of answering from stale data.
     void addSourceFile(const std::string& path, const std::string& digest);
 
-    /// Joins `file` rows to `source_file` rows: `origins` maps each as-written
+    /// Joins `file` rows to `src_file` rows: `origins` maps each as-written
     /// spelling to the absolute path the buffer really came from. Called once,
     /// after rows are written (file paths intern lazily) and before finish().
     void linkSourceFiles(
@@ -427,6 +460,7 @@ public:
     void addModule(const ModuleRow& r);
     void addTreeNode(const TreeNodeRow& r);
     void addInst(const InstRow& r);
+    void addInstParam(const InstParamRow& r);
     void addPrimitive(const PrimitiveRow& r);
     void addNet(const NetRow& r);
     void addTerm(const TermRow& r);
@@ -434,7 +468,7 @@ public:
     void addNetConn(const NetConnRow& r);
     void addProcedure(const ProcedureRow& r);
     void addStmt(const StmtRow& r);
-    void addAssignTarget(const AssignTargetRow& r);
+    void addStmtTarget(const StmtTargetRow& r);
     void addAssignOperand(const AssignOperandRow& r);
     void addExprRef(const ExprRefRow& r);
     void addProcEvent(const ProcEventRow& r);
@@ -455,9 +489,10 @@ private:
     void bumped();
 
     enum Ins {
-        InsModule, InsTreeNode, InsInst, InsPrimitive, InsNet, InsTerm,
-        InsTermMap, InsNetConn, InsProcedure, InsStmt, InsAssignTarget,
-        InsAssignOperand, InsExprRef, InsProcEvent, InsNetDep, InsHierRef,
+        InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
+        InsTerm, InsTermMap, InsNetConn, InsProcedure, InsStmt,
+        InsStmtTarget, InsAssignOperand, InsExprRef, InsProcEvent,
+        InsNetDep, InsHierRef,
         InsCount
     };
 
