@@ -136,7 +136,12 @@ provides.
 
 ```
 CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
-src/                    main.cpp (CLI + filelist parsing), Extractor, DesignDb
+src/                    main.cpp (CLI + filelist parsing), Extractor (the
+                        two-pass export), DesignDb (the writer)
+src/sql/                the DDL: Schema, Indexes, Views
+src/extract/            Ref/SymbolText/Template (the vocabulary), DeclIndex,
+                        StatementWalker, TemplateBuilder (pass 1),
+                        Stamper (pass 2)
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
 examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
@@ -146,6 +151,7 @@ examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
                         deliberate black box -- exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
+                        refactor-equivalence.sh (two binaries, same rows?),
                         designdb-coverage.py (what an export had to approximate),
                         export-real-designs.sh (the measurements table, from a
                         local checkout of the public designs),
