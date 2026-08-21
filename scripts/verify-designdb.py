@@ -1715,6 +1715,20 @@ if mode == "callsite":
     check(one("""SELECT count(*) FROM v_call_site
                  WHERE subroutine_name='bump' AND depth=1""") == 2,
           "the task is called from two call sites")
+    # A call in a control expression (`pick(c)` in the condition) has no
+    # owning statement: its call_site names no caller statement, and its
+    # argument binding carries no call_site_id (the universal invariant
+    # "a dependency in a call carries its statement" holds because such a
+    # dependency is tagged only when it has a statement).
+    check(one("""SELECT count(*) FROM v_call_site
+                 WHERE subroutine_name='pick' AND caller_stmt_id IS NULL
+                   AND depth=1""") == 1,
+          "a control-expression call names no caller statement")
+    check(one("""
+        SELECT count(*) FROM net_dep d
+        JOIN call_site cs ON cs.id = d.call_site_id
+        WHERE cs.subroutine_name='pick'""") == 0,
+          "and its statement-less binding carries no call_site_id")
     # Each call's argument binds to the shared formal under its OWN site.
     check(one("""
         SELECT count(DISTINCT call_site_id) FROM v_net_dep
@@ -1775,6 +1789,10 @@ if mode == "package":
         SELECT count(DISTINCT driver_net_id) FROM v_driver
         WHERE driver_name='mask' AND driver_kind='data'""") == 1,
           "both readers are driven by the one package net")
+    check(one("""
+        SELECT count(DISTINCT signal_inst_id) FROM v_driver
+        WHERE driver_name='mask' AND driver_kind='data'""") == 2,
+          "and there really are two distinct readers of it")
     check(one("""
         SELECT count(*) FROM hier_ref
         WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,

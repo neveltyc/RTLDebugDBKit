@@ -1151,7 +1151,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// `allocCallSite` mints a template call-site row for the entered call and
     /// returns its index. Both null outside a real build (dry runs).
     int32_t* callSiteSlot = nullptr;
-    std::function<int32_t(const SubroutineSymbol&, int64_t depth)> allocCallSite;
+    std::function<int32_t(const SubroutineSymbol&, int64_t depth, bool bindable)>
+        allocCallSite;
 
     StatementWalker(EmitTarget t, EmitCallBinding b, EmitEvent e, EmitRead r,
                     EvalContext& eval) :
@@ -1404,7 +1405,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // with it. Restored on every exit path below.
         const int32_t savedCallSite = callSiteSlot ? *callSiteSlot : -1;
         if (callSiteSlot && allocCallSite)
-            *callSiteSlot = allocCallSite(**sub, subDepth + 1);
+            *callSiteSlot = allocCallSite(**sub, subDepth + 1, bindable);
         struct Restore {
             int32_t* slot;
             int32_t val;
@@ -2556,10 +2557,12 @@ private:
         walker.budget = &b.callBudget;
         walker.truncated = &b.truncatedCalls;
         walker.callSiteSlot = &b.curCallSite;
-        walker.allocCallSite = [&b](const SubroutineSymbol& sub,
-                                    int64_t depth) -> int32_t {
+        walker.allocCallSite = [&b](const SubroutineSymbol& sub, int64_t depth,
+                                    bool bindable) -> int32_t {
             TplCallSite cs;
-            cs.callerStmt = b.curStmt;         // the statement making the call
+            // NULL for a call in a control expression (`if (f())`): it has no
+            // owning statement, and b.curStmt there is a stale earlier one.
+            cs.callerStmt = bindable ? b.curStmt : -1;
             cs.parentCallSite = b.curCallSite; // the enclosing expansion
             cs.subName = std::string(sub.name);
             cs.depth = depth;
