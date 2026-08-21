@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 12. The version is the *consumption contract*, not the DDL: a
+Schema version 13. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. What bumps it: removing or renaming a table the
 contract names, a view or a view column; changing a column's meaning, value
@@ -10,7 +10,21 @@ query, or changing how a view is computed while its contract holds.
 
 No database is upgraded in place: a version bump means re-exporting the RTL.
 (For v9 that was structural — the folded model never stored the
-per-occurrence identity v10 needs; for v12 it is the renames.)
+per-occurrence identity v10 needs; for v12/v13 it is the renames and the
+grown value domains.)
+
+## What changed in v13
+
+Three things a v12 reader either could not ask or could not ask precisely.
+
+**`v_net_attachment` gets typed ids.** Its single polymorphic `other_id`
+became seven typed nullable columns — `term_id, stmt_target_id,
+assign_operand_id, expr_ref_id, proc_id, dep_id, hier_ref_id` — exactly one
+non-null per row, the one `attachment_kind` names. The same exclusive-arc
+shape `net_dep` already uses: a consumer joins the right base table without
+decoding the kind.
+
+*(Package and call-site sections are added as their phases land.)*
 
 ## What changed in v12
 
@@ -691,17 +705,21 @@ exact` (targets) / `operand_lo/hi/exact` (operands — no classic
 abbreviation, so the word stays whole).
 
 **`v_net_attachment`** — everything touching one net, one row per
-attachment: `net_id, inst_id, net_name, attachment_kind, other_id, lo,
-hi, exact, stmt_id`. The structural adjacency the directional views
-cannot ask flatly — "what hangs off this net" — with `attachment_kind`
-naming the relation and `other_id` that relation's own row or object:
-`terminal_inside` (term_map; the terminal), `actual_outside` (net_conn;
-the child terminal), `written_by`/`read_by` (target/operand row),
-`condition`/`statement_read` (expr_ref, split on role='control'),
-`event` (proc_event; the procedure), `dep_in`/`dep_out` (net_dep, by
-end), `named_from_outside` (a resolved hier_ref). `lo/hi/exact` are this
-net's window in the attachment. Each branch is one base selection,
-count-reconciled; a point query by `net_id` seeks on every branch.
+attachment: `net_id, inst_id, net_name, attachment_kind, lo, hi, exact,
+stmt_id, term_id, stmt_target_id, assign_operand_id, expr_ref_id,
+proc_id, dep_id, hier_ref_id`. The structural adjacency the directional
+views cannot ask flatly — "what hangs off this net" — with
+`attachment_kind` naming the relation and exactly ONE of the seven typed
+id columns pointing at that relation's own row (the exclusive-arc shape
+`net_dep` uses, not one polymorphic id): `terminal_inside` /
+`actual_outside` → `term_id`; `written_by` / `release_target` →
+`stmt_target_id`; `read_by` → `assign_operand_id`; `condition` /
+`statement_read` → `expr_ref_id`; `event` → `proc_id`; `dep_in` /
+`dep_out` → `dep_id`; `named_from_outside` → `hier_ref_id`. `lo/hi/exact`
+are this net's window in the attachment. Each branch is one base
+selection, count-reconciled; a point query by `net_id` seeks on every
+branch; and the verifier holds that exactly one typed id is non-null per
+row and is the one `attachment_kind` implies.
 
 `file_path` is the spelling as written in the filelist; `src_path` the
 absolute path it resolved to. They answer different questions and neither

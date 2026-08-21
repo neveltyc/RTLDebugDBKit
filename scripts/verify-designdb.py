@@ -31,7 +31,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 
 
 def one(sql, *args):
@@ -686,8 +686,10 @@ VIEW_COLUMNS = {
         "operand_id", "stmt_id", "ordinal", "net_id", "net_name",
         "operand_lo", "operand_hi", "operand_exact"],
     "v_net_attachment": [
-        "net_id", "inst_id", "net_name", "attachment_kind", "other_id",
-        "lo", "hi", "exact", "stmt_id"],
+        "net_id", "inst_id", "net_name", "attachment_kind",
+        "lo", "hi", "exact", "stmt_id",
+        "term_id", "stmt_target_id", "assign_operand_id", "expr_ref_id",
+        "proc_id", "dep_id", "hier_ref_id"],
 }
 for view, want in VIEW_COLUMNS.items():
     row = con.execute(
@@ -816,6 +818,41 @@ check(one("""
     WHERE a.attachment_kind = 'release_target'
       AND s.stmt_kind != 'release'""") == 0,
       "and release_target is exactly the releases")
+# Exclusive arc, like net_dep: exactly one of the seven typed id columns is
+# non-null per row, and it is the one attachment_kind names -- so a consumer
+# joins the right base table without decoding the kind, and no row smuggles
+# an id into a slot its kind does not own.
+check(one("""
+    SELECT count(*) FROM v_net_attachment
+    WHERE (term_id IS NOT NULL) + (stmt_target_id IS NOT NULL)
+        + (assign_operand_id IS NOT NULL) + (expr_ref_id IS NOT NULL)
+        + (proc_id IS NOT NULL) + (dep_id IS NOT NULL)
+        + (hier_ref_id IS NOT NULL) != 1""") == 0,
+      "every attachment names exactly one typed id")
+check(one("""
+    SELECT count(*) FROM v_net_attachment WHERE CASE attachment_kind
+        WHEN 'terminal_inside'    THEN term_id IS NULL
+        WHEN 'actual_outside'     THEN term_id IS NULL
+        WHEN 'written_by'         THEN stmt_target_id IS NULL
+        WHEN 'release_target'     THEN stmt_target_id IS NULL
+        WHEN 'read_by'            THEN assign_operand_id IS NULL
+        WHEN 'condition'          THEN expr_ref_id IS NULL
+        WHEN 'statement_read'     THEN expr_ref_id IS NULL
+        WHEN 'event'              THEN proc_id IS NULL
+        WHEN 'dep_in'             THEN dep_id IS NULL
+        WHEN 'dep_out'            THEN dep_id IS NULL
+        WHEN 'named_from_outside' THEN hier_ref_id IS NULL
+        ELSE 1 END""") == 0,
+      "and it is the typed id its attachment_kind implies")
+# Each typed id resolves in its own table -- the join a consumer would make.
+for col, tbl in (("term_id", "term"), ("stmt_target_id", "stmt_target"),
+                 ("assign_operand_id", "assign_operand"),
+                 ("expr_ref_id", "expr_ref"), ("proc_id", "proc"),
+                 ("dep_id", "net_dep"), ("hier_ref_id", "hier_ref")):
+    check(one(f"""SELECT count(*) FROM v_net_attachment a
+        WHERE a.{col} IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM "{tbl}" b WHERE b.id = a.{col})""") == 0,
+          f"v_net_attachment.{col} resolves in {tbl}")
 
 check(one("""
     SELECT count(*) FROM v_driver
@@ -1478,7 +1515,7 @@ if mode == "xmr":
     check(one("""
         SELECT count(*) FROM v_net_attachment a
         JOIN v_net n ON n.net_id = a.net_id
-        JOIN v_term t ON t.term_id = a.other_id
+        JOIN v_term t ON t.term_id = a.term_id
         JOIN v_tree_node tn ON tn.node_id = t.inst_id
         WHERE n.net_name='g' AND a.attachment_kind='actual_outside'
           AND t.term_name='p' AND tn.node_name='u_sink'""") == 1,
