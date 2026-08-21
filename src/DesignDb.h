@@ -169,9 +169,18 @@ namespace designdb {
 /// `v_net_attachment`'s one polymorphic `other_id` becomes seven typed
 /// nullable ids (exactly one non-null per row, the one attachment_kind
 /// names) -- the exclusive-arc shape net_dep already uses, so a consumer
-/// joins the right base table without decoding the kind. (Packages as
-/// first-class objects and per-call-site dataflow tagging land in the same
-/// version; their notes are added as those pieces do.)
+/// joins the right base table without decoding the kind.
+///
+/// Packages become first-class objects. A package is a pseudo-occurrence --
+/// a tree_node/inst under node_kind/def_kind 'package', above the roots
+/// (parent_inst_id NULL), its variables `net` rows -- so a `pkg::x`
+/// reference resolves to a real net (driver_kind='data') instead of
+/// dead-ending at 'external', and two modules reading one package variable
+/// meet on it. 'external' now means only the genuinely unresolvable: an
+/// upward hierarchical reference from a shared body, an interface-array
+/// binding. ($unit compilation-unit items are not stamped yet.)
+/// (Per-call-site dataflow tagging lands in the same version; its note is
+/// added as that piece does.)
 inline constexpr int SchemaVersion = 13;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.

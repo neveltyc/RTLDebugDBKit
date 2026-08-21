@@ -24,7 +24,7 @@ import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias", "external")
+         "unresolved", "xmr", "alias", "external", "package")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
@@ -79,8 +79,8 @@ print("ok: integrity_check and foreign_key_check pass")
 # open sets (decl_kind) and the NULL-required combinations CHECK
 # cannot express.
 for tbl, col, values, nullable in (
-    ("module", "def_kind", ("module", "interface", "program", "checker"), False),
-    ("tree_node", "node_kind", ("root", "instance", "generate", "primitive", "unresolved"), False),
+    ("module", "def_kind", ("module", "interface", "program", "checker", "package"), False),
+    ("tree_node", "node_kind", ("root", "instance", "generate", "primitive", "unresolved", "package"), False),
     ("prim", "prim_kind", ("gate", "switch", "udp"), False),
     ("term", "term_kind", ("signal", "interface"), False),
     ("term", "direction", ("input", "output", "inout", "ref"), True),
@@ -160,11 +160,11 @@ print("ok: range lo/hi pair up, lo <= hi, endpoints imply exact")
 
 # -------------------------------------------------- tree and the subtypes
 check(one("SELECT count(*) FROM tree_node WHERE (parent_node_id IS NULL) != "
-          "(node_kind = 'root')") == 0,
-      "root nodes are exactly the parentless ones")
+          "(node_kind IN ('root','package'))") == 0,
+      "parentless nodes are exactly the roots and packages")
 check(one("""
     SELECT count(*) FROM tree_node t
-    WHERE (t.node_kind IN ('root','instance','unresolved'))
+    WHERE (t.node_kind IN ('root','instance','unresolved','package'))
           != EXISTS (SELECT 1 FROM inst i WHERE i.id = t.id)""") == 0,
       "instance-like nodes have inst rows, others do not")
 check(one("""
@@ -182,8 +182,8 @@ check(one("""
           OR i.param_signature IS NOT NULL)""") == 0,
       "an unresolved inst names its definition and no parameters")
 check(one("SELECT count(*) FROM inst WHERE (parent_inst_id IS NULL) != "
-          "(id IN (SELECT id FROM tree_node WHERE node_kind='root'))") == 0,
-      "the root instances are exactly the parentless inst rows")
+          "(id IN (SELECT id FROM tree_node WHERE node_kind IN ('root','package')))") == 0,
+      "the parentless inst rows are exactly the roots and packages")
 
 # The hierarchy is encoded twice -- tree_node.parent_node_id and
 # inst.parent_inst_id -- and the two must tell one story: parent_inst is the
@@ -947,7 +947,8 @@ if mode:
     want_top = {"constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
                 "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
-                "alias": "alias_top", "external": "external_top"}[mode]
+                "alias": "alias_top", "external": "tb_top",
+                "package": "package_top"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1635,33 +1636,69 @@ if mode == "alias":
           "and a trace from one side reaches the others")
 
 if mode == "external":
-    # A package variable has no net row -- a package is not an occurrence
-    # -- so the reference stays unresolved and the dependency carries a
-    # NULL source net. Before v12 these rows were dropped, and every
-    # target here reported undriven.
+    # After v13 taught packages to resolve, what still leaves the model is an
+    # upward hierarchical reference from a shared body: tb_top.glob climbs out
+    # of up_leaf, and the one analysed body cannot say where each of its two
+    # occurrences sits. The dependency carries a NULL source net and the
+    # reference on the source end; v_driver says 'external' -- not undriven.
     check(one("""
         SELECT count(*) FROM v_driver
-        WHERE driver_kind='external' AND signal_name='q'""") == 1,
-          "the masked output is driven through the package variable")
+        WHERE driver_kind='external' AND signal_name='o'""") >= 1,
+          "an output driven by an upward reference is external")
     check(one("""
         SELECT count(*) FROM v_driver v JOIN net_dep d ON d.id = v.dep_id
         JOIN hier_ref h ON h.id = d.src_hier_ref_id
         WHERE v.driver_kind='external' AND v.signal_name='nib'
-          AND h.path='ext_pkg::mask' AND h.resolved_net_id IS NULL
-          AND v.driver_lo=0 AND v.driver_hi=3 AND v.driver_exact=1""") == 1,
-          "the windowed read keeps its window on the external driver")
+          AND h.resolved_net_id IS NULL
+          AND v.driver_lo=0 AND v.driver_hi=3 AND v.driver_exact=1""") >= 1,
+          "the windowed upward read keeps its window on the external driver")
     check(one("""
         SELECT count(*) FROM net_dep
         WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL
           AND dep_kind='control'""") >= 1,
-          "an unresolved condition still gates as a control dependency")
+          "an upward condition gates as a control dependency with no source")
     check(one("""
         SELECT count(*) FROM v_driver
         WHERE driver_kind='external' AND signal_name='g'""") >= 1,
-          "so the package-gated target shows its external control")
+          "so the upward-gated target shows its external control")
+    # o and nib are pure upward reads -- no constant hides among their
+    # drivers. (g legitimately also has constant drivers: the 8'hFF/8'h00 it
+    # assigns under the upward condition.)
     check(one("""
         SELECT count(*) FROM v_driver
-        WHERE signal_name IN ('q','nib') AND driver_kind='constant'""") == 0,
-          "and no external source is misreported as a constant")
+        WHERE signal_name IN ('o','nib') AND driver_kind='constant'""") == 0,
+          "and no upward source is misreported as a constant")
+
+if mode == "package":
+    # A package is a pseudo-occurrence now: node_kind='package', a matching
+    # inst with parent_inst_id NULL and a def_kind='package' module.
+    check(one("""
+        SELECT count(*) FROM v_tree_node
+        WHERE node_kind='package' AND node_name='cfg_pkg'""") == 1,
+          "the package is a tree node of its own kind")
+    check(one("""
+        SELECT count(*) FROM inst i JOIN tree_node t ON t.id=i.id
+        JOIN module m ON m.id=i.module_id
+        WHERE t.node_kind='package' AND i.parent_inst_id IS NULL
+          AND m.def_kind='package'""") == 1,
+          "with a parentless inst and a package module")
+    # Its variables are nets of that occurrence.
+    check(one("""
+        SELECT count(*) FROM v_net n JOIN v_tree_node t ON t.node_id=n.inst_id
+        WHERE t.node_kind='package' AND n.net_name IN ('mask','enable')""") == 2,
+          "the package variables are nets")
+    # The payoff: cfg_pkg::mask resolves to a real driver, not 'external',
+    # and BOTH readers meet on the one package net.
+    check(one("""
+        SELECT count(*) FROM v_driver WHERE driver_kind='external'""") == 0,
+          "no reference is left external once the package resolves")
+    check(one("""
+        SELECT count(DISTINCT driver_net_id) FROM v_driver
+        WHERE driver_name='mask' AND driver_kind='data'""") == 1,
+          "both readers are driven by the one package net")
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,
+          "the pkg:: reference is recorded as written and resolved")
 
 print("OK")

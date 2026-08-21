@@ -85,7 +85,7 @@ CREATE TABLE module(
     id              INTEGER PRIMARY KEY,
     name            TEXT NOT NULL,
     def_kind        TEXT NOT NULL
-        /*!*/CHECK(def_kind IN ('module','interface','program','checker'))/*!*/,
+        /*!*/CHECK(def_kind IN ('module','interface','program','checker','package'))/*!*/,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
     col             INTEGER,
@@ -105,12 +105,17 @@ CREATE TABLE module(
 --   primitive   a gate, switch or UDP -> `primitive`.
 --   unresolved  an instance whose definition slang could not find -> `inst`
 --               with module_id NULL. A trace really does stop here.
+--   package     a package (or the compilation unit's `$unit` scope), a
+--               pseudo-occurrence above the roots -> `inst` with
+--               parent_inst_id NULL and a `module` of def_kind 'package'.
+--               Its variables are `net` rows, so a `pkg::x` reference
+--               resolves to a real object instead of leaving the model.
 CREATE TABLE tree_node(
     id             INTEGER PRIMARY KEY,
     parent_node_id INTEGER REFERENCES tree_node(id),
     name           TEXT NOT NULL,
     node_kind      TEXT NOT NULL
-        /*!*/CHECK(node_kind IN ('root','instance','generate','primitive','unresolved'))/*!*/,
+        /*!*/CHECK(node_kind IN ('root','instance','generate','primitive','unresolved','package'))/*!*/,
     ordinal        INTEGER NOT NULL);
 
 -- One module instance occurrence. `id` IS the tree_node id -- one id space
