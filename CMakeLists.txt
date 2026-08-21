@@ -83,6 +83,7 @@ add_executable(rtl-designdb
   src/DesignDb.cpp
   src/Extractor.cpp
   src/extract/TemplateBuilder.cpp
+  src/extract/TemplateBuilder_Conn.cpp
   src/extract/Stamper.cpp)
 
 target_include_directories(rtl-designdb PRIVATE src)
