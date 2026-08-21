@@ -138,7 +138,7 @@ does not apply to); solid edges are always present.
 | dataflow | `net_dep` | one net-to-net dependency occurrence | `src_net_id`/`tgt_net_id → net`, `stmt_id → stmt`, `prim_id → prim`, `call_site_id → call_site`, `assign_operand_id`, `stmt_target_id`, `expr_ref_id`, `src_hier_ref_id`/`tgt_hier_ref_id → hier_ref` |
 | boundary | `hier_ref` | one reference that leaves its instance | `inst_id`/`resolved_inst_id → inst`, `stmt_id → stmt`, `resolved_net_id → net` |
 
-The DDL in `src/DesignDb.cpp` carries the authoritative per-column comments;
+The DDL in `src/sql/Schema.inc` carries the authoritative per-column comments;
 this file states the semantics a consumer builds on. The columns of each
 table follow.
 

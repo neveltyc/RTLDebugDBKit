@@ -3,7 +3,8 @@
 //
 // Walks an elaborated design and hands rows to the writer.
 //
-// Two passes, matching how the work divides:
+// Two passes, matching how the work divides -- extract/TemplateBuilder.h and
+// extract/Stamper.h are their interfaces:
 //
 //   templates   one per (definition, parameter values) group -- the analyzed
 //               body's nets, terminals, statements, references and
@@ -16,6 +17,9 @@
 //               template and one analysis; what differs per occurrence (the
 //               place in the tree, the connections written in the parent,
 //               the resolution of hierarchical references) is computed here.
+//
+// Everything below those two interfaces lives in namespace designdb::detail and
+// is nobody else's business; this header is the whole public surface.
 
 #pragma once
 
