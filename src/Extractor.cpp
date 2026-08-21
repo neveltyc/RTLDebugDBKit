@@ -957,7 +957,8 @@ struct TplHierRef {
         None,                // slang gave no target usable per occurrence
         Downward,            // segs descend from the occurrence's own node
         Absolute,            // segs descend from the design root
-        ViaIfaceTerm         // segs descend from the interface bound to term
+        ViaIfaceTerm,        // segs descend from the interface bound to term
+        Package              // segs[0] names a package; netName its member
     } resolve = None;
     int32_t ifaceTerm = -1;  // ViaIfaceTerm: which of this template's terms
     std::vector<std::string> segs;   // tree segments to descend
@@ -1694,6 +1695,10 @@ public:
                             /*ifaceBind=*/{});
         }
 
+        // Packages after the module tree: their nets must exist before
+        // hier_ref resolution binds `pkg::x` references to them.
+        stampPackages();
+
         // Hierarchical references last: an absolute path may land in a
         // subtree stamped after the referring occurrence.
         resolveHierRefs();
@@ -2110,6 +2115,26 @@ private:
                 e = &e->as<ConversionExpression>().operand();
             else
                 break;
+        }
+        // A package item -- `pkg::mask`, or a bare `mask` imported from one.
+        // slang resolves the `::` at compile time, so this is a NamedValue,
+        // not a HierarchicalValue: it is caught here on the symbol's own
+        // scope, before the HierarchicalValue gate below. It resolves per
+        // occurrence once packages are stamped as pseudo-occurrences; segs[0]
+        // carries the package name, netName the member. ($unit compilation-
+        // unit items are not stamped yet, so they fall through and stay
+        // external -- no worse than before.)
+        if (r.sym) {
+            if (auto* scope = r.sym->getParentScope()) {
+                auto& owner = scope->asSymbol();
+                if (owner.kind == SymbolKind::Package && !owner.name.empty() &&
+                    !r.sym->name.empty()) {
+                    row.resolve = TplHierRef::Package;
+                    row.segs = {std::string(owner.name)};
+                    row.netName = std::string(r.sym->name);
+                    return;
+                }
+            }
         }
         if (!e || e->kind != ExpressionKind::HierarchicalValue)
             return;
@@ -4197,6 +4222,82 @@ private:
             stats.duplicatePaths++;
     }
 
+    /// Packages as pseudo-occurrences: each becomes a tree_node/inst above
+    /// the roots (node_kind/def_kind 'package'), and its variables become net
+    /// rows, so a `pkg::x` reference resolves to a real object instead of
+    /// leaving the model as an 'external' driver. No dataflow is walked here
+    /// -- a package variable's initializer is not a driver, and its
+    /// readers/writers are the modules that reference it, whose cross-refs
+    /// resolve onto these nets. Package module ids follow the definition
+    /// modules; nodes and nets draw from the same counters as everything else.
+    void stampPackages() {
+        int64_t nextModuleId = int64_t(moduleIds.size());
+        const PackageSymbol* stdPkg = &compilation.getStdPackage();
+        for (auto* pkg : compilation.getPackages()) {
+            if (!pkg || pkg == stdPkg || pkg->name.empty())
+                continue;
+            const TplLoc at = locate(pkg->location);
+            ModuleRow mrow;
+            mrow.id = ++nextModuleId;
+            mrow.name = std::string(pkg->name);
+            mrow.definitionKind = "package";
+            mrow.fileId = at.fileId;
+            mrow.line = at.line;
+            mrow.column = at.column;
+            writer.addModule(mrow);
+            stats.modules++;
+
+            const int64_t nodeId = ++nodeCounter;
+            TreeNodeRow node;
+            node.id = nodeId;
+            node.parentNodeId = 0;   // a pseudo-occurrence above the roots
+            node.name = std::string(pkg->name);
+            node.nodeKind = "package";
+            node.ordinal = rootOrdinal++;
+            writer.addTreeNode(node);
+
+            InstRow inst;
+            inst.id = nodeId;
+            inst.moduleId = mrow.id;
+            inst.parentInstId = 0;
+            inst.fileId = at.fileId;
+            inst.line = at.line;
+            inst.column = at.column;
+            writer.addInst(inst);
+            stats.instances++;
+
+            PackageInfo info;
+            info.nodeId = nodeId;
+            for (auto& member : pkg->members()) {
+                if (member.kind != SymbolKind::Variable &&
+                    member.kind != SymbolKind::Net)
+                    continue;
+                if (member.name.empty())
+                    continue;
+                auto& vs = member.as<ValueSymbol>();
+                NetRow nrow;
+                nrow.id = ++netCounter;
+                nrow.instId = nodeId;
+                nrow.scopeNodeId = nodeId;
+                nrow.name = std::string(vs.name);
+                nrow.declarationKind = declarationKindOf(vs);
+                nrow.dataTypeId = writer.internDataType(typeOf(vs));
+                nrow.width = vs.getType().isIntegral()
+                                 ? int64_t(vs.getType().getBitWidth()) : -1;
+                nrow.isImplicit = vs.kind == SymbolKind::Net &&
+                                  vs.as<NetSymbol>().isImplicit;
+                const TplLoc nloc = locate(vs.location);
+                nrow.fileId = nloc.fileId;
+                nrow.line = nloc.line;
+                nrow.column = nloc.column;
+                writer.addNet(nrow);
+                stats.nets++;
+                info.netByName.emplace(nrow.name, nrow.id);
+            }
+            packageByName.emplace(std::string(pkg->name), std::move(info));
+        }
+    }
+
     /// Writes every hier_ref row, resolving the ones whose replay lands on a
     /// stamped object -- then materialises the queued cross-instance
     /// dependencies whose endpoints those resolutions are. The tree walk is
@@ -4234,6 +4335,24 @@ private:
                         node = descend(job.ifaceBind[size_t(ref.ifaceTerm)],
                                        ref.segs);
                     break;
+                case TplHierRef::Package: {
+                    // Not a tree descent -- a package is not under a normal
+                    // parent, and its path uses `::`. Look it up directly and
+                    // resolve the member against its own net map; node stays
+                    // 0 so the generic net-index block below is skipped.
+                    if (ref.segs.empty())
+                        break;
+                    auto pit = packageByName.find(ref.segs.front());
+                    if (pit == packageByName.end())
+                        break;
+                    row.resolvedInstId = pit->second.nodeId;
+                    auto nit = pit->second.netByName.find(ref.netName);
+                    if (nit != pit->second.netByName.end()) {
+                        row.resolvedNetId = nit->second;
+                        resolvedNet.emplace(row.id, row.resolvedNetId);
+                    }
+                    break;
+                }
                 default:
                     break;
             }
@@ -4357,6 +4476,14 @@ private:
     std::vector<CrossJob> crossJobs;
     /// node id -> (template, net id base) for net-name resolution at replay.
     std::unordered_map<int64_t, std::pair<const Template*, int64_t>> nodeTemplate;
+    /// A stamped package pseudo-occurrence: its node id and member->net id.
+    /// Kept apart from childByName because a package path uses `::`, not `.`,
+    /// and a top instance could legally be named like a package.
+    struct PackageInfo {
+        int64_t nodeId = 0;
+        std::unordered_map<std::string, int64_t> netByName;
+    };
+    std::unordered_map<std::string, PackageInfo> packageByName;
 
     Stats stats;
 };

@@ -24,7 +24,18 @@ non-null per row, the one `attachment_kind` names. The same exclusive-arc
 shape `net_dep` already uses: a consumer joins the right base table without
 decoding the kind.
 
-*(Package and call-site sections are added as their phases land.)*
+**Packages become first-class objects.** A package is a pseudo-occurrence
+now — a `tree_node`/`inst` with `node_kind`/`def_kind` `'package'`, above
+the roots (`parent_inst_id` NULL), its variables ordinary `net` rows. So a
+`pkg::mask` reference resolves to that net instead of dead-ending: the
+reading module shows `driver_kind='data'` through the package net, two
+modules reading one package variable meet on it, and `hier_ref` carries the
+resolution like any other. This *narrows* `driver_kind='external'` to what
+is genuinely unresolvable — an upward hierarchical reference from a shared
+body, an interface-array binding. (`$unit` compilation-unit items are not
+stamped yet and stay external.)
+
+*(The call-site section is added as that phase lands.)*
 
 ## What changed in v12
 
@@ -237,9 +248,16 @@ order among siblings. `node_kind`:
   has an `inst` row with `module_id` NULL and `unresolved_def` set.
   A trace really does stop here, and that is different from stopping at a
   gate — which is why the kinds are distinct words.
+* `package` — a package, a pseudo-occurrence above the roots: an `inst`
+  row with `parent_inst_id` NULL and a `module` of `def_kind='package'`,
+  its variables `net` rows. It is not in the elaborated tree the way an
+  instance is — it has no parent and instantiates nothing — but giving it
+  the same object rows is what lets a `pkg::x` reference resolve to a real
+  net. See *Packages*.
 
-The verifier holds the bijections: instance-like kinds have `inst` rows and
-no others do; `primitive` likewise.
+The verifier holds the bijections: instance-like kinds (`root`, `instance`,
+`unresolved`, `package`) have `inst` rows and no others do; `primitive`
+likewise. Parentless nodes are exactly the roots and packages.
 
 **`inst`** — `id` IS the tree_node id (one id space for the hierarchy).
 `parent_inst_id` is the nearest enclosing module instance, skipping generate
@@ -831,12 +849,13 @@ Unchanged from v9, and still deliberate:
 
 ## Known limits
 
-* Upward hierarchical references and package variables keep `resolved_*`
-  NULL — the one analysed body speaks for occurrences whose surroundings
-  may differ, and a package is not an occurrence at all. Since v12 their
-  dataflow is no longer silent (`driver_kind='external'`), but the far
-  OBJECT still has no row: a trace ends at the reference text, and two
-  readers of one package variable are not joined through it.
+* Upward hierarchical references keep `resolved_*` NULL — the one analysed
+  body speaks for occurrences whose surroundings may differ, so
+  `$root`-relative climbs from a shared body cannot be pinned per
+  occurrence. Their dataflow is not silent (`driver_kind='external'` since
+  v12), but the far object has no row: a trace ends at the reference text.
+  Package variables no longer share this fate — v13 gives them net rows
+  (see *Packages*) — but `$unit` compilation-unit items still do.
 * Interface-array element bindings (`.b(arr[k])`) have no per-occurrence
   instance id; `outer_intf_inst_id` stays NULL and the member references
   through them stay text-only.
@@ -891,6 +910,32 @@ statements their ordinary rows. What differs is the boundary:
 So "what drives `axi_if.master`'s `vld`" is `v_driver` on the interface
 instance's own net — the interface occurrence is a first-class place, not
 a bundle of wires spliced into its users.
+
+## Packages
+
+A package is a *pseudo-occurrence*: not part of the elaborated tree — it
+has no parent and instantiates nothing — but given the same object rows as
+one, so its state is a place a trace can reach. It is a `tree_node` with
+`node_kind='package'` (`parent_node_id` NULL, above the roots), a matching
+`inst` with `parent_inst_id` NULL and a `module` of `def_kind='package'`,
+and each package variable is a `net` under it.
+
+That is all it takes for a `pkg::mask` reference to resolve. slang settles
+the `::` at compile time, so such a reference is a plain read of the
+package variable's symbol; the exporter records it as a `hier_ref` whose
+`path` keeps the `pkg::` prefix (`cfg_pkg::mask`) and whose
+`resolved_net_id` is the package net. The dependency across it is an
+ordinary `net_dep` — `driver_kind='data'`, not `'external'` — and an
+imported bare `mask` resolves the same way, because the symbol still knows
+its package. Two modules reading one package variable meet on its net,
+exactly as two modules on one interface meet on the interface's net.
+
+Only package *variables* become nets. A package of nothing but
+`localparam`, `typedef` and functions is a node with no nets — real, and
+correctly empty. `$unit` compilation-unit items are not stamped yet and
+stay `external`. A package variable's initializer is not a driver (the LRM
+rule for variables), so the exporter walks no package-internal dataflow;
+its drivers and loads are the modules that reference it.
 
 ## Tracing across inout, tran and alias
 
