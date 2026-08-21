@@ -168,6 +168,12 @@ private:
 
     // ---------------------------------------------------------- terminals
 
+    /// Port symbol -> terminal slot, for one body. See the definition for why
+    /// this cannot be a stored, shared map.
+    using TermSlotMap = std::unordered_map<const void*, Template::TermSlot>;
+    static void collectTermSlots(const InstanceBodySymbol& body,
+                                 TermSlotMap& out);
+
     /// The port list of one group, as terminal templates. A MultiPort (a
     /// non-ANSI `.p({hi, lo})` formal) is one terminal; its inside is the
     /// term_map segments built later.

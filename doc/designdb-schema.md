@@ -782,8 +782,10 @@ two exports with one digest saw the same filelist, defines and flags.
   and references through one degrade like any dynamic access. Both are
   testbench constructs; the synthesizable subset does not meet them.
 * A non-ANSI concatenation formal (`.p({hi, lo})`) is exported as one
-  terminal with its two inside segments, but no lint fixture covers it:
-  Verilator rejects the construct, so it is verified by hand.
+  terminal with its two inside segments and one `net_conn` row per member,
+  each carrying the member's window of the formal. `examples/constructs/
+  portshape.sv` covers it, with a declared Verilator expect-fail: Verilator
+  rejects complex ports, Icarus accepts them.
 * Task and function bodies have no `proc` rows; their statements
   belong to the procedure that reached them, and a subroutine no procedure
   walks contributes nothing. A body called from N sites is N sets of rows,

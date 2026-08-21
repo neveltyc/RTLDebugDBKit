@@ -254,7 +254,25 @@ struct Template {
     std::vector<TplHierRef> hierRefs;
     std::vector<TplCrossDep> crossDeps;
     std::vector<TplChild> children;
-    std::unordered_map<std::string, int32_t> termIndex;  // name -> terms index
+    /// Where a port symbol sits in this template's terminals.
+    ///
+    /// Terminals are found by symbol, never by name -- there was a name map
+    /// here and every one of its lookups was wrong in some case. A port name
+    /// is not unique (two unnamed ports collapse onto one synthesized
+    /// `<unnamed>`), and for a MultiPort it is not even the name the
+    /// connection carries: slang's expandMultiPortConn hands back one
+    /// PortConnection per MEMBER, so `.p({hi, lo})` arrives as `hi` and `lo`,
+    /// neither of which is a terminal. Identity works for both.
+    ///
+    /// `lsb` and `width` describe the SYMBOL, not the terminal: a MultiPort
+    /// member occupies its own window of the terminal it belongs to, and a
+    /// connection's bits are relative to that window.
+    struct TermSlot {
+        int32_t term = -1;
+        uint64_t lsb = 0;
+        int64_t width = -1;
+    };
+    std::unordered_map<const void*, TermSlot> termOf;
     std::unordered_map<std::string, int32_t> netIndex;   // name -> nets index
     bool hasResolvableRefs = false;
     bool built = false;

@@ -109,6 +109,66 @@ void TemplateBuilder::collect(const InstanceSymbol& inst) {
     /// The port list of one group, as terminal templates. A MultiPort (a
     /// non-ANSI `.p({hi, lo})` formal) is one terminal; its inside is the
     /// term_map segments built later.
+/// Where each port symbol of ONE body sits among that body's terminals.
+///
+/// Recomputed per body rather than stored once, because what a group's bodies
+/// share is the port ORDER, not the port symbols: slang gives identical
+/// instances a single canonical body, so a child's `conn->port` belongs to that
+/// child's own body while its template was built from the canonical one. A
+/// stored symbol-keyed map looks right on a design where nothing shares a body
+/// and silently drops every connection of every instance on one where something
+/// does.
+void TemplateBuilder::collectTermSlots(const InstanceBodySymbol& body,
+                                       TermSlotMap& out) {
+    int32_t termIdx = 0;
+    for (auto* portSym : body.getPortList()) {
+        if (!portSym)
+            continue;
+        auto width = [](const Type& ty) {
+            return ty.isIntegral() ? int64_t(ty.getBitWidth()) : int64_t(-1);
+        };
+        switch (portSym->kind) {
+            case SymbolKind::Port:
+                out.emplace(static_cast<const void*>(portSym),
+                            Template::TermSlot{
+                                termIdx, 0,
+                                width(portSym->as<PortSymbol>().getType())});
+                break;
+            case SymbolKind::MultiPort: {
+                auto& mp = portSym->as<MultiPortSymbol>();
+                out.emplace(static_cast<const void*>(portSym),
+                            Template::TermSlot{termIdx, 0, width(mp.getType())});
+                // Members MSB first, as a concatenation is written, so the
+                // cursor counts down to each member's LSB -- the same offsets
+                // buildTermMaps lays the inside out with, and the same ones
+                // slang's expandMultiPortConn accumulates walking the reverse.
+                uint64_t cursor =
+                    mp.getType().isIntegral() ? mp.getType().getBitWidth() : 0;
+                for (auto* member : mp.ports) {
+                    if (!member)
+                        continue;
+                    const uint64_t w = member->getType().isIntegral()
+                                           ? member->getType().getBitWidth()
+                                           : 0;
+                    if (w && w <= cursor)
+                        cursor -= w;
+                    out.emplace(static_cast<const void*>(member),
+                                Template::TermSlot{termIdx, cursor,
+                                                   w ? int64_t(w) : -1});
+                }
+                break;
+            }
+            case SymbolKind::InterfacePort:
+                out.emplace(static_cast<const void*>(portSym),
+                            Template::TermSlot{termIdx, 0, -1});
+                break;
+            default:
+                continue;   // no terminal, so no index consumed
+        }
+        termIdx++;
+    }
+}
+
 void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
     for (auto* portSym : body.getPortList()) {
         if (!portSym)
@@ -160,9 +220,9 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
         }
         if (term.name.empty())
             term.name = "<unnamed>";
-        t.termIndex.emplace(term.name, int32_t(t.terms.size()));
         t.terms.push_back(std::move(term));
     }
+    collectTermSlots(body, t.termOf);
 }
 
 int32_t TemplateBuilder::newStmt(Build& b, std::string kind, std::string construct,
@@ -317,8 +377,8 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     if (hv.ref.isViaIfacePort() && !hv.ref.path.empty()) {
         const Symbol* first = hv.ref.path.front().symbol;
         if (first && first->kind == SymbolKind::InterfacePort) {
-            auto it = b.t->termIndex.find(std::string(first->name));
-            if (it != b.t->termIndex.end()) {
+            auto it = b.t->termOf.find(static_cast<const void*>(first));
+            if (it != b.t->termOf.end()) {
                 auto& ip = first->as<InterfacePortSymbol>();
                 auto [iface, modport] = ip.getConnection();
                 if (iface) {
@@ -326,7 +386,7 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
                     std::string rel;
                     if (splitBelow(full, ifacePrefix, rel)) {
                         row.resolve = TplHierRef::ViaIfaceTerm;
-                        row.ifaceTerm = it->second;
+                        row.ifaceTerm = it->second.term;
                         splitSegsAndNet(rel, *target, row);
                         return;
                     }
@@ -452,11 +512,10 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
     for (auto* portSym : body.getPortList()) {
         if (!portSym)
             continue;
-        auto termIt = b.t->termIndex.find(std::string(
-            portSym->name.empty() ? std::string_view("<unnamed>") : portSym->name));
-        if (termIt == b.t->termIndex.end())
+        auto termIt = b.t->termOf.find(static_cast<const void*>(portSym));
+        if (termIt == b.t->termOf.end())
             continue;
-        const int32_t termIdx = termIt->second;
+        const int32_t termIdx = termIt->second.term;
         int64_t ordinal = 0;
         auto addSeg = [&](int32_t netIdx, const TplRange& termR,
                          const TplRange& netR, bool mapping) {
@@ -471,31 +530,39 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
             m.mappingExact = mapping;
             b.t->termMaps.push_back(std::move(m));
         };
+        // The internal expression FIRST, and internalSymbol only as the
+        // fallback. The two are not alternatives: slang sets both when the
+        // port reference carries a select (`.p(hi[1:0])` gets an
+        // Expression::bindSelector into internalExpr and keeps hi as the
+        // symbol), so testing the symbol first took a 2-bit formal onto the
+        // whole of a 4-bit net and called the mapping exact -- a one-to-one
+        // claim across widths that cannot hold.
+        auto internalSegs = [&](const Expression& inner) {
+            std::vector<ConnRef> segs;
+            collectConnRefs(inner, evalCtx, segs);
+            for (auto& cn : segs) {
+                if (!cn.ref.sym)
+                    continue;
+                const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
+                if (netIdx < 0)
+                    continue;
+                TplRange termR;
+                const uint64_t fw = inner.type ? inner.type->getBitWidth() : 0;
+                if (cn.windowExact && fw &&
+                    !(cn.winLo == 0 && cn.winHi + 1 >= fw))
+                    termR.bits = std::make_pair(cn.winLo, cn.winHi);
+                termR.exact = cn.windowExact;
+                addSeg(netIdx, termR, rangeOf(cn.ref), cn.positional);
+            }
+        };
         if (portSym->kind == SymbolKind::Port) {
             auto& p = portSym->as<PortSymbol>();
-            if (p.internalSymbol && ValueSymbol::isKind(p.internalSymbol->kind)) {
+            if (auto* inner = p.getInternalExpr())
+                internalSegs(*inner);
+            else if (p.internalSymbol && ValueSymbol::isKind(p.internalSymbol->kind)) {
                 const int32_t netIdx =
                     b.decl->netFor(p.internalSymbol->as<ValueSymbol>());
                 addSeg(netIdx, TplRange{}, TplRange{}, true);
-            }
-            else if (auto* inner = p.getInternalExpr()) {
-                std::vector<ConnRef> segs;
-                collectConnRefs(*inner, evalCtx, segs);
-                for (auto& cn : segs) {
-                    if (!cn.ref.sym)
-                        continue;
-                    const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
-                    if (netIdx < 0)
-                        continue;
-                    TplRange termR;
-                    const uint64_t fw =
-                        inner->type ? inner->type->getBitWidth() : 0;
-                    if (cn.windowExact && fw &&
-                        !(cn.winLo == 0 && cn.winHi + 1 >= fw))
-                        termR.bits = std::make_pair(cn.winLo, cn.winHi);
-                    termR.exact = cn.windowExact;
-                    addSeg(netIdx, termR, rangeOf(cn.ref), cn.positional);
-                }
             }
         }
         else if (portSym->kind == SymbolKind::MultiPort) {
