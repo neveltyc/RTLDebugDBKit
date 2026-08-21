@@ -155,10 +155,9 @@ examples/options/       not a construct fixture: two files, two tops, a macro
                         defined in one and used in the other, and a header
                         reachable only through +incdir+ -- so --single-unit,
                         +define+ and the config digest have something to be
-                        wrong about. Used by refactor-equivalence.sh
+                        wrong about. Exported and asserted by CI
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow),
-                        refactor-equivalence.sh (two binaries, same rows?),
                         designdb-coverage.py (what an export had to approximate),
                         export-real-designs.sh (the measurements table, from a
                         local checkout of the public designs),
