@@ -9,6 +9,10 @@
 
 #include "extract/TemplateBuilderImpl.h"
 
+// Only buildProcedure drives it, so it stays out of the shared header and out
+// of TemplateBuilder_Conn.cpp.
+#include "extract/StatementWalker.h"
+
 namespace designdb::detail {
 
     /// Groups every instance, writes the module rows, then builds each group's

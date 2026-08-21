@@ -8,7 +8,7 @@
 // The class is split across two translation units because it does two
 // separable things: reading a body (its declarations, statements and
 // dataflow) and reading what that body wires its children to. The second is
-// 440 lines that touch the first at three points -- buildTemplate calls
+// 408 lines that touch the first at three points -- buildTemplate calls
 // buildChildren, and two connection paths record an outward reference -- so
 // the seam is thin, but it is not a seam that separates state, which is why
 // this stays one class rather than becoming two.
@@ -70,7 +70,6 @@
 #include "slang/text/SourceManager.h"
 #include "extract/DeclIndex.h"
 #include "extract/Ref.h"
-#include "extract/StatementWalker.h"
 #include "extract/SymbolText.h"
 
 using namespace slang;

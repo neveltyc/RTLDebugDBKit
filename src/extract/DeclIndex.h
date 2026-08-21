@@ -5,10 +5,10 @@
 //
 // Every dependency end is a net id, and an id must exist before anything can
 // point at it -- so this is the layer everything else in the template build
-// stands on. The statement layer asks it for a net 20 times, the connection
-// layer 4; nothing here asks either of them for anything. That one-way traffic
-// is why it is a class of its own rather than four more methods on the builder,
-// and why it owns the two maps instead of borrowing them from per-build state.
+// stands on. TemplateBuilder.cpp calls in 23 times and TemplateBuilder_Conn.cpp
+// 4; nothing here calls back into either. That one-way traffic is why it is a
+// class of its own rather than five more methods on the builder, and why it
+// owns the two maps instead of borrowing them from per-build state.
 //
 // Scoped to one body: an index is a position in that body's template, and the
 // answer to "is this symbol mine" is only meaningful against one body.
