@@ -470,6 +470,15 @@ private:
                     const Bases& parentBase, const std::vector<int64_t>& ifaceIds) {
         for (size_t k = 0; k < c.conns.size(); k++) {
             auto& conn = c.conns[k];
+            // A connection with no terminal has nowhere to hang. The sibling
+            // path in stampUnresolved has always guarded this; here it was
+            // merely unreachable, because a lookup failure dropped the whole
+            // connection before it became a row. Now that the lookup is by
+            // symbol and succeeds, the guard has to be real: -1 would resolve
+            // to childTermBase, the last id issued BEFORE this child, and name
+            // a terminal of a different instance.
+            if (conn.childTerm < 0)
+                continue;
             NetConnRow row;
             row.id = ++connCounter;
             row.netId = conn.parentNet < 0 ? 0 : parentBase.net + conn.parentNet + 1;
