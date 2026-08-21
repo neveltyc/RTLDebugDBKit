@@ -26,7 +26,7 @@ No database is upgraded in place: a version bump means re-exporting the RTL.
 
 ## Tables
 
-Twenty-one tables in six groups. Every relationship is a foreign key: a
+Twenty-two tables in six groups. Every relationship is a foreign key: a
 column named `<x>_id` holds the primary key of another table, and nowhere
 else does `_id` appear. The map (arrow points from the table that carries
 the key to the table it references; `╌╌` marks the two same-id subtype

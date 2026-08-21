@@ -2074,7 +2074,11 @@ void Writer::addNetDep(const NetDepRow& r) {
         bindRange(s, 15, r.targetBits, r.targetExact);
         bindTri(s, 18, r.mappingExact);
     }
-    bindOptId(s, 19, r.callSiteId);
+    // A call site tags a statement's dataflow, so a row with no statement
+    // carries none -- the argument bindings of a call in a control
+    // expression (`if (f(x))`) have stmt_id NULL and get call_site_id NULL
+    // with it, rather than a tag pointing into a call that owns no statement.
+    bindOptId(s, 19, r.stmtId ? r.callSiteId : 0);
     step(s);
     bumped();
 }
