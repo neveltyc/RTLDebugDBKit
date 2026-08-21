@@ -318,6 +318,362 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     return true;
 }
 
+/// The option bag slang is driven with.
+Bag buildOptionBag(const Options& opt) {
+    Bag optionBag;
+
+    parsing::PreprocessorOptions ppOpts;
+    for (auto& d : opt.defines)
+        ppOpts.predefines.push_back(d);
+    for (auto& inc : opt.includeDirs)
+        ppOpts.additionalIncludePaths.emplace_back(inc);
+    optionBag.set(ppOpts);
+
+    ast::CompilationOptions compOpts;
+    if (!opt.top.empty())
+        compOpts.topModules.emplace(opt.top);
+    // Two settings that decide whether this tool works on real IP at all.
+    //
+    // slang short-circuits its elaboration walk once `errorLimit` errors
+    // pile up and marks the compilation fatally errored; AnalysisManager
+    // then returns *silently* without analysing anything. The result is a
+    // database with a full hierarchy and zero dataflow, which reads like a
+    // design made entirely of wires rather than like a failure. The default
+    // limit is 64, and 0 means no limit.
+    compOpts.errorLimit = 0;
+    //
+    // The errors that blow that limit on real IP are overwhelmingly
+    // `MissingTimeScale`: slang declares it an error, while VCS and Questa
+    // compile and simulate the same sources without comment. A vendor PHY
+    // that mixes timescaled and untimescaled files is completely ordinary.
+    // Supplying a default is what the language itself provides for, and the
+    // exporter has no interest in timing.
+    if (auto ts = TimeScale::fromString("1ns/1ps"))
+        compOpts.defaultTimeScale = *ts;
+    optionBag.set(compOpts);
+
+    return optionBag;
+}
+
+/// Loads and parses every source into `trees`. False when a source that was
+/// named could not be read: the export would then not be of the design that
+/// was asked for, and a database that looks complete is worse than a failure.
+bool parseSources(const Options& opt, SourceManager& sourceManager,
+                  const Bag& optionBag, slang::ThreadPool& pool,
+                  std::vector<std::shared_ptr<syntax::SyntaxTree>>& trees) {
+    driver::SourceLoader loader(sourceManager);
+    for (auto& inc : opt.includeDirs)
+        loader.addSearchDirectories(inc);
+
+    if (opt.singleUnit) {
+        // One compilation unit for the whole list. Designs that put their
+        // configuration in a leading `defines file need this: slang gives
+        // each file its own unit by default, so those macros would not
+        // reach anything after them and the design elaborates with the
+        // wrong widths -- reported as "dimension requires a constant
+        // range", far from the actual cause.
+        loader.addSeparateUnit(opt.files, opt.includeDirs, opt.defines, "", {});
+    }
+    else {
+        for (auto& f : opt.files)
+            loader.addFiles(f);
+    }
+
+    { Phase p("parse", opt.timing);
+      trees = loader.loadAndParseSources(optionBag, &pool); }
+
+    if (!loader.getErrors().empty()) {
+        for (auto& err : loader.getErrors())
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+        return false;
+    }
+    return true;
+}
+
+struct DiagCounts {
+    size_t errors = 0;
+    size_t warnings = 0;
+};
+
+/// Counts the elaboration diagnostics and, with --diag, prints them.
+///
+/// Deliberately not fatal, and deliberately not suppressed. An individual
+/// error costs only the construct it is on: slang records it and carries on,
+/// so the enclosing scope still gets analysed and still contributes dataflow.
+/// Verified against a module whose `$fopen` call slang rejects and which
+/// exports 95 edges regardless.
+///
+/// The temptation is to silence the ones that look harmless. That is the wrong
+/// trade for an exporter: some errors do mean a scope elaborated with the wrong
+/// widths, and a database that quietly carries wrong connectivity is worse than
+/// one that says something went wrong. So they are reported, `--diag` shows
+/// them, and only the *limit* is lifted -- what must never happen is the silent
+/// whole-design bail that hitting the limit would otherwise cause.
+DiagCounts reportDiagnostics(const Options& opt, const Diagnostics& diags,
+                             SourceManager& sourceManager) {
+    DiagCounts counts;
+    for (auto& d : diags) {
+        if (d.isError())
+            counts.errors++;
+        else
+            counts.warnings++;
+    }
+
+    if (counts.warnings && !opt.quiet && opt.showDiags == 0) {
+        // Worth saying even though warnings are usually noise: slang marks
+        // the node bad for some of them, and a bad statement takes its
+        // enclosing block out of the export.
+        std::fprintf(stderr, "note: %zu elaboration warning(s); --diag shows them\n",
+                     counts.warnings);
+    }
+    if (opt.showDiags) {
+        slang::DiagnosticEngine engine(sourceManager);
+        auto client = std::make_shared<slang::TextDiagnosticClient>();
+        engine.addClient(client);
+        int shown = 0;
+        for (auto& d : diags) {
+            if (opt.showDiags > 0 && shown++ >= opt.showDiags)
+                break;
+            engine.issue(d);   // warnings included: one can delete a block
+        }
+        std::fputs(client->getString().c_str(), stderr);
+    }
+    if (counts.errors && !opt.quiet) {
+        std::fprintf(stderr,
+                     "warning: %zu elaboration error(s); run with --diag to see them\n",
+                     counts.errors);
+    }
+    return counts;
+}
+
+/// False when --top named something that did not elaborate as a top module.
+bool checkTopElaborated(const Options& opt, ast::Compilation& compilation) {
+    if (opt.top.empty())
+        return true;
+    for (auto inst : compilation.getRoot().topInstances) {
+        if (inst->name == opt.top)
+            return true;
+    }
+    std::fprintf(stderr,
+                 "error: --top '%s' did not elaborate as a top module; "
+                 "check the name and that its source is in the filelist\n",
+                 opt.top.c_str());
+    return false;
+}
+
+/// A digest of everything that decides what the export contains.
+///
+/// Each item carries its category and its byte length, so no run of one
+/// category can be read as a run of another. Joining the lists with newlines
+/// alone did not survive contact: `+incdir+examples +define+src` and
+/// `+incdir+examples+src` put `src` in different lists -- one is a macro, the
+/// other an include directory, and they elaborate differently -- yet both
+/// flattened to the same bytes and so to the same digest. The length prefix
+/// also means an item containing a newline or a colon cannot forge a boundary.
+std::string configDigest(const Options& opt, ast::Compilation& compilation) {
+    std::string cfg;
+    auto put = [&cfg](const char* tag, std::string_view v) {
+        cfg += tag;
+        cfg += ':';
+        cfg += std::to_string(v.size());
+        cfg += ':';
+        cfg += v;
+        cfg += '\n';
+    };
+    for (auto& f : opt.files) put("file", f);
+    for (auto& i : opt.includeDirs) put("incdir", i);
+    for (auto& d : opt.defines) put("define", d);
+    put("mode", opt.singleUnit ? "single-unit" : "multi-unit");
+    for (auto inst : compilation.getRoot().topInstances) put("top", inst->name);
+    put("timescale", "1ns/1ps");
+    put("tool", RTLDESIGNDB_VERSION);
+    put("slang", RTLDESIGNDB_SLANG_TAG);
+    return designdb::digest(cfg);
+}
+
+/// Writes the whole database to `tmpPath` and returns what went into it.
+///
+/// The writer is scoped to this function: when it returns, the file is closed
+/// and complete, which is what makes the caller's atomic rename safe.
+designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
+                              ast::Compilation& compilation,
+                              analysis::AnalysisManager& analysis,
+                              SourceManager& sourceManager,
+                              size_t numErrors, bool fatal, size_t numScopes) {
+    designdb::Stats stats;
+    designdb::Writer writer(tmpPath, opt.checkConstraints);
+    writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
+    writer.setMeta("tool", "rtl-designdb");
+    // The *elaborated* tops, not the --top argument: slang picks tops even
+    // when none is asked for, and a consumer mounting the database against
+    // a waveform needs the name either way. Space-separated when the design
+    // elaborates several -- the case that previously wrote nothing at all.
+    {
+        std::string tops;
+        for (auto inst : compilation.getRoot().topInstances) {
+            if (!tops.empty())
+                tops += ' ';
+            tops += inst->name;
+        }
+        if (!tops.empty())
+            writer.setMeta("top", tops);
+    }
+    // Every buffer the source manager actually opened, not the list that
+    // was asked for. That covers globs after expansion and, more to the
+    // point, headers pulled in by `include -- a `define changed in one of
+    // those is exactly the case a digest exists to catch, and the filelist
+    // does not change when it happens.
+    for (auto id : sourceManager.getAllBuffers()) {
+        auto name = sourceManager.getFullPath(id);
+        if (name.empty())
+            continue;
+        auto path = name.string();
+        // slang names its synthesized buffers `<unnamed_bufferN>`; they are
+        // not files and would land as rows with no digest, which reads as
+        // "a source we could not hash" rather than "not a source".
+        auto digest = designdb::fileDigest(path);
+        if (digest.empty())
+            continue;
+        writer.addSourceFile(path, digest);
+    }
+
+    { Phase p("extract+write", opt.timing);
+      stats = designdb::extract(compilation, analysis, writer); }
+
+    { Phase p("index+views", opt.timing); writer.finish(); }
+
+    // Status and versions are written after finish() so the data and
+    // indexes are complete before the meta seal lands.  setMeta()
+    // operates outside the batch transaction, so it works after
+    // finish(); and the atomic rename in the caller means the consumer
+    // never sees an intermediate state regardless -- this ordering is an
+    // extra defence so that a reader of the temp file can tell whether
+    // the export ran to completion.
+    //
+    // A duplicated hierarchical path makes `partial` for the same reason a
+    // skipped procedure does: the database is missing something it would
+    // otherwise hold. It is not a dataflow gap but a *naming* one -- two
+    // instances answer to one path, so a path lookup can resolve to the
+    // wrong subtree. Only the terminal warning said so, and `-q` silenced
+    // even that, which left the condition invisible to anyone holding the
+    // file.
+    //
+    // `unresolved` deliberately does not: an unresolved instantiation is a
+    // black box, and a design that instantiates a vendor macro it has no
+    // source for is complete as far as this tool can be. The count is
+    // recorded so a consumer can decide for itself.
+    const char* analysisStatus;
+    if (fatal || numScopes == 0)
+        analysisStatus = "hierarchy_only";
+    else if (numErrors || stats.emptyProcedures || stats.duplicatePaths ||
+             stats.truncatedCalls)
+        analysisStatus = "partial";
+    else
+        analysisStatus = "complete";
+    writer.setMeta("analysis_status", analysisStatus);
+    writer.setMeta("error_count", std::to_string(numErrors));
+    writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
+    writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
+    writer.setMeta("duplicate_path_count", std::to_string(stats.duplicatePaths));
+    writer.setMeta("tool_version", RTLDESIGNDB_VERSION);
+    writer.setMeta("slang_version", RTLDESIGNDB_SLANG_TAG);
+    // Which build produced this, at commit granularity. `tool_version`
+    // alone cannot answer it: the edge dedup key and the meta seal both
+    // changed while the version string stayed 0.1.0, so two databases
+    // agreeing on tool_version, slang_version and config_digest could
+    // still have been written by exporters that disagree.
+    writer.setMeta("producer_revision", RTLDESIGNDB_PRODUCER_REVISION);
+    writer.setMeta("config_digest", configDigest(opt, compilation));
+
+    return stats;
+}
+
+/// Removes the half-written temp database if the export does not finish.
+/// Without it a failed run leaves a stray `design.db.tmp` beside the good
+/// database -- which reads as a second, broken export rather than as a run
+/// that did not finish.
+struct TempGuard {
+    const std::string& path;
+    bool armed = true;
+    ~TempGuard() {
+        if (armed) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+};
+
+/// Atomically replaces `output` with the finished export, so a crash
+/// mid-export never leaves a partial database under the real name.
+///
+/// `rename` is specified to behave as POSIX rename(), which replaces an
+/// existing destination; MSVC implements it with MOVEFILE_REPLACE_EXISTING, so
+/// the replace itself is portable. What is *not* portable is replacing a
+/// destination another process holds open: POSIX unlinks it happily, Windows
+/// refuses. That is a real failure a user meets by leaving the database open in
+/// a viewer, so it is reported rather than thrown -- the message has to say
+/// which file and why, and a filesystem_error's what() does not.
+bool publish(const std::string& tmpPath, const std::string& output) {
+    std::error_code ec;
+    std::filesystem::rename(tmpPath, output, ec);
+    if (ec) {
+        std::fprintf(stderr,
+                     "error: could not replace '%s' with the finished export: %s\n"
+                     "       the previous database is untouched; if it is open in "
+                     "another program, close it and retry\n",
+                     output.c_str(), ec.message().c_str());
+        return false;
+    }
+    return true;
+}
+
+/// What the run found, and what it could not.
+void reportStats(const Options& opt, const designdb::Stats& stats) {
+    if (opt.quiet)
+        return;
+    std::printf("%s: %lld modules, %lld instances, %lld nets, %lld terminals, "
+                "%lld connections, %lld statements, %lld dependencies\n",
+                opt.output.c_str(), (long long)stats.modules,
+                (long long)stats.instances, (long long)stats.nets,
+                (long long)stats.terms, (long long)stats.conns,
+                (long long)stats.stmts, (long long)stats.deps);
+    if (stats.emptyProcedures) {
+        std::fprintf(stderr,
+                     "warning: %lld procedure(s) drive a signal but yielded no "
+                     "dataflow; a statement in them was rejected and its whole "
+                     "block skipped -- run with --diag\n",
+                     (long long)stats.emptyProcedures);
+    }
+    if (stats.unresolved) {
+        std::fprintf(stderr,
+                     "note: %lld instantiation(s) name a module that could not "
+                     "be resolved; recorded as unresolved tree nodes\n",
+                     (long long)stats.unresolved);
+    }
+    if (stats.external) {
+        std::fprintf(stderr,
+                     "note: %lld reference(s) to symbols outside their own "
+                     "module (hierarchical, interface or package items); "
+                     "those written as a path are recorded in hier_ref\n",
+                     (long long)stats.external);
+    }
+    if (stats.truncatedCalls) {
+        std::fprintf(stderr,
+                     "warning: %lld call site(s) exceeded the "
+                     "subroutine expansion budget; their bodies were "
+                     "not walked, so dataflow through them is "
+                     "incomplete\n",
+                     (long long)stats.truncatedCalls);
+    }
+    if (stats.duplicatePaths) {
+        std::fprintf(stderr,
+                     "warning: %lld instances share a hierarchical path with "
+                     "another; the design did not fully elaborate, so a path "
+                     "lookup may be ambiguous\n",
+                     (long long)stats.duplicatePaths);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -335,55 +691,7 @@ int main(int argc, char** argv) {
 
     try {
         SourceManager sourceManager;
-        Bag optionBag;
-
-        parsing::PreprocessorOptions ppOpts;
-        for (auto& d : opt.defines)
-            ppOpts.predefines.push_back(d);
-        for (auto& inc : opt.includeDirs)
-            ppOpts.additionalIncludePaths.emplace_back(inc);
-        optionBag.set(ppOpts);
-
-        ast::CompilationOptions compOpts;
-        if (!opt.top.empty())
-            compOpts.topModules.emplace(opt.top);
-        // Two settings that decide whether this tool works on real IP at all.
-        //
-        // slang short-circuits its elaboration walk once `errorLimit` errors
-        // pile up and marks the compilation fatally errored; AnalysisManager
-        // then returns *silently* without analysing anything. The result is a
-        // database with a full hierarchy and zero dataflow, which reads like a
-        // design made entirely of wires rather than like a failure. The default
-        // limit is 64, and 0 means no limit.
-        compOpts.errorLimit = 0;
-        //
-        // The errors that blow that limit on real IP are overwhelmingly
-        // `MissingTimeScale`: slang declares it an error, while VCS and Questa
-        // compile and simulate the same sources without comment. A vendor PHY
-        // that mixes timescaled and untimescaled files is completely ordinary.
-        // Supplying a default is what the language itself provides for, and the
-        // exporter has no interest in timing.
-        if (auto ts = TimeScale::fromString("1ns/1ps"))
-            compOpts.defaultTimeScale = *ts;
-        optionBag.set(compOpts);
-
-        driver::SourceLoader loader(sourceManager);
-        for (auto& inc : opt.includeDirs)
-            loader.addSearchDirectories(inc);
-
-        if (opt.singleUnit) {
-            // One compilation unit for the whole list. Designs that put their
-            // configuration in a leading `defines file need this: slang gives
-            // each file its own unit by default, so those macros would not
-            // reach anything after them and the design elaborates with the
-            // wrong widths -- reported as "dimension requires a constant
-            // range", far from the actual cause.
-            loader.addSeparateUnit(opt.files, opt.includeDirs, opt.defines, "", {});
-        }
-        else {
-            for (auto& f : opt.files)
-                loader.addFiles(f);
-        }
+        const Bag optionBag = buildOptionBag(opt);
 
         // Both the parser and the analysis manager take a thread pool and
         // run serially without one, which is what they were doing: slang is
@@ -392,16 +700,8 @@ int main(int argc, char** argv) {
         // serial), the analysis manager per scope.
         auto pool = std::make_shared<slang::ThreadPool>();
         std::vector<std::shared_ptr<syntax::SyntaxTree>> trees;
-        { Phase p("parse", opt.timing);
-          trees = loader.loadAndParseSources(optionBag, pool.get()); }
-        if (!loader.getErrors().empty()) {
-            // A source that was named and could not be read means the export is
-            // not of the design that was asked for. Continuing would produce a
-            // database that looks complete, so this fails instead.
-            for (auto& err : loader.getErrors())
-                std::fprintf(stderr, "error: %s\n", err.c_str());
+        if (!parseSources(opt, sourceManager, optionBag, *pool, trees))
             return 2;
-        }
 
         ast::Compilation compilation(optionBag);
         for (auto& tree : trees)
@@ -421,53 +721,10 @@ int main(int argc, char** argv) {
         Phase elab("elaborate", opt.timing);
         auto& diags = compilation.getAllDiagnostics();
         elab.stop();
-        size_t numErrors = 0;
-        size_t numWarnings = 0;
-        for (auto& d : diags) {
-            if (d.isError())
-                numErrors++;
-            else
-                numWarnings++;
-        }
-        if (numWarnings && !opt.quiet && opt.showDiags == 0) {
-            // Worth saying even though warnings are usually noise: slang marks
-            // the node bad for some of them, and a bad statement takes its
-            // enclosing block out of the export.
-            std::fprintf(stderr, "note: %zu elaboration warning(s); --diag shows them\n",
-                         numWarnings);
-        }
-        if (opt.showDiags) {
-            slang::DiagnosticEngine engine(sourceManager);
-            auto client = std::make_shared<slang::TextDiagnosticClient>();
-            engine.addClient(client);
-            int shown = 0;
-            for (auto& d : diags) {
-                if (opt.showDiags > 0 && shown++ >= opt.showDiags)
-                    break;
-                engine.issue(d);   // warnings included: one can delete a block
-            }
-            std::fputs(client->getString().c_str(), stderr);
-        }
-        if (numErrors && !opt.quiet) {
-            // Deliberately not fatal, and deliberately not suppressed.
-            //
-            // An individual error costs only the construct it is on: slang
-            // records it and carries on, so the enclosing scope still gets
-            // analysed and still contributes dataflow. Verified against a
-            // module whose `$fopen` call slang rejects and which exports 95
-            // edges regardless.
-            //
-            // The temptation is to silence the ones that look harmless. That is
-            // the wrong trade for an exporter: some errors do mean a scope
-            // elaborated with the wrong widths, and a database that quietly
-            // carries wrong connectivity is worse than one that says something
-            // went wrong. So they are reported, `--diag` shows them, and only
-            // the *limit* is lifted -- what must never happen is the silent
-            // whole-design bail that hitting the limit would otherwise cause.
-            std::fprintf(stderr,
-                         "warning: %zu elaboration error(s); run with --diag to see them\n",
-                         numErrors);
-        }
+        const DiagCounts counts = reportDiagnostics(opt, diags, sourceManager);
+
+        if (!checkTopElaborated(opt, compilation))
+            return 2;
 
         // Checked before analysing, not inferred afterwards. slang sets this on
         // three conditions -- the error limit exceeded, instantiation deeper
@@ -475,19 +732,6 @@ int main(int argc, char** argv) {
         // and `AnalysisManager::analyze()` then returns without a word. Reading
         // it directly is the difference between saying why the dataflow is
         // missing and guessing from an empty result.
-        if (!opt.top.empty()) {
-            bool found = false;
-            for (auto inst : compilation.getRoot().topInstances)
-                found = found || inst->name == opt.top;
-            if (!found) {
-                std::fprintf(stderr,
-                             "error: --top '%s' did not elaborate as a top module; "
-                             "check the name and that its source is in the filelist\n",
-                             opt.top.c_str());
-                return 2;
-            }
-        }
-
         const bool fatal = compilation.hasFatalErrors();
         if (fatal) {
             std::fprintf(stderr,
@@ -513,200 +757,18 @@ int main(int argc, char** argv) {
         }
 
         const std::string tmpPath = opt.output + ".tmp";
-        // Removes the half-written temp database if anything below throws or
-        // returns early. Without it a failed export leaves a stray
-        // `design.db.tmp` beside the good database -- which reads as a second,
-        // broken export rather than as a run that did not finish.
-        struct TempGuard {
-            const std::string& path;
-            bool armed = true;
-            ~TempGuard() {
-                if (armed) {
-                    std::error_code ec;
-                    std::filesystem::remove(path, ec);
-                }
-            }
-        } tempGuard{tmpPath};
-        designdb::Stats stats;
-        {
-        designdb::Writer writer(tmpPath, opt.checkConstraints);
-        writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
-        writer.setMeta("tool", "rtl-designdb");
-        // The *elaborated* tops, not the --top argument: slang picks tops even
-        // when none is asked for, and a consumer mounting the database against
-        // a waveform needs the name either way. Space-separated when the design
-        // elaborates several -- the case that previously wrote nothing at all.
-        {
-            std::string tops;
-            for (auto inst : compilation.getRoot().topInstances) {
-                if (!tops.empty())
-                    tops += ' ';
-                tops += inst->name;
-            }
-            if (!tops.empty())
-                writer.setMeta("top", tops);
-        }
-        // Every buffer the source manager actually opened, not the list that
-        // was asked for. That covers globs after expansion and, more to the
-        // point, headers pulled in by `include -- a `define changed in one of
-        // those is exactly the case a digest exists to catch, and the filelist
-        // does not change when it happens.
-        for (auto id : sourceManager.getAllBuffers()) {
-            auto name = sourceManager.getFullPath(id);
-            if (name.empty())
-                continue;
-            auto path = name.string();
-            // slang names its synthesized buffers `<unnamed_bufferN>`; they are
-            // not files and would land as rows with no digest, which reads as
-            // "a source we could not hash" rather than "not a source".
-            auto digest = designdb::fileDigest(path);
-            if (digest.empty())
-                continue;
-            writer.addSourceFile(path, digest);
-        }
+        TempGuard tempGuard{tmpPath};
 
-        { Phase p("extract+write", opt.timing);
-          stats = designdb::extract(compilation, analysis, writer); }
-
-        { Phase p("index+views", opt.timing); writer.finish(); }
-
-        // Status and versions are written after finish() so the data and
-        // indexes are complete before the meta seal lands.  setMeta()
-        // operates outside the batch transaction, so it works after
-        // finish(); and atomic rename below means the consumer never sees
-        // an intermediate state regardless -- this ordering is an extra
-        // defence so that a reader of the temp file can tell whether the
-        // export ran to completion.
-        //
-        // A duplicated hierarchical path makes `partial` for the same reason a
-        // skipped procedure does: the database is missing something it would
-        // otherwise hold. It is not a dataflow gap but a *naming* one -- two
-        // instances answer to one path, so a path lookup can resolve to the
-        // wrong subtree. Only the terminal warning said so, and `-q` silenced
-        // even that, which left the condition invisible to anyone holding the
-        // file.
-        //
-        // `unresolved` deliberately does not: an unresolved instantiation is a
-        // black box, and a design that instantiates a vendor macro it has no
-        // source for is complete as far as this tool can be. The count is
-        // recorded so a consumer can decide for itself.
-        const char* analysisStatus;
-        if (fatal || astats.numScopes == 0)
-            analysisStatus = "hierarchy_only";
-        else if (numErrors || stats.emptyProcedures || stats.duplicatePaths ||
-                 stats.truncatedCalls)
-            analysisStatus = "partial";
-        else
-            analysisStatus = "complete";
-        writer.setMeta("analysis_status", analysisStatus);
-        writer.setMeta("error_count", std::to_string(numErrors));
-        writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
-        writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
-        writer.setMeta("duplicate_path_count", std::to_string(stats.duplicatePaths));
-        writer.setMeta("tool_version", RTLDESIGNDB_VERSION);
-        writer.setMeta("slang_version", RTLDESIGNDB_SLANG_TAG);
-        // Which build produced this, at commit granularity. `tool_version`
-        // alone cannot answer it: the edge dedup key and the meta seal both
-        // changed while the version string stayed 0.1.0, so two databases
-        // agreeing on tool_version, slang_version and config_digest could
-        // still have been written by exporters that disagree.
-        writer.setMeta("producer_revision", RTLDESIGNDB_PRODUCER_REVISION);
-        {
-            // Each item carries its category and its byte length, so no run of
-            // one category can be read as a run of another. Joining the lists
-            // with newlines alone did not survive contact: `+incdir+examples
-            // +define+src` and `+incdir+examples+src` put `src` in different
-            // lists -- one is a macro, the other an include directory, and they
-            // elaborate differently -- yet both flattened to the same bytes and
-            // so to the same digest. The length prefix also means an item
-            // containing a newline or a colon cannot forge a boundary.
-            std::string cfg;
-            auto put = [&cfg](const char* tag, std::string_view v) {
-                cfg += tag;
-                cfg += ':';
-                cfg += std::to_string(v.size());
-                cfg += ':';
-                cfg += v;
-                cfg += '\n';
-            };
-            for (auto& f : opt.files) put("file", f);
-            for (auto& i : opt.includeDirs) put("incdir", i);
-            for (auto& d : opt.defines) put("define", d);
-            put("mode", opt.singleUnit ? "single-unit" : "multi-unit");
-            for (auto inst : compilation.getRoot().topInstances) put("top", inst->name);
-            put("timescale", "1ns/1ps");
-            put("tool", RTLDESIGNDB_VERSION);
-            put("slang", RTLDESIGNDB_SLANG_TAG);
-            writer.setMeta("config_digest", designdb::digest(cfg));
-        }
-        }
-        // Writer destroyed — the database file is closed and complete.
-        // Atomic rename replaces the target so a crash mid-export never
-        // leaves a partial database under the real name.
-        //
-        // `rename` is specified to behave as POSIX rename(), which replaces an
-        // existing destination; MSVC implements it with MOVEFILE_REPLACE_EXISTING,
-        // so the replace itself is portable. What is *not* portable is replacing
-        // a destination another process holds open: POSIX unlinks it happily,
-        // Windows refuses. That is a real failure a user meets by leaving the
-        // database open in a viewer, so it is reported rather than thrown --
-        // the message has to say which file and why, and a filesystem_error's
-        // what() does not.
-        std::error_code ec;
-        std::filesystem::rename(tmpPath, opt.output, ec);
-        if (ec) {
-            std::fprintf(stderr,
-                         "error: could not replace '%s' with the finished export: %s\n"
-                         "       the previous database is untouched; if it is open in "
-                         "another program, close it and retry\n",
-                         opt.output.c_str(), ec.message().c_str());
+        const designdb::Stats stats =
+            writeDatabase(opt, tmpPath, compilation, analysis, sourceManager,
+                          counts.errors, fatal, astats.numScopes);
+        // The writer is destroyed with writeDatabase's frame, so the database
+        // file is closed and complete before this runs.
+        if (!publish(tmpPath, opt.output))
             return 1;
-        }
         tempGuard.armed = false;
 
-        if (!opt.quiet) {
-            std::printf("%s: %lld modules, %lld instances, %lld nets, %lld terminals, "
-                        "%lld connections, %lld statements, %lld dependencies\n",
-                        opt.output.c_str(), (long long)stats.modules,
-                        (long long)stats.instances, (long long)stats.nets,
-                        (long long)stats.terms, (long long)stats.conns,
-                        (long long)stats.stmts, (long long)stats.deps);
-            if (stats.emptyProcedures) {
-                std::fprintf(stderr,
-                             "warning: %lld procedure(s) drive a signal but yielded no "
-                             "dataflow; a statement in them was rejected and its whole "
-                             "block skipped -- run with --diag\n",
-                             (long long)stats.emptyProcedures);
-            }
-            if (stats.unresolved) {
-                std::fprintf(stderr,
-                             "note: %lld instantiation(s) name a module that could not "
-                             "be resolved; recorded as unresolved tree nodes\n",
-                             (long long)stats.unresolved);
-            }
-            if (stats.external) {
-                std::fprintf(stderr,
-                             "note: %lld reference(s) to symbols outside their own "
-                             "module (hierarchical, interface or package items); "
-                             "those written as a path are recorded in hier_ref\n",
-                             (long long)stats.external);
-            }
-            if (stats.truncatedCalls) {
-                std::fprintf(stderr,
-                             "warning: %lld call site(s) exceeded the "
-                             "subroutine expansion budget; their bodies were "
-                             "not walked, so dataflow through them is "
-                             "incomplete\n",
-                             (long long)stats.truncatedCalls);
-            }
-            if (stats.duplicatePaths) {
-                std::fprintf(stderr,
-                             "warning: %lld instances share a hierarchical path with "
-                             "another; the design did not fully elaborate, so a path "
-                             "lookup may be ambiguous\n",
-                             (long long)stats.duplicatePaths);
-            }
-        }
+        reportStats(opt, stats);
         return 0;
     }
     catch (const std::exception& e) {
