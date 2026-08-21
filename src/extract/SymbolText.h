@@ -42,7 +42,7 @@ using namespace slang;
 using namespace slang::ast;
 
 /// occurrence shares.
-bool relativePath(const Symbol& sym, const std::string& bodyPrefix, std::string& out) {
+inline bool relativePath(const Symbol& sym, const std::string& bodyPrefix, std::string& out) {
     std::string full = sym.getHierarchicalPath();
     if (!bodyPrefix.empty() && full.size() > bodyPrefix.size() &&
         full.compare(0, bodyPrefix.size(), bodyPrefix) == 0 &&
@@ -61,7 +61,7 @@ bool relativePath(const Symbol& sym, const std::string& bodyPrefix, std::string&
     return false;
 }
 
-std::string typeOf(const ValueSymbol& sym) {
+inline std::string typeOf(const ValueSymbol& sym) {
     return sym.getType().toString();
 }
 
@@ -74,7 +74,7 @@ struct Where {
     uint32_t column = 0;
 };
 
-Where whereOf(SourceLocation loc, const SourceManager& sm) {
+inline Where whereOf(SourceLocation loc, const SourceManager& sm) {
     if (!loc)
         return {};
     return Where{std::string(sm.getFileName(loc)),
@@ -87,7 +87,7 @@ Where whereOf(SourceLocation loc, const SourceManager& sm) {
 /// (See v9's history for why not the raw source text: generate loops share a
 /// spelling across distinct references, spellings differ in whitespace, and
 /// macro-assembled references span buffers.)
-std::string canonicalPath(const Expression* e, EvalContext& eval) {
+inline std::string canonicalPath(const Expression* e, EvalContext& eval) {
     for (;;) {
         if (e && e->kind == ExpressionKind::ElementSelect)
             e = &e->as<ElementSelectExpression>().value();
@@ -154,7 +154,7 @@ std::string canonicalPath(const Expression* e, EvalContext& eval) {
 /// The reference as written, with whitespace and comments taken out -- the
 /// fallback for a reference `canonicalPath` cannot walk (an XMR slang
 /// resolves to a single node). Empty for a macro-assembled span.
-std::string normalizedText(const Expression* e, const SourceManager& sm,
+inline std::string normalizedText(const Expression* e, const SourceManager& sm,
                            bool stripTrailingSelect = true) {
     if (!e)
         return {};
@@ -210,7 +210,7 @@ std::string normalizedText(const Expression* e, const SourceManager& sm,
 /// collapsed. Stored as text, never evaluated -- `#(rise, fall)` and
 /// min:typ:max forms are not one number, and pretending otherwise would
 /// store a guess.
-std::string delayText(const TimingControl* t) {
+inline std::string delayText(const TimingControl* t) {
     if (!t || !t->syntax)
         return {};
     switch (t->kind) {
@@ -240,7 +240,7 @@ std::string delayText(const TimingControl* t) {
 
 /// The word an assertion publishes as its `construct`. Spelled out rather
 /// than taken from slang's enum printer: these are a wire format.
-std::string assertionWord(AssertionKind kind) {
+inline std::string assertionWord(AssertionKind kind) {
     switch (kind) {
         case AssertionKind::Assume:        return "assume";
         case AssertionKind::CoverProperty:
@@ -252,7 +252,7 @@ std::string assertionWord(AssertionKind kind) {
 }
 
 /// The proc_kind word for a procedural block.
-std::string procedureWord(const Symbol& sym) {
+inline std::string procedureWord(const Symbol& sym) {
     if (sym.kind != SymbolKind::ProceduralBlock)
         return "always";
     switch (sym.as<ProceduralBlockSymbol>().procedureKind) {
@@ -268,7 +268,7 @@ std::string procedureWord(const Symbol& sym) {
 
 /// Every edge-triggered event in a timing control, in the order written --
 /// all of them, since an event list has no ordering semantics.
-void collectEdgeEvents(const TimingControl* t,
+inline void collectEdgeEvents(const TimingControl* t,
                        std::vector<std::pair<const Expression*, std::string>>& out,
                        std::vector<const Expression*>* iffs = nullptr) {
     if (!t)
@@ -307,7 +307,7 @@ void collectEdgeEvents(const TimingControl* t,
 /// One group's parameter values, as stable text: declaration order, values in
 /// full precision (ConstantValue::toString abbreviates above 128 bits, which
 /// folded distinct parameterisations).
-std::vector<std::pair<std::string, std::string>>
+inline std::vector<std::pair<std::string, std::string>>
 parameterPairs(const InstanceBodySymbol& body) {
     std::vector<std::pair<std::string, std::string>> out;
     for (auto& member : body.members()) {
@@ -327,7 +327,7 @@ parameterPairs(const InstanceBodySymbol& body) {
 
 /// The signature is the pairs, joined -- one normalisation, two
 /// representations, and the verifier holds them equal per occurrence.
-std::string parameterText(const InstanceBodySymbol& body) {
+inline std::string parameterText(const InstanceBodySymbol& body) {
     std::string out;
     for (auto& [name, value] : parameterPairs(body)) {
         if (!out.empty())
@@ -346,7 +346,7 @@ std::string parameterText(const InstanceBodySymbol& body) {
 
 /// The path segment slang gives a generate block: the genvar's *value* for a
 /// loop iteration, the block's name otherwise.
-std::string generateSegment(const GenerateBlockSymbol& block) {
+inline std::string generateSegment(const GenerateBlockSymbol& block) {
     if (auto* index = block.getArrayIndex())
         return "[" + index->toString(LiteralBase::Decimal, false) + "]";
     std::string name(block.name);
@@ -357,7 +357,7 @@ std::string generateSegment(const GenerateBlockSymbol& block) {
 /// slang's array-element index already rendered in source numbering
 /// (`u[0]`) -- the one spelling a tree node's name must use, since an
 /// instance-array element's own `name` is the bare `u`.
-std::string leafSegment(const Symbol& sym) {
+inline std::string leafSegment(const Symbol& sym) {
     std::string full = sym.getHierarchicalPath();
     const size_t dot = full.rfind('.');
     return dot == std::string::npos ? full : full.substr(dot + 1);
@@ -366,7 +366,7 @@ std::string leafSegment(const Symbol& sym) {
 /// Calls `fn` for every member of `scope` of kind `K`, descending through
 /// generate blocks and instance arrays but never into an instance's own body.
 template<SymbolKind K, typename SymT, typename F>
-void forEachOfKind(const Scope& scope, F&& fn) {
+inline void forEachOfKind(const Scope& scope, F&& fn) {
     for (auto& member : scope.members()) {
         if (member.kind == K) {
             fn(member.as<SymT>());
@@ -394,12 +394,12 @@ void forEachOfKind(const Scope& scope, F&& fn) {
 }
 
 template<typename F>
-void forEachInstance(const Scope& scope, F&& fn) {
+inline void forEachInstance(const Scope& scope, F&& fn) {
     forEachOfKind<SymbolKind::Instance, InstanceSymbol>(scope, fn);
 }
 
 /// The decl_kind word for a net or variable.
-std::string declarationKindOf(const Symbol& sym) {
+inline std::string declarationKindOf(const Symbol& sym) {
     if (sym.kind != SymbolKind::Net)
         return "variable";
     auto& nt = sym.as<NetSymbol>().netType;
@@ -423,7 +423,7 @@ std::string declarationKindOf(const Symbol& sym) {
     }
 }
 
-std::string directionWord(ArgumentDirection d) {
+inline std::string directionWord(ArgumentDirection d) {
     switch (d) {
         case ArgumentDirection::In:    return "input";
         case ArgumentDirection::Out:   return "output";

@@ -47,7 +47,7 @@ using namespace slang::ast;
 /// An enum member or a parameter is not something a waveform carries and not
 /// something a trace can step to, so it is not connectivity. Leaving them in
 /// also swamped the count of genuinely dropped cross-module references.
-bool isConstantSymbol(const ValueSymbol& sym) {
+inline bool isConstantSymbol(const ValueSymbol& sym) {
     switch (sym.kind) {
         case SymbolKind::EnumValue:
         case SymbolKind::Parameter:
@@ -75,12 +75,12 @@ struct Ref {
     const Expression* origin = nullptr;
 };
 
-uint64_t bitWidthOf(const ValueSymbol& sym) {
+inline uint64_t bitWidthOf(const ValueSymbol& sym) {
     return sym.getType().getSelectableWidth();
 }
 
 /// Builds a Ref from one of slang's value paths.
-Ref refOf(const ValuePath& path) {
+inline Ref refOf(const ValuePath& path) {
     Ref r;
     r.sym = path.rootSymbol();
     if (!r.sym)
@@ -102,7 +102,7 @@ Ref refOf(const ValuePath& path) {
 /// across the three collection passes of one assignment.
 inline thread_local int64_t filteredConstants = 0;
 
-void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out,
+inline void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out,
                  bool skipSelectors = false) {
     ValuePath::visitPaths(
         expr, ctx,
@@ -147,14 +147,14 @@ constexpr uint64_t kNoWidth = ~uint64_t{0};
 /// counted and reported, never silently dropped.
 constexpr int64_t kCallExpansionBudget = 4000;
 
-uint64_t exprWidthOf(const Expression& e) {
+inline uint64_t exprWidthOf(const Expression& e) {
     return e.type ? e.type->getBitWidth() : 0;
 }
 
 /// Whether the expression *is* a reference to storage rather than a
 /// computation over one; selects and width-preserving conversions are
 /// transparent, everything else answers no.
-bool isPlainReference(const Expression& e) {
+inline bool isPlainReference(const Expression& e) {
     const Expression* p = &e;
     for (;;) {
         switch (p->kind) {
@@ -187,7 +187,7 @@ bool isPlainReference(const Expression& e) {
 /// occupies. Concatenations and simple assignment patterns are positioned
 /// element by element, MSB first; conversions are transparent when width-
 /// preserving or truncating and degrade to range-level when widening.
-void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
+inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
                   std::vector<Slot>& out, bool skipSelectors = false) {
     const uint64_t width = exprWidthOf(expr);
 
@@ -239,7 +239,7 @@ void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
         out.push_back(Slot{r, base, base + width - 1, positional});
 }
 
-bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
+inline bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
     if (a.hi == kNoWidth || b.hi == kNoWidth) {
         lo = 0;
         hi = kNoWidth;
@@ -252,7 +252,7 @@ bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
 
 /// The reference narrowed to the part of it landing in [lo, hi] of the
 /// assignment. Only meaningful for a positional slot.
-Ref narrowed(const Slot& s, uint64_t lo, uint64_t hi) {
+inline Ref narrowed(const Slot& s, uint64_t lo, uint64_t hi) {
     Ref r = s.ref;
     if (!s.positional || s.hi == kNoWidth || hi == kNoWidth || !r.sym)
         return r;
@@ -320,7 +320,7 @@ struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::All
 };
 
 template<typename NodeT>
-void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
+inline void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
     StatementRefCollector c(out);
     node.visit(c);
     out.erase(std::remove_if(out.begin(), out.end(),
@@ -337,7 +337,7 @@ void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
 }
 
 /// A called subroutine's free reads -- what it samples beyond its arguments.
-void collectCallReadsInto(const Expression& expr,
+inline void collectCallReadsInto(const Expression& expr,
                           std::set<const SubroutineSymbol*>& active,
                           std::vector<Ref>& out) {
     struct CallFinder : ASTVisitor<CallFinder, VisitFlags::AllGood> {
@@ -409,7 +409,7 @@ struct ReadCollector : public ASTVisitor<ReadCollector, VisitFlags::AllGood> {
     }
 };
 
-void collectReads(const Expression& expr, std::vector<const ValueSymbol*>& out) {
+inline void collectReads(const Expression& expr, std::vector<const ValueSymbol*>& out) {
     std::set<const SubroutineSymbol*> active;
     ReadCollector c(out, active);
     expr.visit(c);
