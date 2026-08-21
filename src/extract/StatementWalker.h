@@ -524,6 +524,26 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         collectSlots(expr.right(), eval, 0, rhsSlots);
         collectAuxSlots(expr.right(), 0, rhsSlots, /*selectors=*/false);
         collectAuxSlots(expr.left(), 0, rhsSlots, /*selectors=*/true);
+        // `a += b` reads a, and nothing above finds that read. slang does not
+        // rewrite a compound assignment into `a = a + b`; it builds the right
+        // side as BinaryExpression(LValueReferenceExpression, b), and an
+        // LValueReference is a bare placeholder -- no sub-expressions, no link
+        // back to the lvalue, and no case in ValuePath::visitPaths. So the
+        // target's own contribution yielded no reference at all: `b += x`
+        // recorded only b <- x, and `d <<= 2`, whose whole right side is that
+        // placeholder and a constant, recorded d as driven by a CONSTANT --
+        // a tie-off claim on a signal fed by itself.
+        //
+        // positional is cleared because the operator carries between bits:
+        // leaving it set would claim `b += x` maps bit for bit, which an adder
+        // does not.
+        if (expr.isCompound()) {
+            std::vector<Slot> selfRead;
+            collectSlots(expr.left(), eval, 0, selfRead, /*skipSelectors=*/true);
+            for (auto& sr : selfRead)
+                sr.positional = false;
+            rhsSlots.insert(rhsSlots.end(), selfRead.begin(), selfRead.end());
+        }
         const int64_t droppedConstants = filteredConstants;
 
         eval.reset();
