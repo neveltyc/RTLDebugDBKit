@@ -332,7 +332,7 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
         return;
     }
     std::string rel;
-    if (splitBelow(full, b.prefix, rel)) {
+    if (splitBelow(full, b.decl->bodyPrefix(), rel)) {
         row.resolve = TplHierRef::Downward;
         splitSegsAndNet(rel, *target, row);
         return;
@@ -422,7 +422,6 @@ void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body)
     Build b;
     b.t = &t;
     b.body = &body;
-    b.prefix = body.getHierarchicalPath();
     b.decl = &decl;
 
     b.decl->collectDeclarations(body, 0);
@@ -1411,7 +1410,7 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
 
 void TemplateBuilder::addHierRefIfOutward(Build& b, const Ref& r, EvalContext& evalCtx) {
     std::string rel;
-    if (r.sym && !relativePath(*r.sym, b.prefix, rel))
+    if (r.sym && !relativePath(*r.sym, b.decl->bodyPrefix(), rel))
         addHierRef(b, false, r, TplLoc{}, evalCtx);
 }
 

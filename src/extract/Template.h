@@ -24,9 +24,6 @@
 
 namespace designdb::detail {
 
-using namespace slang;
-using namespace slang::ast;
-
 // Everything a group's occurrences share, held with template-local indices.
 // Stamping is then arithmetic: global id = per-occurrence base + index. The
 // invariant that makes this sound: two bodies with one (definition,

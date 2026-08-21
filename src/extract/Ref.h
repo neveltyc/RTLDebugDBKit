@@ -43,6 +43,7 @@ namespace designdb::detail {
 using namespace slang;
 using namespace slang::ast;
 
+/// True for a symbol that is a compile-time constant rather than a net.
 ///
 /// An enum member or a parameter is not something a waveform carries and not
 /// something a trace can step to, so it is not connectivity. Leaving them in
@@ -59,10 +60,6 @@ inline bool isConstantSymbol(const ValueSymbol& sym) {
             return false;
     }
 }
-
-/// The path of `sym` as seen from `body`, i.e. with the instance's own prefix
-/// removed. Rows name objects scope-relative (`g[0].sig`, `bump.v`); the
-/// template is stamped per occurrence, so the relative spelling is what every
 
 struct Ref {
     const ValueSymbol* sym = nullptr;

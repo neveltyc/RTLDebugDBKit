@@ -102,7 +102,6 @@ private:
     struct Build {
         Template* t = nullptr;
         const InstanceBodySymbol* body = nullptr;
-        std::string prefix;
         /// The declaration index for this body. Owns what used to be
         /// netOf/scopeOf, and is the only thing here that hands out net
         /// and scope indices.

@@ -41,6 +41,9 @@ namespace designdb::detail {
 using namespace slang;
 using namespace slang::ast;
 
+/// The path of `sym` as seen from `body`, i.e. with the instance's own prefix
+/// removed. Rows name objects scope-relative (`g[0].sig`, `bump.v`); the
+/// template is stamped per occurrence, so the relative spelling is what every
 /// occurrence shares.
 inline bool relativePath(const Symbol& sym, const std::string& bodyPrefix, std::string& out) {
     std::string full = sym.getHierarchicalPath();

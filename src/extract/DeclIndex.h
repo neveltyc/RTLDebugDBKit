@@ -167,6 +167,11 @@ public:
         return addScope(sym, parent, std::move(seg));
     }
 
+    /// The body's own hierarchical path, which every scope-relative name is
+    /// taken against. Exposed rather than copied: two owners of one string that
+    /// relativePath keys on is one edit away from disagreeing.
+    const std::string& bodyPrefix() const { return prefix; }
+
     int32_t scopeForSymbol(const Symbol& sym) const {
         // Climb to the nearest scope the template modelled: a generate block
         // or the body itself. Statement blocks and subroutines fold onto it.
