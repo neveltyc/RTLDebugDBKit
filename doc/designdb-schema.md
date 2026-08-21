@@ -26,39 +26,129 @@ No database is upgraded in place: a version bump means re-exporting the RTL.
 
 ## Tables
 
-| Group | Table | One row is |
-|---|---|---|
-| provenance | `meta` | one key/value of the seal |
-| | `src_file` | one file slang read, with its SHA-256 |
-| | `file` | one path spelling rows carry, joined to its src_file |
-| | `data_type` | one interned type text |
-| hierarchy | `module` | one source definition |
-| | `tree_node` | one level of the elaborated tree |
-| | `inst` | one module/interface/program instance occurrence |
-| | `inst_param` | one elaborated parameter value of one occurrence |
-| | `prim` | one gate, switch or UDP instance |
-| objects | `net` | one connectable object of one occurrence |
-| | `term` | one terminal on one occurrence's boundary |
-| | `term_map` | one segment of a terminal's inside |
-| | `net_conn` | one segment of a terminal's outside |
-| statements | `proc` | one always/initial/final block |
-| | `call_site` | one subroutine-body expansion (a call) |
-| | `stmt` | one statement or statement-level construct |
-| | `stmt_target` | one statement's target reference (LHS, release, system write) |
-| | `assign_operand` | one assignment right-hand-side reference |
-| | `expr_ref` | one non-operand read, classified by role |
-| | `proc_event` | one edge event triggered or waited on |
-| dataflow | `net_dep` | one net-to-net dependency occurrence |
-| boundary | `hier_ref` | one reference that leaves its instance |
+Twenty-one tables in six groups. Every relationship is a foreign key: a
+column named `<x>_id` holds the primary key of another table, and nowhere
+else does `_id` appear. The map (arrow points from the table that carries
+the key to the table it references; `╌╌` marks the two same-id subtype
+links, where `inst.id` and `prim.id` ARE a `tree_node.id`):
+
+```mermaid
+flowchart LR
+  subgraph provenance
+    src_file[src_file]
+    file[file]
+    data_type[data_type]
+    meta[meta]
+  end
+  subgraph hierarchy
+    module[module]
+    tree_node[tree_node]
+    inst[inst]
+    inst_param[inst_param]
+    prim[prim]
+  end
+  subgraph objects
+    net[net]
+    term[term]
+    term_map[term_map]
+    net_conn[net_conn]
+  end
+  subgraph statements
+    proc[proc]
+    call_site[call_site]
+    stmt[stmt]
+    stmt_target[stmt_target]
+    assign_operand[assign_operand]
+    expr_ref[expr_ref]
+    proc_event[proc_event]
+  end
+  net_dep[net_dep]
+  hier_ref[hier_ref]
+
+  file --> src_file
+  module --> file
+  tree_node --> tree_node
+  inst -.->|module_id| module
+  inst -->|parent_inst_id| inst
+  inst_param --> inst
+  inst ==>|id| tree_node
+  prim ==>|id| tree_node
+  prim --> inst
+
+  net --> inst
+  net -.->|data_type_id| data_type
+  term --> inst
+  term_map -->|term_id| term
+  term_map -->|inner_net_id| net
+  net_conn -->|term_id| term
+  net_conn -->|outer_net_id| net
+  net_conn -.->|outer_hier_ref_id| hier_ref
+
+  proc --> inst
+  stmt -->|inst_id| inst
+  stmt -.->|proc_id| proc
+  stmt -.->|call_site_id| call_site
+  call_site -->|inst_id| inst
+  call_site -.->|caller_stmt_id| stmt
+  call_site -.->|parent| call_site
+  stmt_target -->|stmt_id| stmt
+  stmt_target -->|net_id| net
+  assign_operand --> stmt
+  expr_ref --> stmt
+  proc_event -->|proc_id| proc
+  proc_event -.->|net_id| net
+
+  net_dep -->|src/tgt_net_id| net
+  net_dep -.->|stmt_id| stmt
+  net_dep -.->|prim_id| prim
+  net_dep -.->|call_site_id| call_site
+  net_dep -.->|src/tgt_hier_ref_id| hier_ref
+  hier_ref -->|inst_id| inst
+  hier_ref -.->|resolved_net_id| net
+```
+
+`net_dep` also carries the provenance columns `assign_operand_id`,
+`stmt_target_id` and `expr_ref_id` (the local reference each end came from);
+`hier_ref` carries `resolved_inst_id` beside `resolved_net_id`. Dashed
+edges are nullable references (the key is absent for rows the relationship
+does not apply to); solid edges are always present.
+
+| Group | Table | One row is | Foreign keys (`col → table`) |
+|---|---|---|---|
+| provenance | `meta` | one key/value of the seal | — |
+| | `src_file` | one file slang read, with its SHA-256 | — |
+| | `file` | one path spelling rows carry | `src_file_id → src_file` |
+| | `data_type` | one interned type text | — |
+| hierarchy | `module` | one source definition | `file_id → file` |
+| | `tree_node` | one level of the elaborated tree | `parent_node_id → tree_node` |
+| | `inst` | one module/interface/program instance occurrence | `id → tree_node`, `module_id → module`, `parent_inst_id → inst` |
+| | `inst_param` | one elaborated parameter value of one occurrence | `inst_id → inst` |
+| | `prim` | one gate, switch or UDP instance | `id → tree_node`, `inst_id → inst` |
+| objects | `net` | one connectable object of one occurrence | `inst_id → inst`, `scope_node_id → tree_node`, `data_type_id → data_type` |
+| | `term` | one terminal on one occurrence's boundary | `inst_id → inst`, `data_type_id → data_type` |
+| | `term_map` | one segment of a terminal's inside | `term_id → term`, `inner_net_id → net` |
+| | `net_conn` | one segment of a terminal's outside | `term_id → term`, `outer_net_id → net`, `outer_intf_inst_id → inst`, `outer_hier_ref_id → hier_ref` |
+| statements | `proc` | one always/initial/final block | `inst_id → inst`, `scope_node_id → tree_node` |
+| | `call_site` | one subroutine-body expansion (a call) | `inst_id → inst`, `caller_stmt_id → stmt`, `parent_call_site_id → call_site` |
+| | `stmt` | one statement or statement-level construct | `inst_id → inst`, `scope_node_id → tree_node`, `proc_id → proc`, `call_site_id → call_site` |
+| | `stmt_target` | one statement's target reference (LHS, release, system write) | `stmt_id → stmt`, `net_id → net` |
+| | `assign_operand` | one assignment right-hand-side reference | `stmt_id → stmt`, `net_id → net` |
+| | `expr_ref` | one non-operand read, classified by role | `stmt_id → stmt`, `net_id → net` |
+| | `proc_event` | one edge event triggered or waited on | `proc_id → proc`, `stmt_id → stmt`, `net_id → net` |
+| dataflow | `net_dep` | one net-to-net dependency occurrence | `src_net_id`/`tgt_net_id → net`, `stmt_id → stmt`, `prim_id → prim`, `call_site_id → call_site`, `assign_operand_id`, `stmt_target_id`, `expr_ref_id`, `src_hier_ref_id`/`tgt_hier_ref_id → hier_ref` |
+| boundary | `hier_ref` | one reference that leaves its instance | `inst_id`/`resolved_inst_id → inst`, `stmt_id → stmt`, `resolved_net_id → net` |
 
 The DDL in `src/DesignDb.cpp` carries the authoritative per-column comments;
-this file states the semantics a consumer builds on.
+this file states the semantics a consumer builds on. The columns of each
+table follow.
 
 ### Hierarchy
 
 **`module`** — `id, name, def_kind, file_id, line, column`, unique on
 (name, file_id, line). `def_kind` is `module | interface | program |
-checker`. However many parameterisations elaborate, the definition is one
+checker | package` (a package's pseudo-occurrence carries a `module` row of
+its own, see *Packages*). However many parameterisations elaborate, the
+definition is one
 row.
 
 **`tree_node`** — `id, parent_node_id, name, node_kind, ordinal`. One path
