@@ -50,10 +50,11 @@ def share(part, whole):
     return round(100.0 * part / whole, 2) if whole else 0.0
 
 
-TABLES = ("module", "tree_node", "inst", "primitive", "net", "term", "term_map",
-          "net_conn", "procedure", "stmt", "assign_target", "assign_operand",
+TABLES = ("module", "tree_node", "inst", "inst_param", "prim", "net", "term",
+          "term_map",
+          "net_conn", "proc", "stmt", "stmt_target", "assign_operand",
           "expr_ref", "proc_event", "net_dep", "hier_ref", "data_type", "file",
-          "source_file")
+          "src_file")
 
 report = {
     "database": os.path.basename(path),
@@ -70,10 +71,10 @@ report = {
 # upper bound rather than the bits actually touched, so a trace crossing it
 # fans out to more of the object than the RTL really reaches.
 inexact = {}
-for tbl, col in (("net_dep", "source_exact"), ("net_dep", "target_exact"),
-                 ("net_conn", "net_exact"), ("net_conn", "term_exact"),
-                 ("term_map", "term_exact"), ("term_map", "net_exact"),
-                 ("assign_target", "is_exact"), ("assign_operand", "is_exact"),
+for tbl, col in (("net_dep", "src_exact"), ("net_dep", "tgt_exact"),
+                 ("net_conn", "outer_exact"), ("net_conn", "term_exact"),
+                 ("term_map", "term_exact"), ("term_map", "inner_exact"),
+                 ("stmt_target", "is_exact"), ("assign_operand", "is_exact"),
                  ("expr_ref", "is_exact"), ("hier_ref", "is_exact")):
     total = scalar(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" IS NOT NULL')
     n = scalar(f'SELECT count(*) FROM "{tbl}" WHERE "{col}" = 0')
@@ -84,12 +85,12 @@ report["inexact_ranges"] = inexact
 # count -- a design full of arithmetic legitimately reports a high share --
 # but it is the fraction of the graph a bit-level trace cannot follow
 # precisely, which is worth knowing before trusting one.
-deps_total = scalar("SELECT count(*) FROM net_dep WHERE mapping_exact IS NOT NULL")
-coarse = scalar("SELECT count(*) FROM net_dep WHERE mapping_exact = 0")
+deps_total = scalar("SELECT count(*) FROM net_dep WHERE map_exact IS NOT NULL")
+coarse = scalar("SELECT count(*) FROM net_dep WHERE map_exact = 0")
 report["coarse_bit_mapping"] = {
     "n": coarse, "of": deps_total, "pct": share(coarse, deps_total)}
-conns_total = scalar("SELECT count(*) FROM net_conn WHERE mapping_exact IS NOT NULL")
-ccoarse = scalar("SELECT count(*) FROM net_conn WHERE mapping_exact = 0")
+conns_total = scalar("SELECT count(*) FROM net_conn WHERE map_exact IS NOT NULL")
+ccoarse = scalar("SELECT count(*) FROM net_conn WHERE map_exact = 0")
 report["coarse_conn_mapping"] = {
     "n": ccoarse, "of": conns_total, "pct": share(ccoarse, conns_total)}
 
@@ -109,7 +110,7 @@ report["dropped_operands"] = {
 # `q <= 8'h0` is one on purpose; a large share is the shape a systematic miss
 # takes, because a target whose sources were all lost still gets its row.
 deps = report["rows"]["net_dep"]
-null_src = scalar("SELECT count(*) FROM net_dep WHERE source_net_id IS NULL")
+null_src = scalar("SELECT count(*) FROM net_dep WHERE src_net_id IS NULL")
 report["deps_without_source"] = {
     "n": null_src, "of": deps, "pct": share(null_src, deps)}
 
@@ -136,7 +137,7 @@ report["hier_ref_resolution"] = {
 # seven-branch union, and a correlated subquery re-runs it once per net --
 # 90 seconds on a design where scanning it once takes 20 milliseconds.
 root_inputs = scalar("""
-    SELECT count(DISTINCT m.net_id) FROM term_map m
+    SELECT count(DISTINCT m.inner_net_id) FROM term_map m
     JOIN term t ON t.id = m.term_id
     JOIN tree_node n ON n.id = t.inst_id
     WHERE n.node_kind = 'root' AND t.direction IN ('input', 'inout')""")
@@ -147,7 +148,7 @@ undriven_internal = scalar("""
     SELECT count(*) FROM net WHERE id NOT IN
         (SELECT signal_net_id FROM v_driver WHERE signal_net_id IS NOT NULL)
       AND id NOT IN
-        (SELECT m.net_id FROM term_map m JOIN term t ON t.id = m.term_id
+        (SELECT m.inner_net_id FROM term_map m JOIN term t ON t.id = m.term_id
          JOIN tree_node n ON n.id = t.inst_id
          WHERE n.node_kind = 'root' AND t.direction IN ('input', 'inout'))""")
 nets = report["rows"]["net"]
@@ -164,7 +165,7 @@ report["undriven_nets"] = {
 # is the multiplier it paid -- a ratio near 1.0 means the design has almost
 # no replication and the expansion cost nothing.
 variants = scalar("""SELECT count(*) FROM (SELECT DISTINCT module_id,
-                     COALESCE(parameter_signature, '') FROM inst
+                     COALESCE(param_signature, '') FROM inst
                      WHERE module_id IS NOT NULL)""")
 instances = scalar("SELECT count(*) FROM inst WHERE module_id IS NOT NULL")
 report["expansion_ratio"] = round(instances / variants, 2) if variants else 0.0
