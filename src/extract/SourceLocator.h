@@ -3,10 +3,11 @@
 //
 // Source locations, interned.
 //
-// The one thing the two passes share. Of the 47 methods the extractor's walker
-// had, exactly two were reachable from both the template build and the
-// stamping: these. Everything else belongs to one side or the other, which is
-// what made the split along that seam worth doing.
+// The one thing the two passes share. When the extractor was one class, exactly
+// two of its 47 methods were reachable from both the template build and the
+// stamping: these. Everything else belonged to one side or the other, which is
+// what made splitting along that seam worth doing -- and why TemplateBuilder
+// and Stamper each take a locator rather than owning one.
 //
 // A location is a file id plus a line and column, and the three travel
 // together -- taking the line from a statement and the file from its enclosing

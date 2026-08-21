@@ -9,9 +9,11 @@
 // silently. Everything a group's occurrences have in common is read once here;
 // what differs per occurrence is the stamping pass's business.
 //
-// The interface is one function, and the builder itself is a detail of the
-// translation unit. Nothing outside needs to name it: it is used exactly once,
-// in order, and every method it has is a step of that one traversal.
+// The interface is one function. The builder behind it is declared in
+// extract/TemplateBuilderImpl.h and defined across TemplateBuilder.cpp and
+// TemplateBuilder_Conn.cpp; nothing outside those three files should name it.
+// It is used exactly once, in order, and every method it has is a step of that
+// one traversal.
 
 #pragma once
 

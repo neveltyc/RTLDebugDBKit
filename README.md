@@ -139,9 +139,11 @@ CMakeLists.txt          the build; slang and SQLite are fetched, not vendored
 src/                    main.cpp (CLI + filelist parsing), Extractor (the
                         two-pass export), DesignDb (the writer)
 src/sql/                the DDL: Schema, Indexes, Views
-src/extract/            Ref/SymbolText/Template (the vocabulary), DeclIndex,
-                        StatementWalker, TemplateBuilder (pass 1),
-                        Stamper (pass 2)
+src/extract/            the export, in layers. Ref/SymbolText/Template are the
+                        vocabulary (header-only); SourceLocator, DeclIndex and
+                        StatementWalker the services over it; TemplateBuilder
+                        (+ _Conn) is pass 1 and Stamper pass 2, each behind a
+                        one-function interface
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
 examples/constructs/    self-feedback, primitives, UDPs, waits, delays,

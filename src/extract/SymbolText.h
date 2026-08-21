@@ -158,7 +158,7 @@ inline std::string canonicalPath(const Expression* e, EvalContext& eval) {
 /// fallback for a reference `canonicalPath` cannot walk (an XMR slang
 /// resolves to a single node). Empty for a macro-assembled span.
 inline std::string normalizedText(const Expression* e, const SourceManager& sm,
-                           bool stripTrailingSelect = true) {
+                                  bool stripTrailingSelect = true) {
     if (!e)
         return {};
     auto range = e->sourceRange;
@@ -272,8 +272,8 @@ inline std::string procedureWord(const Symbol& sym) {
 /// Every edge-triggered event in a timing control, in the order written --
 /// all of them, since an event list has no ordering semantics.
 inline void collectEdgeEvents(const TimingControl* t,
-                       std::vector<std::pair<const Expression*, std::string>>& out,
-                       std::vector<const Expression*>* iffs = nullptr) {
+                              std::vector<std::pair<const Expression*, std::string>>& out,
+                              std::vector<const Expression*>* iffs = nullptr) {
     if (!t)
         return;
     switch (t->kind) {

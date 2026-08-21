@@ -100,7 +100,7 @@ inline Ref refOf(const ValuePath& path) {
 inline thread_local int64_t filteredConstants = 0;
 
 inline void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out,
-                 bool skipSelectors = false) {
+                        bool skipSelectors = false) {
     ValuePath::visitPaths(
         expr, ctx,
         [&](const ValuePath& path) {
@@ -185,7 +185,7 @@ inline bool isPlainReference(const Expression& e) {
 /// element by element, MSB first; conversions are transparent when width-
 /// preserving or truncating and degrade to range-level when widening.
 inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
-                  std::vector<Slot>& out, bool skipSelectors = false) {
+                         std::vector<Slot>& out, bool skipSelectors = false) {
     const uint64_t width = exprWidthOf(expr);
 
     const bool elementwise = expr.kind == ExpressionKind::Concatenation ||
@@ -335,8 +335,8 @@ inline void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
 
 /// A called subroutine's free reads -- what it samples beyond its arguments.
 inline void collectCallReadsInto(const Expression& expr,
-                          std::set<const SubroutineSymbol*>& active,
-                          std::vector<Ref>& out) {
+                                 std::set<const SubroutineSymbol*>& active,
+                                 std::vector<Ref>& out) {
     struct CallFinder : ASTVisitor<CallFinder, VisitFlags::AllGood> {
         std::set<const SubroutineSymbol*>& active;
         std::vector<Ref>& out;
