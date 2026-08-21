@@ -308,8 +308,18 @@ inline void collectEdgeEvents(const TimingControl* t,
 }
 
 /// One group's parameter values, as stable text: declaration order, values in
-/// full precision (ConstantValue::toString abbreviates above 128 bits, which
-/// folded distinct parameterisations).
+/// full precision.
+///
+/// The text is a template's identity -- two bodies sharing a (definition,
+/// parameters) key are replayed from one analysis -- so any abbreviation here
+/// folds designs that are not the same. SVInt::toString abbreviates two ways
+/// and both have to be defeated: MAX_BITS turns off the length cut above 128
+/// bits, and exactUnknowns turns off the one that matters more. Left false, a
+/// value that has unknown bits, is wider than 64, and is neither
+/// all-x nor all-z prints as the single letter `X` (SVInt.cpp's base
+/// heuristic), so `128'h...0x` and `128'h...1x` become one key -- and the
+/// second instance is then stamped from the first one's body, reporting the
+/// generate branch it did not elaborate.
 inline std::vector<std::pair<std::string, std::string>>
 parameterPairs(const InstanceBodySymbol& body) {
     std::vector<std::pair<std::string, std::string>> out;
@@ -317,7 +327,8 @@ parameterPairs(const InstanceBodySymbol& body) {
         if (member.kind == SymbolKind::Parameter) {
             auto& p = member.as<ParameterSymbol>();
             out.emplace_back(std::string(p.name),
-                             p.getValue().toString(SVInt::MAX_BITS));
+                             p.getValue().toString(SVInt::MAX_BITS,
+                                                   /*exactUnknowns=*/true));
         }
         else if (member.kind == SymbolKind::TypeParameter) {
             auto& tp = member.as<TypeParameterSymbol>();
