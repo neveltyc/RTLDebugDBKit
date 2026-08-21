@@ -41,6 +41,7 @@ struct Stats {
     int64_t conns = 0;        // net_conn rows
     int64_t procedures = 0;
     int64_t stmts = 0;
+    int64_t callSites = 0;    // call_site rows
     int64_t deps = 0;         // net_dep rows
     int64_t hierRefs = 0;
     /// References to symbols outside their instance that could not be stored

@@ -52,7 +52,7 @@ def share(part, whole):
 
 TABLES = ("module", "tree_node", "inst", "inst_param", "prim", "net", "term",
           "term_map",
-          "net_conn", "proc", "stmt", "stmt_target", "assign_operand",
+          "net_conn", "proc", "call_site", "stmt", "stmt_target", "assign_operand",
           "expr_ref", "proc_event", "net_dep", "hier_ref", "data_type", "file",
           "src_file")
 

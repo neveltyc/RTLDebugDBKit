@@ -179,8 +179,17 @@ namespace designdb {
 /// meet on it. 'external' now means only the genuinely unresolvable: an
 /// upward hierarchical reference from a shared body, an interface-array
 /// binding. ($unit compilation-unit items are not stamped yet.)
-/// (Per-call-site dataflow tagging lands in the same version; its note is
-/// added as that piece does.)
+///
+/// And subroutine dataflow gets call-site identity. A task or function body
+/// is walked once per call site, but the formal is one shared net, so a
+/// fan-in cone mixed one call's gating with another's argument -- a
+/// combination no real call makes. Every stmt and net_dep a body walk
+/// produces now names its site in call_site_id, a new call_site table
+/// (caller_stmt, subroutine, depth, parent_call_site_id for the call
+/// string), exposed on v_net_dep/v_driver/v_load and v_call_site. A
+/// consumer follows only one call's rows at each hop and keeps each call's
+/// real combination. Additive: the column is nullable and the table new, so
+/// a reader that ignores both is unaffected.
 inline constexpr int SchemaVersion = 13;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
@@ -344,9 +353,20 @@ struct StmtRow {
     std::string assignmentKind;   // continuous | blocking | nonblocking; "" = NULL
     std::string delay;            // normalised delay control text; "" = NULL
     int64_t droppedOperandCount = 0;
+    int64_t callSiteId = 0;       // the call-site expansion this belongs to; 0 = NULL
     int64_t fileId = 0;
     uint32_t line = 0;
     uint32_t column = 0;
+};
+
+/// One subroutine-body expansion: a body walked once per call site.
+struct CallSiteRow {
+    int64_t id = 0;
+    int64_t instId = 0;
+    int64_t callerStmtId = 0;      // the statement making the call; 0 = NULL
+    int64_t parentCallSiteId = 0;  // the enclosing expansion; 0 = NULL (top)
+    std::string subroutineName;
+    int64_t depth = 0;
 };
 
 /// One assignment target reference (LHS).
@@ -415,6 +435,7 @@ struct NetDepRow {
     std::optional<std::pair<uint64_t, uint64_t>> targetBits;
     bool targetExact = true;
     int mappingExact = -1;        // -1 = nothing to correspond, stored NULL
+    int64_t callSiteId = 0;       // the call-site expansion this belongs to; 0 = NULL
 };
 
 /// One reference that leaves the instance, as written and, when slang could
@@ -484,6 +505,7 @@ public:
     void addTermMap(const TermMapRow& r);
     void addNetConn(const NetConnRow& r);
     void addProcedure(const ProcedureRow& r);
+    void addCallSite(const CallSiteRow& r);
     void addStmt(const StmtRow& r);
     void addStmtTarget(const StmtTargetRow& r);
     void addAssignOperand(const AssignOperandRow& r);
@@ -507,7 +529,7 @@ private:
 
     enum Ins {
         InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
-        InsTerm, InsTermMap, InsNetConn, InsProcedure, InsStmt,
+        InsTerm, InsTermMap, InsNetConn, InsProcedure, InsCallSite, InsStmt,
         InsStmtTarget, InsAssignOperand, InsExprRef, InsProcEvent,
         InsNetDep, InsHierRef,
         InsCount

@@ -897,7 +897,21 @@ struct TplStmt {
     std::string assignKind;  // "" = NULL
     std::string delay;
     int64_t dropped = 0;
+    int32_t callSite = -1;   // the call-site expansion this belongs to (-1 = none)
     TplLoc loc;
+};
+
+/// One subroutine-body expansion: a body is walked once per call site, and
+/// this is that site's identity, so a consumer can partition a cone by it
+/// and never mix one call's gating with another's argument. `callerStmt` is
+/// the statement making the call; `parentCallSite` is the enclosing
+/// expansion (a call-string for nested calls); ids are template-relative and
+/// stamped per occurrence like everything else.
+struct TplCallSite {
+    int32_t callerStmt = -1;
+    int32_t parentCallSite = -1;
+    std::string subName;
+    int64_t depth = 0;
 };
 
 struct TplStmtRef {          // stmt_target and assign_operand share the shape
@@ -943,6 +957,7 @@ struct TplDep {
     std::string kind;
     TplRange srcR, tgtR;
     int mappingExact = -1;
+    int32_t callSite = -1;   // the call-site expansion, or -1 at module level
 };
 
 /// Replay data for one outward reference: how to find the target from an
@@ -987,6 +1002,7 @@ struct TplCrossDep {
     int32_t exprRef = -1;
     TplRange srcR, tgtR;
     int mappingExact = -1;
+    int32_t callSite = -1;   // the call-site expansion, or -1 at module level
 };
 
 struct TplConn {
@@ -1026,6 +1042,7 @@ struct Template {
     std::vector<TplTermMap> termMaps;
     std::vector<TplProcedure> procedures;
     std::vector<TplStmt> stmts;
+    std::vector<TplCallSite> callSites;
     std::vector<TplStmtRef> targets;
     std::vector<TplStmtRef> operands;
     std::vector<TplExprRef> exprRefs;
@@ -1129,6 +1146,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// while visiting control expressions, whose calls belong to no statement
     /// this schema records.
     bool bindable = true;
+    /// The call-site machinery. `callSiteSlot` points at Build::curCallSite so
+    /// handle(CallExpression) can set the site in force around a body walk;
+    /// `allocCallSite` mints a template call-site row for the entered call and
+    /// returns its index. Both null outside a real build (dry runs).
+    int32_t* callSiteSlot = nullptr;
+    std::function<int32_t(const SubroutineSymbol&, int64_t depth)> allocCallSite;
 
     StatementWalker(EmitTarget t, EmitCallBinding b, EmitEvent e, EmitRead r,
                     EvalContext& eval) :
@@ -1376,9 +1399,20 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         auto sub = std::get_if<const SubroutineSymbol*>(&expr.subroutine);
         if (!sub || !*sub)
             return;
+        // Enter the call site before binding: the argument bindings and the
+        // body statements both belong to THIS call, so both must be tagged
+        // with it. Restored on every exit path below.
+        const int32_t savedCallSite = callSiteSlot ? *callSiteSlot : -1;
+        if (callSiteSlot && allocCallSite)
+            *callSiteSlot = allocCallSite(**sub, subDepth + 1);
+        struct Restore {
+            int32_t* slot;
+            int32_t val;
+            ~Restore() { if (slot) *slot = val; }
+        } restore{callSiteSlot, savedCallSite};
         bindArguments(expr, **sub);
         if (!activeSubs.insert(*sub).second)
-            return;                       // recursion guard
+            return;                       // recursion guard (Restore fires)
         // Per CALL SITE, deliberately. Walking the body once per subroutine
         // read cleaner but lost call-site semantics: in
         // `if (g1) put(d1); if (g2) put(d2);` the body's `q <= v` inherited
@@ -1878,6 +1912,7 @@ private:
         std::map<std::tuple<const Expression*, bool, int32_t>, int32_t> hierSeen;
         int32_t curStmt = -1;      // where call bindings attach
         int32_t curProc = -1;      // procedure of statements being created
+        int32_t curCallSite = -1;  // the call-site body walk in force (-1 = top)
         int32_t curScope = 0;
         int64_t targetOrdinal = 0; // per-stmt ordinals
         int64_t operandOrdinal = 0;
@@ -2021,6 +2056,7 @@ private:
         s.assignKind = std::move(assignKind);
         s.delay = std::move(delay);
         s.dropped = dropped;
+        s.callSite = b.curCallSite;
         s.loc = loc;
         const int32_t idx = int32_t(b.t->stmts.size());
         b.t->stmts.push_back(std::move(s));
@@ -2519,6 +2555,18 @@ private:
         walker.sensitivityTiming = sens.timingControl;
         walker.budget = &b.callBudget;
         walker.truncated = &b.truncatedCalls;
+        walker.callSiteSlot = &b.curCallSite;
+        walker.allocCallSite = [&b](const SubroutineSymbol& sub,
+                                    int64_t depth) -> int32_t {
+            TplCallSite cs;
+            cs.callerStmt = b.curStmt;         // the statement making the call
+            cs.parentCallSite = b.curCallSite; // the enclosing expansion
+            cs.subName = std::string(sub.name);
+            cs.depth = depth;
+            const int32_t idx = int32_t(b.t->callSites.size());
+            b.t->callSites.push_back(std::move(cs));
+            return idx;
+        };
         if (isContinuous) {
             walker.pendingDelay = delayText(
                 sym.as<ContinuousAssignSymbol>().getDelay());
@@ -2586,6 +2634,7 @@ private:
             d.stmt = stmt;
             d.tgtHref = href;
             d.tgtR = rangeOf(r);
+            d.callSite = b.curCallSite;
             b.t->crossDeps.push_back(std::move(d));
             return;
         }
@@ -2603,6 +2652,7 @@ private:
         d.targetRef = targetIdx;
         d.kind = "data";
         d.tgtR = rangeOf(r);
+        d.callSite = b.curCallSite;
         b.t->deps.push_back(std::move(d));
     }
 
@@ -2763,6 +2813,7 @@ private:
                 // everything the statement writes.
                 d.tgtR = rangeOf(p.tgt);
                 d.mappingExact = p.mapExact ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
             }
             else if (srcNet >= 0 || srcHref >= 0) {
@@ -2778,6 +2829,7 @@ private:
                 d.srcR = rangeOf(p.src);
                 d.tgtR = rangeOf(p.tgt);
                 d.mappingExact = p.mapExact ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
         }
@@ -2795,6 +2847,7 @@ private:
                 d.targetRef = targetIdx;
                 d.kind = "data";
                 d.tgtR = rangeOf(dst);
+                d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
             }
             else {
@@ -2808,6 +2861,7 @@ private:
                 d.stmt = stmt;
                 d.tgtHref = tgtHref;
                 d.tgtR = rangeOf(dst);
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
         }
@@ -2835,6 +2889,7 @@ private:
                     d.srcR = rangeOf(src);
                     d.tgtR = rangeOf(dst);
                     d.mappingExact = 0;
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                 }
                 else {
@@ -2850,6 +2905,7 @@ private:
                     d.srcR = rangeOf(src);
                     d.tgtR = rangeOf(dst);
                     d.mappingExact = 0;
+                    d.callSite = b.curCallSite;
                     b.t->crossDeps.push_back(std::move(d));
                 }
             }
@@ -2887,6 +2943,7 @@ private:
                 d.tgtNet = formalNet;
                 d.srcR = rangeOf(actual);
                 d.mappingExact = oneToOne ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
             if (writes) {
@@ -2897,6 +2954,7 @@ private:
                 d.tgtHref = href;
                 d.tgtR = rangeOf(actual);
                 d.mappingExact = oneToOne ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
             return;
@@ -2913,6 +2971,7 @@ private:
             d.kind = "procedure";
             d.srcR = rangeOf(actual);
             d.mappingExact = oneToOne ? 1 : 0;
+            d.callSite = b.curCallSite;
             b.t->deps.push_back(std::move(d));
         }
         if (writes) {
@@ -2923,6 +2982,7 @@ private:
             d.kind = "procedure";
             d.tgtR = rangeOf(actual);
             d.mappingExact = oneToOne ? 1 : 0;
+            d.callSite = b.curCallSite;
             b.t->deps.push_back(std::move(d));
         }
     }
@@ -3069,6 +3129,7 @@ private:
                     // coarse if a side could not be narrowed.
                     d.mappingExact =
                         (sides[i].ref.exact && sides[j].ref.exact) ? 1 : 0;
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                 }
             }
@@ -3208,6 +3269,7 @@ private:
                         (dst.whole ? bitWidthOf(*dst.sym) == 1
                                    : dst.hi == dst.lo);
                     d.mappingExact = oneBit ? 1 : 0;
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                     anyInput = true;
                 }
@@ -3220,6 +3282,7 @@ private:
                     d.prim = primIdx;
                     d.kind = "primitive";
                     d.tgtR = rangeOf(dst);
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                 }
             }
@@ -3740,7 +3803,7 @@ private:
     /// Everything one stamped occurrence needs to remember.
     struct Bases {
         int64_t net = 0, term = 0, proc = 0, stmt = 0, target = 0, operand = 0,
-                exprRef = 0, procEvent = 0, dep = 0, hierRef = 0;
+                exprRef = 0, procEvent = 0, dep = 0, hierRef = 0, callSite = 0;
     };
 
     struct ReplayJob {
@@ -3826,6 +3889,8 @@ private:
         procEventCounter += int64_t(t.procEvents.size());
         base.dep = depCounter;         depCounter += int64_t(t.deps.size());
         base.hierRef = hierRefCounter; hierRefCounter += int64_t(t.hierRefs.size());
+        base.callSite = callSiteCounter;
+        callSiteCounter += int64_t(t.callSites.size());
 
         // Primitives are tree nodes; their ids come from the node counter.
         std::vector<int64_t> primNode(t.prims.size(), 0);
@@ -3919,6 +3984,22 @@ private:
         }
         stats.procedures += int64_t(t.procedures.size());
 
+        // Call sites first: a stmt row names the site it belongs to, so the
+        // site ids must be issued before the statements reference them.
+        for (size_t i = 0; i < t.callSites.size(); i++) {
+            auto& cs = t.callSites[i];
+            CallSiteRow row;
+            row.id = base.callSite + int64_t(i) + 1;
+            row.instId = instId;
+            row.callerStmtId = cs.callerStmt < 0 ? 0 : base.stmt + cs.callerStmt + 1;
+            row.parentCallSiteId =
+                cs.parentCallSite < 0 ? 0 : base.callSite + cs.parentCallSite + 1;
+            row.subroutineName = cs.subName;
+            row.depth = cs.depth;
+            writer.addCallSite(row);
+        }
+        stats.callSites += int64_t(t.callSites.size());
+
         for (size_t i = 0; i < t.stmts.size(); i++) {
             auto& s = t.stmts[i];
             StmtRow row;
@@ -3933,6 +4014,7 @@ private:
             row.assignmentKind = s.assignKind;
             row.delay = s.delay;
             row.droppedOperandCount = s.dropped;
+            row.callSiteId = s.callSite < 0 ? 0 : base.callSite + s.callSite + 1;
             row.fileId = s.loc.fileId;
             row.line = s.loc.line;
             row.column = s.loc.column;
@@ -4005,6 +4087,7 @@ private:
             row.targetBits = d.tgtR.bits;
             row.targetExact = d.tgtR.exact;
             row.mappingExact = d.mappingExact;
+            row.callSiteId = d.callSite < 0 ? 0 : base.callSite + d.callSite + 1;
             writer.addNetDep(row);
         }
         stats.deps += int64_t(t.deps.size());
@@ -4425,6 +4508,8 @@ private:
             row.targetBits = d.tgtR.bits;
             row.targetExact = d.tgtR.exact;
             row.mappingExact = d.mappingExact;
+            row.callSiteId =
+                d.callSite < 0 ? 0 : job.base.callSite + d.callSite + 1;
             writer.addNetDep(row);
             stats.deps++;
         }
@@ -4469,6 +4554,7 @@ private:
     int64_t depCounter = 0;
     int64_t connCounter = 0;
     int64_t hierRefCounter = 0;
+    int64_t callSiteCounter = 0;
     int64_t rootOrdinal = 0;
 
     std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>> childByName;

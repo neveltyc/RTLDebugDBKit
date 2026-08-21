@@ -303,6 +303,26 @@ CREATE TABLE proc(
     line           INTEGER,
     col            INTEGER);
 
+-- One subroutine-body expansion. A task or function body is walked once per
+-- call site (its statements carry that call's gating and delay), and this is
+-- that site's identity, so a consumer can partition a fan-in cone by it and
+-- never mix one call's gating with another's argument -- the combination no
+-- single call makes, which a shared formal net otherwise admits. `stmt` and
+-- `net_dep` rows a body walk produced name their site in `call_site_id`;
+-- `parent_call_site_id` chains nested calls into a call string.
+--
+-- caller_stmt_id is the statement making the call (NULL for a call in a
+-- control expression, which this schema attaches to no statement). depth is
+-- the call-stack depth, 1 at the outermost call. Additive: a reader that
+-- does not know call sites ignores the column and the table.
+CREATE TABLE call_site(
+    id                   INTEGER PRIMARY KEY,
+    inst_id              INTEGER NOT NULL REFERENCES inst(id),
+    caller_stmt_id       INTEGER REFERENCES stmt(id),
+    parent_call_site_id  INTEGER REFERENCES call_site(id),
+    subroutine_name      TEXT NOT NULL,
+    depth                INTEGER NOT NULL);
+
 -- One statement, or one statement-level construct. The statement is the
 -- object; its targets, operands and other reads are child rows -- v9's
 -- `assignment` was one row per TARGET, so `{a,b} = {x,y}` was two rows
@@ -340,6 +360,7 @@ CREATE TABLE stmt(
         /*!*/CHECK(assign_kind IN ('continuous','blocking','nonblocking'))/*!*/,
     delay                 TEXT,
     dropped_operand_count INTEGER NOT NULL,
+    call_site_id          INTEGER REFERENCES call_site(id),
     file_id               INTEGER REFERENCES file(id),
     line                  INTEGER,
     col                   INTEGER);
@@ -481,7 +502,8 @@ CREATE TABLE net_dep(
     tgt_lo             INTEGER,
     tgt_hi             INTEGER,
     tgt_exact          INTEGER NOT NULL CHECK(tgt_exact IN (0,1)),
-    map_exact          INTEGER CHECK(map_exact IN (0,1)));
+    map_exact          INTEGER CHECK(map_exact IN (0,1)),
+    call_site_id       INTEGER REFERENCES call_site(id));
 
 -- One reference that leaves the instance: an XMR, an interface member, a
 -- package item. The path is stored as written (normalised), AND -- new in
@@ -537,6 +559,9 @@ CREATE INDEX net_conn_by_net        ON net_conn(outer_net_id);
 CREATE INDEX net_conn_by_href       ON net_conn(outer_hier_ref_id)
     WHERE outer_hier_ref_id IS NOT NULL;
 CREATE INDEX proc_by_inst      ON proc(inst_id, ordinal);
+CREATE INDEX call_site_by_inst      ON call_site(inst_id);
+CREATE INDEX call_site_by_parent    ON call_site(parent_call_site_id)
+    WHERE parent_call_site_id IS NOT NULL;
 CREATE INDEX stmt_by_inst           ON stmt(inst_id, ordinal);
 CREATE INDEX stmt_by_proc      ON stmt(proc_id, sequence)
     WHERE proc_id IS NOT NULL;
@@ -549,6 +574,8 @@ CREATE INDEX proc_event_by_net      ON proc_event(net_id)
 CREATE INDEX net_dep_by_src      ON net_dep(src_net_id);
 CREATE INDEX net_dep_by_tgt      ON net_dep(tgt_net_id);
 CREATE INDEX net_dep_by_stmt        ON net_dep(stmt_id);
+CREATE INDEX net_dep_by_call_site   ON net_dep(call_site_id)
+    WHERE call_site_id IS NOT NULL;
 CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id)
     WHERE assign_operand_id IS NOT NULL;
 CREATE INDEX net_dep_by_tgt_ref  ON net_dep(stmt_target_id);
@@ -793,6 +820,7 @@ SELECT
     d.tgt_hier_ref_id        AS tgt_hier_ref_id,
     d.dep_kind               AS dep_kind,
     d.map_exact              AS map_exact,
+    d.call_site_id           AS call_site_id,
     f.path                   AS file_path,
     sf.path                  AS src_path,
     COALESCE(s.line, p.line) AS src_line,
@@ -1030,6 +1058,7 @@ SELECT
     d.prim_id                AS prim_id,
     NULL                     AS term_id,
     d.map_exact              AS map_exact,
+    d.call_site_id           AS call_site_id,
     f.path                   AS file_path,
     sf.path                  AS src_path,
     COALESCE(s.line, p.line) AS src_line,
@@ -1052,7 +1081,7 @@ SELECT
          WHEN 'constant'           THEN 'constant'
          ELSE 'connection' END,
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact,
+    a.map_exact, NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
@@ -1068,7 +1097,7 @@ SELECT
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact,
+    a.map_exact, NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
@@ -1084,7 +1113,7 @@ SELECT
     NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id,
-    NULL,
+    NULL, NULL,
     f.path, sf.path, t.line, t.col
 FROM term_map m
 JOIN term t              ON t.id = m.term_id
@@ -1141,6 +1170,7 @@ SELECT
     s.proc_id                AS proc_id,
     NULL                     AS term_id,
     d.map_exact              AS map_exact,
+    d.call_site_id           AS call_site_id,
     f.path                   AS file_path,
     sf.path                  AS src_path,
     COALESCE(s.line, p.line) AS src_line,
@@ -1160,7 +1190,7 @@ SELECT
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact,
+    a.map_exact, NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net outnet          ON outnet.id = a.outer_net_id
@@ -1176,7 +1206,7 @@ SELECT
     a.outer_lo, a.outer_hi, a.outer_exact,
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact,
+    a.map_exact, NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
@@ -1191,7 +1221,7 @@ SELECT
     NULL, NULL, 1,
     NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
-    NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL,
+    NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, NULL,
     f.path, sf.path, pe.line, pe.col
 FROM proc_event pe
 JOIN net n               ON n.id = pe.net_id
@@ -1205,7 +1235,7 @@ SELECT
     CASE e.role WHEN 'wait' THEN 'wait'
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
-    NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL,
+    NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL, NULL,
     f.path, sf.path, s.line, s.col
 FROM expr_ref e
 JOIN net n               ON n.id = e.net_id
@@ -1220,7 +1250,7 @@ SELECT
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
-    NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL,
+    NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, NULL,
     f.path, sf.path, s.line, s.col
 FROM assign_operand o
 JOIN net n               ON n.id = o.net_id
@@ -1234,7 +1264,7 @@ SELECT
     m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
-    NULL, NULL, NULL, NULL, t.id, NULL,
+    NULL, NULL, NULL, NULL, t.id, NULL, NULL,
     f.path, sf.path, t.line, t.col
 FROM term_map m
 JOIN term t              ON t.id = m.term_id
@@ -1405,6 +1435,27 @@ SELECT h.resolved_net_id, n.inst_id, n.name, 'named_from_outside',
        NULL, NULL, NULL, NULL, NULL, NULL, h.id
 FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
 WHERE h.resolved_net_id IS NOT NULL;
+
+-- One row per call_site: a subroutine-body expansion, the context a
+-- net_dep or stmt names in its call_site_id. Walk parent_call_site_id to
+-- recover the call string; caller_stmt_id is the statement that made the
+-- call. depth is 1 at the outermost call. A fan-in cone stays
+-- context-sensitive by following, at each hop through a subroutine, only
+-- the rows whose call_site_id shares the chain -- never mixing one call's
+-- gating with another's argument, the combination the shared formal admits.
+CREATE VIEW v_call_site AS
+SELECT
+    cs.id                  AS call_site_id,
+    cs.inst_id             AS inst_id,
+    i.module_id            AS module_id,
+    m.name                 AS module_name,
+    cs.caller_stmt_id      AS caller_stmt_id,
+    cs.parent_call_site_id AS parent_call_site_id,
+    cs.subroutine_name     AS subroutine_name,
+    cs.depth               AS depth
+FROM call_site cs
+JOIN inst i        ON i.id = cs.inst_id
+LEFT JOIN module m ON m.id = i.module_id;
 )SQL";
 
 // Rows per transaction. Committing per row is orders of magnitude slower;
@@ -1566,14 +1617,15 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
         prepare("INSERT INTO net_conn VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetConn]);
         prepare("INSERT INTO proc VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcedure]);
-        prepare("INSERT INTO stmt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsStmt]);
+        prepare("INSERT INTO call_site VALUES(?,?,?,?,?,?)", &ins[InsCallSite]);
+        prepare("INSERT INTO stmt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsStmt]);
         prepare("INSERT INTO stmt_target VALUES(?,?,?,?,?,?,?)",
                 &ins[InsStmtTarget]);
         prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?,?,?)",
                 &ins[InsAssignOperand]);
         prepare("INSERT INTO expr_ref VALUES(?,?,?,?,?,?,?,?)", &ins[InsExprRef]);
         prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcEvent]);
-        prepare("INSERT INTO net_dep VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        prepare("INSERT INTO net_dep VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetDep]);
         prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsHierRef]);
@@ -1917,7 +1969,22 @@ void Writer::addStmt(const StmtRow& r) {
     bindOptText(s, 9, r.assignmentKind);
     bindOptText(s, 10, r.delay);
     sqlite3_bind_int64(s, 11, r.droppedOperandCount);
-    bindLoc(s, 12, r.fileId, r.line, r.column);
+    bindOptId(s, 12, r.callSiteId);
+    bindLoc(s, 13, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addCallSite(const CallSiteRow& r) {
+    auto* s = ins[InsCallSite];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    bindOptId(s, 3, r.callerStmtId);
+    bindOptId(s, 4, r.parentCallSiteId);
+    sqlite3_bind_text(s, 5, r.subroutineName.c_str(),
+                      static_cast<int>(r.subroutineName.size()), SQLITE_STATIC);
+    sqlite3_bind_int64(s, 6, r.depth);
     step(s);
     bumped();
 }
@@ -2007,6 +2074,7 @@ void Writer::addNetDep(const NetDepRow& r) {
         bindRange(s, 15, r.targetBits, r.targetExact);
         bindTri(s, 18, r.mappingExact);
     }
+    bindOptId(s, 19, r.callSiteId);
     step(s);
     bumped();
 }
