@@ -1,34 +1,27 @@
-// Sources this export can name but not resolve: a package variable has no
-// net row (a package is not an occurrence), so before v12 a target fed
-// from one reported NO driver at all -- silence indistinguishable from
-// genuinely undriven. v12 writes the dependency anyway, with a NULL source
-// net and the reference on the source end; v_driver reports it as
-// driver_kind='external', the path and location on the hier_ref row.
+// What still leaves the model after v13 taught packages to resolve: an
+// UPWARD hierarchical reference from a shared body. `tb_top.glob` climbs out
+// of up_leaf to the enclosing top and back down; the body is stamped for two
+// instances, so the one analysed body cannot speak for where each occurrence
+// actually sits, and the reference stays unresolved. The dependency is
+// written with a NULL source net and the reference on the source end;
+// v_driver reports driver_kind='external' -- not undriven, not a constant.
 
-package ext_pkg;
-    logic [7:0] mask;
-    logic       mode;
-endpackage
-
-module ext_use(input logic [7:0] d, output logic [7:0] q,
-               output logic [7:0] g, output logic [3:0] nib);
-    // Data source beside a local one: q is driven by d AND by the
-    // package variable, and only the second needed the new kind.
-    assign q = d & ext_pkg::mask;
-    // A windowed read: the spelled range survives onto the external
-    // driver row, because the referenced object's bits are real even
-    // when unnamed here.
-    assign nib = ext_pkg::mask[3:0];
-    // Control source: the condition is a package variable no dependency
-    // could carry before -- the gated target showed only its local data
-    // driver, as though the gate were not there.
+module up_leaf(output logic [7:0] o, output logic [3:0] nib,
+               output logic [7:0] g);
+    assign o   = tb_top.glob;       // whole upward object -> external data
+    assign nib = tb_top.glob[3:0];  // a window of it -- the window survives
     always_comb begin
-        if (ext_pkg::mode) g = d;
-        else               g = '0;
+        if (tb_top.gmode) g = 8'hFF; // upward condition -> external control
+        else              g = 8'h00;
     end
 endmodule
 
-module external_top(input logic [7:0] din, output logic [7:0] qout,
-                    output logic [7:0] gout, output logic [3:0] nibout);
-    ext_use u_e (.d(din), .q(qout), .g(gout), .nib(nibout));
+module tb_top(output logic [7:0] o1, output logic [3:0] n1,
+              output logic [7:0] g1, output logic [7:0] o2);
+    logic [7:0] glob;
+    logic       gmode;
+    assign glob  = 8'hA5;
+    assign gmode = 1'b1;
+    up_leaf u1 (.o(o1), .nib(n1), .g(g1));
+    up_leaf u2 (.o(o2), .nib(), .g());   // second instance: body is shared
 endmodule

@@ -897,7 +897,21 @@ struct TplStmt {
     std::string assignKind;  // "" = NULL
     std::string delay;
     int64_t dropped = 0;
+    int32_t callSite = -1;   // the call-site expansion this belongs to (-1 = none)
     TplLoc loc;
+};
+
+/// One subroutine-body expansion: a body is walked once per call site, and
+/// this is that site's identity, so a consumer can partition a cone by it
+/// and never mix one call's gating with another's argument. `callerStmt` is
+/// the statement making the call; `parentCallSite` is the enclosing
+/// expansion (a call-string for nested calls); ids are template-relative and
+/// stamped per occurrence like everything else.
+struct TplCallSite {
+    int32_t callerStmt = -1;
+    int32_t parentCallSite = -1;
+    std::string subName;
+    int64_t depth = 0;
 };
 
 struct TplStmtRef {          // stmt_target and assign_operand share the shape
@@ -943,6 +957,7 @@ struct TplDep {
     std::string kind;
     TplRange srcR, tgtR;
     int mappingExact = -1;
+    int32_t callSite = -1;   // the call-site expansion, or -1 at module level
 };
 
 /// Replay data for one outward reference: how to find the target from an
@@ -957,7 +972,8 @@ struct TplHierRef {
         None,                // slang gave no target usable per occurrence
         Downward,            // segs descend from the occurrence's own node
         Absolute,            // segs descend from the design root
-        ViaIfaceTerm         // segs descend from the interface bound to term
+        ViaIfaceTerm,        // segs descend from the interface bound to term
+        Package              // segs[0] names a package; netName its member
     } resolve = None;
     int32_t ifaceTerm = -1;  // ViaIfaceTerm: which of this template's terms
     std::vector<std::string> segs;   // tree segments to descend
@@ -986,6 +1002,7 @@ struct TplCrossDep {
     int32_t exprRef = -1;
     TplRange srcR, tgtR;
     int mappingExact = -1;
+    int32_t callSite = -1;   // the call-site expansion, or -1 at module level
 };
 
 struct TplConn {
@@ -1025,6 +1042,7 @@ struct Template {
     std::vector<TplTermMap> termMaps;
     std::vector<TplProcedure> procedures;
     std::vector<TplStmt> stmts;
+    std::vector<TplCallSite> callSites;
     std::vector<TplStmtRef> targets;
     std::vector<TplStmtRef> operands;
     std::vector<TplExprRef> exprRefs;
@@ -1128,6 +1146,13 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// while visiting control expressions, whose calls belong to no statement
     /// this schema records.
     bool bindable = true;
+    /// The call-site machinery. `callSiteSlot` points at Build::curCallSite so
+    /// handle(CallExpression) can set the site in force around a body walk;
+    /// `allocCallSite` mints a template call-site row for the entered call and
+    /// returns its index. Both null outside a real build (dry runs).
+    int32_t* callSiteSlot = nullptr;
+    std::function<int32_t(const SubroutineSymbol&, int64_t depth, bool bindable)>
+        allocCallSite;
 
     StatementWalker(EmitTarget t, EmitCallBinding b, EmitEvent e, EmitRead r,
                     EvalContext& eval) :
@@ -1375,9 +1400,20 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         auto sub = std::get_if<const SubroutineSymbol*>(&expr.subroutine);
         if (!sub || !*sub)
             return;
+        // Enter the call site before binding: the argument bindings and the
+        // body statements both belong to THIS call, so both must be tagged
+        // with it. Restored on every exit path below.
+        const int32_t savedCallSite = callSiteSlot ? *callSiteSlot : -1;
+        if (callSiteSlot && allocCallSite)
+            *callSiteSlot = allocCallSite(**sub, subDepth + 1, bindable);
+        struct Restore {
+            int32_t* slot;
+            int32_t val;
+            ~Restore() { if (slot) *slot = val; }
+        } restore{callSiteSlot, savedCallSite};
         bindArguments(expr, **sub);
         if (!activeSubs.insert(*sub).second)
-            return;                       // recursion guard
+            return;                       // recursion guard (Restore fires)
         // Per CALL SITE, deliberately. Walking the body once per subroutine
         // read cleaner but lost call-site semantics: in
         // `if (g1) put(d1); if (g2) put(d2);` the body's `q <= v` inherited
@@ -1694,6 +1730,10 @@ public:
                             /*ifaceBind=*/{});
         }
 
+        // Packages after the module tree: their nets must exist before
+        // hier_ref resolution binds `pkg::x` references to them.
+        stampPackages();
+
         // Hierarchical references last: an absolute path may land in a
         // subtree stamped after the referring occurrence.
         resolveHierRefs();
@@ -1873,6 +1913,7 @@ private:
         std::map<std::tuple<const Expression*, bool, int32_t>, int32_t> hierSeen;
         int32_t curStmt = -1;      // where call bindings attach
         int32_t curProc = -1;      // procedure of statements being created
+        int32_t curCallSite = -1;  // the call-site body walk in force (-1 = top)
         int32_t curScope = 0;
         int64_t targetOrdinal = 0; // per-stmt ordinals
         int64_t operandOrdinal = 0;
@@ -2016,6 +2057,7 @@ private:
         s.assignKind = std::move(assignKind);
         s.delay = std::move(delay);
         s.dropped = dropped;
+        s.callSite = b.curCallSite;
         s.loc = loc;
         const int32_t idx = int32_t(b.t->stmts.size());
         b.t->stmts.push_back(std::move(s));
@@ -2110,6 +2152,26 @@ private:
                 e = &e->as<ConversionExpression>().operand();
             else
                 break;
+        }
+        // A package item -- `pkg::mask`, or a bare `mask` imported from one.
+        // slang resolves the `::` at compile time, so this is a NamedValue,
+        // not a HierarchicalValue: it is caught here on the symbol's own
+        // scope, before the HierarchicalValue gate below. It resolves per
+        // occurrence once packages are stamped as pseudo-occurrences; segs[0]
+        // carries the package name, netName the member. ($unit compilation-
+        // unit items are not stamped yet, so they fall through and stay
+        // external -- no worse than before.)
+        if (r.sym) {
+            if (auto* scope = r.sym->getParentScope()) {
+                auto& owner = scope->asSymbol();
+                if (owner.kind == SymbolKind::Package && !owner.name.empty() &&
+                    !r.sym->name.empty()) {
+                    row.resolve = TplHierRef::Package;
+                    row.segs = {std::string(owner.name)};
+                    row.netName = std::string(r.sym->name);
+                    return;
+                }
+            }
         }
         if (!e || e->kind != ExpressionKind::HierarchicalValue)
             return;
@@ -2494,6 +2556,20 @@ private:
         walker.sensitivityTiming = sens.timingControl;
         walker.budget = &b.callBudget;
         walker.truncated = &b.truncatedCalls;
+        walker.callSiteSlot = &b.curCallSite;
+        walker.allocCallSite = [&b](const SubroutineSymbol& sub, int64_t depth,
+                                    bool bindable) -> int32_t {
+            TplCallSite cs;
+            // NULL for a call in a control expression (`if (f())`): it has no
+            // owning statement, and b.curStmt there is a stale earlier one.
+            cs.callerStmt = bindable ? b.curStmt : -1;
+            cs.parentCallSite = b.curCallSite; // the enclosing expansion
+            cs.subName = std::string(sub.name);
+            cs.depth = depth;
+            const int32_t idx = int32_t(b.t->callSites.size());
+            b.t->callSites.push_back(std::move(cs));
+            return idx;
+        };
         if (isContinuous) {
             walker.pendingDelay = delayText(
                 sym.as<ContinuousAssignSymbol>().getDelay());
@@ -2561,6 +2637,7 @@ private:
             d.stmt = stmt;
             d.tgtHref = href;
             d.tgtR = rangeOf(r);
+            d.callSite = b.curCallSite;
             b.t->crossDeps.push_back(std::move(d));
             return;
         }
@@ -2578,6 +2655,7 @@ private:
         d.targetRef = targetIdx;
         d.kind = "data";
         d.tgtR = rangeOf(r);
+        d.callSite = b.curCallSite;
         b.t->deps.push_back(std::move(d));
     }
 
@@ -2738,6 +2816,7 @@ private:
                 // everything the statement writes.
                 d.tgtR = rangeOf(p.tgt);
                 d.mappingExact = p.mapExact ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
             }
             else if (srcNet >= 0 || srcHref >= 0) {
@@ -2753,6 +2832,7 @@ private:
                 d.srcR = rangeOf(p.src);
                 d.tgtR = rangeOf(p.tgt);
                 d.mappingExact = p.mapExact ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
         }
@@ -2770,6 +2850,7 @@ private:
                 d.targetRef = targetIdx;
                 d.kind = "data";
                 d.tgtR = rangeOf(dst);
+                d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
             }
             else {
@@ -2783,6 +2864,7 @@ private:
                 d.stmt = stmt;
                 d.tgtHref = tgtHref;
                 d.tgtR = rangeOf(dst);
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
         }
@@ -2810,6 +2892,7 @@ private:
                     d.srcR = rangeOf(src);
                     d.tgtR = rangeOf(dst);
                     d.mappingExact = 0;
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                 }
                 else {
@@ -2825,6 +2908,7 @@ private:
                     d.srcR = rangeOf(src);
                     d.tgtR = rangeOf(dst);
                     d.mappingExact = 0;
+                    d.callSite = b.curCallSite;
                     b.t->crossDeps.push_back(std::move(d));
                 }
             }
@@ -2862,6 +2946,7 @@ private:
                 d.tgtNet = formalNet;
                 d.srcR = rangeOf(actual);
                 d.mappingExact = oneToOne ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
             if (writes) {
@@ -2872,6 +2957,7 @@ private:
                 d.tgtHref = href;
                 d.tgtR = rangeOf(actual);
                 d.mappingExact = oneToOne ? 1 : 0;
+                d.callSite = b.curCallSite;
                 b.t->crossDeps.push_back(std::move(d));
             }
             return;
@@ -2888,6 +2974,7 @@ private:
             d.kind = "procedure";
             d.srcR = rangeOf(actual);
             d.mappingExact = oneToOne ? 1 : 0;
+            d.callSite = b.curCallSite;
             b.t->deps.push_back(std::move(d));
         }
         if (writes) {
@@ -2898,6 +2985,7 @@ private:
             d.kind = "procedure";
             d.tgtR = rangeOf(actual);
             d.mappingExact = oneToOne ? 1 : 0;
+            d.callSite = b.curCallSite;
             b.t->deps.push_back(std::move(d));
         }
     }
@@ -3044,6 +3132,7 @@ private:
                     // coarse if a side could not be narrowed.
                     d.mappingExact =
                         (sides[i].ref.exact && sides[j].ref.exact) ? 1 : 0;
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                 }
             }
@@ -3183,6 +3272,7 @@ private:
                         (dst.whole ? bitWidthOf(*dst.sym) == 1
                                    : dst.hi == dst.lo);
                     d.mappingExact = oneBit ? 1 : 0;
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                     anyInput = true;
                 }
@@ -3195,6 +3285,7 @@ private:
                     d.prim = primIdx;
                     d.kind = "primitive";
                     d.tgtR = rangeOf(dst);
+                    d.callSite = b.curCallSite;
                     b.t->deps.push_back(std::move(d));
                 }
             }
@@ -3715,7 +3806,7 @@ private:
     /// Everything one stamped occurrence needs to remember.
     struct Bases {
         int64_t net = 0, term = 0, proc = 0, stmt = 0, target = 0, operand = 0,
-                exprRef = 0, procEvent = 0, dep = 0, hierRef = 0;
+                exprRef = 0, procEvent = 0, dep = 0, hierRef = 0, callSite = 0;
     };
 
     struct ReplayJob {
@@ -3801,6 +3892,8 @@ private:
         procEventCounter += int64_t(t.procEvents.size());
         base.dep = depCounter;         depCounter += int64_t(t.deps.size());
         base.hierRef = hierRefCounter; hierRefCounter += int64_t(t.hierRefs.size());
+        base.callSite = callSiteCounter;
+        callSiteCounter += int64_t(t.callSites.size());
 
         // Primitives are tree nodes; their ids come from the node counter.
         std::vector<int64_t> primNode(t.prims.size(), 0);
@@ -3894,6 +3987,22 @@ private:
         }
         stats.procedures += int64_t(t.procedures.size());
 
+        // Call sites first: a stmt row names the site it belongs to, so the
+        // site ids must be issued before the statements reference them.
+        for (size_t i = 0; i < t.callSites.size(); i++) {
+            auto& cs = t.callSites[i];
+            CallSiteRow row;
+            row.id = base.callSite + int64_t(i) + 1;
+            row.instId = instId;
+            row.callerStmtId = cs.callerStmt < 0 ? 0 : base.stmt + cs.callerStmt + 1;
+            row.parentCallSiteId =
+                cs.parentCallSite < 0 ? 0 : base.callSite + cs.parentCallSite + 1;
+            row.subroutineName = cs.subName;
+            row.depth = cs.depth;
+            writer.addCallSite(row);
+        }
+        stats.callSites += int64_t(t.callSites.size());
+
         for (size_t i = 0; i < t.stmts.size(); i++) {
             auto& s = t.stmts[i];
             StmtRow row;
@@ -3908,6 +4017,7 @@ private:
             row.assignmentKind = s.assignKind;
             row.delay = s.delay;
             row.droppedOperandCount = s.dropped;
+            row.callSiteId = s.callSite < 0 ? 0 : base.callSite + s.callSite + 1;
             row.fileId = s.loc.fileId;
             row.line = s.loc.line;
             row.column = s.loc.column;
@@ -3980,6 +4090,7 @@ private:
             row.targetBits = d.tgtR.bits;
             row.targetExact = d.tgtR.exact;
             row.mappingExact = d.mappingExact;
+            row.callSiteId = d.callSite < 0 ? 0 : base.callSite + d.callSite + 1;
             writer.addNetDep(row);
         }
         stats.deps += int64_t(t.deps.size());
@@ -4197,6 +4308,82 @@ private:
             stats.duplicatePaths++;
     }
 
+    /// Packages as pseudo-occurrences: each becomes a tree_node/inst above
+    /// the roots (node_kind/def_kind 'package'), and its variables become net
+    /// rows, so a `pkg::x` reference resolves to a real object instead of
+    /// leaving the model as an 'external' driver. No dataflow is walked here
+    /// -- a package variable's initializer is not a driver, and its
+    /// readers/writers are the modules that reference it, whose cross-refs
+    /// resolve onto these nets. Package module ids follow the definition
+    /// modules; nodes and nets draw from the same counters as everything else.
+    void stampPackages() {
+        int64_t nextModuleId = int64_t(moduleIds.size());
+        const PackageSymbol* stdPkg = &compilation.getStdPackage();
+        for (auto* pkg : compilation.getPackages()) {
+            if (!pkg || pkg == stdPkg || pkg->name.empty())
+                continue;
+            const TplLoc at = locate(pkg->location);
+            ModuleRow mrow;
+            mrow.id = ++nextModuleId;
+            mrow.name = std::string(pkg->name);
+            mrow.definitionKind = "package";
+            mrow.fileId = at.fileId;
+            mrow.line = at.line;
+            mrow.column = at.column;
+            writer.addModule(mrow);
+            stats.modules++;
+
+            const int64_t nodeId = ++nodeCounter;
+            TreeNodeRow node;
+            node.id = nodeId;
+            node.parentNodeId = 0;   // a pseudo-occurrence above the roots
+            node.name = std::string(pkg->name);
+            node.nodeKind = "package";
+            node.ordinal = rootOrdinal++;
+            writer.addTreeNode(node);
+
+            InstRow inst;
+            inst.id = nodeId;
+            inst.moduleId = mrow.id;
+            inst.parentInstId = 0;
+            inst.fileId = at.fileId;
+            inst.line = at.line;
+            inst.column = at.column;
+            writer.addInst(inst);
+            stats.instances++;
+
+            PackageInfo info;
+            info.nodeId = nodeId;
+            for (auto& member : pkg->members()) {
+                if (member.kind != SymbolKind::Variable &&
+                    member.kind != SymbolKind::Net)
+                    continue;
+                if (member.name.empty())
+                    continue;
+                auto& vs = member.as<ValueSymbol>();
+                NetRow nrow;
+                nrow.id = ++netCounter;
+                nrow.instId = nodeId;
+                nrow.scopeNodeId = nodeId;
+                nrow.name = std::string(vs.name);
+                nrow.declarationKind = declarationKindOf(vs);
+                nrow.dataTypeId = writer.internDataType(typeOf(vs));
+                nrow.width = vs.getType().isIntegral()
+                                 ? int64_t(vs.getType().getBitWidth()) : -1;
+                nrow.isImplicit = vs.kind == SymbolKind::Net &&
+                                  vs.as<NetSymbol>().isImplicit;
+                const TplLoc nloc = locate(vs.location);
+                nrow.fileId = nloc.fileId;
+                nrow.line = nloc.line;
+                nrow.column = nloc.column;
+                writer.addNet(nrow);
+                stats.nets++;
+                info.netByName.emplace(nrow.name, nrow.id);
+            }
+            packageByName.emplace(std::string(pkg->name), std::move(info));
+        }
+    }
+
     /// Writes every hier_ref row, resolving the ones whose replay lands on a
     /// stamped object -- then materialises the queued cross-instance
     /// dependencies whose endpoints those resolutions are. The tree walk is
@@ -4234,6 +4421,24 @@ private:
                         node = descend(job.ifaceBind[size_t(ref.ifaceTerm)],
                                        ref.segs);
                     break;
+                case TplHierRef::Package: {
+                    // Not a tree descent -- a package is not under a normal
+                    // parent, and its path uses `::`. Look it up directly and
+                    // resolve the member against its own net map; node stays
+                    // 0 so the generic net-index block below is skipped.
+                    if (ref.segs.empty())
+                        break;
+                    auto pit = packageByName.find(ref.segs.front());
+                    if (pit == packageByName.end())
+                        break;
+                    row.resolvedInstId = pit->second.nodeId;
+                    auto nit = pit->second.netByName.find(ref.netName);
+                    if (nit != pit->second.netByName.end()) {
+                        row.resolvedNetId = nit->second;
+                        resolvedNet.emplace(row.id, row.resolvedNetId);
+                    }
+                    break;
+                }
                 default:
                     break;
             }
@@ -4306,6 +4511,8 @@ private:
             row.targetBits = d.tgtR.bits;
             row.targetExact = d.tgtR.exact;
             row.mappingExact = d.mappingExact;
+            row.callSiteId =
+                d.callSite < 0 ? 0 : job.base.callSite + d.callSite + 1;
             writer.addNetDep(row);
             stats.deps++;
         }
@@ -4350,6 +4557,7 @@ private:
     int64_t depCounter = 0;
     int64_t connCounter = 0;
     int64_t hierRefCounter = 0;
+    int64_t callSiteCounter = 0;
     int64_t rootOrdinal = 0;
 
     std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>> childByName;
@@ -4357,6 +4565,14 @@ private:
     std::vector<CrossJob> crossJobs;
     /// node id -> (template, net id base) for net-name resolution at replay.
     std::unordered_map<int64_t, std::pair<const Template*, int64_t>> nodeTemplate;
+    /// A stamped package pseudo-occurrence: its node id and member->net id.
+    /// Kept apart from childByName because a package path uses `::`, not `.`,
+    /// and a top instance could legally be named like a package.
+    struct PackageInfo {
+        int64_t nodeId = 0;
+        std::unordered_map<std::string, int64_t> netByName;
+    };
+    std::unordered_map<std::string, PackageInfo> packageByName;
 
     Stats stats;
 };

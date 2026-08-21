@@ -6,7 +6,7 @@
 # build that links proves the slang pin resolves; this proves the exporter
 # still writes rows -- and that the rows keep every contract the schema
 # documents: the subtype bijections, the ownership rules, the provenance
-# matrix behind net_dep, the range discipline, and the thirteen stable views
+# matrix behind net_dep, the range discipline, and the fourteen stable views
 # with their exact columns and row formulas. CI runs it against examples/ on
 # every platform binary it builds, so the mode branches assert only what
 # those small designs must produce, not exact counts.
@@ -24,14 +24,14 @@ import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias", "external")
+         "unresolved", "xmr", "alias", "external", "package", "callsite")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 
 
 def one(sql, *args):
@@ -79,8 +79,8 @@ print("ok: integrity_check and foreign_key_check pass")
 # open sets (decl_kind) and the NULL-required combinations CHECK
 # cannot express.
 for tbl, col, values, nullable in (
-    ("module", "def_kind", ("module", "interface", "program", "checker"), False),
-    ("tree_node", "node_kind", ("root", "instance", "generate", "primitive", "unresolved"), False),
+    ("module", "def_kind", ("module", "interface", "program", "checker", "package"), False),
+    ("tree_node", "node_kind", ("root", "instance", "generate", "primitive", "unresolved", "package"), False),
     ("prim", "prim_kind", ("gate", "switch", "udp"), False),
     ("term", "term_kind", ("signal", "interface"), False),
     ("term", "direction", ("input", "output", "inout", "ref"), True),
@@ -160,11 +160,11 @@ print("ok: range lo/hi pair up, lo <= hi, endpoints imply exact")
 
 # -------------------------------------------------- tree and the subtypes
 check(one("SELECT count(*) FROM tree_node WHERE (parent_node_id IS NULL) != "
-          "(node_kind = 'root')") == 0,
-      "root nodes are exactly the parentless ones")
+          "(node_kind IN ('root','package'))") == 0,
+      "parentless nodes are exactly the roots and packages")
 check(one("""
     SELECT count(*) FROM tree_node t
-    WHERE (t.node_kind IN ('root','instance','unresolved'))
+    WHERE (t.node_kind IN ('root','instance','unresolved','package'))
           != EXISTS (SELECT 1 FROM inst i WHERE i.id = t.id)""") == 0,
       "instance-like nodes have inst rows, others do not")
 check(one("""
@@ -182,8 +182,8 @@ check(one("""
           OR i.param_signature IS NOT NULL)""") == 0,
       "an unresolved inst names its definition and no parameters")
 check(one("SELECT count(*) FROM inst WHERE (parent_inst_id IS NULL) != "
-          "(id IN (SELECT id FROM tree_node WHERE node_kind='root'))") == 0,
-      "the root instances are exactly the parentless inst rows")
+          "(id IN (SELECT id FROM tree_node WHERE node_kind IN ('root','package')))") == 0,
+      "the parentless inst rows are exactly the roots and packages")
 
 # The hierarchy is encoded twice -- tree_node.parent_node_id and
 # inst.parent_inst_id -- and the two must tell one story: parent_inst is the
@@ -323,6 +323,43 @@ check(one("""
     JOIN stmt s ON s.id = t.stmt_id
     WHERE s.stmt_kind='release'""") == 0,
       "no dependency borrows a release's target")
+
+# ------------------------------------------------------------ call sites
+# A call site is a subroutine-body expansion, and the stmt/net_dep rows that
+# name it must sit in the same instance -- a body walked at a call site is
+# stamped into that occurrence, so its rows and the site share an inst.
+check(one("""
+    SELECT count(*) FROM stmt s JOIN call_site cs ON cs.id = s.call_site_id
+    WHERE s.inst_id != cs.inst_id""") == 0,
+      "a statement's call site is in its own instance")
+check(one("""
+    SELECT count(*) FROM net_dep d JOIN call_site cs ON cs.id = d.call_site_id
+    JOIN stmt s ON s.id = d.stmt_id
+    WHERE s.inst_id != cs.inst_id""") == 0,
+      "a dependency's call site is in its statement's instance")
+# A dependency that names a call site was made walking a subroutine body, so
+# it names the statement it came from -- there is no call site without one.
+check(one("""
+    SELECT count(*) FROM net_dep
+    WHERE call_site_id IS NOT NULL AND stmt_id IS NULL""") == 0,
+      "a dependency in a call carries its statement")
+# The parent chain is a proper call string: a nested call sits one level
+# deeper than its parent and in the same instance, and an outermost call is
+# depth 1. Depth strictly decreasing toward the parent makes it acyclic.
+check(one("""
+    SELECT count(*) FROM call_site cs
+    WHERE (cs.parent_call_site_id IS NULL) != (cs.depth = 1)""") == 0,
+      "an outermost call site is exactly depth 1")
+check(one("""
+    SELECT count(*) FROM call_site cs JOIN call_site p
+      ON p.id = cs.parent_call_site_id
+    WHERE cs.depth != p.depth + 1 OR cs.inst_id != p.inst_id""") == 0,
+      "a nested call site is one level below its parent, same instance")
+# The caller statement, when named, is a real statement of that instance.
+check(one("""
+    SELECT count(*) FROM call_site cs JOIN stmt s ON s.id = cs.caller_stmt_id
+    WHERE s.inst_id != cs.inst_id""") == 0,
+      "the caller statement belongs to the call site's instance")
 # One direction only: a continuous assignment is never inside a procedure,
 # but a procedure-less blocking/nonblocking row is legal -- a function body
 # reached from an `assign` keeps its own `=`, and executes in no procedure.
@@ -615,7 +652,7 @@ for k in ("error_count", "unresolved_count", "empty_procedure_count",
 print("ok: v_db_info agrees with meta and casts its counts")
 
 # --------------------------------------------------------- view contract
-# The thirteen stable views: existence, exact columns in exact order, and row
+# The fourteen stable views: existence, exact columns in exact order, and row
 # formulas. v_conn_arc is scaffolding, not contract, and is deliberately
 # absent from this list.
 VIEW_COLUMNS = {
@@ -657,21 +694,21 @@ VIEW_COLUMNS = {
         "tgt_exact", "stmt_id", "assign_operand_id",
         "stmt_target_id", "expr_ref_id", "prim_id",
         "src_hier_ref_id", "tgt_hier_ref_id",
-        "dep_kind", "map_exact", "file_path", "src_path",
+        "dep_kind", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
     "v_driver": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
         "signal_hi", "signal_exact", "driver_net_id", "driver_inst_id",
         "driver_name", "driver_lo", "driver_hi", "driver_exact",
         "driver_kind", "dep_id", "conn_id", "stmt_id",
-        "prim_id", "term_id", "map_exact", "file_path",
+        "prim_id", "term_id", "map_exact", "call_site_id", "file_path",
         "src_path", "src_line", "src_col"],
     "v_load": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
         "signal_hi", "signal_exact", "load_net_id", "load_inst_id",
         "load_name", "load_lo", "load_hi", "load_exact", "load_kind",
         "dep_id", "conn_id", "stmt_id", "proc_id",
-        "term_id", "map_exact", "file_path", "src_path",
+        "term_id", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
     "v_stmt": [
         "stmt_id", "inst_id", "module_id", "module_name",
@@ -686,8 +723,13 @@ VIEW_COLUMNS = {
         "operand_id", "stmt_id", "ordinal", "net_id", "net_name",
         "operand_lo", "operand_hi", "operand_exact"],
     "v_net_attachment": [
-        "net_id", "inst_id", "net_name", "attachment_kind", "other_id",
-        "lo", "hi", "exact", "stmt_id"],
+        "net_id", "inst_id", "net_name", "attachment_kind",
+        "lo", "hi", "exact", "stmt_id",
+        "term_id", "stmt_target_id", "assign_operand_id", "expr_ref_id",
+        "proc_id", "dep_id", "hier_ref_id"],
+    "v_call_site": [
+        "call_site_id", "inst_id", "module_id", "module_name",
+        "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
 }
 for view, want in VIEW_COLUMNS.items():
     row = con.execute(
@@ -699,7 +741,7 @@ for view, want in VIEW_COLUMNS.items():
     if got != want:
         sys.exit(f"{view} columns diverge from the contract:\n"
                  f"  want {want}\n  got  {got}")
-print("ok: the thirteen stable views exist with their contracted columns")
+print("ok: the fourteen stable views exist with their contracted columns")
 
 # Fact views: one view row is one base row.
 for view, base in (
@@ -708,6 +750,7 @@ for view, base in (
     ("v_net_dep", "net_dep"), ("v_stmt", "stmt"),
     ("v_stmt_target", "stmt_target"),
     ("v_stmt_operand", "assign_operand"),
+    ("v_call_site", "call_site"),
 ):
     nv = one(f'SELECT count(*) FROM "{view}"')
     nb = one(f'SELECT count(*) FROM "{base}"')
@@ -816,6 +859,41 @@ check(one("""
     WHERE a.attachment_kind = 'release_target'
       AND s.stmt_kind != 'release'""") == 0,
       "and release_target is exactly the releases")
+# Exclusive arc, like net_dep: exactly one of the seven typed id columns is
+# non-null per row, and it is the one attachment_kind names -- so a consumer
+# joins the right base table without decoding the kind, and no row smuggles
+# an id into a slot its kind does not own.
+check(one("""
+    SELECT count(*) FROM v_net_attachment
+    WHERE (term_id IS NOT NULL) + (stmt_target_id IS NOT NULL)
+        + (assign_operand_id IS NOT NULL) + (expr_ref_id IS NOT NULL)
+        + (proc_id IS NOT NULL) + (dep_id IS NOT NULL)
+        + (hier_ref_id IS NOT NULL) != 1""") == 0,
+      "every attachment names exactly one typed id")
+check(one("""
+    SELECT count(*) FROM v_net_attachment WHERE CASE attachment_kind
+        WHEN 'terminal_inside'    THEN term_id IS NULL
+        WHEN 'actual_outside'     THEN term_id IS NULL
+        WHEN 'written_by'         THEN stmt_target_id IS NULL
+        WHEN 'release_target'     THEN stmt_target_id IS NULL
+        WHEN 'read_by'            THEN assign_operand_id IS NULL
+        WHEN 'condition'          THEN expr_ref_id IS NULL
+        WHEN 'statement_read'     THEN expr_ref_id IS NULL
+        WHEN 'event'              THEN proc_id IS NULL
+        WHEN 'dep_in'             THEN dep_id IS NULL
+        WHEN 'dep_out'            THEN dep_id IS NULL
+        WHEN 'named_from_outside' THEN hier_ref_id IS NULL
+        ELSE 1 END""") == 0,
+      "and it is the typed id its attachment_kind implies")
+# Each typed id resolves in its own table -- the join a consumer would make.
+for col, tbl in (("term_id", "term"), ("stmt_target_id", "stmt_target"),
+                 ("assign_operand_id", "assign_operand"),
+                 ("expr_ref_id", "expr_ref"), ("proc_id", "proc"),
+                 ("dep_id", "net_dep"), ("hier_ref_id", "hier_ref")):
+    check(one(f"""SELECT count(*) FROM v_net_attachment a
+        WHERE a.{col} IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM "{tbl}" b WHERE b.id = a.{col})""") == 0,
+          f"v_net_attachment.{col} resolves in {tbl}")
 
 check(one("""
     SELECT count(*) FROM v_driver
@@ -907,10 +985,11 @@ if mode:
         WHERE src_file_id IS NULL""") == 0,
           "every file row joined to src_file")
     top = meta.get("top")
-    want_top = {"constructs": "constructs", "interfaces": "interfaces",
+    want_top = {"callsite": "callsite_top", "constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
                 "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
-                "alias": "alias_top", "external": "external_top"}[mode]
+                "alias": "alias_top", "external": "tb_top",
+                "package": "package_top"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1478,7 +1557,7 @@ if mode == "xmr":
     check(one("""
         SELECT count(*) FROM v_net_attachment a
         JOIN v_net n ON n.net_id = a.net_id
-        JOIN v_term t ON t.term_id = a.other_id
+        JOIN v_term t ON t.term_id = a.term_id
         JOIN v_tree_node tn ON tn.node_id = t.inst_id
         WHERE n.net_name='g' AND a.attachment_kind='actual_outside'
           AND t.term_name='p' AND tn.node_name='u_sink'""") == 1,
@@ -1598,33 +1677,125 @@ if mode == "alias":
           "and a trace from one side reaches the others")
 
 if mode == "external":
-    # A package variable has no net row -- a package is not an occurrence
-    # -- so the reference stays unresolved and the dependency carries a
-    # NULL source net. Before v12 these rows were dropped, and every
-    # target here reported undriven.
+    # After v13 taught packages to resolve, what still leaves the model is an
+    # upward hierarchical reference from a shared body: tb_top.glob climbs out
+    # of up_leaf, and the one analysed body cannot say where each of its two
+    # occurrences sits. The dependency carries a NULL source net and the
+    # reference on the source end; v_driver says 'external' -- not undriven.
     check(one("""
         SELECT count(*) FROM v_driver
-        WHERE driver_kind='external' AND signal_name='q'""") == 1,
-          "the masked output is driven through the package variable")
+        WHERE driver_kind='external' AND signal_name='o'""") >= 1,
+          "an output driven by an upward reference is external")
     check(one("""
         SELECT count(*) FROM v_driver v JOIN net_dep d ON d.id = v.dep_id
         JOIN hier_ref h ON h.id = d.src_hier_ref_id
         WHERE v.driver_kind='external' AND v.signal_name='nib'
-          AND h.path='ext_pkg::mask' AND h.resolved_net_id IS NULL
-          AND v.driver_lo=0 AND v.driver_hi=3 AND v.driver_exact=1""") == 1,
-          "the windowed read keeps its window on the external driver")
+          AND h.resolved_net_id IS NULL
+          AND v.driver_lo=0 AND v.driver_hi=3 AND v.driver_exact=1""") >= 1,
+          "the windowed upward read keeps its window on the external driver")
     check(one("""
         SELECT count(*) FROM net_dep
         WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL
           AND dep_kind='control'""") >= 1,
-          "an unresolved condition still gates as a control dependency")
+          "an upward condition gates as a control dependency with no source")
     check(one("""
         SELECT count(*) FROM v_driver
         WHERE driver_kind='external' AND signal_name='g'""") >= 1,
-          "so the package-gated target shows its external control")
+          "so the upward-gated target shows its external control")
+    # o and nib are pure upward reads -- no constant hides among their
+    # drivers. (g legitimately also has constant drivers: the 8'hFF/8'h00 it
+    # assigns under the upward condition.)
     check(one("""
         SELECT count(*) FROM v_driver
-        WHERE signal_name IN ('q','nib') AND driver_kind='constant'""") == 0,
-          "and no external source is misreported as a constant")
+        WHERE signal_name IN ('o','nib') AND driver_kind='constant'""") == 0,
+          "and no upward source is misreported as a constant")
+
+if mode == "callsite":
+    # Two calls to one task, from two sites -- both bump, both outermost.
+    check(one("""SELECT count(*) FROM v_call_site
+                 WHERE subroutine_name='bump' AND depth=1""") == 2,
+          "the task is called from two call sites")
+    # A call in a control expression (`pick(c)` in the condition) has no
+    # owning statement: its call_site names no caller statement, and its
+    # argument binding carries no call_site_id (the universal invariant
+    # "a dependency in a call carries its statement" holds because such a
+    # dependency is tagged only when it has a statement).
+    check(one("""SELECT count(*) FROM v_call_site
+                 WHERE subroutine_name='pick' AND caller_stmt_id IS NULL
+                   AND depth=1""") == 1,
+          "a control-expression call names no caller statement")
+    check(one("""
+        SELECT count(*) FROM net_dep d
+        JOIN call_site cs ON cs.id = d.call_site_id
+        WHERE cs.subroutine_name='pick'""") == 0,
+          "and its statement-less binding carries no call_site_id")
+    # Each call's argument binds to the shared formal under its OWN site.
+    check(one("""
+        SELECT count(DISTINCT call_site_id) FROM v_net_dep
+        WHERE tgt_name='bump.v' AND dep_kind='procedure'
+          AND src_name IN ('a','b')""") == 2,
+          "each argument binds the formal under its own call site")
+    # The body's write is walked once per site: bump.v -> r under both.
+    check(one("""
+        SELECT count(DISTINCT call_site_id) FROM v_net_dep
+        WHERE tgt_name='r' AND src_name='bump.v'""") == 2,
+          "the body write is stamped once per call site")
+
+    # The payoff, as a cone. Filtering r's fan-in to call site 1 (plus the
+    # site-less module-level rows) reaches a and g1 -- call 1's real
+    # combination -- and NEVER b or g2, the cross combination the shared
+    # formal would otherwise admit.
+    def cone(cs):
+        return set(r[0] for r in con.execute(f"""
+            WITH RECURSIVE c(n) AS (
+                SELECT tgt_net_id FROM net_dep
+                    WHERE tgt_net_id IN (SELECT net_id FROM v_net WHERE net_name='r')
+                      AND call_site_id = {cs}
+                UNION
+                SELECT d.src_net_id FROM c JOIN net_dep d ON d.tgt_net_id = c.n
+                    WHERE d.src_net_id IS NOT NULL
+                      AND (d.call_site_id = {cs} OR d.call_site_id IS NULL))
+            SELECT DISTINCT net_name FROM c JOIN v_net ON net_id = n""")) - {'r'}
+    c1, c2 = cone(1), cone(2)
+    check('a' in c1 and 'g1' in c1 and 'b' not in c1 and 'g2' not in c1,
+          "call site 1's cone is a and g1, never b or g2", f"got {sorted(c1)}")
+    check('b' in c2 and 'g2' in c2 and 'a' not in c2 and 'g1' not in c2,
+          "call site 2's cone is b and g2, never a or g1", f"got {sorted(c2)}")
+
+if mode == "package":
+    # A package is a pseudo-occurrence now: node_kind='package', a matching
+    # inst with parent_inst_id NULL and a def_kind='package' module.
+    check(one("""
+        SELECT count(*) FROM v_tree_node
+        WHERE node_kind='package' AND node_name='cfg_pkg'""") == 1,
+          "the package is a tree node of its own kind")
+    check(one("""
+        SELECT count(*) FROM inst i JOIN tree_node t ON t.id=i.id
+        JOIN module m ON m.id=i.module_id
+        WHERE t.node_kind='package' AND i.parent_inst_id IS NULL
+          AND m.def_kind='package'""") == 1,
+          "with a parentless inst and a package module")
+    # Its variables are nets of that occurrence.
+    check(one("""
+        SELECT count(*) FROM v_net n JOIN v_tree_node t ON t.node_id=n.inst_id
+        WHERE t.node_kind='package' AND n.net_name IN ('mask','enable')""") == 2,
+          "the package variables are nets")
+    # The payoff: cfg_pkg::mask resolves to a real driver, not 'external',
+    # and BOTH readers meet on the one package net.
+    check(one("""
+        SELECT count(*) FROM v_driver WHERE driver_kind='external'""") == 0,
+          "no reference is left external once the package resolves")
+    check(one("""
+        SELECT count(DISTINCT driver_net_id) FROM v_driver
+        WHERE driver_name='mask' AND driver_kind='data'""") == 1,
+          "both readers are driven by the one package net")
+    check(one("""
+        SELECT count(DISTINCT signal_inst_id) FROM v_driver
+        WHERE driver_name='mask' AND driver_kind='data'""") == 2,
+          "and there really are two distinct readers of it")
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,
+          "the pkg:: reference is recorded as written and resolved")
 
 print("OK")
