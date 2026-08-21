@@ -61,6 +61,14 @@ jobs:
             ./build/rtl-designdb "examples/constructs/$mode.sv" -o "$mode.db"
             python3 scripts/verify-designdb.py "$mode.db" "$mode"
           done
+          # The CLI itself, which the constructs family never exercises: two
+          # files sharing one compilation unit (so a macro defined in the first
+          # reaches the second), a header found only through +incdir+, a define
+          # from the command line, and two uninstantiated tops -- the case that
+          # makes meta.top space-separated.
+          (cd examples/options && ../../build/rtl-designdb -f opts.f --single-unit \
+             +incdir+. +define+EXTRA_WIDTH=4 -o "$GITHUB_WORKSPACE/options.db")
+          python3 scripts/verify-designdb.py options.db
 
   # The four release platforms, as workflow artifacts on every push. The same
   # workflow builds a tagged release, so a red push here is a release that
