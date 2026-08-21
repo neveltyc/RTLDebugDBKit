@@ -2,6 +2,10 @@
 // released under the BSD 3-Clause License (see LICENSE)
 
 #include "Extractor.h"
+#include "extract/Ref.h"
+#include "extract/SourceLocator.h"
+#include "extract/SymbolText.h"
+#include "extract/Template.h"
 
 #include <algorithm>
 #include <optional>
@@ -59,1004 +63,10 @@ namespace designdb {
 
 namespace {
 
-/// True for a symbol that is a compile-time constant rather than a net.
-///
-/// An enum member or a parameter is not something a waveform carries and not
-/// something a trace can step to, so it is not connectivity. Leaving them in
-/// also swamped the count of genuinely dropped cross-module references.
-bool isConstantSymbol(const ValueSymbol& sym) {
-    switch (sym.kind) {
-        case SymbolKind::EnumValue:
-        case SymbolKind::Parameter:
-        case SymbolKind::Specparam:
-            return true;
-        case SymbolKind::Variable:
-            return sym.as<VariableSymbol>().flags.has(VariableFlags::Const);
-        default:
-            return false;
-    }
-}
-
-/// The path of `sym` as seen from `body`, i.e. with the instance's own prefix
-/// removed. Rows name objects scope-relative (`g[0].sig`, `bump.v`); the
-/// template is stamped per occurrence, so the relative spelling is what every
-/// occurrence shares.
-bool relativePath(const Symbol& sym, const std::string& bodyPrefix, std::string& out) {
-    std::string full = sym.getHierarchicalPath();
-    if (!bodyPrefix.empty() && full.size() > bodyPrefix.size() &&
-        full.compare(0, bodyPrefix.size(), bodyPrefix) == 0 &&
-        full[bodyPrefix.size()] == '.') {
-        out = full.substr(bodyPrefix.size() + 1);
-        return true;
-    }
-    if (full == bodyPrefix) {
-        out = full;
-        return true;
-    }
-    // Outside the instance: an upward hierarchical reference, an interface
-    // signal, a package item. Recorded as hier_ref or counted, never stored
-    // as a net of this instance.
-    out = full;
-    return false;
-}
-
-std::string typeOf(const ValueSymbol& sym) {
-    return sym.getType().toString();
-}
-
-/// A file, line and column that came from one source location. The three
-/// travel together: taking the line from a statement and the file from its
-/// enclosing procedure names a line in a file that does not contain it.
-struct Where {
-    std::string file;
-    uint32_t line = 0;
-    uint32_t column = 0;
-};
-
-Where whereOf(SourceLocation loc, const SourceManager& sm) {
-    if (!loc)
-        return {};
-    return Where{std::string(sm.getFileName(loc)),
-                 static_cast<uint32_t>(sm.getLineNumber(loc)),
-                 static_cast<uint32_t>(sm.getColumnNumber(loc))};
-}
-
-/// The canonical text of a reference that leaves its instance: the path as
-/// written, with every select resolved to the constant it elaborated to.
-/// (See v9's history for why not the raw source text: generate loops share a
-/// spelling across distinct references, spellings differ in whitespace, and
-/// macro-assembled references span buffers.)
-std::string canonicalPath(const Expression* e, EvalContext& eval) {
-    for (;;) {
-        if (e && e->kind == ExpressionKind::ElementSelect)
-            e = &e->as<ElementSelectExpression>().value();
-        else if (e && e->kind == ExpressionKind::RangeSelect)
-            e = &e->as<RangeSelectExpression>().value();
-        else
-            break;
-    }
-    std::string out;
-    auto build = [&](auto&& self, const Expression* x) -> bool {
-        if (!x)
-            return false;
-        switch (x->kind) {
-            case ExpressionKind::NamedValue: {
-                auto& sym = x->as<ValueExpressionBase>().symbol;
-                if (sym.name.empty())
-                    return false;
-                // A package item keeps its package: a bare `mask` resolves
-                // against imports a reader cannot see, `pkg::mask` says where
-                // to look.
-                if (auto* scope = sym.getParentScope()) {
-                    auto& owner = scope->asSymbol();
-                    if (owner.kind == SymbolKind::Package && !owner.name.empty()) {
-                        out += owner.name;
-                        out += "::";
-                    }
-                }
-                out += sym.name;
-                return true;
-            }
-            case ExpressionKind::MemberAccess: {
-                auto& ma = x->as<MemberAccessExpression>();
-                if (!self(self, &ma.value()))
-                    return false;
-                if (ma.member.name.empty())
-                    return false;
-                out += '.';
-                out += ma.member.name;
-                return true;
-            }
-            case ExpressionKind::ElementSelect: {
-                auto& sel = x->as<ElementSelectExpression>();
-                if (!self(self, &sel.value()))
-                    return false;
-                auto cv = sel.selector().eval(eval);
-                if (!cv)
-                    return false;   // a runtime index names no one element
-                out += '[';
-                out += cv.toString();
-                out += ']';
-                return true;
-            }
-            case ExpressionKind::Conversion:
-                return self(self, &x->as<ConversionExpression>().operand());
-            default:
-                return false;
-        }
-    };
-    if (!build(build, e))
-        return {};
-    return out;
-}
-
-/// The reference as written, with whitespace and comments taken out -- the
-/// fallback for a reference `canonicalPath` cannot walk (an XMR slang
-/// resolves to a single node). Empty for a macro-assembled span.
-std::string normalizedText(const Expression* e, const SourceManager& sm,
-                           bool stripTrailingSelect = true) {
-    if (!e)
-        return {};
-    auto range = e->sourceRange;
-    if (!range.start() || !range.end() ||
-        range.start().buffer() != range.end().buffer())
-        return {};
-    auto text = sm.getSourceText(range.start().buffer());
-    const size_t a = range.start().offset();
-    const size_t b = range.end().offset();
-    if (a >= b || b > text.size())
-        return {};
-    std::string out;
-    auto raw = text.substr(a, b - a);
-    for (size_t i = 0; i < raw.size(); i++) {
-        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '*') {
-            auto end = raw.find("*/", i + 2);
-            if (end == std::string_view::npos)
-                return {};
-            i = end + 1;
-            continue;
-        }
-        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/') {
-            auto nl = raw.find('\n', i + 2);
-            if (nl == std::string_view::npos)
-                break;
-            i = nl;
-            continue;
-        }
-        if (!std::isspace(static_cast<unsigned char>(raw[i])))
-            out += raw[i];
-    }
-    // Trailing selects are the bit range, which has columns of its own --
-    // every group of them, matched by bracket depth.
-    while (stripTrailingSelect && !out.empty() && out.back() == ']') {
-        int depth = 0;
-        size_t i = out.size();
-        while (i > 0) {
-            --i;
-            if (out[i] == ']')
-                depth++;
-            else if (out[i] == '[' && --depth == 0)
-                break;
-        }
-        if (depth != 0 || i == 0)
-            break;
-        out.resize(i);
-    }
-    return out;
-}
-
-/// The normalised text of a timing control: its syntax with whitespace runs
-/// collapsed. Stored as text, never evaluated -- `#(rise, fall)` and
-/// min:typ:max forms are not one number, and pretending otherwise would
-/// store a guess.
-std::string delayText(const TimingControl* t) {
-    if (!t || !t->syntax)
-        return {};
-    switch (t->kind) {
-        case TimingControlKind::Delay:
-        case TimingControlKind::Delay3:
-        case TimingControlKind::CycleDelay:
-            break;
-        default:
-            return {};
-    }
-    std::string raw = t->syntax->toString();
-    std::string out;
-    bool pendingSpace = false;
-    for (char c : raw) {
-        if (std::isspace(static_cast<unsigned char>(c))) {
-            pendingSpace = !out.empty();
-            continue;
-        }
-        if (pendingSpace) {
-            out += ' ';
-            pendingSpace = false;
-        }
-        out += c;
-    }
-    return out;
-}
-
-/// The word an assertion publishes as its `construct`. Spelled out rather
-/// than taken from slang's enum printer: these are a wire format.
-std::string assertionWord(AssertionKind kind) {
-    switch (kind) {
-        case AssertionKind::Assume:        return "assume";
-        case AssertionKind::CoverProperty:
-        case AssertionKind::CoverSequence: return "cover";
-        case AssertionKind::Restrict:      return "restrict";
-        case AssertionKind::Expect:        return "expect";
-        default:                           return "assert";
-    }
-}
-
-/// The proc_kind word for a procedural block.
-std::string procedureWord(const Symbol& sym) {
-    if (sym.kind != SymbolKind::ProceduralBlock)
-        return "always";
-    switch (sym.as<ProceduralBlockSymbol>().procedureKind) {
-        case ProceduralBlockKind::AlwaysComb:  return "always_comb";
-        case ProceduralBlockKind::AlwaysLatch: return "always_latch";
-        case ProceduralBlockKind::AlwaysFF:    return "always_ff";
-        case ProceduralBlockKind::Always:      return "always";
-        case ProceduralBlockKind::Initial:     return "initial";
-        case ProceduralBlockKind::Final:       return "final";
-        default:                               return "always";
-    }
-}
-
-/// Every edge-triggered event in a timing control, in the order written --
-/// all of them, since an event list has no ordering semantics.
-void collectEdgeEvents(const TimingControl* t,
-                       std::vector<std::pair<const Expression*, std::string>>& out,
-                       std::vector<const Expression*>* iffs = nullptr) {
-    if (!t)
-        return;
-    switch (t->kind) {
-        case TimingControlKind::SignalEvent: {
-            auto& se = t->as<SignalEventControl>();
-            // An explicitly written event is recorded whether or not it
-            // names an edge: `always @(b)` samples b, and a signal that
-            // appears ONLY in a sensitivity list was otherwise invisible to
-            // every load query. edge_kind stays NULL for the plain form.
-            // Implicit lists (`@*`, always_comb) are deliberately NOT
-            // expanded here: their sensitivity IS the read set, which the
-            // dataflow rows already carry, and duplicating it would list
-            // every combinational read twice.
-            out.emplace_back(&se.expr,
-                             se.edge == EdgeKind::PosEdge   ? "posedge"
-                             : se.edge == EdgeKind::NegEdge ? "negedge"
-                             : se.edge == EdgeKind::BothEdges ? "both"
-                                                              : "");
-            // `@(posedge clk iff en)` samples `en` too; it qualifies the
-            // event rather than being one.
-            if (iffs && se.iffCondition)
-                iffs->push_back(se.iffCondition);
-            return;
-        }
-        case TimingControlKind::EventList:
-            for (auto* c : t->as<EventListControl>().events)
-                collectEdgeEvents(c, out, iffs);
-            return;
-        default:
-            return;
-    }
-}
-
-/// One group's parameter values, as stable text: declaration order, values in
-/// full precision (ConstantValue::toString abbreviates above 128 bits, which
-/// folded distinct parameterisations).
-std::vector<std::pair<std::string, std::string>>
-parameterPairs(const InstanceBodySymbol& body) {
-    std::vector<std::pair<std::string, std::string>> out;
-    for (auto& member : body.members()) {
-        if (member.kind == SymbolKind::Parameter) {
-            auto& p = member.as<ParameterSymbol>();
-            out.emplace_back(std::string(p.name),
-                             p.getValue().toString(SVInt::MAX_BITS));
-        }
-        else if (member.kind == SymbolKind::TypeParameter) {
-            auto& tp = member.as<TypeParameterSymbol>();
-            out.emplace_back(std::string(tp.name),
-                             tp.targetType.getType().toString());
-        }
-    }
-    return out;
-}
-
-/// The signature is the pairs, joined -- one normalisation, two
-/// representations, and the verifier holds them equal per occurrence.
-std::string parameterText(const InstanceBodySymbol& body) {
-    std::string out;
-    for (auto& [name, value] : parameterPairs(body)) {
-        if (!out.empty())
-            out += ',';
-        out += name;
-        out += '=';
-        out += value;
-    }
-    return out;
-}
-
-/// One reference to a signal, with the bits it touches. Encoding unchanged
-/// from v7: `whole` spans the object, `exact=false` means the range is an
-/// upper bound (a dynamic selector).
-struct Ref {
-    const ValueSymbol* sym = nullptr;
-    uint64_t lo = 0;
-    uint64_t hi = 0;
-    bool whole = true;
-    bool exact = true;
-    /// The expression the reference was written as; consulted when the symbol
-    /// lives outside the instance (hier_ref text) and for resolution replay.
-    const Expression* origin = nullptr;
-};
-
-uint64_t bitWidthOf(const ValueSymbol& sym) {
-    return sym.getType().getSelectableWidth();
-}
-
-/// Builds a Ref from one of slang's value paths.
-Ref refOf(const ValuePath& path) {
-    Ref r;
-    r.sym = path.rootSymbol();
-    if (!r.sym)
-        return r;
-    r.origin = path.fullExpr;
-    r.exact = path.isFullyStatic();
-    if (!path.lsp) {
-        r.exact = false;
-        return r;
-    }
-    r.lo = path.lspBounds.first;
-    r.hi = path.lspBounds.second;
-    const uint64_t width = bitWidthOf(*r.sym);
-    r.whole = width == 0 || (r.lo == 0 && r.hi + 1 >= width);
-    return r;
-}
-
-/// Constants filtered per statement; see the v9 note on why accumulated
-/// across the three collection passes of one assignment.
-inline thread_local int64_t filteredConstants = 0;
-
-void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out,
-                 bool skipSelectors = false) {
-    ValuePath::visitPaths(
-        expr, ctx,
-        [&](const ValuePath& path) {
-            Ref r = refOf(path);
-            if (!r.sym)
-                return;
-            if (isConstantSymbol(*r.sym)) {
-                filteredConstants++;
-                return;
-            }
-            out.push_back(r);
-        },
-        skipSelectors);
-}
-
-/// A reference together with the bits of the *assignment* it occupies -- what
-/// makes `{a, b} = {x, y}` answerable without the v7 cross product.
-struct Slot {
-    Ref ref;
-    uint64_t lo = 0;
-    uint64_t hi = 0;
-    /// True when the reference's own bits map one-to-one onto [lo, hi].
-    bool positional = false;
-};
-
-constexpr uint64_t kNoWidth = ~uint64_t{0};
-
-/// How many subroutine bodies one module may instantiate across all its
-/// procedures.
-///
-/// Per-call-site expansion is what makes a call's gating and delay its own,
-/// but the cycle guard bounds only recursion, not fan-out: a call DAG
-/// branching twice per level costs 2^depth, and 21 such levels turned an
-/// 88-line file into 3.1 M statements and 1.2 GB. This bounds that.
-///
-/// The number is set from measurement, not taste: of the designs exported
-/// here, the heaviest user of calls is picorv32 with 13 call statements,
-/// and tinyriscv and VeeRwolf have none. Four thousand is two orders of
-/// magnitude above that, so real RTL -- and any testbench short of a
-/// deliberately exponential one -- never reaches it. What it stops is
-/// counted and reported, never silently dropped.
-constexpr int64_t kCallExpansionBudget = 4000;
-
-uint64_t exprWidthOf(const Expression& e) {
-    return e.type ? e.type->getBitWidth() : 0;
-}
-
-/// Whether the expression *is* a reference to storage rather than a
-/// computation over one; selects and width-preserving conversions are
-/// transparent, everything else answers no.
-bool isPlainReference(const Expression& e) {
-    const Expression* p = &e;
-    for (;;) {
-        switch (p->kind) {
-            case ExpressionKind::NamedValue:
-            case ExpressionKind::HierarchicalValue:
-                return true;
-            case ExpressionKind::ElementSelect:
-                p = &p->as<ElementSelectExpression>().value();
-                break;
-            case ExpressionKind::RangeSelect:
-                p = &p->as<RangeSelectExpression>().value();
-                break;
-            case ExpressionKind::MemberAccess:
-                p = &p->as<MemberAccessExpression>().value();
-                break;
-            case ExpressionKind::Conversion: {
-                auto& conv = p->as<ConversionExpression>();
-                if (exprWidthOf(conv.operand()) != exprWidthOf(*p))
-                    return false;
-                p = &conv.operand();
-                break;
-            }
-            default:
-                return false;
-        }
-    }
-}
-
-/// Every reference in `expr`, tagged with the bits of the assignment it
-/// occupies. Concatenations and simple assignment patterns are positioned
-/// element by element, MSB first; conversions are transparent when width-
-/// preserving or truncating and degrade to range-level when widening.
-void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
-                  std::vector<Slot>& out, bool skipSelectors = false) {
-    const uint64_t width = exprWidthOf(expr);
-
-    const bool elementwise = expr.kind == ExpressionKind::Concatenation ||
-                             expr.kind == ExpressionKind::SimpleAssignmentPattern;
-    if (elementwise && width) {
-        auto ops = expr.kind == ExpressionKind::Concatenation
-                       ? expr.as<ConcatenationExpression>().operands()
-                       : expr.as<SimpleAssignmentPatternExpression>().elements();
-        uint64_t cursor = base + width;
-        for (auto* op : ops) {
-            if (!op)
-                continue;
-            const uint64_t w = exprWidthOf(*op);
-            if (!w) {
-                std::vector<Ref> rest;
-                collectRefs(expr, ctx, rest, skipSelectors);
-                for (auto& r : rest)
-                    out.push_back(Slot{r, 0, kNoWidth, false});
-                return;
-            }
-            cursor -= w;
-            collectSlots(*op, ctx, cursor, out, skipSelectors);
-        }
-        return;
-    }
-
-    if (expr.kind == ExpressionKind::Conversion) {
-        auto& conv = expr.as<ConversionExpression>();
-        const uint64_t iw = exprWidthOf(conv.operand());
-        if (width && iw >= width) {
-            collectSlots(conv.operand(), ctx, base, out, skipSelectors);
-            return;
-        }
-    }
-
-    std::vector<Ref> refs;
-    collectRefs(expr, ctx, refs, skipSelectors);
-    if (!width) {
-        for (auto& r : refs)
-            out.push_back(Slot{r, 0, kNoWidth, false});
-        return;
-    }
-    const bool positional =
-        isPlainReference(expr) && refs.size() == 1 && refs[0].exact &&
-        (refs[0].whole ? bitWidthOf(*refs[0].sym) == width
-                       : refs[0].hi - refs[0].lo + 1 == width);
-    for (auto& r : refs)
-        out.push_back(Slot{r, base, base + width - 1, positional});
-}
-
-bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
-    if (a.hi == kNoWidth || b.hi == kNoWidth) {
-        lo = 0;
-        hi = kNoWidth;
-        return true;
-    }
-    lo = std::max(a.lo, b.lo);
-    hi = std::min(a.hi, b.hi);
-    return lo <= hi;
-}
-
-/// The reference narrowed to the part of it landing in [lo, hi] of the
-/// assignment. Only meaningful for a positional slot.
-Ref narrowed(const Slot& s, uint64_t lo, uint64_t hi) {
-    Ref r = s.ref;
-    if (!s.positional || s.hi == kNoWidth || hi == kNoWidth || !r.sym)
-        return r;
-    if (lo <= s.lo && hi >= s.hi)
-        return r;
-    const uint64_t offset = r.whole ? 0 : r.lo;
-    r.lo = offset + (lo - s.lo);
-    r.hi = offset + (hi - s.lo);
-    const uint64_t total = bitWidthOf(*r.sym);
-    r.whole = total == 0 || (r.lo == 0 && r.hi + 1 >= total);
-    return r;
-}
-
-struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::AllGood> {
-    std::vector<Ref>& out;
-    explicit StatementRefCollector(std::vector<Ref>& out) : out(out) {}
-    void handle(const NamedValueExpression& e) { addRef(e); }
-    void handle(const HierarchicalValueExpression& e) { addRef(e); }
-    /// An assignment's target is written, not read. Visiting it as an
-    /// ordinary value made a subroutine's *writes* come back as reads of
-    /// the call site: `task touch(); freewr = freerd; endtask` reported
-    /// freewr as read at the call, though nothing in the design reads it,
-    /// and the same database showed it with a single driver -- two rows
-    /// contradicting each other. The selectors on the left ARE reads
-    /// (`m[i] = x` reads i), so they are still visited.
-    void handle(const AssignmentExpression& e) {
-        collectLeftSelectorReads(e.left());
-        e.right().visit(*this);
-    }
-    void collectLeftSelectorReads(const Expression& lhs) {
-        switch (lhs.kind) {
-            case ExpressionKind::ElementSelect: {
-                auto& sel = lhs.as<ElementSelectExpression>();
-                sel.selector().visit(*this);
-                collectLeftSelectorReads(sel.value());
-                return;
-            }
-            case ExpressionKind::RangeSelect: {
-                auto& sel = lhs.as<RangeSelectExpression>();
-                sel.left().visit(*this);
-                sel.right().visit(*this);
-                collectLeftSelectorReads(sel.value());
-                return;
-            }
-            case ExpressionKind::MemberAccess:
-                collectLeftSelectorReads(lhs.as<MemberAccessExpression>().value());
-                return;
-            case ExpressionKind::Concatenation:
-                for (auto* op : lhs.as<ConcatenationExpression>().operands())
-                    collectLeftSelectorReads(*op);
-                return;
-            default:
-                return;
-        }
-    }
-    void addRef(const ValueExpressionBase& e) {
-        Ref r;
-        r.sym = &e.symbol;
-        r.origin = &e;
-        // No bounds computed here: the whole object is an upper bound, and
-        // storing it as exact would state uncertainty as fact.
-        r.exact = false;
-        out.push_back(r);
-    }
-};
-
-template<typename NodeT>
-void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
-    StatementRefCollector c(out);
-    node.visit(c);
-    out.erase(std::remove_if(out.begin(), out.end(),
-                             [](const Ref& r) {
-                                 if (!r.sym)
-                                     return true;
-                                 if (isConstantSymbol(*r.sym)) {
-                                     filteredConstants++;
-                                     return true;
-                                 }
-                                 return false;
-                             }),
-              out.end());
-}
-
-/// A called subroutine's free reads -- what it samples beyond its arguments.
-void collectCallReadsInto(const Expression& expr,
-                          std::set<const SubroutineSymbol*>& active,
-                          std::vector<Ref>& out) {
-    struct CallFinder : ASTVisitor<CallFinder, VisitFlags::AllGood> {
-        std::set<const SubroutineSymbol*>& active;
-        std::vector<Ref>& out;
-        CallFinder(std::set<const SubroutineSymbol*>& active, std::vector<Ref>& out) :
-            active(active), out(out) {}
-        void handle(const CallExpression& call) {
-            visitDefault(call);
-            auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
-            if (!sub || !*sub)
-                return;
-            if (!active.insert(*sub).second)
-                return;
-            std::vector<Ref> inner;
-            collectStatementRefs((*sub)->getBody(), inner);
-            const std::string scope = (*sub)->getHierarchicalPath();
-            for (auto& r : inner) {
-                std::string path = r.sym->getHierarchicalPath();
-                const bool isLocal = path.size() > scope.size() &&
-                                     path.compare(0, scope.size(), scope) == 0 &&
-                                     path[scope.size()] == '.';
-                if (!isLocal)
-                    out.push_back(r);
-            }
-            active.erase(*sub);
-        }
-    };
-    CallFinder finder(active, out);
-    expr.visit(finder);
-}
-
-/// The value symbols an expression reads, subroutine free reads included.
-struct ReadCollector : public ASTVisitor<ReadCollector, VisitFlags::AllGood> {
-    std::vector<const ValueSymbol*>& out;
-    std::set<const SubroutineSymbol*>& active;
-    explicit ReadCollector(std::vector<const ValueSymbol*>& out,
-                           std::set<const SubroutineSymbol*>& active) :
-        out(out), active(active) {}
-
-    void handle(const NamedValueExpression& e) {
-        if (!isConstantSymbol(e.symbol))
-            out.push_back(&e.symbol);
-    }
-    void handle(const HierarchicalValueExpression& e) {
-        if (!isConstantSymbol(e.symbol))
-            out.push_back(&e.symbol);
-    }
-    void handle(const CallExpression& e) {
-        visitDefault(e);
-        auto sub = std::get_if<const SubroutineSymbol*>(&e.subroutine);
-        if (!sub || !*sub)
-            return;
-        if (!active.insert(*sub).second)
-            return;
-        std::vector<const ValueSymbol*> inner;
-        ReadCollector c(inner, active);
-        (*sub)->getBody().visit(c);
-        const std::string scope = (*sub)->getHierarchicalPath();
-        for (auto* sym : inner) {
-            std::string path = sym->getHierarchicalPath();
-            const bool isLocal = path.size() > scope.size() &&
-                                 path.compare(0, scope.size(), scope) == 0 &&
-                                 path[scope.size()] == '.';
-            if (!isLocal)
-                out.push_back(sym);
-        }
-        active.erase(*sub);
-    }
-};
-
-void collectReads(const Expression& expr, std::vector<const ValueSymbol*>& out) {
-    std::set<const SubroutineSymbol*> active;
-    ReadCollector c(out, active);
-    expr.visit(c);
-}
-
-/// The path segment slang gives a generate block: the genvar's *value* for a
-/// loop iteration, the block's name otherwise.
-std::string generateSegment(const GenerateBlockSymbol& block) {
-    if (auto* index = block.getArrayIndex())
-        return "[" + index->toString(LiteralBase::Decimal, false) + "]";
-    std::string name(block.name);
-    return name.empty() ? block.getExternalName() : name;
-}
-
-/// The last segment of a symbol's hierarchical path: the leaf name with
-/// slang's array-element index already rendered in source numbering
-/// (`u[0]`) -- the one spelling a tree node's name must use, since an
-/// instance-array element's own `name` is the bare `u`.
-std::string leafSegment(const Symbol& sym) {
-    std::string full = sym.getHierarchicalPath();
-    const size_t dot = full.rfind('.');
-    return dot == std::string::npos ? full : full.substr(dot + 1);
-}
-
-/// Calls `fn` for every member of `scope` of kind `K`, descending through
-/// generate blocks and instance arrays but never into an instance's own body.
-template<SymbolKind K, typename SymT, typename F>
-void forEachOfKind(const Scope& scope, F&& fn) {
-    for (auto& member : scope.members()) {
-        if (member.kind == K) {
-            fn(member.as<SymT>());
-            continue;
-        }
-        switch (member.kind) {
-            case SymbolKind::GenerateBlock: {
-                auto& block = member.as<GenerateBlockSymbol>();
-                if (block.isUninstantiated)
-                    break;
-                forEachOfKind<K, SymT>(block, fn);
-                break;
-            }
-            case SymbolKind::GenerateBlockArray:
-                for (auto& entry : member.as<GenerateBlockArraySymbol>().entries)
-                    forEachOfKind<K, SymT>(*entry, fn);
-                break;
-            case SymbolKind::InstanceArray:
-                forEachOfKind<K, SymT>(member.as<InstanceArraySymbol>(), fn);
-                break;
-            default:
-                break;
-        }
-    }
-}
-
-template<typename F>
-void forEachInstance(const Scope& scope, F&& fn) {
-    forEachOfKind<SymbolKind::Instance, InstanceSymbol>(scope, fn);
-}
-
-/// The decl_kind word for a net or variable.
-std::string declarationKindOf(const Symbol& sym) {
-    if (sym.kind != SymbolKind::Net)
-        return "variable";
-    auto& nt = sym.as<NetSymbol>().netType;
-    switch (nt.netKind) {
-        case NetType::Wire:         return "wire";
-        case NetType::WAnd:         return "wand";
-        case NetType::WOr:          return "wor";
-        case NetType::Tri:          return "tri";
-        case NetType::TriAnd:       return "triand";
-        case NetType::TriOr:        return "trior";
-        case NetType::Tri0:         return "tri0";
-        case NetType::Tri1:         return "tri1";
-        case NetType::TriReg:       return "trireg";
-        case NetType::Supply0:      return "supply0";
-        case NetType::Supply1:      return "supply1";
-        case NetType::UWire:        return "uwire";
-        case NetType::Interconnect: return "interconnect";
-        case NetType::UserDefined:
-            return nt.name.empty() ? "wire" : std::string(nt.name);
-        default:                    return "wire";
-    }
-}
-
-std::string directionWord(ArgumentDirection d) {
-    switch (d) {
-        case ArgumentDirection::In:    return "input";
-        case ArgumentDirection::Out:   return "output";
-        case ArgumentDirection::InOut: return "inout";
-        default:                       return "ref";
-    }
-}
-
-// ---------------------------------------------------------------- templates
-//
-// Everything a group's occurrences share, held with template-local indices.
-// Stamping is then arithmetic: global id = per-occurrence base + index. The
-// invariant that makes this sound: two bodies with one (definition,
-// parameters) key are the same AST, so any deterministic traversal of one is
-// the same traversal of the other.
-
-struct TplLoc {
-    int64_t fileId = 0;
-    uint32_t line = 0;
-    uint32_t column = 0;
-};
-
-struct TplRange {
-    std::optional<std::pair<uint64_t, uint64_t>> bits;
-    bool exact = true;
-};
-
-TplRange rangeOf(const Ref& r) {
-    TplRange out;
-    if (r.sym && !r.whole)
-        out.bits = std::make_pair(r.lo, r.hi);
-    out.exact = r.sym ? r.exact : true;
-    return out;
-}
-
-struct TplScope {          // a generate level below the instance; 0 = the body
-    int32_t parent = -1;
-    std::string name;
-};
-
-struct TplNet {
-    int32_t scope = 0;
-    std::string name;
-    std::string declKind;
-    int64_t dataTypeId = 0;
-    int64_t width = -1;
-    bool isImplicit = false;
-    TplLoc loc;
-};
-
-struct TplTerm {
-    std::string name;
-    std::string kind;        // signal | interface
-    std::string direction;   // "" = NULL
-    int64_t dataTypeId = 0;
-    int64_t width = -1;
-    int isConst = -1;
-    std::string modport;
-    TplLoc loc;
-};
-
-struct TplTermMap {
-    int32_t term = 0;
-    int64_t ordinal = 0;
-    int32_t net = 0;
-    TplRange termR, netR;
-    bool mappingExact = false;
-};
-
-struct TplProcedure {
-    int32_t scope = 0;
-    std::string name;
-    std::string kind;
-    TplLoc loc;
-};
-
-struct TplStmt {
-    int32_t scope = 0;
-    int32_t proc = -1;
-    int64_t sequence = -1;
-    std::string kind;
-    std::string construct;
-    std::string assignKind;  // "" = NULL
-    std::string delay;
-    int64_t dropped = 0;
-    int32_t callSite = -1;   // the call-site expansion this belongs to (-1 = none)
-    TplLoc loc;
-};
-
-/// One subroutine-body expansion: a body is walked once per call site, and
-/// this is that site's identity, so a consumer can partition a cone by it
-/// and never mix one call's gating with another's argument. `callerStmt` is
-/// the statement making the call; `parentCallSite` is the enclosing
-/// expansion (a call-string for nested calls); ids are template-relative and
-/// stamped per occurrence like everything else.
-struct TplCallSite {
-    int32_t callerStmt = -1;
-    int32_t parentCallSite = -1;
-    std::string subName;
-    int64_t depth = 0;
-};
-
-struct TplStmtRef {          // stmt_target and assign_operand share the shape
-    int32_t stmt = 0;
-    int64_t ordinal = 0;
-    int32_t net = 0;
-    TplRange r;
-};
-
-struct TplExprRef {
-    int32_t stmt = 0;
-    int64_t ordinal = 0;
-    int32_t net = 0;
-    std::string role;
-    TplRange r;
-};
-
-struct TplProcEvent {
-    int32_t proc = 0;
-    int32_t stmt = -1;
-    int32_t net = -1;
-    std::string eventKind;
-    std::string edgeKind;
-    TplLoc loc;
-};
-
-struct TplPrim {
-    int32_t scope = 0;
-    std::string name;
-    std::string primKind;
-    std::string defName;
-    TplLoc loc;
-};
-
-struct TplDep {
-    int32_t srcNet = -1;     // -1 = constant source
-    int32_t tgtNet = 0;
-    int32_t stmt = -1;
-    int32_t operandRef = -1;
-    int32_t targetRef = -1;
-    int32_t exprRef = -1;
-    int32_t prim = -1;
-    std::string kind;
-    TplRange srcR, tgtR;
-    int mappingExact = -1;
-    int32_t callSite = -1;   // the call-site expansion, or -1 at module level
-};
-
-/// Replay data for one outward reference: how to find the target from an
-/// occurrence of this template. `kind` decides the walk.
-struct TplHierRef {
-    int32_t stmt = -1;
-    std::string path;
-    std::string access;      // read | write | connect
-    TplRange r;
-    TplLoc loc;
-    enum ResolveKind {
-        None,                // slang gave no target usable per occurrence
-        Downward,            // segs descend from the occurrence's own node
-        Absolute,            // segs descend from the design root
-        ViaIfaceTerm,        // segs descend from the interface bound to term
-        Package              // segs[0] names a package; netName its member
-    } resolve = None;
-    int32_t ifaceTerm = -1;  // ViaIfaceTerm: which of this template's terms
-    std::vector<std::string> segs;   // tree segments to descend
-    std::string netName;     // scope-relative net name at the target instance
-};
-
-/// One dependency with at least one end outside the instance, paired where
-/// the statement was walked -- per (source element, target element), never
-/// by joining afterwards -- and materialised once the occurrence's
-/// references resolve. An end is a local net index or a hierRefs index,
-/// never both.
-struct TplCrossDep {
-    std::string kind;        // data | control | procedure
-    /// True when the dependency has no source BY DESIGN -- a system task
-    /// writing across the boundary. Without it, "no source reference" and
-    /// "the source reference did not resolve" look alike, and the second
-    /// must be dropped while the first must not.
-    bool sourceless = false;
-    int32_t stmt = -1;
-    int32_t srcNet = -1;
-    int32_t srcHref = -1;
-    int32_t tgtNet = -1;
-    int32_t tgtHref = -1;
-    int32_t operandRef = -1;
-    int32_t targetRef = -1;
-    int32_t exprRef = -1;
-    TplRange srcR, tgtR;
-    int mappingExact = -1;
-    int32_t callSite = -1;   // the call-site expansion, or -1 at module level
-};
-
-struct TplConn {
-    std::string kind;        // net_conn.conn_kind
-    int32_t parentNet = -1;  // index into the PARENT template's nets
-    int32_t childTerm = -1;  // index into the child template's terms
-    int64_t ordinal = 0;     // segment ordinal within that terminal
-    TplRange netR;
-    int netExact = -1;       // -1 = no net end (writer NULLs the range too)
-    TplRange termR;
-    int termExact = -1;
-    int mappingExact = -1;
-    int32_t ifaceChild = -1; // interface binding to a sibling child
-    int32_t ifaceOwnTerm = -1; // interface pass-through of the parent's port
-    int32_t hierRef = -1;    // external tie: index into parent's hierRefs
-    TplLoc loc;
-};
-
-struct TplChild {
-    int32_t scope = 0;
-    std::string name;        // ONE path segment
-    enum Kind { Module, Unresolved } kind = Module;
-    std::string groupKey;    // Module: which template to stamp
-    std::string defName;     // Unresolved: the definition as written
-    std::vector<std::string> unresolvedPorts;  // Unresolved: term names in order
-    std::vector<TplConn> conns;
-    TplLoc loc;
-};
-
-struct Template {
-    int64_t moduleId = 0;
-    std::string params;
-    std::vector<std::pair<std::string, std::string>> paramPairs;
-    std::vector<TplScope> scopes;
-    std::vector<TplNet> nets;
-    std::vector<TplTerm> terms;
-    std::vector<TplTermMap> termMaps;
-    std::vector<TplProcedure> procedures;
-    std::vector<TplStmt> stmts;
-    std::vector<TplCallSite> callSites;
-    std::vector<TplStmtRef> targets;
-    std::vector<TplStmtRef> operands;
-    std::vector<TplExprRef> exprRefs;
-    std::vector<TplProcEvent> procEvents;
-    std::vector<TplPrim> prims;
-    std::vector<TplDep> deps;
-    std::vector<TplHierRef> hierRefs;
-    std::vector<TplCrossDep> crossDeps;
-    std::vector<TplChild> children;
-    std::unordered_map<std::string, int32_t> termIndex;  // name -> terms index
-    std::unordered_map<std::string, int32_t> netIndex;   // name -> nets index
-    bool hasResolvableRefs = false;
-    bool built = false;
-};
+// The leaf layers this file was built out of. `using namespace detail`
+// rather than qualifying every use: the code below is moved, not
+// rewritten, and it named these unqualified all along.
+using namespace detail;
 
 // ------------------------------------------------------- statement walking
 //
@@ -1064,24 +74,6 @@ struct Template {
 // layer reshaped: a target arrives with its paired operands and the gating
 // stack in one call, because the template needs the pairing (net_dep names
 // the operand and target rows) rather than a stream of independent edges.
-
-/// One operand paired with the part of the target its bits actually reach.
-///
-/// Both ends are narrowed to the overlap, not just the source. Keeping the
-/// target whole while narrowing the source is what made
-/// `assign swap = {c[3:0], c[7:4]}` export two dependencies each claiming
-/// all eight bits of swap with map_exact=1 -- a four-bit source cannot
-/// map one-to-one onto an eight-bit target, so the row was not merely
-/// coarse but impossible, and it said the bytes were not swapped.
-struct PairedSrc {
-    Ref src;
-    Ref tgt;
-    bool mapExact = false;
-    /// The source as the RTL spells it, before pairing narrowed it to this
-    /// target's bits. Only a hier_ref row wants this: it describes the
-    /// reference, not one dependency through it.
-    Ref srcAsWritten;
-};
 
 struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood> {
     /// One assignment target with everything that reaches it. `firstTarget`
@@ -1690,7 +682,8 @@ class Walker {
 public:
     Walker(Compilation& comp, AnalysisManager& mgr, Writer& w) :
         compilation(comp), analysis(mgr), writer(w),
-        sourceManager(*comp.getSourceManager()) {}
+        sourceManager(*comp.getSourceManager()),
+        locator(sourceManager, w) {}
 
     Stats run() {
         // Pass 1: group every instance by what module it actually is, and
@@ -1738,7 +731,7 @@ public:
         // subtree stamped after the referring occurrence.
         resolveHierRefs();
 
-        writer.linkSourceFiles(fileOrigins);
+        writer.linkSourceFiles(locator.origins());
         return stats;
     }
 
@@ -1805,28 +798,6 @@ private:
         forEachInstance(inst.body, [&](const InstanceSymbol& child) { collect(child); });
     }
 
-    // ---------------------------------------------------------- locations
-
-    void noteFile(SourceLocation loc, const std::string& asWritten) {
-        if (!loc || asWritten.empty())
-            return;
-        if (fileOrigins.count(asWritten))
-            return;
-        auto path = sourceManager.getFullPath(
-            sourceManager.getFullyExpandedLoc(loc).buffer());
-        if (path.empty())
-            return;
-        fileOrigins.emplace(asWritten, path.string());
-    }
-
-    TplLoc locate(SourceLocation loc, const TplLoc& fallback = {}) {
-        if (!loc)
-            return fallback;
-        Where w = whereOf(loc, sourceManager);
-        noteFile(loc, w.file);
-        return TplLoc{writer.internFile(w.file), w.line, w.column};
-    }
-
     // ---------------------------------------------------------- terminals
 
     /// The port list of one group, as terminal templates. A MultiPort (a
@@ -1838,7 +809,7 @@ private:
                 continue;
             TplTerm term;
             term.name = std::string(portSym->name);
-            term.loc = locate(portSym->location);
+            term.loc = locator.locate(portSym->location);
             switch (portSym->kind) {
                 case SymbolKind::Port: {
                     auto& p = portSym->as<PortSymbol>();
@@ -1964,7 +935,7 @@ private:
             net.width = static_cast<int64_t>(sym.getType().getBitWidth());
         if (sym.kind == SymbolKind::Net)
             net.isImplicit = sym.as<NetSymbol>().isImplicit;
-        net.loc = locate(sym.location);
+        net.loc = locator.locate(sym.location);
         const int32_t idx = int32_t(b.t->nets.size());
         b.t->netIndex.emplace(net.name, idx);
         b.t->nets.push_back(std::move(net));
@@ -2417,7 +1388,7 @@ private:
     void buildProcedure(Build& b, const AnalyzedProcedure& proc) {
         const Symbol& sym = *proc.analyzedSymbol;
         const bool isContinuous = sym.kind == SymbolKind::ContinuousAssign;
-        const TplLoc procAt = locate(sym.location);
+        const TplLoc procAt = locator.locate(sym.location);
         EvalContext evalCtx(sym);
 
         std::string construct;
@@ -2486,7 +1457,7 @@ private:
                 reached = true;
                 if (!dst.sym || inputPorts.count(dst.sym))
                     return;
-                const TplLoc at = locate(where.start(), procAt);
+                const TplLoc at = locator.locate(where.start(), procAt);
                 emitAssignment(b, dst, pairs, gating, at, seq, blocking,
                                dropped, inSubroutine, firstTarget, delay,
                                isContinuous,
@@ -2498,14 +1469,14 @@ private:
                 bool oneToOne, bool bindable, SourceRange where) {
                 reached = true;
                 emitCallBinding(b, formal, actual, reads, writes, oneToOne,
-                                bindable, locate(where.start(), procAt), evalCtx);
+                                bindable, locator.locate(where.start(), procAt), evalCtx);
             },
             // ---- a statement-level event control (a wait)
             [&](const Expression* e, const std::string& edge, int64_t seq,
                 SourceRange where) {
                 if (procIdx < 0)
                     return;
-                const TplLoc at = locate(where.start(), procAt);
+                const TplLoc at = locator.locate(where.start(), procAt);
                 const int32_t s = newStmt(b, "event_control", "wait",
                                           std::string(), seq, std::string(), 0,
                                           at);
@@ -2516,7 +1487,7 @@ private:
             [&](const std::vector<Ref>& reads, const std::vector<Ref>& gating,
                 const std::vector<Ref>& writes, const std::string& stmtKind,
                 const std::string& construct2, int64_t seq, SourceRange where) {
-                const TplLoc at = locate(where.start(), procAt);
+                const TplLoc at = locator.locate(where.start(), procAt);
                 filteredConstants = 0;
                 const int32_t s = newStmt(b, stmtKind, construct2,
                                           std::string(), seq, std::string(), 0,
@@ -2999,7 +1970,7 @@ private:
             const Expression* init = net.getInitializer();
             if (!init)
                 return;
-            const TplLoc at = locate(net.location);
+            const TplLoc at = locator.locate(net.location);
             std::vector<Slot> rhs;
             filteredConstants = 0;
             collectSlots(*init, evalCtx, 0, rhs);
@@ -3067,7 +2038,7 @@ private:
             auto refs = al.getNetReferences();
             if (refs.size() < 2)
                 return;
-            const TplLoc at = locate(al.location);
+            const TplLoc at = locator.locate(al.location);
             b.curScope = 0;
             const int32_t stmt = newStmt(b, "alias", "alias", std::string(),
                                          /*seq=*/-1, std::string(), 0, at);
@@ -3179,7 +2150,7 @@ private:
                              ? "udp"
                              : kSwitches.count(def.name) ? "switch" : "gate";
             p.defName = std::string(def.name);
-            p.loc = locate(prim.location);
+            p.loc = locator.locate(prim.location);
             const int32_t primIdx = int32_t(b.t->prims.size());
             b.t->prims.push_back(std::move(p));
             if (conns.empty())
@@ -3456,7 +2427,7 @@ private:
                     auto& cbody = inst.getCanonicalBody() ? *inst.getCanonicalBody()
                                                           : inst.body;
                     c.groupKey = groupKey(cbody);
-                    c.loc = locate(inst.location);
+                    c.loc = locator.locate(inst.location);
                     childOf.emplace(&inst, int32_t(b.t->children.size()));
                     childSyms.push_back(&inst);
                     b.t->children.push_back(std::move(c));
@@ -3471,7 +2442,7 @@ private:
                         c.name = "<unnamed>";
                     c.kind = TplChild::Unresolved;
                     c.defName = std::string(u.definitionName);
-                    c.loc = locate(u.location);
+                    c.loc = locator.locate(u.location);
                     stats.unresolved++;
                     buildUnresolvedConns(b, u, c);
                     childSyms.push_back(nullptr);
@@ -3525,7 +2496,7 @@ private:
                                                    : child.body;
         Template& childT = templates[groupKey(childBody)];
         EvalContext evalCtx(child);
-        const TplLoc instAt = locate(child.location);
+        const TplLoc instAt = locator.locate(child.location);
         bool inArray = false;
         if (auto* ps = child.getParentScope())
             inArray = ps->asSymbol().kind == SymbolKind::InstanceArray;
@@ -3536,7 +2507,7 @@ private:
                 continue;
             const Expression* connExpr = conn->getExpression();
             const TplLoc at = connExpr
-                                  ? locate(connExpr->sourceRange.start(), instAt)
+                                  ? locator.locate(connExpr->sourceRange.start(), instAt)
                                   : instAt;
             auto termIt = childT.termIndex.find(std::string(conn->port.name));
             if (termIt == childT.termIndex.end())
@@ -3725,7 +2696,7 @@ private:
                 expr = expr->as<InvalidExpression>().child;
             if (expr && expr->kind == ExpressionKind::EmptyArgument)
                 expr = nullptr;
-            const TplLoc at = locate(u.location);
+            const TplLoc at = locator.locate(u.location);
             if (!expr) {
                 TplConn tc;
                 tc.kind = "unconnected";
@@ -3792,7 +2763,7 @@ private:
             case DefinitionKind::Program:   row.definitionKind = "program";   break;
             default:                        row.definitionKind = "module";    break;
         }
-        const TplLoc at = locate(def.location);
+        const TplLoc at = locator.locate(def.location);
         row.fileId = at.fileId;
         row.line = at.line;
         row.column = at.column;
@@ -4322,7 +3293,7 @@ private:
         for (auto* pkg : compilation.getPackages()) {
             if (!pkg || pkg == stdPkg || pkg->name.empty())
                 continue;
-            const TplLoc at = locate(pkg->location);
+            const TplLoc at = locator.locate(pkg->location);
             ModuleRow mrow;
             mrow.id = ++nextModuleId;
             mrow.name = std::string(pkg->name);
@@ -4372,7 +3343,7 @@ private:
                                  ? int64_t(vs.getType().getBitWidth()) : -1;
                 nrow.isImplicit = vs.kind == SymbolKind::Net &&
                                   vs.as<NetSymbol>().isImplicit;
-                const TplLoc nloc = locate(vs.location);
+                const TplLoc nloc = locator.locate(vs.location);
                 nrow.fileId = nloc.fileId;
                 nrow.line = nloc.line;
                 nrow.column = nloc.column;
@@ -4542,7 +3513,7 @@ private:
     std::unordered_map<const InstanceSymbol*, std::string> instanceGroup;
     std::map<std::string, Template> templates;
     std::unordered_map<const DefinitionSymbol*, int64_t> moduleIds;
-    std::unordered_map<std::string, std::string> fileOrigins;
+    SourceLocator locator;
 
     // Global id counters; every table's ids are dense and process-issued.
     int64_t nodeCounter = 0;
