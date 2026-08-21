@@ -11,21 +11,33 @@
 #                        back its buffers, and parsing runs on a thread pool --
 #                        so two runs of the SAME binary disagree on a multi-file
 #                        design. Measured on veerwolf: 492 differing lines out
-#                        of 159,590, all of them in these two tables. The id
-#                        assignment is not deterministic; the CONTENT is, so the
-#                        tables are compared as a sorted (path, digest) set
-#                        rather than dropped.
+#                        of 159,590, all of them in these two tables.
+#
+#                        Only the id assignment is non-deterministic; the CONTENT
+#                        is not, so BOTH tables are compared separately as sorted
+#                        sets -- src_file as (path, digest), file as (path,
+#                        resolved src_file path). Dropping them from the dump
+#                        without that compensation is a real hole rather than a
+#                        theoretical one: a database with garbage in file.path
+#                        and a NULL src_file_id passes every other check here,
+#                        and the file table is precisely what SourceLocator and
+#                        linkSourceFiles produce.
 #
 #   meta.producer_revision   The git describe of the build, which is supposed to
 #                        differ between the two binaries being compared.
 #
 # Anything else that differs is a real behaviour change.
 #
+# Exit codes are COMPARED, not merely required to be zero, and three fixtures
+# expect a non-zero one -- a gate made only of success cases would pass a build
+# whose every error path had been rewired to return success.
+#
 #   usage: refactor-equivalence.sh <reference-binary> [candidate-binary]
 #
 # The candidate defaults to build/rtl-designdb. Exit status is 0 only when every
 # fixture matches.
 set -u
+set -o pipefail    # else a failing sqlite3 leaves both dumps empty and diff says "same"
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 ref="${1:?usage: refactor-equivalence.sh <reference-binary> [candidate-binary]}"
@@ -69,17 +81,42 @@ sources() {
     sqlite3 "$1" "SELECT path, digest FROM src_file ORDER BY path, digest"
 }
 
+# Same for `file`, and for the same reason. Dropping both tables from the dump
+# without this left the entire as-written-spelling to real-path mapping
+# invisible -- which is exactly what SourceLocator and linkSourceFiles produce,
+# so the one thing the gate could not see was the thing being refactored. A
+# database with garbage in file.path and a NULL src_file_id passed every other
+# check here.
+files() {
+    sqlite3 "$1" "SELECT f.path, COALESCE(s.path, '<null>')
+                  FROM file f LEFT JOIN src_file s ON s.id = f.src_file_id
+                  ORDER BY 1, 2"
+}
+
 # One fixture: export with both binaries, compare, and read the result back.
 run() {
     name="$1"; dir="$2"; shift 2
     checked=$((checked + 1))
     printf '%-14s ' "$name"
 
-    if ! (cd "$dir" && "$ref" "$@" -o "$work/$name.ref.db" -q) 2>"$work/$name.ref.log"; then
-        echo "FAIL (reference export)"; sed 's/^/    /' "$work/$name.ref.log" >&2; fail=1; return
+    (cd "$dir" && "$ref" "$@" -o "$work/$name.ref.db" -q) 2>"$work/$name.ref.log"
+    rc_ref=$?
+    (cd "$dir" && "$new" "$@" -o "$work/$name.new.db" -q) 2>"$work/$name.new.log"
+    rc_new=$?
+    # Compared, not merely required to be zero. The commit that rewired every
+    # exit path would have passed a gate that only demanded success.
+    if [ "$rc_ref" -ne "$rc_new" ]; then
+        echo "FAIL (exit $rc_ref vs $rc_new)"; fail=1; return
     fi
-    if ! (cd "$dir" && "$new" "$@" -o "$work/$name.new.db" -q) 2>"$work/$name.new.log"; then
-        echo "FAIL (candidate export)"; sed 's/^/    /' "$work/$name.new.log" >&2; fail=1; return
+    if [ "$rc_ref" -ne 0 ]; then
+        # An expected failure: no database to compare, so stderr is the check.
+        if ! diff -q "$work/$name.ref.log" "$work/$name.new.log" >/dev/null; then
+            echo "FAIL (stderr differs on exit $rc_ref)"
+            diff "$work/$name.ref.log" "$work/$name.new.log" | head -10 | sed 's/^/    /' >&2
+            fail=1; return
+        fi
+        echo "ok  (both exit $rc_ref, same message)"
+        return
     fi
 
     normalise "$work/$name.ref.db" > "$work/$name.ref.sql"
@@ -96,6 +133,14 @@ run() {
     if ! diff -q "$work/$name.ref.src" "$work/$name.new.src" >/dev/null; then
         echo "FAIL (src_file content)"
         diff "$work/$name.ref.src" "$work/$name.new.src" | head -10 | sed 's/^/    /' >&2
+        fail=1; return
+    fi
+
+    files "$work/$name.ref.db" > "$work/$name.ref.f"
+    files "$work/$name.new.db" > "$work/$name.new.f"
+    if ! diff -q "$work/$name.ref.f" "$work/$name.new.f" >/dev/null; then
+        echo "FAIL (file content)"
+        diff "$work/$name.ref.f" "$work/$name.new.f" | head -10 | sed 's/^/    /' >&2
         fail=1; return
     fi
 
@@ -123,6 +168,35 @@ run() {
     echo "ok  ($rows rows identical)"
 }
 
+# A fixture that must FAIL. Runs both binaries with exactly the given argv --
+# run() appends its own -o and -q, which is fine for success cases and wrong for
+# a case whose point is the -o. Requires the same non-zero status and the same
+# message from both.
+run_fail() {
+    name="$1"; dir="$2"; want="$3"; shift 3
+    checked=$((checked + 1))
+    printf '%-14s ' "$name"
+
+    (cd "$dir" && "$ref" "$@") >"$work/$name.ref.out" 2>"$work/$name.ref.log"
+    rc_ref=$?
+    (cd "$dir" && "$new" "$@") >"$work/$name.new.out" 2>"$work/$name.new.log"
+    rc_new=$?
+
+    if [ "$rc_ref" -ne "$want" ]; then
+        echo "FAIL (reference exited $rc_ref, fixture expects $want)"; fail=1; return
+    fi
+    if [ "$rc_ref" -ne "$rc_new" ]; then
+        echo "FAIL (exit $rc_ref vs $rc_new)"; fail=1; return
+    fi
+    if ! diff -q "$work/$name.ref.log" "$work/$name.new.log" >/dev/null ||
+       ! diff -q "$work/$name.ref.out" "$work/$name.new.out" >/dev/null; then
+        echo "FAIL (output differs on exit $rc_ref)"
+        diff "$work/$name.ref.log" "$work/$name.new.log" | head -10 | sed 's/^/    /' >&2
+        fail=1; return
+    fi
+    echo "ok  (both exit $rc_ref, same message)"
+}
+
 # ------------------------------------------------------------------ fixtures
 
 run basic "$here" examples/basic/top.sv --top top
@@ -133,6 +207,32 @@ for f in constructs interfaces assertions hierarchy udp unresolved xmr alias \
     [ -f "$here/examples/constructs/$f.sv" ] || continue
     run "$f" "$here" "examples/constructs/$f.sv"
 done
+
+# The option matrix. Every fixture above is a bare .sv with -q, which leaves
+# whole code paths untouched exactly where the refactor was working:
+# --single-unit is the addSeparateUnit call that moved into parseSources,
+# --diag is the entire DiagnosticEngine block that moved into reportDiagnostics,
+# --check-constraints changes the DDL that actually gets executed, and with no
+# +define+ or +incdir+ the two ppOpts loops in buildOptionBag and the matching
+# loops in configDigest could be deleted without changing a byte of output.
+run single-unit  "$here/examples/options" -f opts.f --single-unit \
+                 "+incdir+$here/examples/options"
+run multi-unit   "$here/examples/options" -f opts.f "+incdir+$here/examples/options"
+run opts-digest  "$here/examples/options" -f opts.f --single-unit \
+                 "+incdir+$here/examples/options" +define+EXTRA_WIDTH=4
+run constraints  "$here" examples/constructs/constructs.sv --check-constraints
+run diag-all     "$here" examples/constructs/external.sv --diag
+run diag-capped  "$here" examples/constructs/external.sv --diag 2
+
+# Paths that must FAIL, with the same code and the same message. The commit that
+# rewired every exit path would have passed a gate made only of success cases.
+run_fail missing-src "$here" 2 examples/constructs/does-not-exist.sv -o "$work/x.db" -q
+run_fail bad-top     "$here" 2 examples/basic/top.sv --top no_such_module -o "$work/x.db" -q
+# A directory where the output file should go: the temp database writes fine and
+# the rename onto it fails, which is publish()'s error path. Created here
+# because $work is wiped at startup.
+mkdir -p "$work/adir"
+run_fail bad-output  "$here" 1 examples/basic/top.sv --top top -o "$work/adir" -q
 
 # Real designs, when a local checkout is present. These are what actually
 # exercise scale -- the examples are a few hundred rows, veerwolf is 160k.
@@ -188,7 +288,12 @@ done
 
 echo
 if [ "$fail" -eq 0 ]; then
-    echo "PASS: $checked fixture(s) byte-identical"
+    if [ -z "$rwa" ] || [ ! -d "$rwa" ]; then
+        echo "PASS: $checked fixture(s) byte-identical (examples only -- the three"
+        echo "      real designs were NOT run; set RWA_DIR for coverage at scale)"
+    else
+        echo "PASS: $checked fixture(s) byte-identical"
+    fi
 else
     echo "FAIL: see above ($checked fixture(s) checked)"
 fi

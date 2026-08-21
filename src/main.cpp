@@ -358,10 +358,17 @@ Bag buildOptionBag(const Options& opt) {
 /// Loads and parses every source into `trees`. False when a source that was
 /// named could not be read: the export would then not be of the design that
 /// was asked for, and a database that looks complete is worse than a failure.
-bool parseSources(const Options& opt, SourceManager& sourceManager,
+///
+/// The loader is the caller's, not this function's, and deliberately so. It owns
+/// the SourceLibrary objects, and both SourceManager::FileInfo::library and
+/// SyntaxTree::library keep non-owning pointers into that map -- so it has to
+/// outlive the compilation, not the parse. Nothing names a library today
+/// (addFiles passes none, and addSeparateUnit's empty library name resolves to
+/// none), which is the only reason a loader scoped to this call would not
+/// already be a use-after-free.
+bool parseSources(const Options& opt, driver::SourceLoader& loader,
                   const Bag& optionBag, slang::ThreadPool& pool,
                   std::vector<std::shared_ptr<syntax::SyntaxTree>>& trees) {
-    driver::SourceLoader loader(sourceManager);
     for (auto& inc : opt.includeDirs)
         loader.addSearchDirectories(inc);
 
@@ -699,8 +706,10 @@ int main(int argc, char** argv) {
         // parser splits per file (so a single compilation unit stays
         // serial), the analysis manager per scope.
         auto pool = std::make_shared<slang::ThreadPool>();
+        // Outlives the compilation on purpose -- see parseSources.
+        driver::SourceLoader loader(sourceManager);
         std::vector<std::shared_ptr<syntax::SyntaxTree>> trees;
-        if (!parseSources(opt, sourceManager, optionBag, *pool, trees))
+        if (!parseSources(opt, loader, optionBag, *pool, trees))
             return 2;
 
         ast::Compilation compilation(optionBag);
