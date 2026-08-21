@@ -154,6 +154,38 @@ else
     echo "note: no rwa checkout found; real designs skipped (set RWA_DIR)"
 fi
 
+# ------------------------------------------------------------ terminal output
+#
+# Everything above runs with -q, so the reporting path is untested by it: the
+# phase timings, the analysis line, and the note/warning lines that say what the
+# export could not do. Those are part of what the tool IS, and a refactor that
+# drops one or reorders the phases is a behaviour change the rows cannot show.
+# Durations are normalised away; their labels and order are not.
+echo
+printf '%-14s ' "reporting"
+tcheck=0
+for f in xmr unresolved package callsite; do
+    [ -f "$here/examples/constructs/$f.sv" ] || continue
+    for tag in ref new; do
+        eval bin=\$$tag
+        # Same -o for both: the summary line echoes the output path, so two
+        # different names would report as a difference that is only the flag.
+        (cd "$here" && "$bin" "examples/constructs/$f.sv" --timing \
+            -o "$work/tm.db") >"$work/tm.$tag.out" 2>"$work/tm.$tag.err"
+        sed 's/[0-9][0-9]* ms/N ms/' "$work/tm.$tag.err" > "$work/tm.$tag.err.n"
+    done
+    if ! diff -q "$work/tm.ref.out" "$work/tm.new.out" >/dev/null ||
+       ! diff -q "$work/tm.ref.err.n" "$work/tm.new.err.n" >/dev/null; then
+        echo "FAIL ($f)"
+        diff "$work/tm.ref.err.n" "$work/tm.new.err.n" | head -10 | sed 's/^/    /' >&2
+        diff "$work/tm.ref.out" "$work/tm.new.out" | head -10 | sed 's/^/    /' >&2
+        fail=1
+        break
+    fi
+    tcheck=$((tcheck + 1))
+done
+[ "$fail" -eq 0 ] && echo "ok  ($tcheck fixture(s), --timing and notes identical)"
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "PASS: $checked fixture(s) byte-identical"
