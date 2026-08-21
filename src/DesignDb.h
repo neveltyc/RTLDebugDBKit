@@ -164,7 +164,15 @@ namespace designdb {
 /// bidirectional. Additive, so no reader must change: `inst_param` makes
 /// the parameter signature queryable, and `v_net_attachment` is a
 /// thirteenth view -- one row per relation touching a net.
-inline constexpr int SchemaVersion = 12;
+///
+/// v13 sharpens what a v12 reader could not ask precisely.
+/// `v_net_attachment`'s one polymorphic `other_id` becomes seven typed
+/// nullable ids (exactly one non-null per row, the one attachment_kind
+/// names) -- the exclusive-arc shape net_dep already uses, so a consumer
+/// joins the right base table without decoding the kind. (Packages as
+/// first-class objects and per-call-site dataflow tagging land in the same
+/// version; their notes are added as those pieces do.)
+inline constexpr int SchemaVersion = 13;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
