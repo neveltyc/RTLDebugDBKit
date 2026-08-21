@@ -35,7 +35,15 @@ is genuinely unresolvable — an upward hierarchical reference from a shared
 body, an interface-array binding. (`$unit` compilation-unit items are not
 stamped yet and stay external.)
 
-*(The call-site section is added as that phase lands.)*
+**Subroutine dataflow gets call-site identity.** A task or function body is
+walked once per call site, but its formal is one shared net — so a fan-in
+cone mixed one call's gating with another call's argument, a combination no
+real call makes. Every `stmt` and `net_dep` a body walk produces now names
+its site in `call_site_id`, into a new `call_site` table (caller statement,
+subroutine, depth, and `parent_call_site_id` for the call string), exposed
+on `v_net_dep`/`v_driver`/`v_load` and a fourteenth view `v_call_site`. A
+consumer follows only one call's rows at each hop and keeps each call's real
+combination. Additive — a nullable column and a new table.
 
 ## What changed in v12
 
@@ -208,6 +216,7 @@ resolution of hierarchical references) is computed per occurrence.
 | | `term_map` | one segment of a terminal's inside |
 | | `net_conn` | one segment of a terminal's outside |
 | statements | `proc` | one always/initial/final block |
+| | `call_site` | one subroutine-body expansion (a call) |
 | | `stmt` | one statement or statement-level construct |
 | | `stmt_target` | one statement's target reference (LHS, release, system write) |
 | | `assign_operand` | one assignment right-hand-side reference |
@@ -382,6 +391,15 @@ so a module that exceeds the budget stops instantiating bodies, counts the
 call sites it skipped, and reports `analysis_status='partial'`. Measured
 RTL does not come close — the heaviest caller among the designs exported
 here has thirteen call statements.
+
+**`call_site`** — `id, inst_id, caller_stmt_id, parent_call_site_id,
+subroutine_name, depth`. One row per subroutine-body expansion, i.e. per
+call. It exists because a body is walked once per call site and the formal
+net is shared: without a per-call tag, a cone mixes the calls. Every `stmt`
+and `net_dep` a body walk produced points here through `call_site_id`;
+`parent_call_site_id` chains nested calls into a call string, `depth` is 1
+at the outermost call, and `caller_stmt_id` is the statement that made the
+call (NULL for a call in a control expression). See *Tracing across calls*.
 
 **`stmt`** — one row per statement or statement-level construct; `{a,b} =
 {x,y}` is ONE row however many targets it writes. `stmt_kind` is
@@ -640,11 +658,13 @@ src_net_id, src_inst_id, src_name, src_lo, src_hi,
 src_exact, tgt_net_id, tgt_inst_id, tgt_name, tgt_lo,
 tgt_hi, tgt_exact, stmt_id, assign_operand_id, stmt_target_id,
 expr_ref_id, prim_id, src_hier_ref_id,
-tgt_hier_ref_id, dep_kind, map_exact, file_path, src_path,
+tgt_hier_ref_id, dep_kind, map_exact, call_site_id, file_path, src_path,
 src_line, src_col`. Location is the statement's, or the
 primitive's for a primitive arc. A row whose `src_inst_id` and
 `tgt_inst_id` differ crossed by name; the `*_hier_ref_id` column on
-that end names the reference it went through. Not deduplicated.
+that end names the reference it went through. `call_site_id` is set when
+the row was produced walking a subroutine body (NULL at module level).
+Not deduplicated.
 
 **`v_driver`** — every direct driving arc of `signal_net`, one row each:
 `signal_net_id, signal_inst_id, signal_name, signal_lo, signal_hi,
@@ -874,10 +894,14 @@ Unchanged from v9, and still deliberate:
   exceeds it reports the skipped sites rather than exhausting memory, and
   `meta` says the export is `partial`.
 * A subroutine's formals are one net per subroutine, not one per call site.
-  Each call's gating and delay are its own, but the formal is shared, so
-  the transitive cone through a task called twice admits combinations no
-  single call makes (`g1` with the second call's argument). Per-call-site
-  formals would fix it and are not in v12.
+  The formal is shared, so a transitive cone that ignores call sites admits
+  combinations no single call makes (`g1` with the second call's argument).
+  v13 makes this *filterable* rather than fixing the storage: every `stmt`
+  and `net_dep` a body walk produces carries a `call_site_id`, so a
+  consumer that follows one call's rows at each hop keeps each call's real
+  combination (see *Tracing across calls*). Per-call-site formal NETS —
+  materialising the shared net once per site — would remove the need to
+  filter at all, and are not in v13.
 * A function call contributes both a summary arc (each argument to the
   call's target) and the detail arcs through its formals, so a fan-out
   count over both double-counts that read. The detail path also stops at
@@ -955,6 +979,28 @@ three habits keep a walk over it honest:
   counts by its kind; an inout bus with N modules on it genuinely has N
   potential drivers, and the schema reports exactly that — the resolution
   of who wins is simulation, not structure.
+
+## Tracing across calls
+
+A task or function called twice is two call sites sharing one set of formal
+nets. A fan-in cone that treats those formals as ordinary nets mixes the
+two calls — it reaches a formal, then *both* callers' arguments, admitting
+`g1` (call 1's gating) with call 2's argument, a path no execution takes.
+
+`call_site_id` breaks the mixing without materialising per-site nets. Every
+`stmt` and `net_dep` a body walk produced carries the site it belongs to;
+`v_call_site` names each site's caller statement, subroutine and depth, and
+chains nested calls through `parent_call_site_id`. The recipe: when a
+recursive trace reaches a dependency that carries a `call_site_id`, follow
+only rows of that same site (module-level rows, `call_site_id` NULL, always
+pass). One call's cone then holds that call's real combination and no
+other's — `{g1, a}` and `{g2, b}`, never `{g1, b}`. This is context
+sensitivity by call string, the shape static analysis calls *k*-CFA, done
+at query time over tags rather than baked into the stored graph.
+
+What it does not do: give each site its own formal *net*. The shared net is
+still one row; the tags are what let a careful consumer tell the two calls
+apart. A consumer that ignores `call_site_id` sees exactly the v12 graph.
 
 ## Reading it honestly
 

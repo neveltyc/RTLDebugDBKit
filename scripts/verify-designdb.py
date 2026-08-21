@@ -6,7 +6,7 @@
 # build that links proves the slang pin resolves; this proves the exporter
 # still writes rows -- and that the rows keep every contract the schema
 # documents: the subtype bijections, the ownership rules, the provenance
-# matrix behind net_dep, the range discipline, and the thirteen stable views
+# matrix behind net_dep, the range discipline, and the fourteen stable views
 # with their exact columns and row formulas. CI runs it against examples/ on
 # every platform binary it builds, so the mode branches assert only what
 # those small designs must produce, not exact counts.
@@ -24,7 +24,7 @@ import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias", "external", "package")
+         "unresolved", "xmr", "alias", "external", "package", "callsite")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
@@ -323,6 +323,43 @@ check(one("""
     JOIN stmt s ON s.id = t.stmt_id
     WHERE s.stmt_kind='release'""") == 0,
       "no dependency borrows a release's target")
+
+# ------------------------------------------------------------ call sites
+# A call site is a subroutine-body expansion, and the stmt/net_dep rows that
+# name it must sit in the same instance -- a body walked at a call site is
+# stamped into that occurrence, so its rows and the site share an inst.
+check(one("""
+    SELECT count(*) FROM stmt s JOIN call_site cs ON cs.id = s.call_site_id
+    WHERE s.inst_id != cs.inst_id""") == 0,
+      "a statement's call site is in its own instance")
+check(one("""
+    SELECT count(*) FROM net_dep d JOIN call_site cs ON cs.id = d.call_site_id
+    JOIN stmt s ON s.id = d.stmt_id
+    WHERE s.inst_id != cs.inst_id""") == 0,
+      "a dependency's call site is in its statement's instance")
+# A dependency that names a call site was made walking a subroutine body, so
+# it names the statement it came from -- there is no call site without one.
+check(one("""
+    SELECT count(*) FROM net_dep
+    WHERE call_site_id IS NOT NULL AND stmt_id IS NULL""") == 0,
+      "a dependency in a call carries its statement")
+# The parent chain is a proper call string: a nested call sits one level
+# deeper than its parent and in the same instance, and an outermost call is
+# depth 1. Depth strictly decreasing toward the parent makes it acyclic.
+check(one("""
+    SELECT count(*) FROM call_site cs
+    WHERE (cs.parent_call_site_id IS NULL) != (cs.depth = 1)""") == 0,
+      "an outermost call site is exactly depth 1")
+check(one("""
+    SELECT count(*) FROM call_site cs JOIN call_site p
+      ON p.id = cs.parent_call_site_id
+    WHERE cs.depth != p.depth + 1 OR cs.inst_id != p.inst_id""") == 0,
+      "a nested call site is one level below its parent, same instance")
+# The caller statement, when named, is a real statement of that instance.
+check(one("""
+    SELECT count(*) FROM call_site cs JOIN stmt s ON s.id = cs.caller_stmt_id
+    WHERE s.inst_id != cs.inst_id""") == 0,
+      "the caller statement belongs to the call site's instance")
 # One direction only: a continuous assignment is never inside a procedure,
 # but a procedure-less blocking/nonblocking row is legal -- a function body
 # reached from an `assign` keeps its own `=`, and executes in no procedure.
@@ -615,7 +652,7 @@ for k in ("error_count", "unresolved_count", "empty_procedure_count",
 print("ok: v_db_info agrees with meta and casts its counts")
 
 # --------------------------------------------------------- view contract
-# The thirteen stable views: existence, exact columns in exact order, and row
+# The fourteen stable views: existence, exact columns in exact order, and row
 # formulas. v_conn_arc is scaffolding, not contract, and is deliberately
 # absent from this list.
 VIEW_COLUMNS = {
@@ -657,21 +694,21 @@ VIEW_COLUMNS = {
         "tgt_exact", "stmt_id", "assign_operand_id",
         "stmt_target_id", "expr_ref_id", "prim_id",
         "src_hier_ref_id", "tgt_hier_ref_id",
-        "dep_kind", "map_exact", "file_path", "src_path",
+        "dep_kind", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
     "v_driver": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
         "signal_hi", "signal_exact", "driver_net_id", "driver_inst_id",
         "driver_name", "driver_lo", "driver_hi", "driver_exact",
         "driver_kind", "dep_id", "conn_id", "stmt_id",
-        "prim_id", "term_id", "map_exact", "file_path",
+        "prim_id", "term_id", "map_exact", "call_site_id", "file_path",
         "src_path", "src_line", "src_col"],
     "v_load": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
         "signal_hi", "signal_exact", "load_net_id", "load_inst_id",
         "load_name", "load_lo", "load_hi", "load_exact", "load_kind",
         "dep_id", "conn_id", "stmt_id", "proc_id",
-        "term_id", "map_exact", "file_path", "src_path",
+        "term_id", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
     "v_stmt": [
         "stmt_id", "inst_id", "module_id", "module_name",
@@ -690,6 +727,9 @@ VIEW_COLUMNS = {
         "lo", "hi", "exact", "stmt_id",
         "term_id", "stmt_target_id", "assign_operand_id", "expr_ref_id",
         "proc_id", "dep_id", "hier_ref_id"],
+    "v_call_site": [
+        "call_site_id", "inst_id", "module_id", "module_name",
+        "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
 }
 for view, want in VIEW_COLUMNS.items():
     row = con.execute(
@@ -701,7 +741,7 @@ for view, want in VIEW_COLUMNS.items():
     if got != want:
         sys.exit(f"{view} columns diverge from the contract:\n"
                  f"  want {want}\n  got  {got}")
-print("ok: the thirteen stable views exist with their contracted columns")
+print("ok: the fourteen stable views exist with their contracted columns")
 
 # Fact views: one view row is one base row.
 for view, base in (
@@ -710,6 +750,7 @@ for view, base in (
     ("v_net_dep", "net_dep"), ("v_stmt", "stmt"),
     ("v_stmt_target", "stmt_target"),
     ("v_stmt_operand", "assign_operand"),
+    ("v_call_site", "call_site"),
 ):
     nv = one(f'SELECT count(*) FROM "{view}"')
     nb = one(f'SELECT count(*) FROM "{base}"')
@@ -944,7 +985,7 @@ if mode:
         WHERE src_file_id IS NULL""") == 0,
           "every file row joined to src_file")
     top = meta.get("top")
-    want_top = {"constructs": "constructs", "interfaces": "interfaces",
+    want_top = {"callsite": "callsite_top", "constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
                 "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
@@ -1668,6 +1709,44 @@ if mode == "external":
         SELECT count(*) FROM v_driver
         WHERE signal_name IN ('o','nib') AND driver_kind='constant'""") == 0,
           "and no upward source is misreported as a constant")
+
+if mode == "callsite":
+    # Two calls to one task, from two sites -- both bump, both outermost.
+    check(one("""SELECT count(*) FROM v_call_site
+                 WHERE subroutine_name='bump' AND depth=1""") == 2,
+          "the task is called from two call sites")
+    # Each call's argument binds to the shared formal under its OWN site.
+    check(one("""
+        SELECT count(DISTINCT call_site_id) FROM v_net_dep
+        WHERE tgt_name='bump.v' AND dep_kind='procedure'
+          AND src_name IN ('a','b')""") == 2,
+          "each argument binds the formal under its own call site")
+    # The body's write is walked once per site: bump.v -> r under both.
+    check(one("""
+        SELECT count(DISTINCT call_site_id) FROM v_net_dep
+        WHERE tgt_name='r' AND src_name='bump.v'""") == 2,
+          "the body write is stamped once per call site")
+
+    # The payoff, as a cone. Filtering r's fan-in to call site 1 (plus the
+    # site-less module-level rows) reaches a and g1 -- call 1's real
+    # combination -- and NEVER b or g2, the cross combination the shared
+    # formal would otherwise admit.
+    def cone(cs):
+        return set(r[0] for r in con.execute(f"""
+            WITH RECURSIVE c(n) AS (
+                SELECT tgt_net_id FROM net_dep
+                    WHERE tgt_net_id IN (SELECT net_id FROM v_net WHERE net_name='r')
+                      AND call_site_id = {cs}
+                UNION
+                SELECT d.src_net_id FROM c JOIN net_dep d ON d.tgt_net_id = c.n
+                    WHERE d.src_net_id IS NOT NULL
+                      AND (d.call_site_id = {cs} OR d.call_site_id IS NULL))
+            SELECT DISTINCT net_name FROM c JOIN v_net ON net_id = n""")) - {'r'}
+    c1, c2 = cone(1), cone(2)
+    check('a' in c1 and 'g1' in c1 and 'b' not in c1 and 'g2' not in c1,
+          "call site 1's cone is a and g1, never b or g2", f"got {sorted(c1)}")
+    check('b' in c2 and 'g2' in c2 and 'a' not in c2 and 'g1' not in c2,
+          "call site 2's cone is b and g2, never a or g1", f"got {sorted(c2)}")
 
 if mode == "package":
     # A package is a pseudo-occurrence now: node_kind='package', a matching
