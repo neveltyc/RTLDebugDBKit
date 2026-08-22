@@ -245,6 +245,13 @@ inline constexpr int SchemaVersion = 14;
 /// last_insert_rowid back per row. 0 in an id field spells "none" and is
 /// stored as NULL; real ids start at 1.
 ///
+/// `src_file` is the exception, and the only one: it is written straight
+/// through addSourceFile, so its ids are SQLite's and its insert order is its
+/// id order. main.cpp interns those rows in path order for exactly that
+/// reason -- slang returns the buffers in the order its source loader
+/// finished reading files, which is a thread pool's completion order, and an
+/// id that follows it makes two exports of an unchanged design differ.
+///
 /// Ranges use one encoding everywhere, unchanged from v7: a range is
 /// LSB-relative offsets into the flattened object (not declared indices), an
 /// absent range with exact=true is the whole object, an absent range with
