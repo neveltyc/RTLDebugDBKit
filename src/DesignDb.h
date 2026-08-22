@@ -401,6 +401,15 @@ namespace designdb {
 /// call writing its output actual. Nothing that was `written_by` stops being
 /// it; a v15 reader that enumerated the causes rather than the value is the one
 /// this concerns.
+///
+/// The OUTPUT actual of a call inside a control expression stops being a
+/// `control` source of what that expression gates. `control` has always meant
+/// "reaches the target through a branch condition", and `if (chk(a, y))` never
+/// read y -- the call writes it. No column, view or granularity moves, so the
+/// version does not: the rows that violated the documented meaning are gone,
+/// along with the `expr_ref` per gated statement that claimed the same read.
+/// The write is untouched. `inout` and `ref` actuals are read as well as
+/// written and still gate, as do a written actual's selectors.
 inline constexpr int SchemaVersion = 16;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
