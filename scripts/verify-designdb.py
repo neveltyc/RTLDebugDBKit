@@ -25,17 +25,19 @@
 #   verify-designdb.py <design.db> rootref      + examples/constructs/rootref.sv facts
 #   verify-designdb.py <design.db> typeparam    + examples/constructs/typeparam.sv facts
 #   verify-designdb.py <design.db> concatcursor + examples/constructs/concatcursor.sv facts
+#   verify-designdb.py <design.db> naming       + examples/constructs/naming.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "anonymous", "xmr", "alias", "external", "package",
          "callsite", "recursion", "rootref", "typeparam", "concatcursor",
+         "naming",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
          "paramfold", "portshape", "compound", "macroloc", "stmtgaps",
-         "patterncase", "outward", "naming", "aliascat")
+         "patterncase", "outward", "aliascat")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
@@ -1646,6 +1648,27 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dep
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "naming":
+    # Every leaf comes through leafSegment, so an escaped name keeps slang's
+    # own `\name ` spelling and an array element carries its SOURCE index --
+    # for a gate exactly as for a module instantiation, since the two are one
+    # symbol base. A gate used to take its name raw, which lost both.
+    for kind, names in (("instance", ("\\u.1 ", "\\u[2] ", "u[0]", "u[1]")),
+                        ("primitive", ("\\g.1 ", "\\g[2] ", "p[0]", "p[1]"))):
+        for name in names:
+            check(one("""
+                SELECT count(*) FROM tree_node t JOIN tree_node par
+                  ON par.id = t.parent_node_id
+                WHERE par.name = 'naming' AND t.node_kind = ?
+                  AND t.name = ?""", kind, name) == 1,
+                  f"the {kind} leaf {name!r} is spelled as written")
+    # The point of the index suffix: two elements of one array are two
+    # siblings, and the bare array name is not a leaf.
+    check(one("""
+        SELECT count(*) FROM tree_node
+        WHERE name IN ('u', 'p')""") == 0,
+          "and no node answers to the bare name of an array")
 
 if mode == "anonymous":
     # An instantiation with no instance name is named after its definition,
