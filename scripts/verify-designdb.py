@@ -511,7 +511,12 @@ check(one("""
                   -- stmt_target row beside it is what says the statement
                   -- writes the actual, and the two are one fact: neither may
                   -- stand without the other.
-                  THEN d.stmt_id IS NULL OR d.stmt_target_id IS NULL
+                  -- The target row is a position within a statement, so a
+                  -- call in a CONDITION -- which belongs to no statement
+                  -- this schema records -- has the dependency and no target
+                  -- row. The two travel together wherever there is a
+                  -- statement at all.
+                  THEN (d.stmt_id IS NULL) IS NOT (d.stmt_target_id IS NULL)
                        OR d.expr_ref_id IS NOT NULL
                        OR d.tgt_hier_ref_id IS NOT NULL
                        OR d.map_exact IS NOT NULL
@@ -1748,6 +1753,18 @@ if mode == "outward":
               ON d.signal_net_id = t.net_id AND d.stmt_id = t.stmt_id
             WHERE t.net_name = ? AND t.target_kind = 'written_by'""", net) == 1,
               f"and the two views agree that that statement writes {net}")
+    # And the same write from a condition, which has no statement to be a
+    # position within -- so the dependency stands alone, and the fact that
+    # `condb` is written survives even though nothing can say where.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'condb' AND driver_kind = 'procedure'
+          AND driver_net_id IS NULL AND stmt_id IS NULL""") == 1,
+          "a call in a condition drives its actual with no statement to name")
+    check(one("""
+        SELECT count(*) FROM v_stmt_target WHERE net_name = 'condb'""") == 0,
+          "and takes no target row, a target being a place in a statement")
+
     # `setit` is the one with nothing to read: its statement has no reference
     # of any kind, so the write-back is the only thing holding the target up.
     check(one("""

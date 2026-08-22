@@ -1,6 +1,8 @@
 // Copyright (c) 2026 neveltyc
 // released under the BSD 3-Clause License (see LICENSE)
 //
+// check-rtl: expect-fail icarus -- no output arguments on a function
+//
 // References that leave the instance and had no path to be stored under.
 //
 // A reference only got a hier_ref row if its recovered text contained a '.'
@@ -33,6 +35,14 @@
 // has an unresolved read on it -- and the invariant that every target has a
 // dependency was satisfied by that read rather than by the write-back. With
 // no argument to read, nothing stands in.
+//
+// `chk` is the same write from a CONDITION, which belongs to no statement this
+// schema records. There is no stmt_target to hang it on -- a target is a
+// position within a statement -- so the dependency goes out on its own, with
+// no source, no statement and no target row: "something writes this, and the
+// database cannot say what or where". That is the answer the null-source
+// discipline is for, and it beats the one this used to give, which was that
+// nothing wrote it at all.
 
 `define TOPNAME outward_tb
 
@@ -43,13 +53,18 @@ package outward_pkg;
     task automatic setit(output logic [7:0] o);
         o = 8'hA5;
     endtask
+    function automatic bit chk(input logic [7:0] a, output logic [7:0] o);
+        o = a ^ 8'h0F;
+        return |a;
+    endfunction
 endpackage
 
 logic       unit_en;         // $unit scope: bare names, no separator
 logic [7:0] unit_cfg;
 
 module outward_leaf (input logic clk, output logic [7:0] q, gated, taken,
-                     output logic [7:0] setb);
+                     output logic [7:0] setb, output logic [7:0] condb,
+                     output logic hit);
     import outward_pkg::*;
     always_ff @(posedge clk)
         q <= `TOPNAME.glob;              // macro-built upward reference
@@ -57,12 +72,18 @@ module outward_leaf (input logic clk, output logic [7:0] q, gated, taken,
         if (unit_en) gated <= unit_cfg;  // both the read AND the gating
     always_comb bump(unit_cfg, taken);   // package task: formal is outward
     always_comb setit(setb);             // the same, with nothing read
+    always_comb begin                    // and the same from a condition
+        hit = 1'b0;
+        if (chk(unit_cfg, condb))
+            hit = 1'b1;
+    end
 endmodule
 
 module outward_tb;
     logic clk;
     logic [7:0] glob;
-    logic [7:0] q, gated, taken, setb;
+    logic [7:0] q, gated, taken, setb, condb;
+    logic hit;
     outward_leaf u (.clk(clk), .q(q), .gated(gated), .taken(taken),
-                    .setb(setb));
+                    .setb(setb), .condb(condb), .hit(hit));
 endmodule
