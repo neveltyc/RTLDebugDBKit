@@ -80,9 +80,20 @@ struct Where {
 inline Where whereOf(SourceLocation loc, const SourceManager& sm) {
     if (!loc)
         return {};
-    return Where{std::string(sm.getFileName(loc)),
-                 static_cast<uint32_t>(sm.getLineNumber(loc)),
-                 static_cast<uint32_t>(sm.getColumnNumber(loc))};
+    // Expanded once, here, so all three come from the same place.
+    //
+    // getFileName and getLineNumber expand internally; getColumnNumber does
+    // not -- slang states the precondition on it, "location must be a file
+    // location", and for a macro location the buffer holds an ExpansionInfo,
+    // so it finds no FileInfo and returns 0. Passing the raw location gave the
+    // file and line of the expansion site and a column of 0, which is not a
+    // column in any 1-based numbering, and broke the one rule this struct
+    // exists to keep. getFullyExpandedLoc is idempotent, so the two that
+    // already expand are unaffected and keep their `line-directive handling.
+    const SourceLocation at = sm.getFullyExpandedLoc(loc);
+    return Where{std::string(sm.getFileName(at)),
+                 static_cast<uint32_t>(sm.getLineNumber(at)),
+                 static_cast<uint32_t>(sm.getColumnNumber(at))};
 }
 
 /// The canonical text of a reference that leaves its instance: the path as

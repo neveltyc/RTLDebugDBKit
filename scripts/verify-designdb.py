@@ -229,6 +229,18 @@ for tbl in ("net", "proc", "stmt"):
           f"{tbl}.scope_node_id lies inside its own instance")
 check(one("SELECT count(*) FROM tree_node WHERE instr(name, '.') > 0") == 0,
       "every tree node name is a single path segment")
+# A location is a file, a line and a column, and they come from one place or
+# they are not a location. Lines and columns are 1-based, so 0 in either is not
+# a position -- it is a call that failed and was stored anyway. This is how a
+# macro location used to arrive: slang's getFileName and getLineNumber expand
+# internally, getColumnNumber does not and returns 0 off a file location it was
+# never given, so the row named the expansion site's file and line at column
+# nothing. Every fixture passed, because nothing looked.
+for tbl in ("module", "inst", "prim", "net", "term", "proc", "stmt",
+            "net_conn", "proc_event", "hier_ref"):
+    check(one(f"""SELECT count(*) FROM "{tbl}"
+                  WHERE file_id IS NOT NULL AND (line < 1 OR col < 1)""") == 0,
+          f"{tbl} positions are 1-based where a file is named")
 # Siblings sharing (parent, name) are exactly what duplicate_path_count
 # admits to: the exporter counts every node after the first in a group,
 # so the tree must show sum(n - 1) collisions -- no more, no fewer. A
