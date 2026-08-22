@@ -129,6 +129,12 @@ private:
         std::vector<int32_t> curControlRefs;   // control expr_refs of curStmt
         std::vector<int32_t> curControlHrefs;  // outward conditions, as hierRefs
         std::vector<Ref> curControlSrcs;
+        /// Next ordinal for a synthesised `$def$n` segment, per scope index.
+        /// One counter for anonymous gates and unnamed instantiations alike:
+        /// they are siblings in the tree, and one sequence per scope makes
+        /// them unique without an argument about whether a primitive and a
+        /// module definition could ever answer to one name.
+        std::unordered_map<int32_t, int> anonSeq;
         /// Subroutine-body instantiations left for this module, and the
         /// call sites skipped once they ran out. See handle(CallExpression)
         /// for why per-call-site expansion needs a ceiling at all.
@@ -319,6 +325,12 @@ private:
     void registerChildren(Build& b, const Scope& scope, int32_t scopeIdx,
                           std::unordered_map<const Symbol*, int32_t>& childOf,
                           std::vector<const Symbol*>& childSyms);
+
+    /// The tree segment for an instantiation written without an instance
+    /// name: `$def$n`, '$'-prefixed so it cannot collide with an identifier
+    /// the source could have written, and counted per scope so siblings
+    /// differ. Same shape and same counter as an anonymous gate's.
+    std::string anonSegment(Build& b, int32_t scopeIdx, std::string_view defName);
 
     /// One resolved child's connection templates: the outside of each of its
     /// terminals, as written here in the parent.

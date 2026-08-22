@@ -18,13 +18,15 @@
 #   verify-designdb.py <design.db> hierarchy    + examples/constructs/hierarchy.sv facts
 #   verify-designdb.py <design.db> udp          + examples/constructs/udp.sv facts
 #   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
+#   verify-designdb.py <design.db> anonymous    + examples/constructs/anonymous.sv facts
 #   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
 #   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias", "external", "package", "callsite",
+         "unresolved", "anonymous", "xmr", "alias", "external", "package",
+         "callsite",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -36,7 +38,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "15"
 
 
 def one(sql, *args):
@@ -1045,7 +1047,8 @@ if mode:
     top = meta.get("top")
     want_top = {"callsite": "callsite_top", "constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
-                "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
+                "udp": "udps", "unresolved": "unresolved",
+                "anonymous": "anonymous", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
                 "package": "package_top",
                 "paramfold": "paramfold", "portshape": "portshape",
@@ -1498,6 +1501,72 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dep
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "anonymous":
+    # An instantiation with no instance name is named after its definition,
+    # not after the instance holding it: `$def$n`, '$'-prefixed because no
+    # identifier the source could write starts that way, and counted per
+    # scope because siblings are what a name has to separate.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE t.name = p.name""") == 0,
+          "no node takes the name of the node above it")
+    check(one("""
+        SELECT count(*) FROM (SELECT parent_node_id, name, count(*) c
+                              FROM tree_node GROUP BY parent_node_id, name
+                              HAVING c > 1)""") == 0,
+          "and no two siblings share a name")
+    check(int(meta["duplicate_path_count"]) == 0,
+          "so the design reports no duplicate paths")
+    # The names are synthesised, the diagnostics are not: an unnamed module
+    # instantiation is still an elaboration error, and the export still says
+    # the design did not fully compile.
+    check(status == "partial",
+          "and the export still reports what slang rejected")
+    # The two in the top body, and the one inside anon_mid.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
+        JOIN module m ON m.id = i.module_id
+        WHERE t.node_kind='instance' AND m.name='anon_leaf'
+          AND t.name LIKE '$anon_leaf$%'""") == 5,
+          "every unnamed instantiation is named from its definition")
+    # A gate and an instantiation in one scope draw from ONE counter, so
+    # the numbering is a single sequence per scope. Two counters could only
+    # collide if a primitive and a module definition shared a name, which
+    # the language does not allow -- one sequence means not having to say
+    # so.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE p.name='anonymous' AND t.name IN
+              ('$buf$0', '$anon_leaf$1', '$anon_leaf$2', '$anon_ghost$3')
+        """) == 4,
+          "the gate and the instantiations beside it number consecutively")
+    # Per scope, not per instance: each generate element restarts at 0, and
+    # the two are siblings of nothing.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE p.node_kind='generate' AND p.name IN ('g[0]', 'g[1]')
+          AND t.name='$anon_leaf$0'""") == 2,
+          "a generate level counts its own children")
+    # An unnamed instantiation of a definition that is missing too: the
+    # black box keeps both its synthesised segment and its definition name.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
+        WHERE t.node_kind='unresolved' AND t.name='$anon_ghost$3'
+          AND i.unresolved_def='anon_ghost'""") == 1,
+          "an unnamed black box keeps the definition it wanted")
+    # The names are segments like any other, so the tree still walks:
+    # anonymous.u_mid.$anon_leaf$0 is three (parent_node_id, name) lookups.
+    check(one("""
+        SELECT count(*) FROM tree_node t
+        JOIN tree_node p ON p.id = t.parent_node_id
+        JOIN tree_node g ON g.id = p.parent_node_id
+        WHERE g.name='anonymous' AND p.name='u_mid'
+          AND t.name='$anon_leaf$0'""") == 1,
+          "and a path resolves through one segment per level")
 
 if mode == "xmr":
     # A downward read is a real dependency naming the reference it went
