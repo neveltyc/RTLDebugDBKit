@@ -235,7 +235,29 @@ namespace designdb {
 ///
 /// One export that used to fail now succeeds: two unnamed ports in one module
 /// collided on a synthesized name and aborted on a UNIQUE constraint.
-inline constexpr int SchemaVersion = 14;
+///
+/// v15 corrects one more value, and moves the version for v14's reason. An
+/// instantiation written without an instance name no longer answers to the
+/// name of the instance holding it. slang leaves such a symbol's name empty
+/// and a hierarchical path built from an empty name ends at the PARENT, so
+/// the last segment WAS the parent's -- the defect v14 fixed for anonymous
+/// gates and left standing for instantiations, because inventing a name for
+/// one was a separate decision. It is decided here: the synthesised `$def$n`
+/// segment now covers module instantiations and unresolved definitions as
+/// well, and all three kinds draw from one counter per scope, so a gate and
+/// an instantiation beside it cannot be handed one name twice.
+///
+/// A module instance name is mandatory, which makes this look like a case
+/// that cannot arise. It arises whenever a macro supplies the name and does
+/// not expand: veerwolf compiled without `TEC_RV_ICG has 302 such nodes, 32
+/// instances and 270 black boxes, every one of them carrying its parent's
+/// name. Two in one scope collided outright -- duplicate_path_count counted
+/// a collision the design does not have, and (parent_node_id, name) answered
+/// with two nodes. One alone was quieter and no better: `free_cg` under
+/// `free_cg` is one name twice, one level apart, and nothing in the source
+/// spells the second. `tree_node.name` is the only column that changes; the
+/// row counts of every table are what they were.
+inline constexpr int SchemaVersion = 15;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row

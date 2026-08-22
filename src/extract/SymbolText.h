@@ -382,6 +382,8 @@ inline std::string generateSegment(const GenerateBlockSymbol& block) {
 /// slang's array-element index already rendered in source numbering
 /// (`u[0]`) -- the one spelling a tree node's name must use, since an
 /// instance-array element's own `name` is the bare `u`.
+///
+/// Empty when the symbol has no name of its own; the caller synthesises one.
 inline std::string leafSegment(const Symbol& sym) {
     // Built from the symbol, not by splitting its path on the last '.'.
     // slang escapes a name that is not a plain identifier as `\name ` --
@@ -425,11 +427,28 @@ inline std::string leafSegment(const Symbol& sym) {
             sc = owner.getParentScope();
         }
     }
-    std::string out;
-    if (!base.empty()) {
-        out = needsEscaping(base) ? "\\" + std::string(base) + " "
-                                  : std::string(base);
+    if (base.empty()) {
+        // An instantiation with no name of its own: legal for a gate or a
+        // UDP, and what a module instantiation degrades to when the name
+        // came from a macro that did not expand. slang leaves the name
+        // empty and the hierarchical path then ends at the PARENT, so
+        // taking the last segment named the child after the instance
+        // holding it -- every such child answered to its parent's name,
+        // two of them in one scope answered to each other's, and
+        // (parent_node_id, name) stopped being a lookup.
+        //
+        // Nothing here can do better: a segment that is unique among
+        // siblings needs to know the siblings, which only the caller
+        // building them does. Empty says one must be synthesised.
+        //
+        // The array suffix goes with it. `arrayPath` indexes an array that
+        // has no name either, so a bare `[0]` is no more of a segment than
+        // the empty string is -- and two unnamed arrays of one shape in a
+        // scope would spell their elements identically.
+        return {};
     }
+    std::string out = needsEscaping(base) ? "\\" + std::string(base) + " "
+                                          : std::string(base);
     if (sym.kind == SymbolKind::Instance || sym.kind == SymbolKind::CheckerInstance) {
         auto& inst = sym.as<InstanceSymbolBase>();
         if (!inst.arrayPath.empty()) {
@@ -441,17 +460,6 @@ inline std::string leafSegment(const Symbol& sym) {
                                                 dims[i].lower()) + "]";
             }
         }
-    }
-    if (out.empty()) {
-        // An instantiation with no name of its own -- slang leaves the name
-        // empty and the path then ends at the PARENT, so the last segment is
-        // the parent's name. That is what this has always returned for such a
-        // symbol, and it is left alone here: the path split is only wrong for
-        // an escaped name, which the branch above now handles, and inventing a
-        // name for an unnamed instantiation is a separate decision.
-        std::string full = sym.getHierarchicalPath();
-        const size_t dot = full.rfind('.');
-        return dot == std::string::npos ? full : full.substr(dot + 1);
     }
     return out;
 }
