@@ -235,7 +235,41 @@ namespace designdb {
 ///
 /// One export that used to fail now succeeds: two unnamed ports in one module
 /// collided on a synthesized name and aborted on a UNIQUE constraint.
-inline constexpr int SchemaVersion = 14;
+/// v15 moves for one field pair and one reason: `hier_ref.resolved_inst_id`
+/// and `resolved_net_id` are no longer NULL for a path anchored at `$root`,
+/// and a v14 consumer read that NULL as "this reference cannot be resolved
+/// per occurrence" -- a statement about the reference rather than about the
+/// exporter.
+///
+/// An absolute path names one object, seen from any occurrence of the body
+/// that spells it, which is exactly the property that makes replay sound;
+/// the resolution machinery for it existed on both ends and was cut off in
+/// the middle. slang's HierarchicalReference::isUpward() is
+/// `upwardCount > 0 || path[0] is Root`, and the exporter tested it whole,
+/// so `$root.a.b.c` was dropped alongside the upward names it has nothing in
+/// common with. Both ends of a dependency through such a reference move
+/// with it: a `$root` READ was a `net_dep` with no source net that
+/// `v_driver` reported as `external`, and a `$root` WRITE could not be
+/// materialised at all -- the target net had no driver row of any kind, so a
+/// trace back from it said the design never wrote it. Both now carry the
+/// resolved net, like any downward reference.
+///
+/// Upward references are unchanged and still NULL, for the reason they
+/// always were: one analysed body cannot answer for surroundings that differ
+/// per occurrence.
+///
+/// Riding along, neither of them a contract change. `analysis_status` no
+/// longer tests slang's analysed-scope count, which could not be zero unless
+/// the compilation was fatally errored -- the branch beside it -- and
+/// `hierarchy_only` therefore has one cause rather than the two it named. It
+/// gains a `partial` disjunct in its place, for an occurrence stamped from a
+/// module body the analysis never reached; that is a guard against slang's
+/// descent and the template walk drifting apart, unreachable while they
+/// agree, and it fires on no design measured here. And the concatenation
+/// cursor walk in Ref.h gained the wider-than-remaining guard its twin in
+/// StatementWalker.h already had, so the two agree about when an operand
+/// walk stops meaning anything.
+inline constexpr int SchemaVersion = 15;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
