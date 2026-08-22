@@ -148,14 +148,24 @@ void TemplateBuilder::registerChildren(Build& b, const Scope& scope, int32_t sco
         switch (member.kind) {
             case SymbolKind::Instance: {
                 auto& inst = member.as<InstanceSymbol>();
+                auto& cbody = inst.getCanonicalBody() ? *inst.getCanonicalBody()
+                                                      : inst.body;
                 TplChild c;
                 c.scope = scopeIdx;
                 c.name = leafSegment(inst);
-                if (c.name.empty())
-                    c.name = "<unnamed>";
+                // The LRM makes an instance name mandatory for a module,
+                // so an unnamed one is a fragment of a line that did not
+                // survive: veerwolf's `\`TEC_RV_ICG rvclkhdr (.*)` with the
+                // macro undefined leaves `rvclkhdr (.*)`, an instantiation
+                // of rvclkhdr with no name at all. It still elaborates and
+                // still has to be reachable, so it gets a segment of its
+                // own rather than its parent's name.
+                if (c.name.empty()) {
+                    c.name = anonSegment(b, scopeIdx,
+                                         cbody.getDefinition().name);
+                    stats.anonymous++;
+                }
                 c.kind = TplChild::Module;
-                auto& cbody = inst.getCanonicalBody() ? *inst.getCanonicalBody()
-                                                      : inst.body;
                 c.groupKey = groupKey(cbody);
                 c.loc = locator.locate(inst.location);
                 childOf.emplace(&inst, int32_t(b.t->children.size()));
@@ -168,8 +178,13 @@ void TemplateBuilder::registerChildren(Build& b, const Scope& scope, int32_t sco
                 TplChild c;
                 c.scope = scopeIdx;
                 c.name = leafSegment(u);
-                if (c.name.empty())
-                    c.name = "<unnamed>";
+                // Legitimately nameless here as well as accidentally: an
+                // unnamed UDP instance whose primitive this compilation
+                // has no source for arrives as one of these.
+                if (c.name.empty()) {
+                    c.name = anonSegment(b, scopeIdx, u.definitionName);
+                    stats.anonymous++;
+                }
                 c.kind = TplChild::Unresolved;
                 c.defName = std::string(u.definitionName);
                 c.loc = locator.locate(u.location);

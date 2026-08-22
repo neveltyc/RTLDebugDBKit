@@ -669,6 +669,14 @@ void reportStats(const Options& opt, const designdb::Stats& stats) {
                      "be resolved; recorded as unresolved tree nodes\n",
                      (long long)stats.unresolved);
     }
+    if (stats.anonymous) {
+        std::fprintf(stderr,
+                     "note: %lld instantiation(s) carry no instance name; "
+                     "each holds a synthesised $def$n path segment rather "
+                     "than its parent's name. A module instantiation must be "
+                     "named, so a macro may not have expanded\n",
+                     (long long)stats.anonymous);
+    }
     if (stats.external) {
         std::fprintf(stderr,
                      "note: %lld reference(s) to symbols outside their own "
