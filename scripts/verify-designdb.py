@@ -1171,11 +1171,20 @@ check(one("""
 # deriving the outer end of a crossing with COALESCE over two tables left
 # the value attributable to neither, so neither table's index could be
 # used, and tracing a clock took minutes.
+#
+# The call-site columns are here for the same reason and are not about a net:
+# the contract offers them as a LOOKUP -- "which rows belong to this call" --
+# and a walk that does it per hop pays a scan per hop without an index behind
+# each one.
 for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
                   ("v_net_dep", "tgt_net_id"),
                   ("v_net_conn", "outer_net_id"),
                   ("v_net_attachment", "net_id"),
-                  ("v_hier_ref", "resolved_net_id")):
+                  ("v_hier_ref", "resolved_net_id"),
+                  ("v_net_dep", "call_site_id"),
+                  ("v_stmt", "call_site_id"),
+                  ("v_stmt_target", "call_site_id"),
+                  ("v_stmt_operand", "call_site_id")):
     plan = con.execute(
         f"EXPLAIN QUERY PLAN SELECT * FROM {view} WHERE {col} = 1").fetchall()
     scanned = [r[3] for r in plan
@@ -1183,12 +1192,17 @@ for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
     check(not scanned, f"{view} seeks rather than scans for one {col}",
           "; ".join(scanned))
 
+# Every `file` spelling resolves to the `src_file` it was read from. This is
+# universal rather than mode-gated: CI passes no mode for examples/options,
+# which is its only fixture whose `file` table has more than one row and so
+# the only one where the join could come apart.
+check(one("""
+    SELECT count(*) FROM file
+    WHERE src_file_id IS NULL""") == 0,
+      "every file row joined to src_file")
+
 # ------------------------------------------------------ mode-gated checks
 if mode:
-    check(one("""
-        SELECT count(*) FROM file
-        WHERE src_file_id IS NULL""") == 0,
-          "every file row joined to src_file")
     top = meta.get("top")
     want_top = {"callsite": "callsite_top", "constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
