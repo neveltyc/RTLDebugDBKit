@@ -1207,9 +1207,9 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
         // names it with the actual's text and resolves it against the actual's
         // target. Both wrong, and quietly so.
         const int32_t actualIdx = b.decl->netFor(*actual.sym);
-        if (actualIdx < 0 || stmt < 0)
+        if (actualIdx < 0)
             return;
-        if (reads)
+        if (reads && stmt >= 0)
             addExprRef(b, stmt, actual, "call_argument", actualIdx);
         if (writes) {
             // The target row AND a source-less `procedure` dependency, which
@@ -1230,13 +1230,23 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
             // the honest answer and the one the vocabulary already has --
             // `data` is the kind that must not be used here, since a
             // source-less `data` row is what `constant` means.
-            TplStmtRef tr;
-            tr.stmt = stmt;
-            tr.ordinal = b.targetOrdinal++;
-            tr.net = actualIdx;
-            tr.r = rangeOf(actual);
-            const int32_t targetIdx = int32_t(b.t->targets.size());
-            b.t->targets.push_back(std::move(tr));
+            // A call written inside a CONDITION belongs to no statement this
+            // schema records, so there is no stmt_target to hang the write
+            // on -- stmt_target.stmt_id is NOT NULL, and rightly, since a
+            // target is a position within a statement. The dependency still
+            // goes out: `if (chk(a, y))` writes y, and without the row the
+            // database said nothing did, which is the answer this whole
+            // branch exists to stop giving.
+            int32_t targetIdx = -1;
+            if (stmt >= 0) {
+                TplStmtRef tr;
+                tr.stmt = stmt;
+                tr.ordinal = b.targetOrdinal++;
+                tr.net = actualIdx;
+                tr.r = rangeOf(actual);
+                targetIdx = int32_t(b.t->targets.size());
+                b.t->targets.push_back(std::move(tr));
+            }
             TplDep d;
             d.srcNet = -1;
             d.tgtNet = actualIdx;

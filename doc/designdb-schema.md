@@ -920,6 +920,14 @@ no dataflow, not that the hierarchy stops early.
   call's target) and the detail arcs through its formals, so a fan-out
   count over both double-counts that read. The detail path also stops at
   the function's return net, which has no arc onward to the target.
+* An OUTPUT actual of a function called inside a condition is also recorded
+  as a `control` source of whatever that condition gates. The condition's
+  operands are collected as one expression, before the call's argument
+  directions are known, so `if (chk(a, y))` reads `y` as gating even though
+  the call writes it and never reads it. The write itself is recorded (a
+  source-less `procedure` dependency, no statement); it is the extra
+  `control` edge that is wrong, and a walk that filters `dep_kind='control'`
+  by whether the same statement also writes the net can exclude it.
 * A macro-assembled reference spans two buffers and cannot be recovered as
   one span; it is counted (`meta` external tally), not stored.
 * Statements slang marks bad take their enclosing block out of the walk;
