@@ -56,11 +56,13 @@ struct Stats {
     /// unresolved tree nodes rather than dropped, and counted.
     int64_t unresolved = 0;
     /// Instantiations written without an instance name. Counted where the
-    /// template is built, like `unresolved`, so this counts spellings in the
-    /// source rather than the nodes they stamp -- veerwolf's two of them
-    /// stamp 302 nodes. Each gets a synthesised `$def$n` tree segment; the
-    /// count is reported because a module instantiation must be named, so a
-    /// non-zero one usually means a macro did not expand.
+    /// template is built, like `unresolved`, so this counts template children
+    /// rather than the nodes they stamp -- veerwolf's two of them stamp 302
+    /// nodes. Not quite source spellings either: a generate loop is unrolled
+    /// before the template walk sees it, so one spelling inside a four-
+    /// iteration loop counts four times. Each gets a synthesised `$def$n`
+    /// tree segment; the count is reported because a module instantiation
+    /// must be named, so a non-zero one usually means a macro did not expand.
     int64_t anonymous = 0;
     /// Procedures the analysis says drive something but from which nothing
     /// could be extracted -- normally a statement slang marked bad, which

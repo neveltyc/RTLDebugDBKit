@@ -300,7 +300,9 @@ namespace designdb {
 /// gains a `partial` disjunct in its place, for an occurrence stamped from a
 /// module body the analysis never reached; that is a guard against slang's
 /// descent and the template walk drifting apart, unreachable while they
-/// agree, and it fires on no design measured here. And the concatenation
+/// agree. The only fixture that reaches it is the recursive hierarchy, which
+/// slang rejects outright -- so `fatal` has already made it `hierarchy_only`
+/// and the disjunct chooses nothing there either. And the concatenation
 /// cursor walk in Ref.h gained the wider-than-remaining guard its twin in
 /// StatementWalker.h already had, so the two agree about when an operand
 /// walk stops meaning anything.
@@ -347,12 +349,13 @@ inline constexpr int SchemaVersion = 15;
 /// last_insert_rowid back per row. 0 in an id field spells "none" and is
 /// stored as NULL; real ids start at 1.
 ///
-/// `src_file` is the exception, and the only one: it is written straight
-/// through addSourceFile, so its ids are SQLite's and its insert order is its
-/// id order. main.cpp interns those rows in path order for exactly that
-/// reason -- slang returns the buffers in the order its source loader
-/// finished reading files, which is a thread pool's completion order, and an
-/// id that follows it makes two exports of an unchanged design differ.
+/// `src_file`, `file` and `data_type` are the exceptions: they are interned
+/// through SQLite, so their insert order is their id order. `src_file` is the
+/// one whose insert order is CHOSEN rather than incidental -- the other two
+/// follow the extraction walk, which is already fixed -- so main.cpp interns
+/// its rows in path order. slang returns the buffers in the order its source
+/// loader finished reading files, which is a thread pool's completion order,
+/// and an id that followed it made two exports of an unchanged design differ.
 ///
 /// Ranges use one encoding everywhere, unchanged from v7: a range is
 /// LSB-relative offsets into the flattened object (not declared indices), an
