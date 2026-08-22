@@ -1,28 +1,32 @@
 // Copyright (c) 2026 neveltyc
 // released under the BSD 3-Clause License (see LICENSE)
 //
-// Instantiations written without an instance name. NOT a check-rtl fixture:
-// the LRM makes the name mandatory for a module instantiation, so both lints
-// reject this file -- and that is the point. It is what a design elaborates
-// to when the name came from a macro that did not expand. veerwolf's clock
-// gating is written TEC_RV_ICG clkhdr (.*) and TEC_RV_ICG rvclkhdr (.*),
-// both behind a macro tick; compile it without the macro and those two lines
-// stamp 302 nodes with no instance name at all.
+// check-rtl: expect-fail verilator -- an instance name is mandatory (23.3.2)
+// check-rtl: expect-fail icarus -- an instance name is mandatory (23.3.2)
 //
-// slang leaves such a symbol's name empty, and a hierarchical path built
-// from an empty name ends at the PARENT -- so the last segment was the
-// parent's own name. Every one of these answered to the instance holding it,
-// two in one scope answered to each other, and (parent_node_id, name), the
-// only lookup the tree has, stopped identifying a node. Each gets a
-// synthesised $def$n segment instead: the same shape an anonymous gate gets,
-// from the same per-scope counter.
+// Instantiations written without an instance name. Both markers are declared
+// rather than the file being left unchecked: LRM 23.3.2 makes the name
+// mandatory, so every front end MUST reject this file, and one that starts
+// accepting it is reported as STALE.
+//
+// It is what a design elaborates to when the name came from a macro that did
+// not expand -- veerwolf's clock gating is `TEC_RV_ICG clkhdr (.*)` behind a
+// macro tick, and compiling it without the macro stamps 302 nodes with no
+// instance name at all.
+//
+// slang leaves such a symbol's name empty, and a hierarchical path built from
+// an empty name ends at the PARENT, so the last segment is the parent's own
+// name: every one of these answers to the instance holding it, two in one
+// scope answer to each other, and (parent_node_id, name) -- the only lookup
+// the tree has -- stops identifying a node. Each gets a synthesised $def$n
+// segment instead, from the same per-scope counter an anonymous gate uses.
 
 module anon_leaf(input logic a, output logic y);
     assign y = ~a;
 endmodule
 
-// One unnamed child, alone in its body: it used to be called `anon_mid`,
-// after the very instance it hangs under.
+// One unnamed child, alone in its body: taking the last segment of its path
+// names it `anon_mid`, after the very instance it hangs under.
 module anon_mid(input logic a, output logic y);
     anon_leaf (.a(a), .y(y));           // $anon_leaf$0
 endmodule

@@ -4,18 +4,14 @@
 // check-rtl: expect-fail verilator -- SV-2009 pattern matching not implemented
 // check-rtl: expect-fail icarus -- SV-2009 pattern matching not implemented
 //
-// `case … matches`, alone, because no open front end implements it.
+// LRM 12.6 -- `case … matches`, alone in a file because no open front end
+// implements it. slang accepts the construct, so the RTL is valid; the markers
+// name the tools that cannot confirm that, and go stale if either ever can.
 //
-// Both markers are declared rather than the file being left unchecked: slang
-// accepts the construct, so the RTL is valid, and saying which tools cannot
-// confirm that is the honest record. If either ever implements it, check-rtl
-// reports the marker as stale rather than silently keeping a waiver.
-//
-// The gap this pins: PatternCaseStatement had no handler, so it fell to
-// visitDefault -- which visits the condition, and the walker has no handler
-// for a bare value expression. Neither the gating nor even the read was
-// recorded, and `sel` had zero load rows in the entire database despite
-// selecting the branch.
+// Without its own handler PatternCaseStatement falls to visitDefault, which
+// visits the condition -- and the walker has no handler for a bare value
+// expression either. Neither the gating nor even the read survives, leaving
+// `sel` with zero load rows anywhere despite selecting the branch.
 
 module patterncase (input logic clk, input logic [3:0] sel,
                     input logic [7:0] x, output logic [7:0] q);

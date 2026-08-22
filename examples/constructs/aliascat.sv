@@ -4,17 +4,16 @@
 // check-rtl: expect-fail verilator -- concatenation alias operands unsupported
 // check-rtl: expect-fail icarus -- no alias support
 //
-// `alias {a, b} = c;` is legal (LRM 10.11) and was dropped whole.
+// LRM 10.11 -- `alias {a, b} = c;`, the alias shape that gets dropped whole.
+// A side that must yield exactly one reference cannot take it: getNetReferences
+// hands a concatenation back as one expression yielding several, so the
+// statement carries no dependency and a and b are aliased to nothing.
 //
-// A side had to yield exactly one reference, and getNetReferences hands a
-// concatenation back as one expression yielding several -- so the statement
-// carried no dependency at all and a and b were aliased to nothing.
-//
-// Each reference is its own side now, paired only against the OTHER written
-// side: a and b are different bits of c, not aliases of each other, so the
-// pairs are a<->c and b<->c and never a<->b. The mapping is coarse because
-// which bits of c each side meets is not tracked; a plain two-name alias keeps
-// its exact mapping.
+// Each reference is its own side, paired only against the OTHER written side.
+// a and b are different bits of c, not aliases of each other, so the pairs are
+// a<->c and b<->c and never a<->b. Which bits of c each side meets is not
+// tracked, so those mappings are coarse; the two-name alias beside them is the
+// control that keeps an exact one.
 
 module aliascat (input logic [3:0] ia, ib);
     wire [3:0] a, b;

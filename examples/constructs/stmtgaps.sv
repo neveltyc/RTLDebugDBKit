@@ -1,26 +1,27 @@
 // Copyright (c) 2026 neveltyc
 // released under the BSD 3-Clause License (see LICENSE)
 //
-// Statement forms the walker had no handler for, and one it mis-scoped.
+// LRM 12 procedural statements and LRM 13.4 return -- the forms whose walk is
+// not the obvious one, each paired with the spelling it must agree with.
 //
-//   * `return e;` writes the subroutine's implicit result variable, and slang
-//     does not synthesise that assignment -- the target is
-//     SubroutineSymbol::returnValVar. With no handler the whole body recorded
-//     nothing, so `ret_style` and `assign_style` disagreed although they
+//   * `return e;` writes the subroutine's implicit result variable, which
+//     slang does not synthesise as an assignment: the target is
+//     SubroutineSymbol::returnValVar. Reached any other way the body records
+//     nothing, and `ret_style` disagrees with `assign_style` although the two
 //     compute the same thing.
-//   * `do … while (c)` fell through to visitDefault, which visits the
-//     condition -- and there is no handler for a bare value expression, so
-//     neither the gating nor even the read was recorded. Its condition signal
-//     had zero load rows anywhere. (`case … matches` had the same gap and is
-//     covered by patterncase.sv, which no open front end can lint.)
-//   * a call in a loop condition was attributed to whatever statement preceded
-//     it, because the loop handlers walked their condition with call bindings
-//     still enabled while `if`/`case` did not.
-//   * `release` recorded no gating, so "what decides when the hijack ends"
-//     had no answer.
-//   * and a for-loop's INITIALISER was gated by the loop condition, which it
-//     does not run under -- it executes once, before the condition is ever
-//     evaluated.
+//   * `do … while (c)` falls to visitDefault without a handler of its own,
+//     and visitDefault visits the condition -- for which there is no bare
+//     value-expression handler either, so neither the gating nor even the read
+//     survives. (`case … matches` has the same gap and lives in
+//     patterncase.sv, which no open front end can lint.)
+//   * a call in a loop condition belongs to no statement, so a loop handler
+//     that walks its condition with call bindings still enabled attributes it
+//     to whatever statement precedes it -- which `if`/`case` do not do.
+//   * `release` drives nothing, so it carries no dependency for its gating to
+//     ride; the condition that ends the hijack has to be recorded as a
+//     reference on the release statement itself.
+//   * a for-loop's INITIALISER executes once, before the condition is ever
+//     evaluated, so it is not gated by it. The body is.
 
 module stmtgaps (input logic clk, input logic [7:0] x, k,
                  input logic [3:0] sel, input logic b, g,

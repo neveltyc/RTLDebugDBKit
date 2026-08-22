@@ -20,7 +20,8 @@ module udps(input logic d, input logic en, output wire q, output wire z,
     latch_p u_l (q, d, en);
     tranif1 u_t (a, b, en);
     // A resistive switch and a MOS switch: slang registers both as plain
-    // Fixed gates, so prim_kind='switch' used to miss them.
+    // Fixed gates, so keying prim_kind='switch' on its label alone misses
+    // them.
     rtran   u_r (ra, rb);
     nmos    u_n (m, d, en);
     buf     u_b (z, q);

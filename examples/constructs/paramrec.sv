@@ -9,10 +9,10 @@
 // are already one of its own ancestors'. Keyed on the module alone it would
 // cut here too, at the first level -- and a reduction tree, a recursive adder,
 // a Benes network are all written this way, so the false positive would land
-// on ordinary RTL and truncate a hierarchy nobody would think to check. That
+// on ordinary RTL and truncate a hierarchy no one would think to check. That
 // this file stamps whole is the assertion; the recursion fixture on its own
 // cannot make it, since everything in that file is fatally errored and nothing
-// below the cut would have been stamped for any reason.
+// below the cut would be stamped for any reason.
 //
 // Four levels: W=8 over two W=4 over four W=2 over eight W=1, so fifteen
 // `redtree` instances and eight leaves. Every level repeats the module and

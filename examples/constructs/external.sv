@@ -1,10 +1,11 @@
-// What still leaves the model after v13 taught packages to resolve: an
-// UPWARD hierarchical reference from a shared body. `tb_top.glob` climbs out
-// of up_leaf to the enclosing top and back down; the body is stamped for two
-// instances, so the one analysed body cannot speak for where each occurrence
-// actually sits, and the reference stays unresolved. The dependency is
-// written with a NULL source net and the reference on the source end;
-// v_driver reports driver_kind='external' -- not undriven, not a constant.
+// LRM 23.8 -- an UPWARD hierarchical reference from a shared body, which is
+// what still leaves the model once packages resolve. `tb_top.glob` climbs
+// out of up_leaf to the enclosing top and back down; the body is stamped for
+// two instances, so the one analysed body cannot speak for where each
+// occurrence actually sits, and the reference stays unresolved. The
+// dependency is written with a NULL source net and the reference on the
+// source end; v_driver reports driver_kind='external' -- not undriven, not a
+// constant.
 
 module up_leaf(output logic [7:0] o, output logic [3:0] nib,
                output logic [7:0] g);

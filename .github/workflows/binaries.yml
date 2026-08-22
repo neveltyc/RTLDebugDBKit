@@ -41,6 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Explicit rather than relying on the image: a missing ccache would make
+      # the cache below a silent no-op instead of a failure.
+      - name: Install ccache
+        if: runner.os == 'macOS'
+        run: brew list ccache >/dev/null 2>&1 || brew install ccache
+
       # slang is a large dependency and the pin is exact, so the key is the
       # CMakeLists that carries it: the cache is reused until the pin moves.
       # macOS only. The Linux builds run inside the script's Alpine container,
@@ -55,6 +61,19 @@ jobs:
           key: cpm-${{ matrix.target }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ matrix.target }}-
 
+      # Objects rather than sources, which is where the time goes. macOS only,
+      # for the same two reasons as above: the Linux compile happens inside a
+      # container this cache cannot reach, and MSVC is not a ccache target.
+      # CMake reads the launcher from the environment, so build-release.sh
+      # needs no argument for it.
+      - name: Cache ccache objects
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.target }}-
+
       # The Linux targets go through the script's docker path — the runner
       # itself stays glibc, because JavaScript actions cannot run in an
       # Alpine container on arm64 runners, and the build must not care what
@@ -65,33 +84,37 @@ jobs:
         run: |
           if [ "$RUNNER_OS" == "macOS" ]; then
             export CPM_SOURCE_CACHE="$HOME/.cache/CPM"
+            if command -v ccache >/dev/null; then
+              export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" CCACHE_MAXSIZE=500M
+              export CMAKE_C_COMPILER_LAUNCHER=ccache
+              export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            fi
           fi
           bash scripts/build-release.sh --target ${{ matrix.target }}
+          if [ "$RUNNER_OS" == "macOS" ] && command -v ccache >/dev/null; then
+            ccache --show-stats
+          fi
 
       # Every platform runs the binary it just built: export the example
       # designs and read the databases back. For the Linux pair this runs on
       # the bare glibc runner, so a dynamic dependency that crept into the
       # "static" binary fails here instead of on someone's farm.
       #
-      # `recursion` is here and not only in CI because its failure mode was a
-      # stack overflow, which is the one thing that is genuinely per-platform:
-      # glibc, musl and macOS do not give a thread the same stack. `paramrec`
-      # rides with it as the control -- a stack that runs out early would cut
-      # a legal hierarchy rather than crash, and only the control says so.
+      # The whole fixture set rather than a chosen few. An export costs tens of
+      # milliseconds, so the sweep is seconds per platform, and what it covers
+      # is exactly what a second platform can differ about: `recursion` walks
+      # until a thread's stack runs out and glibc, musl and macOS do not give a
+      # thread the same stack, while every fixture carries file paths, and
+      # Windows spells those differently. The mode list comes from the
+      # verifier, so there is no second list to keep in step.
       - name: Export and read back
         run: |
           ${{ matrix.bin }} examples/basic/top.sv --top top -o design.db
           ${{ matrix.python }} scripts/verify-designdb.py design.db
-          ${{ matrix.bin }} examples/constructs/constructs.sv -o constructs.db
-          ${{ matrix.python }} scripts/verify-designdb.py constructs.db constructs
-          ${{ matrix.bin }} examples/constructs/interfaces.sv -o interfaces.db
-          ${{ matrix.python }} scripts/verify-designdb.py interfaces.db interfaces
-          ${{ matrix.bin }} examples/constructs/assertions.sv -o assertions.db
-          ${{ matrix.python }} scripts/verify-designdb.py assertions.db assertions
-          ${{ matrix.bin }} examples/constructs/recursion.sv -o recursion.db
-          ${{ matrix.python }} scripts/verify-designdb.py recursion.db recursion
-          ${{ matrix.bin }} examples/constructs/paramrec.sv -o paramrec.db
-          ${{ matrix.python }} scripts/verify-designdb.py paramrec.db paramrec
+          for mode in $(${{ matrix.python }} scripts/verify-designdb.py --list-modes); do
+            ${{ matrix.bin }} "examples/constructs/$mode.sv" -o "$mode.db"
+            ${{ matrix.python }} scripts/verify-designdb.py "$mode.db" "$mode"
+          done
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
