@@ -55,8 +55,6 @@ run() {
         fail=1
         return
     fi
-    orphans=$(sqlite3 "$db" "SELECT count(*) FROM (SELECT 1 FROM sqlite_master LIMIT 0)")
-    : "$orphans"
     if [ -f "$verify" ]; then
         if ! python3 "$verify" "$db" >/dev/null; then
             echo "FAIL: verify $name" >&2
@@ -64,11 +62,9 @@ run() {
             return
         fi
     fi
-    # These designs are where reproducibility is actually testable: the
-    # examples in the repository have too few files for slang's parallel
-    # source reads to come back in a different order, and tinyriscv's 28
-    # reordered on every single export. Two more exports, diffed row by row
-    # across every table.
+    # examples/reorder covers the same property in CI with five files; these
+    # designs cover it at a scale where a race has room to happen -- 28 source
+    # files in tinyriscv alone. Two more exports, diffed row by row.
     if [ -f "$repro" ]; then
         if ! (cd "$dir" && python3 "$repro" "$bin" "$@") >/dev/null; then
             echo "FAIL: reproducible $name" >&2

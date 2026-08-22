@@ -1,9 +1,8 @@
-// A package variable is a real object now, not a name that leaves the model.
-// Before v13 a `pkg::mask` reference resolved to nothing: the reading module
-// showed driver_kind='external' with a NULL far net, and two modules reading
-// one package variable did not meet on any row. v13 stamps the package as a
-// pseudo-occurrence (node_kind='package'), its variables as nets, so the
-// references resolve and the readers join at the package net.
+// LRM 26 -- a package variable is a real object, not a name that leaves the
+// model. The package is stamped as a pseudo-occurrence (node_kind='package')
+// and its variables as nets, so `pkg::mask` resolves and every module reading
+// it joins at the one net. Without that the readers show
+// driver_kind='external' with a NULL far net and meet on no row at all.
 
 package cfg_pkg;
     logic [7:0] mask;
@@ -12,8 +11,7 @@ package cfg_pkg;
     // body is written once and walked once per call site, so the statement
     // rows come in two sets -- and the statement layer is where a consumer
     // meets code it did not write itself. v_stmt carries the call_site_id
-    // that tells the sets apart; before v15 the base table knew and the
-    // view did not.
+    // that tells the sets apart.
     //
     // It touches only package variables. A package subroutine's FORMALS are
     // not stamped (only package variables become nets), so a call passing
