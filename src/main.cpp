@@ -8,6 +8,7 @@
 // and nothing else: configuration, project layout and output formatting belong
 // to whatever drives it, and this binary does the one job that has to be fast.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -542,11 +543,36 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     // point, headers pulled in by `include -- a `define changed in one of
     // those is exactly the case a digest exists to catch, and the filelist
     // does not change when it happens.
+    //
+    // Sorted by path, and not taken in the order slang hands the buffers
+    // back: the source loader reads files on a thread pool, so buffer ids
+    // fall in whatever order the reads finish. Interning in that order gave
+    // `src_file.id` -- and every `file.src_file_id` pointing at it -- a
+    // different value on every export of an unchanged design: 44 of
+    // tinyriscv's 15,773 rows moved between two runs of one binary.
+    //
+    // The rest of the exporter already pays for this property, since it is
+    // the one that lets two databases be compared at all: TemplateBuilder's
+    // group key is a source location rather than a pointer so that module
+    // ids do not follow an address, and `config_digest` exists so two
+    // exports can be told apart on their inputs. One table opting out was
+    // enough to make a whole-database diff answer "the exporter ran twice"
+    // where it was asked "did the design change". Path order is also the
+    // order a reader would expect to find the rows in.
+    //
+    // Deduplicated as well: one path can back more than one buffer -- 45 of
+    // them for tinyriscv's 28 files -- and `INSERT OR IGNORE` dropped the
+    // repeats only after fileDigest had re-read and re-hashed the file.
+    std::vector<std::string> sourcePaths;
     for (auto id : sourceManager.getAllBuffers()) {
         auto name = sourceManager.getFullPath(id);
-        if (name.empty())
-            continue;
-        auto path = name.string();
+        if (!name.empty())
+            sourcePaths.push_back(name.string());
+    }
+    std::sort(sourcePaths.begin(), sourcePaths.end());
+    sourcePaths.erase(std::unique(sourcePaths.begin(), sourcePaths.end()),
+                      sourcePaths.end());
+    for (auto& path : sourcePaths) {
         // slang names its synthesized buffers `<unnamed_bufferN>`; they are
         // not files and would land as rows with no digest, which reads as
         // "a source we could not hash" rather than "not a source".
