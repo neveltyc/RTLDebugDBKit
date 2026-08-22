@@ -236,7 +236,17 @@ namespace designdb {
 /// One export that used to fail now succeeds: two unnamed ports in one module
 /// collided on a synthesized name and aborted on a UNIQUE constraint.
 ///
-/// v15 corrects two values, and moves the version for v14's reason.
+/// v15 corrects two values and adds to the query interface, and it moves the
+/// version for both. Correcting a value is a contract change to whoever read
+/// the old one, which is v14's reason; the rule at the top of
+/// doc/designdb-schema.md moved for the additions. One used to be exempt, on
+/// the reasoning that an older reader would merely not query it. That
+/// reasoning omits the reader who WANTS the new column, for whom the version
+/// integer is the only capability signal there is -- leaving it still would
+/// force exactly the out-of-contract probing (PRAGMA table_info, or
+/// query-and-catch) that the additions here exist to retire. One rule now:
+/// the contract is the view set, each view's columns and their order, their
+/// semantics, NULL rules and row granularity, and any change to it bumps.
 ///
 /// The first: an instantiation written without an instance name no longer
 /// answers to the name of the instance holding it. slang leaves such a
@@ -294,6 +304,39 @@ namespace designdb {
 /// cursor walk in Ref.h gained the wider-than-remaining guard its twin in
 /// StatementWalker.h already had, so the two agree about when an operand
 /// walk stops meaning anything.
+///
+/// The additions change no extraction and move no value; three of them are
+/// answers a consumer could not get from the views alone, all three reported
+/// from a real consumer.
+///
+/// `driver_ref`/`load_ref` name the far end of an arc as it was SPELLED, when
+/// it was reached by a hierarchical name. A `driver_kind='external'` row has no
+/// driver net by definition, so before this it named nothing at all: the path
+/// lived on a hier_ref reachable only through dep_id and a base table, one
+/// extra query per row on the one path where the row was least self-sufficient.
+/// A crossing whose tie resolved (`.p(u.g[7:4])`) carries it too, beside the
+/// net -- where the bits live and what the parent wrote are different answers.
+///
+/// `v_hier_ref` is the fifteenth view, and closes a hole older than the
+/// request: the contract published four foreign keys into hier_ref
+/// (v_net_dep's two, v_net_conn's, v_net_attachment's) and no view to resolve
+/// one against. A published key with nothing to follow is a dangling reference
+/// in the contract itself.
+///
+/// `v_stmt_target.target_kind` is v_net_attachment's three-way distinction --
+/// written_by, release_target, alias_binding -- stated from the statement side.
+/// stmt_target holds lvalues, and a `release`/`deassign` or an `alias` names
+/// one while driving nothing; without the column the only path that reaches a
+/// release was also the only one that could report it as a driver. That
+/// confusion has now been made twice, once in this repository (fa9545b).
+///
+/// `call_site_id` reaches the statement layer: v_stmt, v_stmt_target and
+/// v_stmt_operand all carry it now. It was on the base table since v13 and
+/// exposed on v_net_dep, v_driver and v_load, which left the documented
+/// context-sensitive recipe unexecutable from the statement side -- the side a
+/// walk falls back to when a dependency did not survive its sources -- and left
+/// "which call does this statement in a shared body belong to", a lookup rather
+/// than a trace, with no answer at all.
 inline constexpr int SchemaVersion = 15;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
