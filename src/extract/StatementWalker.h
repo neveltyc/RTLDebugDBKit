@@ -429,6 +429,17 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             Ref formal;
             formal.sym = formals[i];
             formal.origin = args[i];
+            // An output or inout actual is not args[i]: Expression::bindLValue
+            // wraps it in an AssignmentExpression whose left is the actual and
+            // whose right is an EmptyArgumentExpression. Unwrapped, every such
+            // binding failed isPlainReference on the wrapper's kind and claimed
+            // map_exact=0 -- even `t(x, y)` with y exactly as wide as its
+            // formal. buildInstanceConns already unwraps this for the same
+            // reason; bindArguments simply had not.
+            const Expression* actualExpr = args[i];
+            if (actualExpr->kind == ExpressionKind::Assignment &&
+                actualExpr->as<AssignmentExpression>().isLValueArg())
+                actualExpr = &actualExpr->as<AssignmentExpression>().left();
             std::vector<Ref> actuals;
             collectRefs(*args[i], eval, actuals, /*skipSelectors=*/writes);
             for (auto& a : actuals) {
@@ -440,7 +451,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 const uint64_t fw = formal.sym ? bitWidthOf(*formal.sym) : 0;
                 const bool oneToOne =
                     actuals.size() == 1 && fw != 0 &&
-                    isPlainReference(*args[i]) && actuals[0].exact &&
+                    isPlainReference(*actualExpr) && actuals[0].exact &&
                     (actuals[0].whole ? bitWidthOf(*actuals[0].sym) == fw
                                       : actuals[0].hi - actuals[0].lo + 1 == fw);
                 emitBinding(formal, a, reads, writes, oneToOne, bindable,
