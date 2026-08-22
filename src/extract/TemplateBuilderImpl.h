@@ -129,6 +129,12 @@ private:
         std::vector<int32_t> curControlRefs;   // control expr_refs of curStmt
         std::vector<int32_t> curControlHrefs;  // outward conditions, as hierRefs
         std::vector<Ref> curControlSrcs;
+        /// Next ordinal for a synthesised `$def$n` segment, per scope index.
+        /// One counter for anonymous gates and unnamed instantiations alike:
+        /// they are siblings in the tree, and one sequence per scope makes
+        /// them unique without an argument about whether a primitive and a
+        /// module definition could ever answer to one name.
+        std::unordered_map<int32_t, int> anonSeq;
         /// Subroutine-body instantiations left for this module, and the
         /// call sites skipped once they ran out. See handle(CallExpression)
         /// for why per-call-site expansion needs a ceiling at all.
@@ -165,6 +171,15 @@ private:
     std::string groupKey(const InstanceBodySymbol& body) const;
 
     void collect(const InstanceSymbol& inst);
+
+    /// The group keys on the branch of the elaborated tree `collect` is
+    /// currently inside. A key already here means this instance re-enters a
+    /// module that is already one of its own ancestors with the same
+    /// parameters -- an infinitely recursive instantiation, which slang
+    /// rejects but still hands over partly elaborated, and which the walk
+    /// must not follow. See collect() for why the bound slang applies is not
+    /// one this walk can rely on.
+    std::unordered_set<std::string> onPath;
 
     // ---------------------------------------------------------- terminals
 
@@ -203,12 +218,15 @@ private:
                        const Ref* asWritten = nullptr);
 
     /// How to reach the reference's target from an occurrence. Downward
-    /// targets replay inside the occurrence's own subtree; absolute ones
-    /// replay from the root; a reference through one of this template's own
-    /// interface terminals replays from whatever instance the terminal is
-    /// bound to in that occurrence. Upward references (upwardCount > 0) stay
-    /// unresolved -- the one analysed body speaks for occurrences whose
-    /// upward surroundings may differ, and a guess is worse than a NULL.
+    /// targets replay inside the occurrence's own subtree; absolute ones --
+    /// the $root-anchored names -- replay from the design root; a reference
+    /// through one of this template's own interface terminals replays from
+    /// whatever instance the terminal is bound to in that occurrence.
+    /// Upward references (upwardCount > 0) stay unresolved -- the one
+    /// analysed body speaks for occurrences whose upward surroundings may
+    /// differ, and a guess is worse than a NULL. That reasoning covers only
+    /// the upward ones, so $root is exempt from it: an absolute path names
+    /// one object no matter which occurrence reads it.
     void fillResolution(Build& b, TplHierRef& row, const Ref& r);
 
     static bool splitBelow(const std::string& full, const std::string& prefix,
@@ -319,6 +337,12 @@ private:
     void registerChildren(Build& b, const Scope& scope, int32_t scopeIdx,
                           std::unordered_map<const Symbol*, int32_t>& childOf,
                           std::vector<const Symbol*>& childSyms);
+
+    /// The tree segment for an instantiation written without an instance
+    /// name: `$def$n`, '$'-prefixed so it cannot collide with an identifier
+    /// the source could have written, and counted per scope so siblings
+    /// differ. Same shape and same counter as an anonymous gate's.
+    std::string anonSegment(Build& b, int32_t scopeIdx, std::string_view defName);
 
     /// One resolved child's connection templates: the outside of each of its
     /// terminals, as written here in the parent.

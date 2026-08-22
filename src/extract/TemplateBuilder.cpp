@@ -27,6 +27,14 @@ TemplateSet TemplateBuilder::run() {
     for (auto inst : compilation.getRoot().topInstances)
         collect(*inst);
 
+    // What pass 1 grouped, before any of it is walked. A group whose chosen
+    // body has no AnalyzedScope yields a template with no procedure in it;
+    // see designdb::Stats for why that happens and why no row moves.
+    for (auto& [key, group] : groups) {
+        if (!analysis.getAnalyzedScope(*group.body))
+            stats.unanalysedBodies++;
+    }
+
     // Module rows: one per source definition, not per parameterisation.
     for (auto& [key, group] : groups)
         internModuleRow(group.body->getDefinition());
@@ -92,6 +100,19 @@ std::string TemplateBuilder::groupKey(const InstanceBodySymbol& body) const {
     return key;
 }
 
+    /// Groups one instance and descends into its children.
+    ///
+    /// The descent stops at an instance whose group is already on the branch
+    /// above it -- a module instantiating itself with identical parameters.
+    /// That is illegal, and slang says so, but it says so having already
+    /// elaborated the instance tree it was walking when it noticed: slang
+    /// bounds the *depth* at 128 and nothing else. One self-instantiation per
+    /// body is therefore 130-odd instances, and two is 2^128 -- an
+    /// elaborated tree this walk cannot finish, ever, on a design whose only
+    /// fault is one line of illegal RTL. The guard is a path set rather than
+    /// a visited set on purpose: a module legitimately instantiated twice by
+    /// one parent is two separate branches and must be collected on both,
+    /// and only a repeat *on the way down* is the impossible one.
 void TemplateBuilder::collect(const InstanceSymbol& inst) {
     auto& body = inst.getCanonicalBody() ? *inst.getCanonicalBody() : inst.body;
     auto key = groupKey(body);
@@ -103,7 +124,13 @@ void TemplateBuilder::collect(const InstanceSymbol& inst) {
     }
     offer(g, body);
     instanceGroup[&inst] = key;
+
+    // The instance itself is grouped either way -- it is a real occurrence
+    // and its body is a real template. Only the descent is cut.
+    if (!onPath.insert(key).second)
+        return;
     forEachInstance(inst.body, [&](const InstanceSymbol& child) { collect(child); });
+    onPath.erase(key);
 }
 
     /// The port list of one group, as terminal templates. A MultiPort (a
@@ -376,7 +403,18 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     const Symbol* target = hv.ref.target;
     if (!target || !r.sym)
         return;
-    if (hv.ref.isUpward())
+    // slang's isUpward() is true for two unrelated shapes, and only one of
+    // them is unresolvable here: a name that climbed OUT of this body
+    // (upwardCount > 0), and a name anchored at $root. The first is a
+    // genuine unknown -- the one analysed body speaks for occurrences whose
+    // upward surroundings may differ, and a guess is worse than a NULL. The
+    // second is the opposite: an absolute path names the same object seen
+    // from every occurrence, which is exactly what TplHierRef::Absolute is
+    // for. Asking isUpward() alone dropped `$root.a.b.c` with the upward
+    // ones and left Absolute unreachable.
+    const bool fromRoot = !hv.ref.path.empty() && hv.ref.path.front().symbol &&
+                          hv.ref.path.front().symbol->kind == SymbolKind::Root;
+    if (!fromRoot && hv.ref.isUpward())
         return;
     // A modport port stands for the net behind it: the reference
     // resolves to that net, not to the modport's own symbol -- whose
@@ -412,12 +450,22 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
         }
         return;
     }
+    // A $root path must not be re-read as a downward one even when it does
+    // sit below this body's prefix. The prefix belongs to the ONE body that
+    // was analysed; replaying `$root.top.u.x` from each occurrence would
+    // answer `top.u.x` for the occurrence that happens to be `top` and
+    // `outer.m.u.x` for one instantiated deeper, and only the first is what
+    // the source spells.
     std::string rel;
-    if (splitBelow(full, b.decl->bodyPrefix(), rel)) {
+    if (!fromRoot && splitBelow(full, b.decl->bodyPrefix(), rel)) {
         row.resolve = TplHierRef::Downward;
         splitSegsAndNet(rel, *target, row);
         return;
     }
+    // getHierarchicalPath() stops at Root (Symbol.cpp:117 walks up only
+    // while the parent is neither Root nor CompilationUnit), so `full` is
+    // already root-relative and its first segment is a top instance name --
+    // which is what Stamper's descend(0, segs) consumes.
     row.resolve = TplHierRef::Absolute;
     splitSegsAndNet(full, *target, row);
 }
@@ -508,12 +556,22 @@ void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body)
     b.decl->collectDeclarations(body, 0);
     buildTermMaps(b, body);
 
+    // Recorded, not just used: a body with no AnalyzedScope yields no
+    // procedure here, and the rows it does produce -- nets, terminals,
+    // children -- look exactly like a module that has no always block and
+    // no continuous assignment. The stamper counts the occurrences that
+    // inherit the gap so the export can say so rather than let a consumer
+    // read absence as fact.
     if (auto* scope = analysis.getAnalyzedScope(body)) {
+        t.analysedBody = true;
         for (auto& proc : scope->procedures)
             buildProcedure(b, proc);
     }
     buildNetInitialisers(b, body);
     buildNetAliases(b, body);
+    // Primitives before children: an anonymous gate and an unnamed
+    // instantiation in one scope are siblings drawing from one counter, so
+    // the order they draw in is what their names are.
     buildPrimitives(b, body);
     buildChildren(b, body);
     stats.truncatedCalls += b.truncatedCalls;
@@ -1411,11 +1469,23 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
     });
 }
 
+std::string TemplateBuilder::anonSegment(Build& b, int32_t scopeIdx,
+                                         std::string_view defName) {
+    // A definition name that is not a plain identifier may hold a '.', and a
+    // tree node name holding one is a path with two segments -- the very
+    // thing an escaped name is written `\name ` to avoid. The name is
+    // decoration here: '$' and the counter are what make the segment unique
+    // and unspellable, so a dotted definition simply contributes nothing.
+    std::string_view label =
+        defName.find('.') == std::string_view::npos ? defName : std::string_view();
+    return "$" + std::string(label) + "$" +
+           std::to_string(b.anonSeq[scopeIdx]++);
+}
+
     /// Gate, switch and UDP instances: a tree node, a primitive row, and one
     /// dependency per LRM (input, output) pairing.
 void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) {
     EvalContext evalCtx(body);
-    std::unordered_map<int32_t, int> anonPrims;
     forEachOfKind<SymbolKind::PrimitiveInstance, PrimitiveInstanceSymbol>(
         body, [&](const PrimitiveInstanceSymbol& prim) {
         auto conns = prim.getPortConnections();
@@ -1434,10 +1504,8 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
         // scope so siblings differ, and prefixed with '$' so it cannot
         // collide with an identifier the source could have written.
         std::string name(prim.name);
-        if (name.empty()) {
-            auto& n = anonPrims[p.scope];
-            name = "$" + std::string(def.name) + "$" + std::to_string(n++);
-        }
+        if (name.empty())
+            name = anonSegment(b, p.scope, def.name);
         p.name = name;
         // slang labels only tran/tranif* as BiDiSwitch; the resistive
         // variants and the whole MOS family register as Fixed like any

@@ -195,11 +195,39 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
                        ? expr.as<ConcatenationExpression>().operands()
                        : expr.as<SimpleAssignmentPatternExpression>().elements();
         uint64_t cursor = base + width;
+        // Where this expression's slots start, so the fallback below can
+        // drop the positional ones already emitted for the operands ahead
+        // of the one that stopped the walk. Appending to them instead would
+        // leave one reference in `out` twice with two contradictory windows.
+        const size_t mark = out.size();
         for (auto* op : ops) {
             if (!op)
                 continue;
             const uint64_t w = exprWidthOf(*op);
-            if (!w) {
+            // Two ways the walk down the operands can stop meaning anything,
+            // and the second used to be unguarded here though its twin in
+            // StatementWalker's collectAuxSlots has always tested for it: an
+            // operand of no width leaves the cursor where it was and gives
+            // the element no position, and an operand WIDER than what is left
+            // of the concatenation means the widths do not add up to the
+            // whole. `cursor -= w` on the second is an unsigned wrap, and the
+            // slots below it would carry bit ranges near 2^64 -- a garbage
+            // answer offered with the same confidence as a real one.
+            //
+            // No expression is known to reach it: slang wraps every operand
+            // whose width differs from its context in a Conversion, so a
+            // well-formed concatenation adds up by construction, and a
+            // malformed one loses its type and arrives here with width 0.
+            // Probed over the constructs fixtures, a concatenation torture
+            // file (packed and unpacked patterns, replication, streaming,
+            // string concatenation, truncating and widening conversions,
+            // unresolved names and types, out-of-range selects) and
+            // picorv32, tinyriscv and veerwolf: not once, in either
+            // function. The two are aligned on the safe side rather than the
+            // cheap one because the costs are not symmetric -- one more
+            // comparison per operand against a silent wrap.
+            if (!w || w > cursor - base) {
+                out.resize(mark);
                 std::vector<Ref> rest;
                 collectRefs(expr, ctx, rest, skipSelectors);
                 for (auto& r : rest)

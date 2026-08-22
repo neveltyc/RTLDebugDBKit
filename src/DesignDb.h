@@ -236,19 +236,78 @@ namespace designdb {
 /// One export that used to fail now succeeds: two unnamed ports in one module
 /// collided on a synthesized name and aborted on a UNIQUE constraint.
 ///
-/// v15 adds columns and a view, and nothing else -- no extraction changed, no
-/// value moved. It moves the version anyway, and the rule at the top of
-/// doc/designdb-schema.md moved with it: an addition used to be exempt, on the
-/// reasoning that an older reader would merely not query it. That reasoning
-/// omits the reader who WANTS the new column, for whom the version integer is
-/// the only capability signal there is -- leaving it still would force exactly
-/// the out-of-contract probing (PRAGMA table_info, or query-and-catch) that
-/// every change here exists to retire. One rule now: the contract is the view
-/// set, each view's columns and their order, their semantics, NULL rules and
-/// row granularity, and any change to it bumps.
+/// v15 corrects two values and adds to the query interface, and it moves the
+/// version for both. Correcting a value is a contract change to whoever read
+/// the old one, which is v14's reason; the rule at the top of
+/// doc/designdb-schema.md moved for the additions. One used to be exempt, on
+/// the reasoning that an older reader would merely not query it. That
+/// reasoning omits the reader who WANTS the new column, for whom the version
+/// integer is the only capability signal there is -- leaving it still would
+/// force exactly the out-of-contract probing (PRAGMA table_info, or
+/// query-and-catch) that the additions here exist to retire. One rule now:
+/// the contract is the view set, each view's columns and their order, their
+/// semantics, NULL rules and row granularity, and any change to it bumps.
 ///
-/// Three answers a consumer could not get from the views alone, all three
-/// reported from a real consumer:
+/// The first: an instantiation written without an instance name no longer
+/// answers to the name of the instance holding it. slang leaves such a
+/// symbol's name empty and a hierarchical path built from an empty name ends
+/// at the PARENT, so the last segment WAS the parent's -- the defect v14
+/// fixed for anonymous gates and left standing for instantiations, because
+/// inventing a name for one was a separate decision. It is decided here: the
+/// synthesised `$def$n` segment now covers module instantiations and
+/// unresolved definitions as well, and all three kinds draw from one counter
+/// per scope, so a gate and an instantiation beside it cannot be handed one
+/// name twice.
+///
+/// A module instance name is mandatory, which makes this look like a case
+/// that cannot arise. It arises whenever a macro supplies the name and does
+/// not expand: veerwolf compiled without `TEC_RV_ICG has 302 such nodes, 32
+/// instances and 270 black boxes, every one of them carrying its parent's
+/// name. Two in one scope collided outright -- duplicate_path_count counted
+/// a collision the design does not have, and (parent_node_id, name) answered
+/// with two nodes. One alone was quieter and no better: `free_cg` under
+/// `free_cg` is one name twice, one level apart, and nothing in the source
+/// spells the second. `tree_node.name` is the only column that changes; the
+/// row counts of every table are what they were.
+///
+/// The second is a field pair: `hier_ref.resolved_inst_id` and
+/// `resolved_net_id` are no longer NULL for a path anchored at `$root`, and
+/// a v14 consumer read that NULL as "this reference cannot be resolved per
+/// occurrence" -- a statement about the reference rather than about the
+/// exporter.
+///
+/// An absolute path names one object, seen from any occurrence of the body
+/// that spells it, which is exactly the property that makes replay sound;
+/// the resolution machinery for it existed on both ends and was cut off in
+/// the middle. slang's HierarchicalReference::isUpward() is
+/// `upwardCount > 0 || path[0] is Root`, and the exporter tested it whole,
+/// so `$root.a.b.c` was dropped alongside the upward names it has nothing in
+/// common with. Both ends of a dependency through such a reference move
+/// with it: a `$root` READ was a `net_dep` with no source net that
+/// `v_driver` reported as `external`, and a `$root` WRITE could not be
+/// materialised at all -- the target net had no driver row of any kind, so a
+/// trace back from it said the design never wrote it. Both now carry the
+/// resolved net, like any downward reference.
+///
+/// Upward references are unchanged and still NULL, for the reason they
+/// always were: one analysed body cannot answer for surroundings that differ
+/// per occurrence.
+///
+/// Riding along, neither of them a contract change. `analysis_status` no
+/// longer tests slang's analysed-scope count, which could not be zero unless
+/// the compilation was fatally errored -- the branch beside it -- and
+/// `hierarchy_only` therefore has one cause rather than the two it named. It
+/// gains a `partial` disjunct in its place, for an occurrence stamped from a
+/// module body the analysis never reached; that is a guard against slang's
+/// descent and the template walk drifting apart, unreachable while they
+/// agree, and it fires on no design measured here. And the concatenation
+/// cursor walk in Ref.h gained the wider-than-remaining guard its twin in
+/// StatementWalker.h already had, so the two agree about when an operand
+/// walk stops meaning anything.
+///
+/// The additions change no extraction and move no value; three of them are
+/// answers a consumer could not get from the views alone, all three reported
+/// from a real consumer.
 ///
 /// `driver_ref`/`load_ref` name the far end of an arc as it was SPELLED, when
 /// it was reached by a hierarchical name. A `driver_kind='external'` row has no
@@ -287,6 +346,13 @@ inline constexpr int SchemaVersion = 15;
 /// counter per table in one process is cheaper and more legible than reading
 /// last_insert_rowid back per row. 0 in an id field spells "none" and is
 /// stored as NULL; real ids start at 1.
+///
+/// `src_file` is the exception, and the only one: it is written straight
+/// through addSourceFile, so its ids are SQLite's and its insert order is its
+/// id order. main.cpp interns those rows in path order for exactly that
+/// reason -- slang returns the buffers in the order its source loader
+/// finished reading files, which is a thread pool's completion order, and an
+/// id that follows it makes two exports of an unchanged design differ.
 ///
 /// Ranges use one encoding everywhere, unchanged from v7: a range is
 /// LSB-relative offsets into the flattened object (not declared indices), an
