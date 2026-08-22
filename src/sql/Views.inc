@@ -55,6 +55,12 @@ SELECT
                   THEN value END) AS INTEGER) AS empty_procedure_count,
     CAST(MAX(CASE WHEN key = 'duplicate_path_count'
                   THEN value END) AS INTEGER) AS duplicate_path_count,
+    CAST(MAX(CASE WHEN key = 'recursion_count'
+                  THEN value END) AS INTEGER) AS recursion_count,
+    CAST(MAX(CASE WHEN key = 'truncated_call_count'
+                  THEN value END) AS INTEGER) AS truncated_call_count,
+    CAST(MAX(CASE WHEN key = 'unanalysed_inst_count'
+                  THEN value END) AS INTEGER) AS unanalysed_inst_count,
     MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest
 FROM meta;
 

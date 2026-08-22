@@ -641,6 +641,21 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
     writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
     writer.setMeta("duplicate_path_count", std::to_string(stats.duplicatePaths));
+    // Three counts that had no key, and one of them is the reason the other
+    // two got one: a recursive hierarchy is stamped one level deep and the
+    // rest of the tree is simply absent, which `hierarchy_only` does not say
+    // -- it says there is no dataflow, not that the tree is a PREFIX. Held
+    // only on stderr, `-q` silenced it, and two databases of one design, one
+    // cut and one whole, read alike to anyone holding the files.
+    //
+    // `truncated_call_count` and `unanalysed_inst_count` come with it because
+    // both choose `partial` above while every published count is zero, which
+    // leaves a consumer told the export is incomplete and given nothing to
+    // look at. Since v5 the status has had to agree with the counts beside
+    // it; these are the counts that were missing from beside it.
+    writer.setMeta("recursion_count", std::to_string(stats.recursiveInstances));
+    writer.setMeta("truncated_call_count", std::to_string(stats.truncatedCalls));
+    writer.setMeta("unanalysed_inst_count", std::to_string(stats.unanalysedInsts));
     writer.setMeta("tool_version", RTLDESIGNDB_VERSION);
     writer.setMeta("slang_version", RTLDESIGNDB_SLANG_TAG);
     // Which build produced this, at commit granularity. `tool_version`
