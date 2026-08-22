@@ -59,7 +59,7 @@ jobs:
         run: |
           ./build/rtl-designdb examples/basic/top.sv --top top -o design.db
           python3 scripts/verify-designdb.py design.db
-          for mode in constructs interfaces assertions hierarchy udp unresolved anonymous xmr alias external package callsite recursion paramfold portshape compound macroloc stmtgaps patterncase outward naming aliascat rootref typeparam concatcursor; do
+          for mode in constructs interfaces assertions hierarchy udp unresolved anonymous xmr alias external package callsite recursion paramfold portshape compound macroloc stmtgaps patterncase outward naming aliascat rootref typeparam concatcursor paramrec; do
             ./build/rtl-designdb "examples/constructs/$mode.sv" -o "$mode.db"
             python3 scripts/verify-designdb.py "$mode.db" "$mode"
           done
@@ -71,6 +71,12 @@ jobs:
           (cd examples/options && ../../build/rtl-designdb -f opts.f --single-unit \
              +incdir+. +define+EXTRA_WIDTH=4 -o "$GITHUB_WORKSPACE/options.db")
           python3 scripts/verify-designdb.py options.db
+          # Five files listed in reverse alphabetical order -- the one example
+          # with enough entries to reach slang's threaded source loader, which
+          # is where src_file id order stops being deterministic on its own.
+          (cd examples/reorder && ../../build/rtl-designdb -f reorder.f \
+             -o "$GITHUB_WORKSPACE/reorder.db")
+          python3 scripts/verify-designdb.py reorder.db
 
       # Two exports of one unchanged design, diffed row by row across every
       # table. `src_file` ids used to follow slang's buffer order, which is
@@ -79,12 +85,18 @@ jobs:
       # design -- and a whole-database diff could not tell "the source
       # changed" from "the exporter ran again".
       #
-      # This is the general check and the weaker one here: it does not know
-      # what it is looking for, but the races it looks for need more files
-      # than these examples have. examples/options, at three files, came out
-      # in the same wrong order every time. The deterministic half is in
-      # verify-designdb.py above -- src_file ids must ascend with path, which
-      # options fails outright when the ids follow buffer order.
+      # It does not know what it is looking for, which is the point -- but the
+      # races it looks for need slang's THREADED source loader, and that
+      # starts at four filelist entries (SourceLoader::MinFilesForThreading).
+      # examples/constructs is one file and examples/options is two, so both
+      # read serially and came out in the same order every time; a revert of
+      # the path sort left them green. examples/reorder exists for this: five
+      # files in reverse alphabetical order, which fails 9 runs in 10 against
+      # a binary that interns in buffer order.
+      #
+      # The deterministic half is in verify-designdb.py above -- src_file ids
+      # must ascend with path -- and options and reorder both fail it outright
+      # when the ids follow the buffers.
       - name: Reproducible export
         run: |
           python3 scripts/check-reproducible.py ./build/rtl-designdb \
@@ -92,6 +104,8 @@ jobs:
           (cd examples/options && python3 ../../scripts/check-reproducible.py \
              ../../build/rtl-designdb -f opts.f --single-unit +incdir+. \
              +define+EXTRA_WIDTH=4)
+          (cd examples/reorder && python3 ../../scripts/check-reproducible.py \
+             -n 10 ../../build/rtl-designdb -f reorder.f)
 
   # The four release platforms, as workflow artifacts on every push. The same
   # workflow builds a tagged release, so a red push here is a release that

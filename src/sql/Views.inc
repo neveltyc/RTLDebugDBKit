@@ -55,6 +55,12 @@ SELECT
                   THEN value END) AS INTEGER) AS empty_procedure_count,
     CAST(MAX(CASE WHEN key = 'duplicate_path_count'
                   THEN value END) AS INTEGER) AS duplicate_path_count,
+    CAST(MAX(CASE WHEN key = 'recursion_count'
+                  THEN value END) AS INTEGER) AS recursion_count,
+    CAST(MAX(CASE WHEN key = 'truncated_call_count'
+                  THEN value END) AS INTEGER) AS truncated_call_count,
+    CAST(MAX(CASE WHEN key = 'unanalysed_inst_count'
+                  THEN value END) AS INTEGER) AS unanalysed_inst_count,
     MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest
 FROM meta;
 
@@ -593,6 +599,16 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 -- already carries into 'dataflow' is not repeated as 'statement' -- the
 -- NOT EXISTS guards are that rule, and the verifier re-derives the counts.
 --
+-- call_site_id is the body expansion the read was walked for, on every arm
+-- that has a statement to take it from -- dataflow, sensitivity, wait and
+-- statement alike. The three arms that read a base table directly used to
+-- write a literal NULL there while their own statement carried a tag, so a
+-- consumer filtering `call_site_id = ? OR call_site_id IS NULL` -- the
+-- documented recipe -- admitted one call's sensitivity into every call's
+-- cone, which is the mixing the tag exists to prevent. The crossing and
+-- terminal arms keep NULL: neither has a statement, so neither belongs to a
+-- call.
+--
 -- load_ref is v_driver's driver_ref with the ends exchanged: how the LOAD
 -- end was spelled when it was reached by a hierarchical name, NULL when it
 -- was not. A dataflow row takes it from the dependency's target reference
@@ -677,10 +693,11 @@ SELECT
     NULL, NULL, 1,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
-    NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, NULL,
+    NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, s.call_site_id,
     f.path, sf.path, pe.line, pe.col
 FROM proc_event pe
 JOIN net n               ON n.id = pe.net_id
+LEFT JOIN stmt s         ON s.id = pe.stmt_id
 LEFT JOIN file f         ON f.id = pe.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
@@ -691,7 +708,7 @@ SELECT
     CASE e.role WHEN 'wait' THEN 'wait'
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
-    NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL, NULL,
+    NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
     f.path, sf.path, s.line, s.col
 FROM expr_ref e
 JOIN net n               ON n.id = e.net_id
@@ -706,7 +723,7 @@ SELECT
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
-    NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, NULL,
+    NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
     f.path, sf.path, s.line, s.col
 FROM assign_operand o
 JOIN net n               ON n.id = o.net_id
@@ -770,7 +787,8 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- write. target_kind says which, in the vocabulary v_net_attachment already
 -- contracts for the same three storage cases:
 --
---   written_by       an assignment or a system task writes the net.
+--   written_by       an assignment, a system task, or a subroutine call
+--                    writing its output or inout actual writes the net.
 --   release_target   a `release`/`deassign` names its lvalue and drives
 --                    NOTHING; the extractor gives it a target row and
 --                    deliberately no dependency, so this table is the only
@@ -781,7 +799,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 --                    it out of a driver count by kind, and this does the
 --                    same for a consumer starting from the statement side.
 --
--- The CASE is v_net_attachment's, character for character; the verifier
+-- The CASE is v_net_attachment's, expression for expression; the verifier
 -- holds the two equal per target row, so the repetition cannot drift. It
 -- costs a join against stmt's primary key and no fan-out. v_stmt_operand
 -- has no counterpart: a read is a read whatever statement makes it.
@@ -842,8 +860,9 @@ JOIN stmt s ON s.id = o.stmt_id;
 --                                    child's terminal, named directly
 --                                    (outer_net_id) or through a resolved
 --                                    external tie (`.p(u.g[7:4])`).
---   written_by          stmt_target_id   stmt_target of an assignment or
---                                    system-task write.
+--   written_by          stmt_target_id   stmt_target of an assignment, a
+--                                    system-task write, or a call writing
+--                                    its output actual.
 --   release_target      stmt_target_id   stmt_target of a
 --                                    `release`/`deassign`. Same storage,
 --                                    but the statement drives NOTHING --

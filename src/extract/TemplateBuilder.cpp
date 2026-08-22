@@ -127,10 +127,10 @@ void TemplateBuilder::collect(const InstanceSymbol& inst) {
 
     // The instance itself is grouped either way -- it is a real occurrence
     // and its body is a real template. Only the descent is cut.
-    if (!onPath.insert(key).second)
+    detail::OnPath guard(onPath, key);
+    if (!guard.entered())
         return;
     forEachInstance(inst.body, [&](const InstanceSymbol& child) { collect(child); });
-    onPath.erase(key);
 }
 
     /// The port list of one group, as terminal templates. A MultiPort (a
@@ -1207,26 +1207,58 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
         // names it with the actual's text and resolves it against the actual's
         // target. Both wrong, and quietly so.
         const int32_t actualIdx = b.decl->netFor(*actual.sym);
-        if (actualIdx < 0 || stmt < 0)
+        if (actualIdx < 0)
             return;
-        if (reads)
+        if (reads && stmt >= 0)
             addExprRef(b, stmt, actual, "call_argument", actualIdx);
         if (writes) {
-            // The target row, and deliberately no dependency. A `procedure`
-            // arc names two nets and is told apart from the reading direction
-            // by the formal being its source -- and the formal is exactly what
-            // is missing here, so a source-less one would be a shape the kind
-            // does not have. What is true and recordable is that this
-            // statement writes the argument: `v_net_attachment` answers "what
-            // writes this net", while `v_driver` reports no arc because there
-            // is no nameable one. Better than the old behaviour, which
-            // recorded neither.
-            TplStmtRef tr;
-            tr.stmt = stmt;
-            tr.ordinal = b.targetOrdinal++;
-            tr.net = actualIdx;
-            tr.r = rangeOf(actual);
-            b.t->targets.push_back(std::move(tr));
+            // The target row AND a source-less `procedure` dependency, which
+            // is the shape v_driver has documented since v14: "`procedure`
+            // with a NULL driver_net_id is a call into a subroutine declared
+            // outside this instance, whose formal is no net here". The view
+            // learned to label the row; nothing emitted one, so the two
+            // contracted views answered "what writes this net" differently --
+            // v_net_attachment and v_stmt_target said this statement did,
+            // v_driver said nothing did. A package task that plainly writes
+            // its output actual read as undriven.
+            //
+            // The formal cannot be named as the source: at a call site it is
+            // a symbol rather than an expression, and the Ref built for it
+            // borrows the ACTUAL's origin, so putting it through addHierRef
+            // names it with the actual's text and resolves it against the
+            // actual's target. Both wrong, and quietly so. A NULL source is
+            // the honest answer and the one the vocabulary already has --
+            // `data` is the kind that must not be used here, since a
+            // source-less `data` row is what `constant` means.
+            // A call written inside a CONDITION belongs to no statement this
+            // schema records, so there is no stmt_target to hang the write
+            // on -- stmt_target.stmt_id is NOT NULL, and rightly, since a
+            // target is a position within a statement. The dependency still
+            // goes out: `if (chk(a, y))` writes y, and without the row the
+            // database said nothing did, which is the answer this whole
+            // branch exists to stop giving.
+            int32_t targetIdx = -1;
+            if (stmt >= 0) {
+                TplStmtRef tr;
+                tr.stmt = stmt;
+                tr.ordinal = b.targetOrdinal++;
+                tr.net = actualIdx;
+                tr.r = rangeOf(actual);
+                targetIdx = int32_t(b.t->targets.size());
+                b.t->targets.push_back(std::move(tr));
+            }
+            TplDep d;
+            d.srcNet = -1;
+            d.tgtNet = actualIdx;
+            d.stmt = stmt;
+            d.targetRef = targetIdx;
+            d.kind = "procedure";
+            d.tgtR = rangeOf(actual);
+            // mappingExact stays NULL: there is no source end to correspond
+            // with, and a correspondence beside a driver that does not exist
+            // is a claim about nothing.
+            d.callSite = b.curCallSite;
+            b.t->deps.push_back(std::move(d));
         }
         return;
     }
@@ -1503,7 +1535,16 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
         // Anonymous gates get a synthesised segment instead, counted per
         // scope so siblings differ, and prefixed with '$' so it cannot
         // collide with an identifier the source could have written.
-        std::string name(prim.name);
+        //
+        // Through leafSegment, like every other child: taking `prim.name`
+        // raw skipped both of the things that function exists for. An array
+        // element's own name is the bare array name, so `buf u[2:1]` gave
+        // one scope two nodes called `u` -- and, once the empty-name branch
+        // below was reached instead, two called `$buf$n`, which `top.u[1]`
+        // cannot find either. And a name needing escaping arrived unescaped,
+        // so `buf \my.gate ()` wrote a node name with a dot in it: two path
+        // segments where the tree contracts one.
+        std::string name = leafSegment(prim);
         if (name.empty())
             name = anonSegment(b, p.scope, def.name);
         p.name = name;
