@@ -22,12 +22,13 @@
 #   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
 #   verify-designdb.py <design.db> rootref      + examples/constructs/rootref.sv facts
 #   verify-designdb.py <design.db> typeparam    + examples/constructs/typeparam.sv facts
+#   verify-designdb.py <design.db> concatcursor + examples/constructs/concatcursor.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "xmr", "alias", "external", "package", "callsite",
-         "rootref", "typeparam",
+         "rootref", "typeparam", "concatcursor",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -1056,7 +1057,8 @@ if mode:
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
                 "outward": "outward_tb", "naming": "naming",
                 "aliascat": "aliascat", "rootref": "rootref",
-                "typeparam": "typeparam"}[mode]
+                "typeparam": "typeparam",
+                "concatcursor": "concatcursor"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1524,6 +1526,39 @@ if mode == "typeparam":
           "so all four flop outputs have the flop as their driver")
     check(one("SELECT analysis_status FROM v_db_info") == "complete",
           "a deduplicated parameterisation does not make the export partial")
+
+
+if mode == "concatcursor":
+    # The cursor walk, in both directions. Every operand of the exact split
+    # takes its own eighth of the source, MSB first; a wrapped cursor would
+    # put one of them at an offset near 2^64 instead, so pinning all four is
+    # what makes the guard's arrival visible if it ever fires wrongly.
+    for name, lo, hi in (("a", 24, 31), ("b", 16, 23), ("c", 8, 15),
+                         ("f", 0, 7)):
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE src_name='d' AND tgt_name=? AND src_lo=? AND src_hi=?
+              AND src_exact=1 AND map_exact=1""", name, lo, hi) == 1,
+              f"the exact split gives {name} bits {hi}:{lo} of d")
+    # And the same concatenation read back, where the positions land on the
+    # target instead.
+    for name, lo, hi in (("a", 24, 31), ("b", 16, 23), ("c", 8, 15),
+                         ("f", 0, 7)):
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE src_name=? AND tgt_name='whole' AND tgt_lo=? AND tgt_hi=?
+              AND tgt_exact=1""", name, lo, hi) == 1,
+              f"and reading it back puts {name} at bits {hi}:{lo} of whole")
+    # No slot anywhere in this file carries a range only an unsigned wrap
+    # could produce. The bound is not a big positive number: a wrapped cursor
+    # lands just below 2^64 and SQLite stores the offsets as signed INTEGER,
+    # so it arrives NEGATIVE -- and the slot it belongs to keeps its own
+    # honest `hi`, leaving lo above hi. Both are what to look for.
+    check(one("""
+        SELECT count(*) FROM net_dep
+        WHERE src_lo < 0 OR src_hi < 0 OR tgt_lo < 0 OR tgt_hi < 0
+           OR src_lo > src_hi OR tgt_lo > tgt_hi""") == 0,
+          "no dependency carries a wrapped bit range")
 
 
 if mode == "rootref":
