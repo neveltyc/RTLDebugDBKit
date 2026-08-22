@@ -799,7 +799,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 --                    it out of a driver count by kind, and this does the
 --                    same for a consumer starting from the statement side.
 --
--- The CASE is v_net_attachment's, character for character; the verifier
+-- The CASE is v_net_attachment's, expression for expression; the verifier
 -- holds the two equal per target row, so the repetition cannot drift. It
 -- costs a join against stmt's primary key and no fan-out. v_stmt_operand
 -- has no counterpart: a read is a read whatever statement makes it.

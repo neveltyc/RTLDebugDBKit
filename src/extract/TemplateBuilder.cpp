@@ -127,10 +127,10 @@ void TemplateBuilder::collect(const InstanceSymbol& inst) {
 
     // The instance itself is grouped either way -- it is a real occurrence
     // and its body is a real template. Only the descent is cut.
-    if (!onPath.insert(key).second)
+    detail::OnPath guard(onPath, key);
+    if (!guard.entered())
         return;
     forEachInstance(inst.body, [&](const InstanceSymbol& child) { collect(child); });
-    onPath.erase(key);
 }
 
     /// The port list of one group, as terminal templates. A MultiPort (a
