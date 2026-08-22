@@ -166,6 +166,15 @@ private:
 
     void collect(const InstanceSymbol& inst);
 
+    /// The group keys on the branch of the elaborated tree `collect` is
+    /// currently inside. A key already here means this instance re-enters a
+    /// module that is already one of its own ancestors with the same
+    /// parameters -- an infinitely recursive instantiation, which slang
+    /// rejects but still hands over partly elaborated, and which the walk
+    /// must not follow. See collect() for why the bound slang applies is not
+    /// one this walk can rely on.
+    std::unordered_set<std::string> onPath;
+
     // ---------------------------------------------------------- terminals
 
     /// Port symbol -> terminal slot, for one body. See the definition for why
