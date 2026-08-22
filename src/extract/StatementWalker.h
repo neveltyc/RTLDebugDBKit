@@ -780,12 +780,18 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 if (!op)
                     continue;
                 const uint64_t w = exprWidthOf(*op);
-                // The same two stops Ref.h's collectSlots takes, and for the
-                // same reason: no width means no position, and more width
-                // than the concatenation has left means `cursor -= w` wraps.
-                // From here on the elements ride the whole expression
-                // instead, which is imprecise where the wrap would be wrong.
-                if (!bad && (w == 0 || w > cursor - base))
+                // Skipped for the reason Ref.h's collectSlots skips it: an
+                // operand of no width occupies no bits, so it moves no
+                // cursor, the elements after it keep their positions, and
+                // reading into it would record what the concatenation does
+                // not read.
+                if (!bad && w == 0)
+                    continue;
+                // The stop Ref.h takes as well: more width than the
+                // concatenation has left means `cursor -= w` wraps. From here
+                // on the elements ride the whole expression instead, which is
+                // imprecise where the wrap would be wrong.
+                if (!bad && w > cursor - base)
                     bad = true;
                 if (bad) {
                     std::vector<Ref> reads;
