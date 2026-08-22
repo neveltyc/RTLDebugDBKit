@@ -24,14 +24,19 @@ import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias", "external", "package", "callsite")
+         "unresolved", "xmr", "alias", "external", "package", "callsite",
+         # These carry no mode-specific assertions of their own; they are named
+         # so CI can pass a mode uniformly and so the mode-gated universal
+         # checks run for them too.
+         "paramfold", "portshape", "compound", "macroloc", "stmtgaps",
+         "patterncase", "outward", "naming", "aliascat")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "13"
+SCHEMA_VERSION = "14"
 
 
 def one(sql, *args):
@@ -227,8 +232,28 @@ for tbl in ("net", "proc", "stmt"):
         SELECT count(*) FROM "{tbl}" x JOIN owner o ON o.node = x.scope_node_id
         WHERE o.inst != x.inst_id""") == 0,
           f"{tbl}.scope_node_id lies inside its own instance")
-check(one("SELECT count(*) FROM tree_node WHERE instr(name, '.') > 0") == 0,
+# A dot means a second segment -- unless the name is an ESCAPED identifier,
+# which slang writes verbatim as `\name ` with no quoting, so `\u.1 ` is one
+# segment containing a dot. Splitting a path on its last dot used to name that
+# node `1`; the leaf comes from the symbol now, and this check has to admit the
+# result or it forbids the very thing that was fixed.
+check(one("""
+    SELECT count(*) FROM tree_node
+    WHERE instr(name, '.') > 0
+      AND NOT (substr(name, 1, 1) = char(92) AND substr(name, -1, 1) = ' ')""") == 0,
       "every tree node name is a single path segment")
+# A location is a file, a line and a column, and they come from one place or
+# they are not a location. Lines and columns are 1-based, so 0 in either is not
+# a position -- it is a call that failed and was stored anyway. This is how a
+# macro location used to arrive: slang's getFileName and getLineNumber expand
+# internally, getColumnNumber does not and returns 0 off a file location it was
+# never given, so the row named the expansion site's file and line at column
+# nothing. Every fixture passed, because nothing looked.
+for tbl in ("module", "inst", "prim", "net", "term", "proc", "stmt",
+            "net_conn", "proc_event", "hier_ref"):
+    check(one(f"""SELECT count(*) FROM "{tbl}"
+                  WHERE file_id IS NOT NULL AND (line < 1 OR col < 1)""") == 0,
+          f"{tbl} positions are 1-based where a file is named")
 # Siblings sharing (parent, name) are exactly what duplicate_path_count
 # admits to: the exporter counts every node after the first in a group,
 # so the tree must show sum(n - 1) collisions -- no more, no fewer. A
@@ -842,7 +867,8 @@ print("ok: v_net_attachment reconciles with its branch formula")
 check(one("""
     SELECT count(*) FROM v_net_attachment
     WHERE attachment_kind NOT IN ('terminal_inside','actual_outside',
-        'written_by','release_target','read_by','condition','statement_read',
+        'written_by','release_target','alias_binding','read_by','condition',
+        'statement_read',
         'event','dep_in','dep_out','named_from_outside')""") == 0,
       "attachment_kind stays in its vocabulary")
 # The bug two correct commits made together: release stores its lvalue as
@@ -859,6 +885,20 @@ check(one("""
     WHERE a.attachment_kind = 'release_target'
       AND s.stmt_kind != 'release'""") == 0,
       "and release_target is exactly the releases")
+# The same discipline for alias, and for the same reason: the storage is a
+# stmt_target row but the statement writes nothing. v_driver already excluded
+# it by kind; this side reported every alias side as written, so the two
+# disagreed about "who writes this net" -- on nets no assignment in the design
+# touches.
+check(one("""
+    SELECT count(*) FROM v_net_attachment a JOIN stmt s ON s.id = a.stmt_id
+    WHERE a.attachment_kind = 'written_by' AND s.stmt_kind = 'alias'""") == 0,
+      "no alias is mislabelled as a writer")
+check(one("""
+    SELECT count(*) FROM v_net_attachment a JOIN stmt s ON s.id = a.stmt_id
+    WHERE a.attachment_kind = 'alias_binding'
+      AND s.stmt_kind != 'alias'""") == 0,
+      "and alias_binding is exactly the aliases")
 # Exclusive arc, like net_dep: exactly one of the seven typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
@@ -876,6 +916,7 @@ check(one("""
         WHEN 'actual_outside'     THEN term_id IS NULL
         WHEN 'written_by'         THEN stmt_target_id IS NULL
         WHEN 'release_target'     THEN stmt_target_id IS NULL
+        WHEN 'alias_binding'      THEN stmt_target_id IS NULL
         WHEN 'read_by'            THEN assign_operand_id IS NULL
         WHEN 'condition'          THEN expr_ref_id IS NULL
         WHEN 'statement_read'     THEN expr_ref_id IS NULL
@@ -895,12 +936,29 @@ for col, tbl in (("term_id", "term"), ("stmt_target_id", "stmt_target"),
           AND NOT EXISTS (SELECT 1 FROM "{tbl}" b WHERE b.id = a.{col})""") == 0,
           f"v_net_attachment.{col} resolves in {tbl}")
 
+# Which kinds may name no driver net. `primitive` and `procedure` are here
+# because a driver can be real and still have nothing to point at: a `pullup`
+# has no input terminal, and a call into a subroutine declared outside this
+# instance has no formal that is a net here. Both used to be swallowed by
+# v_driver's ELSE and reported as `constant` -- a tie-off claim that inflates
+# every multiple-driver count with a conflict that is not one.
+# Two directions, because they are two different statements. `constant`,
+# `terminal`, `system_task` and `external` name no net BY DEFINITION -- there
+# is no object on the far end. `primitive` and `procedure` merely MAY not: a
+# pullup has no input terminal and a call into a subroutine declared outside
+# this instance has no formal that is a net here, while the ordinary gate and
+# the ordinary call both point at something.
 check(one("""
     SELECT count(*) FROM v_driver
-    WHERE (driver_net_id IS NULL)
-          != (driver_kind IN ('constant','terminal','system_task',
-                              'external'))""") == 0,
-      "net-less rows are exactly constant/terminal/system_task/external")
+    WHERE driver_net_id IS NOT NULL
+      AND driver_kind IN ('constant','terminal','system_task','external')""") == 0,
+      "constant/terminal/system_task/external never name a driver net")
+check(one("""
+    SELECT count(*) FROM v_driver
+    WHERE driver_net_id IS NULL
+      AND driver_kind NOT IN ('constant','terminal','system_task','external',
+                              'primitive','procedure')""") == 0,
+      "only kinds that can lack a driver net do")
 # An external driver is real but nameless HERE: no net row, so no name --
 # yet unlike a constant it keeps its window, because the referenced
 # object's bits exist. Its reference must have stayed unresolved (a
@@ -989,7 +1047,12 @@ if mode:
                 "assertions": "assertions", "hierarchy": "hierarchy",
                 "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
-                "package": "package_top"}[mode]
+                "package": "package_top",
+                "paramfold": "paramfold", "portshape": "portshape",
+                "compound": "compound", "macroloc": "macroloc",
+                "stmtgaps": "stmtgaps", "patterncase": "patterncase",
+                "outward": "outward_tb", "naming": "naming",
+                "aliascat": "aliascat"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1408,7 +1471,7 @@ if mode == "unresolved":
     # Terminals for what the parent connected, direction unknown.
     check(one("""
         SELECT count(*) FROM term t JOIN tree_node n ON n.id = t.inst_id
-        WHERE n.node_kind='unresolved' AND t.direction IS NULL""") == 4,
+        WHERE n.node_kind='unresolved' AND t.direction IS NULL""") == 5,
           "the black box has a terminal per connection")
     check(one("""
         SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
@@ -1420,6 +1483,16 @@ if mode == "unresolved":
         JOIN tree_node n ON n.id = t.inst_id
         WHERE n.node_kind='unresolved' AND c.conn_kind='unconnected'""") == 1,
           "its unconnected pin is recorded as unconnected")
+    # And ONLY that pin. A sequence connection is not a simple expression, so
+    # it fell through with no expression at all and was recorded as absent --
+    # a claim the parent wired nothing, on a pin it wired two nets to. The
+    # leaves are recordable even when the shape is not.
+    check(one("""
+        SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
+        JOIN tree_node n ON n.id = t.inst_id
+        WHERE n.node_kind='unresolved' AND t.name='seq'
+          AND c.conn_kind='expression_operand'""") == 2,
+          "a sequence connection names the nets it reaches")
     # The trace stops AT the box: mid still has its consumer.
     check(one("""
         SELECT count(*) FROM v_net_dep
@@ -1726,9 +1799,22 @@ if mode == "callsite":
           "a control-expression call names no caller statement")
     check(one("""
         SELECT count(*) FROM net_dep d
-        JOIN call_site cs ON cs.id = d.call_site_id
-        WHERE cs.subroutine_name='pick'""") == 0,
+        JOIN net f ON f.id = d.tgt_net_id
+        WHERE f.name LIKE 'pick.%'
+          AND d.stmt_id IS NULL
+          AND d.call_site_id IS NOT NULL""") == 0,
           "and its statement-less binding carries no call_site_id")
+    # The BODY is a different matter, and is tagged: `pick` is called in a
+    # control expression, so the binding has no statement to hang on -- but the
+    # `return` inside it does, and every row a body walk produces names the
+    # site it was walked for. This asserted zero tagged rows for `pick`
+    # altogether, which was only true while `return` had no handler and the
+    # body contributed nothing at all.
+    check(one("""
+        SELECT count(*) FROM net_dep d
+        JOIN call_site cs ON cs.id = d.call_site_id
+        WHERE cs.subroutine_name='pick' AND d.stmt_id IS NOT NULL""") > 0,
+          "while the body it walked is")
     # Each call's argument binds to the shared formal under its OWN site.
     check(one("""
         SELECT count(DISTINCT call_site_id) FROM v_net_dep
