@@ -691,6 +691,14 @@ void reportStats(const Options& opt, const designdb::Stats& stats) {
                      "lookup may be ambiguous\n",
                      (long long)stats.duplicatePaths);
     }
+    if (stats.recursiveInstances) {
+        std::fprintf(stderr,
+                     "warning: %lld instance(s) re-enter a module that is "
+                     "already one of their own ancestors; the instantiation "
+                     "is infinitely recursive, so the tree stops there -- run "
+                     "with --diag\n",
+                     (long long)stats.recursiveInstances);
+    }
 }
 
 } // namespace

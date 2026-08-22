@@ -741,6 +741,13 @@ occurrences stamp out); the per-occurrence picture is
 `tree_node.node_kind='unresolved'`. `config_digest` fingerprints the inputs;
 two exports with one digest saw the same filelist, defines and flags.
 
+A `hierarchy_only` database of an infinitely recursive design holds a
+*prefix* of the elaborated tree: an instance whose module is already one of
+its own ancestors keeps its own nets, terminals and incoming connections but
+has no children, because the recursion has no end. One such level is
+recorded per recursion, not the depth slang happened to reach before it
+rejected the design.
+
 ## What is not here
 
 * No clock domains, no `clocked` flag, no election of "the" clock. That

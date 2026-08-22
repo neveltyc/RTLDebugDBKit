@@ -20,11 +20,13 @@
 #   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
 #   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
 #   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
+#   verify-designdb.py <design.db> recursion    + examples/constructs/recursion.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "xmr", "alias", "external", "package", "callsite",
+         "recursion",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -1047,7 +1049,7 @@ if mode:
                 "assertions": "assertions", "hierarchy": "hierarchy",
                 "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
-                "package": "package_top",
+                "package": "package_top", "recursion": "recursion",
                 "paramfold": "paramfold", "portshape": "portshape",
                 "compound": "compound", "macroloc": "macroloc",
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
@@ -1883,5 +1885,54 @@ if mode == "package":
         SELECT count(*) FROM hier_ref
         WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,
           "the pkg:: reference is recorded as written and resolved")
+
+if mode == "recursion":
+    # Illegal RTL that slang rejects, so the database is hierarchy-only by
+    # the same path any fatally-errored compilation takes. Asserted first:
+    # everything below is about a tree built without dataflow.
+    check(meta["analysis_status"] == "hierarchy_only",
+          "a recursive hierarchy is a fatally errored compilation",
+          f"got {meta['analysis_status']!r}")
+
+    # The contract the fix carries: an instance whose module is already one
+    # of its own ancestors is stamped, and stops there. Ancestry by the
+    # tree_node chain, module identity by module_id -- not by name, since two
+    # libraries may define one name.
+    ANCESTORS = """
+        WITH RECURSIVE anc(node, ancestor) AS (
+            SELECT id, parent_node_id FROM tree_node
+            WHERE parent_node_id IS NOT NULL
+          UNION ALL
+            SELECT a.node, t.parent_node_id FROM anc a
+            JOIN tree_node t ON t.id = a.ancestor
+            WHERE t.parent_node_id IS NOT NULL)
+        SELECT %s FROM anc a
+        JOIN inst i  ON i.id = a.node
+        JOIN inst ia ON ia.id = a.ancestor
+        WHERE i.module_id = ia.module_id"""
+
+    # Not vacuous: the file has three of them -- selfchain's one child and
+    # selffan's two, which are the two shapes that used to fail differently.
+    check(one(ANCESTORS % "count(DISTINCT a.node)") == 3,
+          "three instances re-enter a module of their own ancestry")
+    check(one(ANCESTORS % "count(*)" + """
+          AND EXISTS (SELECT 1 FROM tree_node c
+                      WHERE c.parent_node_id = a.node)""") == 0,
+          "and not one of them has a child")
+    # The whole tree, so an unrolled level is a failure and not just an
+    # unasserted extra: root, two children, three cut leaves.
+    check(one("SELECT count(*) FROM tree_node") == 6,
+          "the tree is the design plus one level of each recursion")
+
+    # Cut, not dropped: each keeps the terminals its module declares and the
+    # connections its parent wrote to them, so a trace reaches the recursion
+    # and stops AT it rather than losing the wires that arrive.
+    check(one(ANCESTORS % "count(*)" + """
+          AND (SELECT count(*) FROM term WHERE inst_id = a.node) != 2""") == 0,
+          "each cut instance keeps both its terminals")
+    check(one(ANCESTORS % "count(*)" + """
+          AND (SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
+               WHERE t.inst_id = a.node) != 2""") == 0,
+          "and both connections its parent made to them")
 
 print("OK")
