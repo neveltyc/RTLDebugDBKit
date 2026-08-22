@@ -75,7 +75,7 @@ jobs:
           # with enough entries to reach slang's threaded source loader, which
           # is where src_file id order stops being deterministic on its own.
           (cd examples/reorder && ../../build/rtl-designdb -f reorder.f \
-             --top reorder -o "$GITHUB_WORKSPACE/reorder.db")
+             -o "$GITHUB_WORKSPACE/reorder.db")
           python3 scripts/verify-designdb.py reorder.db
 
       # Two exports of one unchanged design, diffed row by row across every
@@ -105,7 +105,7 @@ jobs:
              ../../build/rtl-designdb -f opts.f --single-unit +incdir+. \
              +define+EXTRA_WIDTH=4)
           (cd examples/reorder && python3 ../../scripts/check-reproducible.py \
-             -n 10 ../../build/rtl-designdb -f reorder.f --top reorder)
+             -n 10 ../../build/rtl-designdb -f reorder.f)
 
   # The four release platforms, as workflow artifacts on every push. The same
   # workflow builds a tagged release, so a red push here is a release that
