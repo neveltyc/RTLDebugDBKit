@@ -781,7 +781,8 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- write. target_kind says which, in the vocabulary v_net_attachment already
 -- contracts for the same three storage cases:
 --
---   written_by       an assignment or a system task writes the net.
+--   written_by       an assignment, a system task, or a subroutine call
+--                    writing its output or inout actual writes the net.
 --   release_target   a `release`/`deassign` names its lvalue and drives
 --                    NOTHING; the extractor gives it a target row and
 --                    deliberately no dependency, so this table is the only
@@ -853,8 +854,9 @@ JOIN stmt s ON s.id = o.stmt_id;
 --                                    child's terminal, named directly
 --                                    (outer_net_id) or through a resolved
 --                                    external tie (`.p(u.g[7:4])`).
---   written_by          stmt_target_id   stmt_target of an assignment or
---                                    system-task write.
+--   written_by          stmt_target_id   stmt_target of an assignment, a
+--                                    system-task write, or a call writing
+--                                    its output actual.
 --   release_target      stmt_target_id   stmt_target of a
 --                                    `release`/`deassign`. Same storage,
 --                                    but the statement drives NOTHING --

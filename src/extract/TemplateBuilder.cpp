@@ -1212,21 +1212,43 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
         if (reads)
             addExprRef(b, stmt, actual, "call_argument", actualIdx);
         if (writes) {
-            // The target row, and deliberately no dependency. A `procedure`
-            // arc names two nets and is told apart from the reading direction
-            // by the formal being its source -- and the formal is exactly what
-            // is missing here, so a source-less one would be a shape the kind
-            // does not have. What is true and recordable is that this
-            // statement writes the argument: `v_net_attachment` answers "what
-            // writes this net", while `v_driver` reports no arc because there
-            // is no nameable one. Better than the old behaviour, which
-            // recorded neither.
+            // The target row AND a source-less `procedure` dependency, which
+            // is the shape v_driver has documented since v14: "`procedure`
+            // with a NULL driver_net_id is a call into a subroutine declared
+            // outside this instance, whose formal is no net here". The view
+            // learned to label the row; nothing emitted one, so the two
+            // contracted views answered "what writes this net" differently --
+            // v_net_attachment and v_stmt_target said this statement did,
+            // v_driver said nothing did. A package task that plainly writes
+            // its output actual read as undriven.
+            //
+            // The formal cannot be named as the source: at a call site it is
+            // a symbol rather than an expression, and the Ref built for it
+            // borrows the ACTUAL's origin, so putting it through addHierRef
+            // names it with the actual's text and resolves it against the
+            // actual's target. Both wrong, and quietly so. A NULL source is
+            // the honest answer and the one the vocabulary already has --
+            // `data` is the kind that must not be used here, since a
+            // source-less `data` row is what `constant` means.
             TplStmtRef tr;
             tr.stmt = stmt;
             tr.ordinal = b.targetOrdinal++;
             tr.net = actualIdx;
             tr.r = rangeOf(actual);
+            const int32_t targetIdx = int32_t(b.t->targets.size());
             b.t->targets.push_back(std::move(tr));
+            TplDep d;
+            d.srcNet = -1;
+            d.tgtNet = actualIdx;
+            d.stmt = stmt;
+            d.targetRef = targetIdx;
+            d.kind = "procedure";
+            d.tgtR = rangeOf(actual);
+            // mappingExact stays NULL: there is no source end to correspond
+            // with, and a correspondence beside a driver that does not exist
+            // is a claim about nothing.
+            d.callSite = b.curCallSite;
+            b.t->deps.push_back(std::move(d));
         }
         return;
     }
