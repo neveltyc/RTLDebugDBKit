@@ -20,11 +20,13 @@
 #   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
 #   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
 #   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
+#   verify-designdb.py <design.db> rootref      + examples/constructs/rootref.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "xmr", "alias", "external", "package", "callsite",
+         "rootref",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -1052,7 +1054,7 @@ if mode:
                 "compound": "compound", "macroloc": "macroloc",
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
                 "outward": "outward_tb", "naming": "naming",
-                "aliascat": "aliascat"}[mode]
+                "aliascat": "aliascat", "rootref": "rootref"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1498,6 +1500,74 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dep
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "rootref":
+    # A $root path is absolute, and the two occurrences of one body that
+    # spell it must land on the SAME object. A downward replay would have
+    # answered r0's own subtree for r0 and r1's for r1; there is nothing
+    # below either, so the give-away is that both rows resolve at all and
+    # resolve alike.
+    check(one("""
+        SELECT count(DISTINCT h.resolved_net_id) FROM hier_ref h
+        WHERE h.path='$root.rootref.u_leaf.q' AND h.access='read'""") == 1,
+          "one absolute path resolves to one net from every occurrence")
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='$root.rootref.u_leaf.q'
+          AND t.name='u_leaf' AND n.name='q'""") == 3,
+          "and it names u_leaf.q -- the write and both reads")
+    # The shortest absolute path there is: one tree segment, straight to a
+    # net of the root instance.
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='$root.rootref.own' AND t.name='rootref'
+          AND n.name='own'""") == 2,
+          "a one-segment absolute path resolves to the root's own net")
+    # The upward spelling of the same net stays unresolved: one analysed
+    # body cannot answer for surroundings it does not know.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path='rootref.u_leaf.q'
+          AND (resolved_inst_id IS NOT NULL OR resolved_net_id IS NOT NULL)
+        """) == 0,
+          "an upward path to the same net stays unresolved")
+    # What the resolution is for: the write becomes a driver instead of a
+    # dependency that could not be materialised, and the read becomes a load.
+    check(one("""
+        SELECT count(*) FROM v_driver v
+        JOIN tree_node t ON t.id = v.signal_inst_id
+        WHERE t.name='u_leaf' AND v.signal_name='q'
+          AND v.driver_name='d' AND v.driver_kind='data'""") == 1,
+          "the absolute write drives the far net")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='own' AND load_name='shallow_o'
+          AND load_kind='dataflow'""") == 2,
+          "and the absolute read loads the root's net, once per occurrence")
+    # The case that separates absolute from downward. rootref_below sits
+    # BELOW the path it spells, so the path does split below the one analysed
+    # body -- and a downward replay would answer each occurrence's own leaf.
+    # Both rows must name u_below_a's; the local `deep.q` beside them, which
+    # does follow the occurrence, is the control.
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN tree_node p ON p.id = d.parent_node_id
+        WHERE h.path='$root.rootref.u_below_a.deep.q'
+          AND d.name='deep' AND p.name='u_below_a'""") == 2,
+          "a $root path below the analysed body still names one leaf, "
+          "from both occurrences")
+    check(one("""
+        SELECT count(DISTINCT p.name) FROM hier_ref h
+        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN tree_node p ON p.id = d.parent_node_id
+        WHERE h.path='deep.q'""") == 2,
+          "while the local path beside it follows the occurrence")
+
 
 if mode == "xmr":
     # A downward read is a real dependency naming the reference it went

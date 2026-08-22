@@ -203,12 +203,15 @@ private:
                        const Ref* asWritten = nullptr);
 
     /// How to reach the reference's target from an occurrence. Downward
-    /// targets replay inside the occurrence's own subtree; absolute ones
-    /// replay from the root; a reference through one of this template's own
-    /// interface terminals replays from whatever instance the terminal is
-    /// bound to in that occurrence. Upward references (upwardCount > 0) stay
-    /// unresolved -- the one analysed body speaks for occurrences whose
-    /// upward surroundings may differ, and a guess is worse than a NULL.
+    /// targets replay inside the occurrence's own subtree; absolute ones --
+    /// the $root-anchored names -- replay from the design root; a reference
+    /// through one of this template's own interface terminals replays from
+    /// whatever instance the terminal is bound to in that occurrence.
+    /// Upward references (upwardCount > 0) stay unresolved -- the one
+    /// analysed body speaks for occurrences whose upward surroundings may
+    /// differ, and a guess is worse than a NULL. That reasoning covers only
+    /// the upward ones, so $root is exempt from it: an absolute path names
+    /// one object no matter which occurrence reads it.
     void fillResolution(Build& b, TplHierRef& row, const Ref& r);
 
     static bool splitBelow(const std::string& full, const std::string& prefix,
