@@ -1669,7 +1669,8 @@ if mode == "anonymous":
     # the design did not fully compile.
     check(status == "partial",
           "and the export still reports what slang rejected")
-    # The two in the top body, and the one inside anon_mid.
+    # The two in the top body, the one inside anon_mid, and one per
+    # generate level.
     check(one("""
         SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
         JOIN module m ON m.id = i.module_id

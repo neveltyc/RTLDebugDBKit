@@ -807,10 +807,10 @@ EDA standards already name:
 `src_file` holds every file slang actually read, absolute path and
 SHA-256, so a consumer can tell whether the database and the RTL diverged.
 Its rows are interned in path order, which is what lets two exports of an
-unchanged design be compared row for row: it is the one table whose ids come
-from SQLite rather than an extractor counter, so its insert order is its id
-order, and the order slang hands the buffers back in is the order a thread
-pool finished reading them.
+unchanged design be compared row for row: its ids come from SQLite rather
+than an extractor counter, so its insert order is its id order, and the order
+slang hands the buffers back in is the order a thread pool finished reading
+them.
 `file` holds the spellings rows carry — as written in the filelist —
 joined to their src_file. `meta` is the seal; its required keys are the
 `v_db_info` columns plus `tool`, except `top` — the space-separated names
@@ -831,11 +831,14 @@ occurrences stamp out); the per-occurrence picture is
 two exports with one digest saw the same filelist, defines and flags.
 
 A `hierarchy_only` database of an infinitely recursive design holds a
-*prefix* of the elaborated tree: an instance whose module is already one of
-its own ancestors keeps its own nets, terminals and incoming connections but
-has no children, because the recursion has no end. One such level is
-recorded per recursion, not the depth slang happened to reach before it
-rejected the design.
+*prefix* of the elaborated tree: an instance whose module AND parameters are
+already those of one of its own ancestors keeps its own nets, terminals,
+incoming connections, generate scopes and primitives, but no child
+instances, because the recursion has no end. Parameters are part of the
+test, so a finite parameterised recursion -- a tree that halves its width
+each level and terminates -- is stamped whole. One level is recorded per
+recursion, not the depth slang happened to reach before it rejected the
+design.
 
 ## What is not here
 
@@ -900,10 +903,10 @@ rejected the design.
 * A subroutine's formals are one net per subroutine, not one per call site.
   The formal is shared, so a transitive cone that ignores call sites admits
   combinations no single call makes (`g1` with the second call's argument).
-  This is *filterable* rather than fixed in the storage: every `stmt`,
-  `stmt_target`, `assign_operand` and `net_dep` a body walk produces
-  carries a `call_site_id`, so a consumer
-  that follows one call's rows at each hop keeps each call's real
+  This is *filterable* rather than fixed in the storage: every `stmt` and
+  every `net_dep` a body walk produces carries a `call_site_id`, and the
+  three statement views derive it for the rows that hang off a statement, so
+  a consumer that follows one call's rows at each hop keeps each call's real
   combination (see *Tracing across calls*). Per-call-site formal NETS —
   materialising the shared net once per site — would remove the need to
   filter at all, and are not modelled.
@@ -1008,7 +1011,7 @@ other's — `{g1, a}` and `{g2, b}`, never `{g1, b}`. This is context
 sensitivity by call string, the shape static analysis calls *k*-CFA, done
 at query time over tags rather than baked into the stored graph.
 
-The tag is on all four views a walk meets: `v_net_dep`, `v_driver` and
+The tag is on all six views a walk meets: `v_net_dep`, `v_driver` and
 `v_load` for the dependency path, and `v_stmt`, `v_stmt_target` and
 `v_stmt_operand` for the statement path — the one a consumer falls back to
 when a dependency did not survive its unresolvable sources. Until v15 the
