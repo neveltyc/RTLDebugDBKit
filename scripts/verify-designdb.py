@@ -91,13 +91,22 @@ if total_sf == 0 or baddig:
 # Compared as adjacent pairs in id order rather than by joining on id + 1,
 # so a gap in the ids -- which nothing produces today, but which an ignored
 # insert would -- does not silently skip the pair that straddles it.
-sf_rows = con.execute("SELECT id, path FROM src_file ORDER BY id").fetchall()
-unsorted = next((
-    (a, b) for a, b in zip(sf_rows, sf_rows[1:]) if b[1] < a[1]), None)
+#
+# Ordered by SQLite rather than in Python, for two reasons. The exporter sorts
+# with std::string::operator<, which is a byte comparison, and BINARY is the
+# collation that means the same thing; Python's str comparison is by code
+# point, which agrees for valid UTF-8 and is not the same rule. And a path is
+# a byte string on Linux, not necessarily valid UTF-8 -- fetching one into
+# Python raises rather than compares, so this was the one check that could
+# make a well-formed database die on a directory name.
+unsorted = con.execute("""
+    SELECT a.id, a.path, b.id, b.path FROM src_file a JOIN src_file b
+      ON b.id > a.id AND b.path < a.path COLLATE BINARY
+    ORDER BY a.id, b.id LIMIT 1""").fetchone()
 check(unsorted is None, f"src_file ids assigned in path order ({total_sf} rows)",
       "" if unsorted is None
-      else f"id {unsorted[0][0]} is {unsorted[0][1]!r} but id "
-           f"{unsorted[1][0]} is {unsorted[1][1]!r}")
+      else f"id {unsorted[0]} is {unsorted[1]!r} but the later id "
+           f"{unsorted[2]} is {unsorted[3]!r}")
 
 # Structural integrity -- catches corruption and generator bugs. The writer
 # leaves foreign_keys off for speed, so this is where the REFERENCES clauses
@@ -2466,7 +2475,7 @@ if mode == "package":
     check(one("""
         SELECT count(DISTINCT signal_inst_id) FROM v_driver
         WHERE driver_name='mask' AND driver_kind='data'""") == 3,
-          "and there really are distinct readers of it")
+          "and there really are three distinct readers of it")
     check(one("""
         SELECT count(*) FROM hier_ref
         WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,

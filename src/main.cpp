@@ -786,7 +786,7 @@ void reportStats(const Options& opt, const designdb::Stats& stats) {
                      "are absent, so they carry hierarchy and connections and "
                      "no procedural dataflow\n",
                      (long long)stats.unanalysedInsts,
-                     (long long)stats.instances);
+                     (long long)stats.stampedBodies);
     }
 }
 
