@@ -24,7 +24,12 @@ import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias", "external", "package", "callsite")
+         "unresolved", "xmr", "alias", "external", "package", "callsite",
+         # These carry no mode-specific assertions of their own; they are named
+         # so CI can pass a mode uniformly and so the mode-gated universal
+         # checks run for them too.
+         "paramfold", "portshape", "compound", "macroloc", "stmtgaps",
+         "patterncase", "outward", "naming", "aliascat")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
@@ -1026,7 +1031,12 @@ if mode:
                 "assertions": "assertions", "hierarchy": "hierarchy",
                 "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
-                "package": "package_top"}[mode]
+                "package": "package_top",
+                "paramfold": "paramfold", "portshape": "portshape",
+                "compound": "compound", "macroloc": "macroloc",
+                "stmtgaps": "stmtgaps", "patterncase": "patterncase",
+                "outward": "outward_tb", "naming": "naming",
+                "aliascat": "aliascat"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1763,9 +1773,22 @@ if mode == "callsite":
           "a control-expression call names no caller statement")
     check(one("""
         SELECT count(*) FROM net_dep d
-        JOIN call_site cs ON cs.id = d.call_site_id
-        WHERE cs.subroutine_name='pick'""") == 0,
+        JOIN net f ON f.id = d.tgt_net_id
+        WHERE f.name LIKE 'pick.%'
+          AND d.stmt_id IS NULL
+          AND d.call_site_id IS NOT NULL""") == 0,
           "and its statement-less binding carries no call_site_id")
+    # The BODY is a different matter, and is tagged: `pick` is called in a
+    # control expression, so the binding has no statement to hang on -- but the
+    # `return` inside it does, and every row a body walk produces names the
+    # site it was walked for. This asserted zero tagged rows for `pick`
+    # altogether, which was only true while `return` had no handler and the
+    # body contributed nothing at all.
+    check(one("""
+        SELECT count(*) FROM net_dep d
+        JOIN call_site cs ON cs.id = d.call_site_id
+        WHERE cs.subroutine_name='pick' AND d.stmt_id IS NOT NULL""") > 0,
+          "while the body it walked is")
     # Each call's argument binds to the shared formal under its OWN site.
     check(one("""
         SELECT count(DISTINCT call_site_id) FROM v_net_dep
