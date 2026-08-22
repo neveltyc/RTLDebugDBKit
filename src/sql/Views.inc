@@ -453,9 +453,18 @@ SELECT
     d.src_lo                 AS driver_lo,
     d.src_hi                 AS driver_hi,
     d.src_exact              AS driver_exact,
+    -- `constant` is claimed only for a DATA row with no source, which is what
+    -- the contract above says and what the word means: a tie-off or a constant
+    -- right-hand side. Every other kind is carried through even without a
+    -- source, because for those a missing source is not a constant -- a
+    -- `pullup` has no input terminal and a call into a subroutine this
+    -- template cannot name has no nameable driver, and reporting either as a
+    -- tie-off inflates every multiple-driver count with a conflict that is
+    -- not one. The ELSE used to swallow them.
     CASE WHEN d.src_net_id IS NOT NULL THEN d.dep_kind
          WHEN d.src_hier_ref_id IS NOT NULL THEN 'external'
          WHEN s.stmt_kind = 'system_task' THEN 'system_task'
+         WHEN d.dep_kind != 'data' THEN d.dep_kind
          ELSE 'constant' END AS driver_kind,
     d.id                     AS dep_id,
     NULL                     AS conn_id,

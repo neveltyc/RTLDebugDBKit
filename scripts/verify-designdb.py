@@ -907,12 +907,29 @@ for col, tbl in (("term_id", "term"), ("stmt_target_id", "stmt_target"),
           AND NOT EXISTS (SELECT 1 FROM "{tbl}" b WHERE b.id = a.{col})""") == 0,
           f"v_net_attachment.{col} resolves in {tbl}")
 
+# Which kinds may name no driver net. `primitive` and `procedure` are here
+# because a driver can be real and still have nothing to point at: a `pullup`
+# has no input terminal, and a call into a subroutine declared outside this
+# instance has no formal that is a net here. Both used to be swallowed by
+# v_driver's ELSE and reported as `constant` -- a tie-off claim that inflates
+# every multiple-driver count with a conflict that is not one.
+# Two directions, because they are two different statements. `constant`,
+# `terminal`, `system_task` and `external` name no net BY DEFINITION -- there
+# is no object on the far end. `primitive` and `procedure` merely MAY not: a
+# pullup has no input terminal and a call into a subroutine declared outside
+# this instance has no formal that is a net here, while the ordinary gate and
+# the ordinary call both point at something.
 check(one("""
     SELECT count(*) FROM v_driver
-    WHERE (driver_net_id IS NULL)
-          != (driver_kind IN ('constant','terminal','system_task',
-                              'external'))""") == 0,
-      "net-less rows are exactly constant/terminal/system_task/external")
+    WHERE driver_net_id IS NOT NULL
+      AND driver_kind IN ('constant','terminal','system_task','external')""") == 0,
+      "constant/terminal/system_task/external never name a driver net")
+check(one("""
+    SELECT count(*) FROM v_driver
+    WHERE driver_net_id IS NULL
+      AND driver_kind NOT IN ('constant','terminal','system_task','external',
+                              'primitive','procedure')""") == 0,
+      "only kinds that can lack a driver net do")
 # An external driver is real but nameless HERE: no net row, so no name --
 # yet unlike a constant it keeps its window, because the referenced
 # object's bits exist. Its reference must have stayed unresolved (a
