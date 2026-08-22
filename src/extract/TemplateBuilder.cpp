@@ -376,7 +376,18 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     const Symbol* target = hv.ref.target;
     if (!target || !r.sym)
         return;
-    if (hv.ref.isUpward())
+    // slang's isUpward() is true for two unrelated shapes, and only one of
+    // them is unresolvable here: a name that climbed OUT of this body
+    // (upwardCount > 0), and a name anchored at $root. The first is a
+    // genuine unknown -- the one analysed body speaks for occurrences whose
+    // upward surroundings may differ, and a guess is worse than a NULL. The
+    // second is the opposite: an absolute path names the same object seen
+    // from every occurrence, which is exactly what TplHierRef::Absolute is
+    // for. Asking isUpward() alone dropped `$root.a.b.c` with the upward
+    // ones and left Absolute unreachable.
+    const bool fromRoot = !hv.ref.path.empty() && hv.ref.path.front().symbol &&
+                          hv.ref.path.front().symbol->kind == SymbolKind::Root;
+    if (!fromRoot && hv.ref.isUpward())
         return;
     // A modport port stands for the net behind it: the reference
     // resolves to that net, not to the modport's own symbol -- whose
@@ -412,12 +423,22 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
         }
         return;
     }
+    // A $root path must not be re-read as a downward one even when it does
+    // sit below this body's prefix. The prefix belongs to the ONE body that
+    // was analysed; replaying `$root.top.u.x` from each occurrence would
+    // answer `top.u.x` for the occurrence that happens to be `top` and
+    // `outer.m.u.x` for one instantiated deeper, and only the first is what
+    // the source spells.
     std::string rel;
-    if (splitBelow(full, b.decl->bodyPrefix(), rel)) {
+    if (!fromRoot && splitBelow(full, b.decl->bodyPrefix(), rel)) {
         row.resolve = TplHierRef::Downward;
         splitSegsAndNet(rel, *target, row);
         return;
     }
+    // getHierarchicalPath() stops at Root (Symbol.cpp:117 walks up only
+    // while the parent is neither Root nor CompilationUnit), so `full` is
+    // already root-relative and its first segment is a top instance name --
+    // which is what Stamper's descend(0, segs) consumes.
     row.resolve = TplHierRef::Absolute;
     splitSegsAndNet(full, *target, row);
 }

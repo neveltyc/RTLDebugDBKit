@@ -426,7 +426,8 @@ hierarchy, `resolved_inst_id` and `resolved_net_id` name the actual rows
 when the export can replay the reference —
 
 * downward (`u_cnt.cnt`): resolved, per occurrence;
-* absolute paths into the exported tree: resolved;
+* absolute paths — anchored at `$root` — resolved from the design root, so
+  every occurrence of the body that spells one lands on the same object;
 * through one of the instance's own interface ports (`bus.vld`, modports
   included): resolved to the interface instance each occurrence is actually
   bound to;
