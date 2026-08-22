@@ -6,13 +6,15 @@
 # contains picorv32/, tinyriscv/ and veerwolf_run/, or keep the default
 # layout where it sits beside the project. Each design is exported, checked
 # with `PRAGMA foreign_key_check`, and -- when the verifier is present --
-# read back with verify-designdb.py. Sizes and times are printed so a schema
-# change's cost shows up here first.
+# read back with verify-designdb.py and re-exported to confirm the two runs
+# agree row for row. Sizes and times are printed so a schema change's cost
+# shows up here first.
 set -u
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$here/build/rtl-designdb"
 verify="$here/scripts/verify-designdb.py"
+repro="$here/scripts/check-reproducible.py"
 out="${OUT_DIR:-/tmp/designdb-real}"
 rwa="${RWA_DIR:-}"
 
@@ -58,6 +60,18 @@ run() {
     if [ -f "$verify" ]; then
         if ! python3 "$verify" "$db" >/dev/null; then
             echo "FAIL: verify $name" >&2
+            fail=1
+            return
+        fi
+    fi
+    # These designs are where reproducibility is actually testable: the
+    # examples in the repository have too few files for slang's parallel
+    # source reads to come back in a different order, and tinyriscv's 28
+    # reordered on every single export. Two more exports, diffed row by row
+    # across every table.
+    if [ -f "$repro" ]; then
+        if ! (cd "$dir" && python3 "$repro" "$bin" "$@") >/dev/null; then
+            echo "FAIL: reproducible $name" >&2
             fail=1
             return
         fi
