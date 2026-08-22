@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 15. The version is the *consumption contract*, not the DDL: a
+Schema version 16. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
@@ -529,7 +529,8 @@ asserts all of it on every export. Ground rules:
 **`v_db_info`** — the meta seal as one row, counts CAST to INTEGER:
 `schema_version, tool_version, slang_version, producer_revision, top,
 analysis_status, error_count, unresolved_count, empty_procedure_count,
-duplicate_path_count, config_digest`.
+duplicate_path_count, recursion_count, truncated_call_count,
+unanalysed_inst_count, config_digest`.
 
 **`v_tree_node`** — one row per node: `node_id, parent_node_id, node_name,
 node_kind, ordinal, inst_id, parent_inst_id, module_id, module_name,
@@ -675,7 +676,8 @@ call_site_id, file_path, src_path, src_line, src_col`.
 ordinal, net_id, net_name, target_kind, tgt_lo, tgt_hi, tgt_exact,
 call_site_id`. An lvalue is not the same thing as a write, and
 `target_kind` says which, in `v_net_attachment`'s vocabulary and computed
-by the same expression: `written_by` (an assignment or a system task),
+by the same expression: `written_by` (an assignment, a system task, or a
+call writing its output actual),
 `release_target` (a `release`/`deassign` names its lvalue and drives
 nothing — this table is the only place it appears, so without the column
 it is also the only place it can be mistaken for a driver) and
@@ -817,13 +819,15 @@ joined to their src_file. `meta` is the seal; its required keys are the
 of the elaborated top instances — which is absent when the design
 elaborates none.
 `analysis_status` is `complete | partial | hierarchy_only` and agrees with
-the counts beside it: errors, skipped procedures, duplicated paths (two
+the counts beside it, each of which is published: `error_count`,
+`empty_procedure_count` (skipped procedures), `duplicate_path_count` (two
 siblings sharing one (parent, name) pair, so a path lookup stops resolving
-uniquely) and truncated call expansions make `partial`, as would an
-occurrence stamped from a module body the analysis never reached — it
-would have hierarchy and connections and no procedure at all, though no
-design measured here produces one. Unresolved instantiations do not make
-`partial`. `hierarchy_only` has one cause: the compilation was fatally
+uniquely), `truncated_call_count` and `unanalysed_inst_count` — an
+occurrence stamped from a module body the analysis never reached, which has
+hierarchy and connections and no procedure at all, though no design measured
+here produces one. Any of the five non-zero makes `partial`, and `partial`
+with all five zero is a malformed file: the status is never a claim a
+consumer cannot look at. Unresolved instantiations do not make `partial`. `hierarchy_only` has one cause: the compilation was fatally
 errored, so slang analysed no dataflow to export. `unresolved_count`
 counts unresolved instantiation *sites* (one per written instantiation, however many
 occurrences stamp out); the per-occurrence picture is
@@ -835,10 +839,12 @@ A `hierarchy_only` database of an infinitely recursive design holds a
 already those of one of its own ancestors keeps its own nets, terminals,
 incoming connections, generate scopes and primitives, but no child
 instances, because the recursion has no end. Parameters are part of the
-test, so a finite parameterised recursion -- a tree that halves its width
-each level and terminates -- is stamped whole. One level is recorded per
+test, so a finite parameterised recursion — a tree that halves its width
+each level and terminates — is stamped whole. One level is recorded per
 recursion, not the depth slang happened to reach before it rejected the
-design.
+design. `recursion_count` is how many such instances there are, which is
+what tells a truncated tree from a whole one: `hierarchy_only` says there is
+no dataflow, not that the hierarchy stops early.
 
 ## What is not here
 
@@ -914,6 +920,14 @@ design.
   call's target) and the detail arcs through its formals, so a fan-out
   count over both double-counts that read. The detail path also stops at
   the function's return net, which has no arc onward to the target.
+* An OUTPUT actual of a function called inside a condition is also recorded
+  as a `control` source of whatever that condition gates. The condition's
+  operands are collected as one expression, before the call's argument
+  directions are known, so `if (chk(a, y))` reads `y` as gating even though
+  the call writes it and never reads it. The write itself is recorded (a
+  source-less `procedure` dependency, no statement); it is the extra
+  `control` edge that is wrong, and a walk that filters `dep_kind='control'`
+  by whether the same statement also writes the net can exclude it.
 * A macro-assembled reference spans two buffers and cannot be recovered as
   one span; it is counted (`meta` external tally), not stored.
 * Statements slang marks bad take their enclosing block out of the walk;
@@ -963,9 +977,12 @@ exactly as two modules on one interface meet on the interface's net.
 
 Only package *variables* become nets. A package subroutine's formals are
 not among them, so a call that passes actuals through them records the
-actual as a `stmt_target` and no dataflow: the argument binding, the body's
-reads and the body's write to the formal are all `hier_ref` rows that
-resolve to nothing. A package subroutine that touches package variables
+write to the actual — a `stmt_target` and a `procedure` dependency with no
+source net, which `v_driver` reports as `driver_kind='procedure'` with a
+NULL driver — and no dataflow THROUGH the subroutine: the argument binding,
+the body's reads and the body's write to the formal are all `hier_ref` rows
+that resolve to nothing, so what the actual is written FROM is not
+recorded. A package subroutine that touches package variables
 only — `enable = |mask` — is a different matter and arcs normally. A
 package of nothing but
 `localparam`, `typedef` and functions is a node with no nets. `$unit`

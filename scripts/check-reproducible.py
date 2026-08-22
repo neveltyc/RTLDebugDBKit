@@ -41,6 +41,8 @@ import tempfile
 argv = sys.argv[1:]
 repeats = 2
 if len(argv) >= 2 and argv[0] == "-n":
+    if not argv[1].isdigit():
+        sys.exit(f"-n takes a number, not {argv[1]!r}")
     repeats = int(argv[1])
     argv = argv[2:]
 if len(argv) < 1 or repeats < 2:
@@ -67,11 +69,15 @@ def compare(ref_db, new_db, run):
 
     if schema(a) != schema(b):
         problems.append(f"run {run}: schema differs from run 1")
+        a.close()
+        b.close()
         return problems, 0
 
     ta, tb = tables(a), tables(b)
     if ta != tb:
         problems.append(f"run {run}: table set differs: {ta} vs {tb}")
+        a.close()
+        b.close()
         return problems, 0
 
     compared = 0
@@ -133,7 +139,17 @@ try:
         sys.exit(f"export is not reproducible: {len(problems)} difference(s) "
                  f"across {repeats} runs of {' '.join(exporter_args)}")
 
-    ntables = len(tables(sqlite3.connect(dbs[0])))
+    con = sqlite3.connect(dbs[0])
+    try:
+        ntables = len(tables(con))
+    finally:
+        con.close()
+    # A guard that cannot detect its own no-op is not a guard. Every path
+    # above reports agreement by finding no disagreement, so an exporter that
+    # wrote an empty file -- or a schema that lost its tables -- would pass
+    # silently: no tables to enumerate, no rows to compare, no problems.
+    if not ntables or not compared:
+        sys.exit(f"compared nothing: {ntables} table(s), {compared} row(s)")
     print(f"ok: {repeats} exports agree on all {compared} rows "
           f"across {ntables} tables")
 finally:

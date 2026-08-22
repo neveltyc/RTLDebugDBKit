@@ -448,7 +448,12 @@ CREATE TABLE proc_event(
 --              and formal back to a written actual. stmt_id is the calling
 --              statement (NULL for a call in a control expression); the
 --              actual's read is expr_ref_id (role='call_argument') or
---              src_hier_ref_id.
+--              src_hier_ref_id. A write-back whose formal is no net of this
+--              instance -- a subroutine declared in a package, an interface
+--              or $unit -- has no source to name, so src_net_id and
+--              src_hier_ref_id are both NULL and stmt_target_id names the
+--              lvalue instead. That is the only procedure row with no
+--              source, and the only one carrying a target row.
 --
 -- A dependency whose end lies in ANOTHER instance -- `assign q = u.x;`,
 -- a write through an interface port -- carries the resolved net id like

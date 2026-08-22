@@ -24,6 +24,37 @@
 
 namespace designdb::detail {
 
+/// Holds one key in a set for the lifetime of a walk down, and takes it out
+/// on the way back up -- a PATH set, which is what tells a cycle from a
+/// module legitimately instantiated twice by one parent.
+///
+/// RAII rather than a matching erase at the end of the function, because the
+/// two walks that use it are long and the cost of one missed erase is
+/// silent: the path set becomes a VISITED set, and the guard starts cutting
+/// legitimate sibling re-instantiation instead of recursion. `entered()`
+/// says whether this call is the one that inserted the key; a false means
+/// the key was already on the path, and nothing is erased on the way out.
+template<typename Set>
+class OnPath {
+public:
+    OnPath(Set& set, typename Set::value_type key)
+        : set_(set), key_(std::move(key)),
+          entered_(set.insert(key_).second) {}
+    ~OnPath() {
+        if (entered_)
+            set_.erase(key_);
+    }
+    OnPath(const OnPath&) = delete;
+    OnPath& operator=(const OnPath&) = delete;
+    bool entered() const { return entered_; }
+
+private:
+    Set& set_;
+    typename Set::value_type key_;
+    bool entered_;
+};
+
+
 // Everything a group's occurrences share, held with template-local indices.
 // Stamping is then arithmetic: global id = per-occurrence base + index. The
 // invariant that makes this sound: two bodies with one (definition,

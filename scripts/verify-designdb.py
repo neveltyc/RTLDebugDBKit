@@ -25,24 +25,28 @@
 #   verify-designdb.py <design.db> rootref      + examples/constructs/rootref.sv facts
 #   verify-designdb.py <design.db> typeparam    + examples/constructs/typeparam.sv facts
 #   verify-designdb.py <design.db> concatcursor + examples/constructs/concatcursor.sv facts
+#   verify-designdb.py <design.db> naming       + examples/constructs/naming.sv facts
+#   verify-designdb.py <design.db> outward      + examples/constructs/outward.sv facts
+#   verify-designdb.py <design.db> paramrec     + examples/constructs/paramrec.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "anonymous", "xmr", "alias", "external", "package",
          "callsite", "recursion", "rootref", "typeparam", "concatcursor",
+         "naming", "outward", "paramrec",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
          "paramfold", "portshape", "compound", "macroloc", "stmtgaps",
-         "patterncase", "outward", "naming", "aliascat")
+         "patterncase", "aliascat")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "15"
+SCHEMA_VERSION = "16"
 
 
 def one(sql, *args):
@@ -87,13 +91,22 @@ if total_sf == 0 or baddig:
 # Compared as adjacent pairs in id order rather than by joining on id + 1,
 # so a gap in the ids -- which nothing produces today, but which an ignored
 # insert would -- does not silently skip the pair that straddles it.
-sf_rows = con.execute("SELECT id, path FROM src_file ORDER BY id").fetchall()
-unsorted = next((
-    (a, b) for a, b in zip(sf_rows, sf_rows[1:]) if b[1] < a[1]), None)
+#
+# Ordered by SQLite rather than in Python, for two reasons. The exporter sorts
+# with std::string::operator<, which is a byte comparison, and BINARY is the
+# collation that means the same thing; Python's str comparison is by code
+# point, which agrees for valid UTF-8 and is not the same rule. And a path is
+# a byte string on Linux, not necessarily valid UTF-8 -- fetching one into
+# Python raises rather than compares, so this was the one check that could
+# make a well-formed database die on a directory name.
+unsorted = con.execute("""
+    SELECT a.id, a.path, b.id, b.path FROM src_file a JOIN src_file b
+      ON b.id > a.id AND b.path < a.path COLLATE BINARY
+    ORDER BY a.id, b.id LIMIT 1""").fetchone()
 check(unsorted is None, f"src_file ids assigned in path order ({total_sf} rows)",
       "" if unsorted is None
-      else f"id {unsorted[0][0]} is {unsorted[0][1]!r} but id "
-           f"{unsorted[1][0]} is {unsorted[1][1]!r}")
+      else f"id {unsorted[0]} is {unsorted[1]!r} but the later id "
+           f"{unsorted[2]} is {unsorted[3]!r}")
 
 # Structural integrity -- catches corruption and generator bugs. The writer
 # leaves foreign_keys off for speed, so this is where the REFERENCES clauses
@@ -488,15 +501,50 @@ check(one("""
              OR d.tgt_hier_ref_id IS NOT NULL
              OR d.map_exact IS NULL
         WHEN 'procedure' THEN d.prim_id IS NOT NULL
-             OR d.stmt_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
-             OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
-             -- The reading side names where the actual came from, exactly
-             -- as the doc promises: an argument reference or a resolved
-             -- outward one. The write-back direction (formal -> actual) has
-             -- neither, and is told apart by the formal being the source.
-             OR (d.expr_ref_id IS NOT NULL AND d.src_hier_ref_id IS NOT NULL)
+             OR d.assign_operand_id IS NOT NULL
+             OR CASE WHEN d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL
+                  -- The write-back of a call whose formal is no net of this
+                  -- instance -- a subroutine declared in a package, an
+                  -- interface or $unit. There is no source to name, which is
+                  -- the shape v_driver has documented since v14:
+                  -- `driver_kind='procedure'` with a NULL driver net. The
+                  -- stmt_target row beside it is what says the statement
+                  -- writes the actual, and the two are one fact: neither may
+                  -- stand without the other.
+                  -- The target row is a position within a statement, so a
+                  -- call in a CONDITION -- which belongs to no statement
+                  -- this schema records -- has the dependency and no target
+                  -- row. The two travel together wherever there is a
+                  -- statement at all.
+                  THEN (d.stmt_id IS NULL) IS NOT (d.stmt_target_id IS NULL)
+                       OR d.expr_ref_id IS NOT NULL
+                       OR d.tgt_hier_ref_id IS NOT NULL
+                       OR d.map_exact IS NOT NULL
+                  -- Every other procedure row names a source, and the
+                  -- write-back direction (formal -> actual) is told apart by
+                  -- the formal being it -- so no target row. The reading side
+                  -- names where the actual came from, exactly as the doc
+                  -- promises: an argument reference or a resolved outward
+                  -- one, never both.
+                  ELSE d.stmt_target_id IS NOT NULL
+                       OR (d.expr_ref_id IS NOT NULL
+                           AND d.src_hier_ref_id IS NOT NULL)
+                END
         ELSE 1 END""") == 0,
       "net_dep provenance columns match dep_kind")
+
+# The general form of what the write-back row above exists for: the two views
+# that answer "what writes this net" must answer alike. v_stmt_target and
+# v_net_attachment read stmt_target, v_driver reads net_dep -- and a call
+# through an unstamped formal used to produce the first without the second, so
+# a package task that plainly writes its output actual read as undriven.
+check(one("""
+    SELECT count(*) FROM v_stmt_target t
+    WHERE t.target_kind = 'written_by'
+      AND NOT EXISTS (SELECT 1 FROM v_driver d
+                      WHERE d.signal_net_id = t.net_id
+                        AND d.stmt_id = t.stmt_id)""") == 0,
+      "every written_by target is a driver of its net from its own statement")
 check(one("""
     SELECT count(*) FROM net_dep d JOIN hier_ref h ON h.id = d.src_hier_ref_id
     WHERE h.resolved_net_id IS NOT d.src_net_id""") == 0,
@@ -672,6 +720,7 @@ check(one("""
 # ------------------------------------------------------------------ meta
 required = ["schema_version", "analysis_status", "error_count",
             "unresolved_count", "empty_procedure_count", "duplicate_path_count",
+            "recursion_count", "truncated_call_count", "unanalysed_inst_count",
             "tool", "tool_version", "slang_version", "producer_revision",
             "config_digest"]
 meta = dict(con.execute("SELECT key, value FROM meta"))
@@ -680,17 +729,27 @@ if missing:
     sys.exit(f"meta lacks required key(s): {', '.join(missing)}")
 if meta["schema_version"] != SCHEMA_VERSION:
     sys.exit(f"schema_version is {meta['schema_version']}, expected {SCHEMA_VERSION}")
-for k in ("error_count", "unresolved_count", "empty_procedure_count",
-          "duplicate_path_count"):
+COUNTS = ("error_count", "unresolved_count", "empty_procedure_count",
+          "duplicate_path_count", "recursion_count", "truncated_call_count",
+          "unanalysed_inst_count")
+for k in COUNTS:
     if not meta[k].isdigit():
         sys.exit(f"meta.{k} is not a number: {meta[k]!r}")
 status = meta["analysis_status"]
 if status not in ("complete", "partial", "hierarchy_only"):
     sys.exit(f"analysis_status is {status!r}")
-if status == "complete" and (int(meta["error_count"]) or
-                             int(meta["empty_procedure_count"]) or
-                             int(meta["duplicate_path_count"])):
+# Every cause of a non-`complete` status is a published count now, so the
+# implication runs both ways: `complete` beside a non-zero count is a
+# malformed file, and a count that chose `partial` can be looked at rather
+# than merely inferred. `unresolved_count` is not among them by design -- a
+# black box is not an incompleteness of the export.
+PARTIAL_CAUSES = ("error_count", "empty_procedure_count",
+                  "duplicate_path_count", "truncated_call_count",
+                  "unanalysed_inst_count")
+if status == "complete" and any(int(meta[k]) for k in PARTIAL_CAUSES):
     sys.exit("analysis_status says complete beside non-zero counts")
+if status == "partial" and not any(int(meta[k]) for k in PARTIAL_CAUSES):
+    sys.exit("analysis_status says partial with no count to explain it")
 print("ok: meta seal present and self-consistent "
       f"(analysis_status={status})")
 
@@ -700,8 +759,7 @@ by = dict(zip(info_cols, info))
 if str(by["schema_version"]) != meta["schema_version"] or \
    not isinstance(by["schema_version"], int):
     sys.exit("v_db_info.schema_version disagrees with meta or is not INTEGER")
-for k in ("error_count", "unresolved_count", "empty_procedure_count",
-          "duplicate_path_count"):
+for k in COUNTS:
     if by[k] != int(meta[k]) or not isinstance(by[k], int):
         sys.exit(f"v_db_info.{k} disagrees with meta or is not INTEGER")
 print("ok: v_db_info agrees with meta and casts its counts")
@@ -714,7 +772,8 @@ VIEW_COLUMNS = {
     "v_db_info": [
         "schema_version", "tool_version", "slang_version", "producer_revision",
         "top", "analysis_status", "error_count", "unresolved_count",
-        "empty_procedure_count", "duplicate_path_count", "config_digest"],
+        "empty_procedure_count", "duplicate_path_count", "recursion_count",
+        "truncated_call_count", "unanalysed_inst_count", "config_digest"],
     "v_tree_node": [
         "node_id", "parent_node_id", "node_name", "node_kind", "ordinal",
         "inst_id", "parent_inst_id", "module_id", "module_name",
@@ -954,12 +1013,28 @@ check(one("""
 # The statement layer's call_site_id is the statement's, on all three views.
 # It is one column read three ways, so the only thing that can go wrong is
 # the join that carries it -- which is what this holds.
-for view, col in (("v_stmt", "stmt_id"), ("v_stmt_target", "target_id"),
-                  ("v_stmt_operand", "operand_id")):
+for view in ("v_stmt", "v_stmt_target", "v_stmt_operand"):
     check(one(f"""
         SELECT count(*) FROM {view} v JOIN stmt s ON s.id = v.stmt_id
         WHERE v.call_site_id IS NOT s.call_site_id""") == 0,
           f"{view}.call_site_id is its statement's")
+# The directional views take the same tag wherever the row has a statement to
+# take it from. v_load's sensitivity, wait and statement arms read a base
+# table directly and used to write a literal NULL while their own statement
+# carried a tag -- which admits one call's read into every call's cone for a
+# consumer following the documented `= ? OR IS NULL` filter.
+#
+# A dependency is allowed one other answer: the summary arc of a CALL names
+# the site that call opens, and the calling statement itself belongs to no
+# site. Crossing and terminal rows have no statement and keep NULL.
+for view in ("v_driver", "v_load", "v_net_dep"):
+    check(one(f"""
+        SELECT count(*) FROM {view} v JOIN stmt s ON s.id = v.stmt_id
+        WHERE v.call_site_id IS NOT s.call_site_id
+          AND NOT EXISTS (SELECT 1 FROM call_site c
+                          WHERE c.id = v.call_site_id
+                            AND c.caller_stmt_id = v.stmt_id)""") == 0,
+          f"{view}.call_site_id is its statement's, or the call it opens")
 # Exclusive arc, like net_dep: exactly one of the seven typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
@@ -1169,11 +1244,20 @@ check(one("""
 # deriving the outer end of a crossing with COALESCE over two tables left
 # the value attributable to neither, so neither table's index could be
 # used, and tracing a clock took minutes.
+#
+# The call-site columns are here for the same reason and are not about a net:
+# the contract offers them as a LOOKUP -- "which rows belong to this call" --
+# and a walk that does it per hop pays a scan per hop without an index behind
+# each one.
 for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
                   ("v_net_dep", "tgt_net_id"),
                   ("v_net_conn", "outer_net_id"),
                   ("v_net_attachment", "net_id"),
-                  ("v_hier_ref", "resolved_net_id")):
+                  ("v_hier_ref", "resolved_net_id"),
+                  ("v_net_dep", "call_site_id"),
+                  ("v_stmt", "call_site_id"),
+                  ("v_stmt_target", "call_site_id"),
+                  ("v_stmt_operand", "call_site_id")):
     plan = con.execute(
         f"EXPLAIN QUERY PLAN SELECT * FROM {view} WHERE {col} = 1").fetchall()
     scanned = [r[3] for r in plan
@@ -1181,12 +1265,17 @@ for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
     check(not scanned, f"{view} seeks rather than scans for one {col}",
           "; ".join(scanned))
 
+# Every `file` spelling resolves to the `src_file` it was read from. This is
+# universal rather than mode-gated: CI passes no mode for examples/options,
+# which is its only fixture whose `file` table has more than one row and so
+# the only one where the join could come apart.
+check(one("""
+    SELECT count(*) FROM file
+    WHERE src_file_id IS NULL""") == 0,
+      "every file row joined to src_file")
+
 # ------------------------------------------------------ mode-gated checks
 if mode:
-    check(one("""
-        SELECT count(*) FROM file
-        WHERE src_file_id IS NULL""") == 0,
-          "every file row joined to src_file")
     top = meta.get("top")
     want_top = {"callsite": "callsite_top", "constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
@@ -1194,6 +1283,7 @@ if mode:
                 "anonymous": "anonymous", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
                 "package": "package_top", "recursion": "recursion",
+                "paramrec": "paramrec",
                 "paramfold": "paramfold", "portshape": "portshape",
                 "compound": "compound", "macroloc": "macroloc",
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
@@ -1646,6 +1736,67 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dep
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "outward":
+    # A call whose formal is no net of this instance still drives its output
+    # actual, and says so in both places: the target row that names the
+    # statement, and a dependency with no source -- there is no formal here to
+    # name as one -- which v_driver reports as `procedure` with a NULL driver.
+    for net in ("taken", "setb"):
+        check(one("""
+            SELECT count(*) FROM v_driver
+            WHERE signal_name = ? AND driver_kind = 'procedure'
+              AND driver_net_id IS NULL AND stmt_id IS NOT NULL""", net) == 1,
+              f"the package task drives {net} without naming a driver net")
+        check(one("""
+            SELECT count(*) FROM v_stmt_target t JOIN v_driver d
+              ON d.signal_net_id = t.net_id AND d.stmt_id = t.stmt_id
+            WHERE t.net_name = ? AND t.target_kind = 'written_by'""", net) == 1,
+              f"and the two views agree that that statement writes {net}")
+    # And the same write from a condition, which has no statement to be a
+    # position within -- so the dependency stands alone, and the fact that
+    # `condb` is written survives even though nothing can say where.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'condb' AND driver_kind = 'procedure'
+          AND driver_net_id IS NULL AND stmt_id IS NULL""") == 1,
+          "a call in a condition drives its actual with no statement to name")
+    check(one("""
+        SELECT count(*) FROM v_stmt_target WHERE net_name = 'condb'""") == 0,
+          "and takes no target row, a target being a place in a statement")
+
+    # `setit` is the one with nothing to read: its statement has no reference
+    # of any kind, so the write-back is the only thing holding the target up.
+    check(one("""
+        SELECT count(*) FROM v_stmt s
+        WHERE s.stmt_kind = 'call'
+          AND EXISTS (SELECT 1 FROM v_stmt_target t
+                      WHERE t.stmt_id = s.stmt_id AND t.net_name = 'setb')
+          AND NOT EXISTS (SELECT 1 FROM hier_ref h WHERE h.stmt_id = s.stmt_id)
+          AND NOT EXISTS (SELECT 1 FROM expr_ref e WHERE e.stmt_id = s.stmt_id)
+        """) == 1,
+          "and it reads nothing at all, so nothing else stands in for it")
+
+if mode == "naming":
+    # Every leaf comes through leafSegment, so an escaped name keeps slang's
+    # own `\name ` spelling and an array element carries its SOURCE index --
+    # for a gate exactly as for a module instantiation, since the two are one
+    # symbol base. A gate used to take its name raw, which lost both.
+    for kind, names in (("instance", ("\\u.1 ", "\\u[2] ", "u[0]", "u[1]")),
+                        ("primitive", ("\\g.1 ", "\\g[2] ", "p[0]", "p[1]"))):
+        for name in names:
+            check(one("""
+                SELECT count(*) FROM tree_node t JOIN tree_node par
+                  ON par.id = t.parent_node_id
+                WHERE par.name = 'naming' AND t.node_kind = ?
+                  AND t.name = ?""", kind, name) == 1,
+                  f"the {kind} leaf {name!r} is spelled as written")
+    # The point of the index suffix: two elements of one array are two
+    # siblings, and the bare array name is not a leaf.
+    check(one("""
+        SELECT count(*) FROM tree_node
+        WHERE name IN ('u', 'p')""") == 0,
+          "and no node answers to the bare name of an array")
 
 if mode == "anonymous":
     # An instantiation with no instance name is named after its definition,
@@ -2341,7 +2492,7 @@ if mode == "package":
     check(one("""
         SELECT count(DISTINCT signal_inst_id) FROM v_driver
         WHERE driver_name='mask' AND driver_kind='data'""") == 3,
-          "and there really are distinct readers of it")
+          "and there really are three distinct readers of it")
     check(one("""
         SELECT count(*) FROM hier_ref
         WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,
@@ -2368,6 +2519,45 @@ if mode == "package":
         WHERE cs.subroutine_name='arm'""") == 1,
           "over one written statement, which is what the tag is for")
 
+if mode == "paramrec":
+    # The control for the recursion guard: a module instantiating itself,
+    # legally, because the parameter shrinks each level. The guard keys on
+    # (module, parameters) and this file repeats the module at every level
+    # and the pair at none, so nothing is cut and the tree is whole.
+    check(meta["analysis_status"] == "complete",
+          "a terminating parameterised recursion compiles clean",
+          f"got {meta['analysis_status']!r}")
+    check(int(meta["recursion_count"]) == 0,
+          "and nothing is cut", f"got {meta['recursion_count']}")
+    # 1 + 2 + 4 + 8. A guard keyed on the module alone would stop at the
+    # first level and leave one.
+    check(one("""
+        SELECT count(*) FROM inst i JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'redtree'""") == 15,
+          "every level of the tree is stamped")
+    # And the levels really are one module at four parameterisations, which
+    # is what makes this a control rather than four different modules.
+    check(one("""
+        SELECT count(DISTINCT i.param_signature) FROM inst i
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'redtree'""") == 4,
+          "as one module under four parameterisations")
+    # Every level's output is driven, and the eight leaves are driven from
+    # their own input bit -- so the dataflow survived the recursion and did
+    # not merely get a tree of empty instances.
+    check(one("""
+        SELECT count(*) FROM net n JOIN inst i ON i.id = n.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'redtree' AND n.name = 'y'
+          AND NOT EXISTS (SELECT 1 FROM v_driver d
+                          WHERE d.signal_net_id = n.id)""") == 0,
+          "every level's output has a driver")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'y' AND driver_name = 'a'
+          AND driver_kind = 'data'""") == 8,
+          "and each of the eight leaves reduces its own bit")
+
 if mode == "recursion":
     # Illegal RTL that slang rejects, so the database is hierarchy-only by
     # the same path any fatally-errored compilation takes. Asserted first:
@@ -2376,10 +2566,13 @@ if mode == "recursion":
           "a recursive hierarchy is a fatally errored compilation",
           f"got {meta['analysis_status']!r}")
 
-    # The contract the fix carries: an instance whose module is already one
-    # of its own ancestors is stamped, and stops there. Ancestry by the
-    # tree_node chain, module identity by module_id -- not by name, since two
-    # libraries may define one name.
+    # The contract the fix carries: an instance whose module AND parameters
+    # are already those of one of its own ancestors is stamped, and stops
+    # there. Ancestry by the tree_node chain, module identity by module_id --
+    # not by name, since two libraries may define one name -- and the
+    # parameters with it, because the guard keys on the pair. A finite
+    # parameterised recursion repeats the module and never the pair, which is
+    # why it is stamped whole; examples/constructs/paramrec.sv is that control.
     ANCESTORS = """
         WITH RECURSIVE anc(node, ancestor) AS (
             SELECT id, parent_node_id FROM tree_node
@@ -2391,16 +2584,25 @@ if mode == "recursion":
         SELECT %s FROM anc a
         JOIN inst i  ON i.id = a.node
         JOIN inst ia ON ia.id = a.ancestor
-        WHERE i.module_id = ia.module_id"""
+        WHERE i.module_id = ia.module_id
+          AND i.param_signature IS ia.param_signature"""
 
     # Not vacuous: the file has three of them -- selfchain's one child and
     # selffan's two, which are the two shapes that used to fail differently.
     check(one(ANCESTORS % "count(DISTINCT a.node)") == 3,
           "three instances re-enter a module of their own ancestry")
+    # And the count is in the FILE, not only on stderr, so a consumer holding
+    # a truncated database can tell it from a whole one.
+    check(int(meta["recursion_count"]) == 3,
+          "meta records all three", f"got {meta['recursion_count']}")
+    # No INSTANCE below a cut one, at any depth. Its generate scopes and its
+    # primitives are stamped -- those come before the guard and are part of
+    # the level the cut keeps -- so a check over children of every kind would
+    # forbid what the fix deliberately preserves.
     check(one(ANCESTORS % "count(*)" + """
-          AND EXISTS (SELECT 1 FROM tree_node c
-                      WHERE c.parent_node_id = a.node)""") == 0,
-          "and not one of them has a child")
+          AND EXISTS (SELECT 1 FROM anc d JOIN inst di ON di.id = d.node
+                      WHERE d.ancestor = a.node)""") == 0,
+          "and no instance stands below one of them")
     # The whole tree, so an unrolled level is a failure and not just an
     # unasserted extra: root, two children, three cut leaves.
     check(one("SELECT count(*) FROM tree_node") == 6,

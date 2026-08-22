@@ -72,6 +72,12 @@ jobs:
       # designs and read the databases back. For the Linux pair this runs on
       # the bare glibc runner, so a dynamic dependency that crept into the
       # "static" binary fails here instead of on someone's farm.
+      #
+      # `recursion` is here and not only in CI because its failure mode was a
+      # stack overflow, which is the one thing that is genuinely per-platform:
+      # glibc, musl and macOS do not give a thread the same stack. `paramrec`
+      # rides with it as the control -- a stack that runs out early would cut
+      # a legal hierarchy rather than crash, and only the control says so.
       - name: Export and read back
         run: |
           ${{ matrix.bin }} examples/basic/top.sv --top top -o design.db
@@ -82,6 +88,10 @@ jobs:
           ${{ matrix.python }} scripts/verify-designdb.py interfaces.db interfaces
           ${{ matrix.bin }} examples/constructs/assertions.sv -o assertions.db
           ${{ matrix.python }} scripts/verify-designdb.py assertions.db assertions
+          ${{ matrix.bin }} examples/constructs/recursion.sv -o recursion.db
+          ${{ matrix.python }} scripts/verify-designdb.py recursion.db recursion
+          ${{ matrix.bin }} examples/constructs/paramrec.sv -o paramrec.db
+          ${{ matrix.python }} scripts/verify-designdb.py paramrec.db paramrec
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

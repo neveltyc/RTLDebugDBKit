@@ -352,7 +352,56 @@ namespace designdb {
 /// walk falls back to when a dependency did not survive its sources -- and left
 /// "which call does this statement in a shared body belong to", a lookup rather
 /// than a trace, with no answer at all.
-inline constexpr int SchemaVersion = 15;
+///
+/// v16 is what a review of the five branches that became v15 found and did not
+/// stop to fix, plus two defects older than any of them. Four values change and
+/// the interface grows; the rule is v15's, so it moves for either.
+///
+/// A GATE took its tree node name from the symbol's own `name` rather than
+/// through leafSegment, and so took neither of the two things that function
+/// exists for. An instance array's element carries the bare array name there,
+/// so `buf p [1:0]` gave one scope two nodes called `p`, and once v15 began
+/// synthesising a segment for a nameless instantiation, two called `$buf$n` --
+/// either way `top.p[1]`, which is what the source wrote, was unreachable by
+/// (parent_node_id, name). And an escaped name arrived unescaped, so
+/// `buf \g.1 ()` wrote a node name holding a dot: two path segments where a
+/// node is one, which the verifier's own universal check already forbade.
+///
+/// A call whose formal is no net of the calling body -- a subroutine declared
+/// in a package, an interface or $unit -- now drives its output actual. It
+/// recorded only the target row, so v_stmt_target and v_net_attachment said the
+/// statement wrote the net and v_driver said nothing did: the same two-views-
+/// disagreeing defect the v14 note records fixing for aliases. The row v_driver
+/// gets is the one it has documented since v14 and never received --
+/// `driver_kind='procedure'` with a NULL driver net, because at a call site the
+/// formal is a symbol rather than an expression and cannot honestly be named as
+/// a source. A call written inside a CONDITION gets the same dependency with no
+/// statement and no target row either, a target being a position within a
+/// statement; before this, such a write was not recorded at all.
+///
+/// `v_load.call_site_id` stops being NULL on the three arms that read a base
+/// table directly -- proc_event, expr_ref, assign_operand. v15 contracted the
+/// column as the tag the other views carry, and the recipe it exists for reads
+/// a NULL as "belongs to no call", so one call's sensitivity, wait or statement
+/// read was admitted into every call's cone: the mixing the tag was added to
+/// prevent, on the arms a walk falls back to.
+///
+/// `meta` and `v_db_info` gain `recursion_count`, `truncated_call_count` and
+/// `unanalysed_inst_count`. A recursive hierarchy is stamped one level deep and
+/// the rest of the tree is simply absent, which `analysis_status` does not say
+/// -- `hierarchy_only` says there is no dataflow, not that the tree is a
+/// PREFIX -- so a cut database and a whole one of the same design read alike.
+/// The other two choose `partial` while every published count is zero, which
+/// tells a consumer the export is incomplete and gives them nothing to look at.
+/// Since v5 the status has had to agree with the counts beside it; these are
+/// the counts that were missing from beside it, and the agreement now runs both
+/// ways.
+///
+/// `written_by` keeps its name and widens: an assignment, a system task, or a
+/// call writing its output actual. Nothing that was `written_by` stops being
+/// it; a v15 reader that enumerated the causes rather than the value is the one
+/// this concerns.
+inline constexpr int SchemaVersion = 16;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row

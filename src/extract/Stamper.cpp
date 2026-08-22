@@ -127,6 +127,7 @@ private:
     /// child from stampChildModule -- which is why the unanalysed count is
     /// taken here and not beside either caller.
     void stampBody(Template& t, int64_t instId, std::vector<int64_t> ifaceBind) {
+        stats.stampedBodies++;
         if (!t.analysedBody)
             stats.unanalysedInsts++;
         // Scope nodes: index 0 is the instance itself; the rest are
@@ -402,7 +403,8 @@ private:
         // limit, not a fact about the design. One level records that the
         // module re-enters itself and where; a hundred and thirty would only
         // dress up the limit as a hierarchy.
-        if (!onPath.insert(&t).second) {
+        detail::OnPath guard(onPath, &t);
+        if (!guard.entered()) {
             stats.recursiveInstances++;
             return;
         }
@@ -458,8 +460,6 @@ private:
                 stampUnresolved(c, childNode[i], parentId, instId, ord, base);
             }
         }
-
-        onPath.erase(&t);
     }
 
     void stampChildModule(const TplChild& c, int64_t nodeId, int64_t parentNode,

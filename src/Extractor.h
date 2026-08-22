@@ -125,6 +125,13 @@ struct Stats {
     /// keep, not ours. If a revision descends differently, the export says
     /// so instead of dropping every procedure of a module in silence.
     int64_t unanalysedInsts = 0;
+    /// The population `unanalysedInsts` is a fraction OF: module occurrences
+    /// that pass through stampBody. Not `instances`, which also counts
+    /// unresolved instantiations and package pseudo-occurrences -- neither
+    /// goes through stampBody, so neither can ever be in the numerator, and
+    /// a warning reading "131 of 132" against a denominator with rows the
+    /// numerator cannot reach is a fraction of the wrong thing.
+    int64_t stampedBodies = 0;
 };
 
 /// Extracts `compilation` into `writer`. `analysis` must already have run.
