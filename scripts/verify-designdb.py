@@ -1033,17 +1033,40 @@ check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind = 'external' AND driver_ref IS NULL""") == 0,
       "every external driver names the reference it reads")
-# A crossing's ref can only come from a tie that was written outward.
+check(one("""
+    SELECT count(*) FROM v_load v
+    JOIN net_dep d ON d.id = v.dep_id
+    JOIN v_hier_ref h ON h.hier_ref_id = d.tgt_hier_ref_id
+    WHERE v.load_ref IS NOT h.ref_path""") == 0,
+      "and the load side carries its own verbatim")
+# A crossing arcs both ways, and only ONE of the two rows has the outward
+# tie as its far end -- so "is driver_ref set" must agree with "is the
+# driver the net that reference resolved to", not merely with "does this
+# connection have a reference". Stated the weak way, both columns could be
+# placed on the wrong branch of the UNION and nothing outside a fixture
+# would notice.
 check(one("""
     SELECT count(*) FROM v_driver v
     JOIN net_conn c ON c.id = v.conn_id
-    WHERE v.driver_ref IS NOT NULL AND c.outer_hier_ref_id IS NULL""") == 0,
-      "a crossing names a reference only where the tie was written outward")
+    JOIN hier_ref h ON h.id = c.outer_hier_ref_id
+    WHERE (v.driver_ref IS NOT NULL)
+          IS NOT (v.driver_net_id IS NOT NULL
+                  AND v.driver_net_id = h.resolved_net_id)""") == 0,
+      "a crossing names a reference exactly when the reference IS its driver")
 check(one("""
     SELECT count(*) FROM v_load v
     JOIN net_conn c ON c.id = v.conn_id
-    WHERE v.load_ref IS NOT NULL AND c.outer_hier_ref_id IS NULL""") == 0,
-      "on the load side too")
+    JOIN hier_ref h ON h.id = c.outer_hier_ref_id
+    WHERE (v.load_ref IS NOT NULL)
+          IS NOT (v.load_net_id IS NOT NULL
+                  AND v.load_net_id = h.resolved_net_id)""") == 0,
+      "and on the load side exactly when it IS its load")
+check(one("""
+    SELECT count(*) FROM v_driver v
+    JOIN net_conn c ON c.id = v.conn_id
+    JOIN hier_ref h ON h.id = c.outer_hier_ref_id
+    WHERE v.driver_ref IS NOT NULL AND v.driver_ref IS NOT h.path""") == 0,
+      "and the spelling it carries is that tie's own")
 # v_hier_ref resolves the four pointers the contract publishes at hier_ref
 # and had nothing to follow. Its one derived column must not invent a name
 # where the reference resolved to nothing, nor lose one where it did.
@@ -1051,6 +1074,20 @@ check(one("""
     SELECT count(*) FROM v_hier_ref
     WHERE (resolved_net_name IS NOT NULL) != (resolved_net_id IS NOT NULL)""") == 0,
       "v_hier_ref names a resolved net exactly when there is one")
+# The rest is projection, and projection is where a pair of columns quietly
+# swaps. Nothing else in this file reads ref_lo/ref_hi/ref_exact or
+# resolved_inst_id, so without this they are pinned by name and position and
+# by nothing about their value.
+check(one("""
+    SELECT count(*) FROM v_hier_ref v JOIN hier_ref h ON h.id = v.hier_ref_id
+    WHERE v.inst_id IS NOT h.inst_id OR v.stmt_id IS NOT h.stmt_id
+       OR v.ref_path IS NOT h.path OR v.access IS NOT h.access
+       OR v.resolved_inst_id IS NOT h.resolved_inst_id
+       OR v.resolved_net_id IS NOT h.resolved_net_id
+       OR v.ref_lo IS NOT h.lo OR v.ref_hi IS NOT h.hi
+       OR v.ref_exact IS NOT h.is_exact
+       OR v.src_line IS NOT h.line OR v.src_col IS NOT h.col""") == 0,
+      "and every other v_hier_ref column is its base row's, unswapped")
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind IN ('constant', 'terminal', 'system_task')
@@ -1894,10 +1931,12 @@ if mode == "external":
     # says the thing the kind depends on: it did not resolve here.
     check(one("""
         SELECT count(*) FROM v_driver v
-        JOIN v_hier_ref h ON h.ref_path = v.driver_ref
+        JOIN v_net_dep d ON d.dep_id = v.dep_id
+        JOIN v_hier_ref h ON h.hier_ref_id = d.src_hier_ref_id
         WHERE v.driver_kind='external' AND v.signal_name='nib'
-          AND h.access='read' AND h.resolved_net_id IS NULL""") >= 1,
-          "and v_hier_ref resolves that spelling to an unresolved read")
+          AND h.access='read' AND h.resolved_net_id IS NULL
+          AND h.ref_lo=0 AND h.ref_hi=3""") >= 1,
+          "and v_hier_ref holds the reference that row named")
     check(one("""
         SELECT count(*) FROM net_dep
         WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL
