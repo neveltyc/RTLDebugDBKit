@@ -27,13 +27,14 @@
 #   verify-designdb.py <design.db> concatcursor + examples/constructs/concatcursor.sv facts
 #   verify-designdb.py <design.db> naming       + examples/constructs/naming.sv facts
 #   verify-designdb.py <design.db> outward      + examples/constructs/outward.sv facts
+#   verify-designdb.py <design.db> paramrec     + examples/constructs/paramrec.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "anonymous", "xmr", "alias", "external", "package",
          "callsite", "recursion", "rootref", "typeparam", "concatcursor",
-         "naming", "outward",
+         "naming", "outward", "paramrec",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -705,6 +706,7 @@ check(one("""
 # ------------------------------------------------------------------ meta
 required = ["schema_version", "analysis_status", "error_count",
             "unresolved_count", "empty_procedure_count", "duplicate_path_count",
+            "recursion_count", "truncated_call_count", "unanalysed_inst_count",
             "tool", "tool_version", "slang_version", "producer_revision",
             "config_digest"]
 meta = dict(con.execute("SELECT key, value FROM meta"))
@@ -713,17 +715,27 @@ if missing:
     sys.exit(f"meta lacks required key(s): {', '.join(missing)}")
 if meta["schema_version"] != SCHEMA_VERSION:
     sys.exit(f"schema_version is {meta['schema_version']}, expected {SCHEMA_VERSION}")
-for k in ("error_count", "unresolved_count", "empty_procedure_count",
-          "duplicate_path_count"):
+COUNTS = ("error_count", "unresolved_count", "empty_procedure_count",
+          "duplicate_path_count", "recursion_count", "truncated_call_count",
+          "unanalysed_inst_count")
+for k in COUNTS:
     if not meta[k].isdigit():
         sys.exit(f"meta.{k} is not a number: {meta[k]!r}")
 status = meta["analysis_status"]
 if status not in ("complete", "partial", "hierarchy_only"):
     sys.exit(f"analysis_status is {status!r}")
-if status == "complete" and (int(meta["error_count"]) or
-                             int(meta["empty_procedure_count"]) or
-                             int(meta["duplicate_path_count"])):
+# Every cause of a non-`complete` status is a published count now, so the
+# implication runs both ways: `complete` beside a non-zero count is a
+# malformed file, and a count that chose `partial` can be looked at rather
+# than merely inferred. `unresolved_count` is not among them by design -- a
+# black box is not an incompleteness of the export.
+PARTIAL_CAUSES = ("error_count", "empty_procedure_count",
+                  "duplicate_path_count", "truncated_call_count",
+                  "unanalysed_inst_count")
+if status == "complete" and any(int(meta[k]) for k in PARTIAL_CAUSES):
     sys.exit("analysis_status says complete beside non-zero counts")
+if status == "partial" and not any(int(meta[k]) for k in PARTIAL_CAUSES):
+    sys.exit("analysis_status says partial with no count to explain it")
 print("ok: meta seal present and self-consistent "
       f"(analysis_status={status})")
 
@@ -733,8 +745,7 @@ by = dict(zip(info_cols, info))
 if str(by["schema_version"]) != meta["schema_version"] or \
    not isinstance(by["schema_version"], int):
     sys.exit("v_db_info.schema_version disagrees with meta or is not INTEGER")
-for k in ("error_count", "unresolved_count", "empty_procedure_count",
-          "duplicate_path_count"):
+for k in COUNTS:
     if by[k] != int(meta[k]) or not isinstance(by[k], int):
         sys.exit(f"v_db_info.{k} disagrees with meta or is not INTEGER")
 print("ok: v_db_info agrees with meta and casts its counts")
@@ -747,7 +758,8 @@ VIEW_COLUMNS = {
     "v_db_info": [
         "schema_version", "tool_version", "slang_version", "producer_revision",
         "top", "analysis_status", "error_count", "unresolved_count",
-        "empty_procedure_count", "duplicate_path_count", "config_digest"],
+        "empty_procedure_count", "duplicate_path_count", "recursion_count",
+        "truncated_call_count", "unanalysed_inst_count", "config_digest"],
     "v_tree_node": [
         "node_id", "parent_node_id", "node_name", "node_kind", "ordinal",
         "inst_id", "parent_inst_id", "module_id", "module_name",
@@ -1257,6 +1269,7 @@ if mode:
                 "anonymous": "anonymous", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
                 "package": "package_top", "recursion": "recursion",
+                "paramrec": "paramrec",
                 "paramfold": "paramfold", "portshape": "portshape",
                 "compound": "compound", "macroloc": "macroloc",
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
@@ -2480,6 +2493,45 @@ if mode == "package":
         WHERE cs.subroutine_name='arm'""") == 1,
           "over one written statement, which is what the tag is for")
 
+if mode == "paramrec":
+    # The control for the recursion guard: a module instantiating itself,
+    # legally, because the parameter shrinks each level. The guard keys on
+    # (module, parameters) and this file repeats the module at every level
+    # and the pair at none, so nothing is cut and the tree is whole.
+    check(meta["analysis_status"] == "complete",
+          "a terminating parameterised recursion compiles clean",
+          f"got {meta['analysis_status']!r}")
+    check(int(meta["recursion_count"]) == 0,
+          "and nothing is cut", f"got {meta['recursion_count']}")
+    # 1 + 2 + 4 + 8. A guard keyed on the module alone would stop at the
+    # first level and leave one.
+    check(one("""
+        SELECT count(*) FROM inst i JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'redtree'""") == 15,
+          "every level of the tree is stamped")
+    # And the levels really are one module at four parameterisations, which
+    # is what makes this a control rather than four different modules.
+    check(one("""
+        SELECT count(DISTINCT i.param_signature) FROM inst i
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'redtree'""") == 4,
+          "as one module under four parameterisations")
+    # Every level's output is driven, and the eight leaves are driven from
+    # their own input bit -- so the dataflow survived the recursion and did
+    # not merely get a tree of empty instances.
+    check(one("""
+        SELECT count(*) FROM net n JOIN inst i ON i.id = n.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'redtree' AND n.name = 'y'
+          AND NOT EXISTS (SELECT 1 FROM v_driver d
+                          WHERE d.signal_net_id = n.id)""") == 0,
+          "every level's output has a driver")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'y' AND driver_name = 'a'
+          AND driver_kind = 'data'""") == 8,
+          "and each of the eight leaves reduces its own bit")
+
 if mode == "recursion":
     # Illegal RTL that slang rejects, so the database is hierarchy-only by
     # the same path any fatally-errored compilation takes. Asserted first:
@@ -2488,10 +2540,13 @@ if mode == "recursion":
           "a recursive hierarchy is a fatally errored compilation",
           f"got {meta['analysis_status']!r}")
 
-    # The contract the fix carries: an instance whose module is already one
-    # of its own ancestors is stamped, and stops there. Ancestry by the
-    # tree_node chain, module identity by module_id -- not by name, since two
-    # libraries may define one name.
+    # The contract the fix carries: an instance whose module AND parameters
+    # are already those of one of its own ancestors is stamped, and stops
+    # there. Ancestry by the tree_node chain, module identity by module_id --
+    # not by name, since two libraries may define one name -- and the
+    # parameters with it, because the guard keys on the pair. A finite
+    # parameterised recursion repeats the module and never the pair, which is
+    # why it is stamped whole; examples/constructs/paramrec.sv is that control.
     ANCESTORS = """
         WITH RECURSIVE anc(node, ancestor) AS (
             SELECT id, parent_node_id FROM tree_node
@@ -2503,16 +2558,25 @@ if mode == "recursion":
         SELECT %s FROM anc a
         JOIN inst i  ON i.id = a.node
         JOIN inst ia ON ia.id = a.ancestor
-        WHERE i.module_id = ia.module_id"""
+        WHERE i.module_id = ia.module_id
+          AND i.param_signature IS ia.param_signature"""
 
     # Not vacuous: the file has three of them -- selfchain's one child and
     # selffan's two, which are the two shapes that used to fail differently.
     check(one(ANCESTORS % "count(DISTINCT a.node)") == 3,
           "three instances re-enter a module of their own ancestry")
+    # And the count is in the FILE, not only on stderr, so a consumer holding
+    # a truncated database can tell it from a whole one.
+    check(int(meta["recursion_count"]) == 3,
+          "meta records all three", f"got {meta['recursion_count']}")
+    # No INSTANCE below a cut one, at any depth. Its generate scopes and its
+    # primitives are stamped -- those come before the guard and are part of
+    # the level the cut keeps -- so a check over children of every kind would
+    # forbid what the fix deliberately preserves.
     check(one(ANCESTORS % "count(*)" + """
-          AND EXISTS (SELECT 1 FROM tree_node c
-                      WHERE c.parent_node_id = a.node)""") == 0,
-          "and not one of them has a child")
+          AND EXISTS (SELECT 1 FROM anc d JOIN inst di ON di.id = d.node
+                      WHERE d.ancestor = a.node)""") == 0,
+          "and no instance stands below one of them")
     # The whole tree, so an unrolled level is a failure and not just an
     # unasserted extra: root, two children, three cut leaves.
     check(one("SELECT count(*) FROM tree_node") == 6,

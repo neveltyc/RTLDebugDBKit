@@ -529,7 +529,8 @@ asserts all of it on every export. Ground rules:
 **`v_db_info`** — the meta seal as one row, counts CAST to INTEGER:
 `schema_version, tool_version, slang_version, producer_revision, top,
 analysis_status, error_count, unresolved_count, empty_procedure_count,
-duplicate_path_count, config_digest`.
+duplicate_path_count, recursion_count, truncated_call_count,
+unanalysed_inst_count, config_digest`.
 
 **`v_tree_node`** — one row per node: `node_id, parent_node_id, node_name,
 node_kind, ordinal, inst_id, parent_inst_id, module_id, module_name,
@@ -818,13 +819,15 @@ joined to their src_file. `meta` is the seal; its required keys are the
 of the elaborated top instances — which is absent when the design
 elaborates none.
 `analysis_status` is `complete | partial | hierarchy_only` and agrees with
-the counts beside it: errors, skipped procedures, duplicated paths (two
+the counts beside it, each of which is published: `error_count`,
+`empty_procedure_count` (skipped procedures), `duplicate_path_count` (two
 siblings sharing one (parent, name) pair, so a path lookup stops resolving
-uniquely) and truncated call expansions make `partial`, as would an
-occurrence stamped from a module body the analysis never reached — it
-would have hierarchy and connections and no procedure at all, though no
-design measured here produces one. Unresolved instantiations do not make
-`partial`. `hierarchy_only` has one cause: the compilation was fatally
+uniquely), `truncated_call_count` and `unanalysed_inst_count` — an
+occurrence stamped from a module body the analysis never reached, which has
+hierarchy and connections and no procedure at all, though no design measured
+here produces one. Any of the five non-zero makes `partial`, and `partial`
+with all five zero is a malformed file: the status is never a claim a
+consumer cannot look at. Unresolved instantiations do not make `partial`. `hierarchy_only` has one cause: the compilation was fatally
 errored, so slang analysed no dataflow to export. `unresolved_count`
 counts unresolved instantiation *sites* (one per written instantiation, however many
 occurrences stamp out); the per-occurrence picture is
@@ -836,10 +839,12 @@ A `hierarchy_only` database of an infinitely recursive design holds a
 already those of one of its own ancestors keeps its own nets, terminals,
 incoming connections, generate scopes and primitives, but no child
 instances, because the recursion has no end. Parameters are part of the
-test, so a finite parameterised recursion -- a tree that halves its width
-each level and terminates -- is stamped whole. One level is recorded per
+test, so a finite parameterised recursion — a tree that halves its width
+each level and terminates — is stamped whole. One level is recorded per
 recursion, not the depth slang happened to reach before it rejected the
-design.
+design. `recursion_count` is how many such instances there are, which is
+what tells a truncated tree from a whole one: `hierarchy_only` says there is
+no dataflow, not that the hierarchy stops early.
 
 ## What is not here
 
