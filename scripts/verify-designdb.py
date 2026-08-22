@@ -18,8 +18,10 @@
 #   verify-designdb.py <design.db> hierarchy    + examples/constructs/hierarchy.sv facts
 #   verify-designdb.py <design.db> udp          + examples/constructs/udp.sv facts
 #   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
+#   verify-designdb.py <design.db> anonymous    + examples/constructs/anonymous.sv facts
 #   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
 #   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
+#   verify-designdb.py <design.db> recursion    + examples/constructs/recursion.sv facts
 #   verify-designdb.py <design.db> rootref      + examples/constructs/rootref.sv facts
 #   verify-designdb.py <design.db> typeparam    + examples/constructs/typeparam.sv facts
 #   verify-designdb.py <design.db> concatcursor + examples/constructs/concatcursor.sv facts
@@ -27,8 +29,8 @@ import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
-         "unresolved", "xmr", "alias", "external", "package", "callsite",
-         "rootref", "typeparam", "concatcursor",
+         "unresolved", "anonymous", "xmr", "alias", "external", "package",
+         "callsite", "recursion", "rootref", "typeparam", "concatcursor",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -68,6 +70,30 @@ baddig = one("SELECT count(*) FROM src_file "
 total_sf = one("SELECT count(*) FROM src_file")
 if total_sf == 0 or baddig:
     sys.exit(f"{baddig} of {total_sf} src_file row(s) lack a SHA-256 digest")
+
+# src_file ids ascend with path, which is the single-database form of "the
+# export is reproducible". The ids used to be handed out in the order slang's
+# source loader finished reading files -- a thread pool's completion order --
+# so exporting one unchanged design twice produced two different id columns
+# here and two different `file.src_file_id` columns pointing at them. Nothing
+# downstream reads an id's *value*, so the databases were equivalent and still
+# diffed, which is the one thing a digest-stamped export exists to make
+# possible.
+#
+# Checked here rather than only by diffing two exports because that diff is
+# probabilistic on a small design and this is not: three files are enough to
+# put them out of order, and examples/options is exactly that case.
+#
+# Compared as adjacent pairs in id order rather than by joining on id + 1,
+# so a gap in the ids -- which nothing produces today, but which an ignored
+# insert would -- does not silently skip the pair that straddles it.
+sf_rows = con.execute("SELECT id, path FROM src_file ORDER BY id").fetchall()
+unsorted = next((
+    (a, b) for a, b in zip(sf_rows, sf_rows[1:]) if b[1] < a[1]), None)
+check(unsorted is None, f"src_file ids assigned in path order ({total_sf} rows)",
+      "" if unsorted is None
+      else f"id {unsorted[0][0]} is {unsorted[0][1]!r} but id "
+           f"{unsorted[1][0]} is {unsorted[1][1]!r}")
 
 # Structural integrity -- catches corruption and generator bugs. The writer
 # leaves foreign_keys off for speed, so this is where the REFERENCES clauses
@@ -1049,9 +1075,10 @@ if mode:
     top = meta.get("top")
     want_top = {"callsite": "callsite_top", "constructs": "constructs", "interfaces": "interfaces",
                 "assertions": "assertions", "hierarchy": "hierarchy",
-                "udp": "udps", "unresolved": "unresolved", "xmr": "xmr",
+                "udp": "udps", "unresolved": "unresolved",
+                "anonymous": "anonymous", "xmr": "xmr",
                 "alias": "alias_top", "external": "tb_top",
-                "package": "package_top",
+                "package": "package_top", "recursion": "recursion",
                 "paramfold": "paramfold", "portshape": "portshape",
                 "compound": "compound", "macroloc": "macroloc",
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
@@ -1505,6 +1532,73 @@ if mode == "unresolved":
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
 
+if mode == "anonymous":
+    # An instantiation with no instance name is named after its definition,
+    # not after the instance holding it: `$def$n`, '$'-prefixed because no
+    # identifier the source could write starts that way, and counted per
+    # scope because siblings are what a name has to separate.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE t.name = p.name""") == 0,
+          "no node takes the name of the node above it")
+    check(one("""
+        SELECT count(*) FROM (SELECT parent_node_id, name, count(*) c
+                              FROM tree_node GROUP BY parent_node_id, name
+                              HAVING c > 1)""") == 0,
+          "and no two siblings share a name")
+    check(int(meta["duplicate_path_count"]) == 0,
+          "so the design reports no duplicate paths")
+    # The names are synthesised, the diagnostics are not: an unnamed module
+    # instantiation is still an elaboration error, and the export still says
+    # the design did not fully compile.
+    check(status == "partial",
+          "and the export still reports what slang rejected")
+    # The two in the top body, and the one inside anon_mid.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
+        JOIN module m ON m.id = i.module_id
+        WHERE t.node_kind='instance' AND m.name='anon_leaf'
+          AND t.name LIKE '$anon_leaf$%'""") == 5,
+          "every unnamed instantiation is named from its definition")
+    # A gate and an instantiation in one scope draw from ONE counter, so
+    # the numbering is a single sequence per scope. Two counters could only
+    # collide if a primitive and a module definition shared a name, which
+    # the language does not allow -- one sequence means not having to say
+    # so.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE p.name='anonymous' AND t.name IN
+              ('$buf$0', '$anon_leaf$1', '$anon_leaf$2', '$anon_ghost$3')
+        """) == 4,
+          "the gate and the instantiations beside it number consecutively")
+    # Per scope, not per instance: each generate element restarts at 0, and
+    # the two are siblings of nothing.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node p
+          ON p.id = t.parent_node_id
+        WHERE p.node_kind='generate' AND p.name IN ('g[0]', 'g[1]')
+          AND t.name='$anon_leaf$0'""") == 2,
+          "a generate level counts its own children")
+    # An unnamed instantiation of a definition that is missing too: the
+    # black box keeps both its synthesised segment and its definition name.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
+        WHERE t.node_kind='unresolved' AND t.name='$anon_ghost$3'
+          AND i.unresolved_def='anon_ghost'""") == 1,
+          "an unnamed black box keeps the definition it wanted")
+    # The names are segments like any other, so the tree still walks:
+    # anonymous.u_mid.$anon_leaf$0 is three (parent_node_id, name) lookups.
+    check(one("""
+        SELECT count(*) FROM tree_node t
+        JOIN tree_node p ON p.id = t.parent_node_id
+        JOIN tree_node g ON g.id = p.parent_node_id
+        WHERE g.name='anonymous' AND p.name='u_mid'
+          AND t.name='$anon_leaf$0'""") == 1,
+          "and a path resolves through one segment per level")
+
+
 if mode == "typeparam":
     # slang folds the two spellings of one type onto a single body, so pass 1
     # ends up with a group it never gets an analysed body for. The claim
@@ -1627,7 +1721,6 @@ if mode == "rootref":
         JOIN tree_node p ON p.id = d.parent_node_id
         WHERE h.path='deep.q'""") == 2,
           "while the local path beside it follows the occurrence")
-
 
 if mode == "xmr":
     # A downward read is a real dependency naming the reference it went
@@ -2013,5 +2106,54 @@ if mode == "package":
         SELECT count(*) FROM hier_ref
         WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,
           "the pkg:: reference is recorded as written and resolved")
+
+if mode == "recursion":
+    # Illegal RTL that slang rejects, so the database is hierarchy-only by
+    # the same path any fatally-errored compilation takes. Asserted first:
+    # everything below is about a tree built without dataflow.
+    check(meta["analysis_status"] == "hierarchy_only",
+          "a recursive hierarchy is a fatally errored compilation",
+          f"got {meta['analysis_status']!r}")
+
+    # The contract the fix carries: an instance whose module is already one
+    # of its own ancestors is stamped, and stops there. Ancestry by the
+    # tree_node chain, module identity by module_id -- not by name, since two
+    # libraries may define one name.
+    ANCESTORS = """
+        WITH RECURSIVE anc(node, ancestor) AS (
+            SELECT id, parent_node_id FROM tree_node
+            WHERE parent_node_id IS NOT NULL
+          UNION ALL
+            SELECT a.node, t.parent_node_id FROM anc a
+            JOIN tree_node t ON t.id = a.ancestor
+            WHERE t.parent_node_id IS NOT NULL)
+        SELECT %s FROM anc a
+        JOIN inst i  ON i.id = a.node
+        JOIN inst ia ON ia.id = a.ancestor
+        WHERE i.module_id = ia.module_id"""
+
+    # Not vacuous: the file has three of them -- selfchain's one child and
+    # selffan's two, which are the two shapes that used to fail differently.
+    check(one(ANCESTORS % "count(DISTINCT a.node)") == 3,
+          "three instances re-enter a module of their own ancestry")
+    check(one(ANCESTORS % "count(*)" + """
+          AND EXISTS (SELECT 1 FROM tree_node c
+                      WHERE c.parent_node_id = a.node)""") == 0,
+          "and not one of them has a child")
+    # The whole tree, so an unrolled level is a failure and not just an
+    # unasserted extra: root, two children, three cut leaves.
+    check(one("SELECT count(*) FROM tree_node") == 6,
+          "the tree is the design plus one level of each recursion")
+
+    # Cut, not dropped: each keeps the terminals its module declares and the
+    # connections its parent wrote to them, so a trace reaches the recursion
+    # and stops AT it rather than losing the wires that arrive.
+    check(one(ANCESTORS % "count(*)" + """
+          AND (SELECT count(*) FROM term WHERE inst_id = a.node) != 2""") == 0,
+          "each cut instance keeps both its terminals")
+    check(one(ANCESTORS % "count(*)" + """
+          AND (SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
+               WHERE t.inst_id = a.node) != 2""") == 0,
+          "and both connections its parent made to them")
 
 print("OK")

@@ -154,14 +154,21 @@ row.
 **`tree_node`** — `id, parent_node_id, name, node_kind, ordinal`. One path
 segment per node, `[i]` included for array elements (`u[0]`, `lane[3]`), so
 resolving `a.b[0].c` is one indexed lookup per segment against
-(parent_node_id, name) and no path strings are stored. An anonymous gate
-(`buf (y, a);`, the usual spelling in cell models) has no segment of its
-own in the source, so it gets a synthesised one — `$buf$0`: `$`-prefixed
-so it cannot collide with an identifier the source could have written,
-counted per scope so siblings differ. Without it an anonymous gate would
-answer to the name of the instance holding it, and (parent_node_id, name)
-would stop being a lookup. `ordinal` is the
-order among siblings. `node_kind`:
+(parent_node_id, name) and no path strings are stored. An instantiation
+written without an instance name has no segment of its own in the source,
+so it gets a synthesised one — `$buf$0`, `$rvclkhdr$1`: the definition
+name, `$`-prefixed so it cannot collide with an identifier the source
+could have written, and counted per scope so siblings differ. Gates
+(`buf (y, a);`, the usual spelling in cell models), UDPs, unresolved
+definitions and module instantiations all draw from one counter per scope.
+Without it such a node answers to the name of the instance holding it, and
+(parent_node_id, name) stops being a lookup. A gate or a UDP may be
+nameless by right; a module instantiation may not, so a synthesised
+`$def$n` on an `instance` node means the source did not fully survive
+preprocessing — usually a macro that supplied the name and did not expand.
+The definition inside the segment is a label, not a field: read the
+definition from `module.name` or `inst.unresolved_def`.
+`ordinal` is the order among siblings. `node_kind`:
 
 * `root` — a top instance; has an `inst` row, no parent.
 * `instance` — a resolved module/interface/program instance; has an `inst`
@@ -727,6 +734,11 @@ EDA standards already name:
 
 `src_file` holds every file slang actually read, absolute path and
 SHA-256, so a consumer can tell whether the database and the RTL diverged.
+Its rows are interned in path order, which is what lets two exports of an
+unchanged design be compared row for row: it is the one table whose ids come
+from SQLite rather than an extractor counter, so its insert order is its id
+order, and the order slang hands the buffers back in is the order a thread
+pool finished reading them.
 `file` holds the spellings rows carry — as written in the filelist —
 joined to their src_file. `meta` is the seal; its required keys are the
 `v_db_info` columns plus `tool`, except `top` — the space-separated names
@@ -745,6 +757,13 @@ counts unresolved instantiation *sites* (one per written instantiation, however 
 occurrences stamp out); the per-occurrence picture is
 `tree_node.node_kind='unresolved'`. `config_digest` fingerprints the inputs;
 two exports with one digest saw the same filelist, defines and flags.
+
+A `hierarchy_only` database of an infinitely recursive design holds a
+*prefix* of the elaborated tree: an instance whose module is already one of
+its own ancestors keeps its own nets, terminals and incoming connections but
+has no children, because the recursion has no end. One such level is
+recorded per recursion, not the depth slang happened to reach before it
+rejected the design.
 
 ## What is not here
 

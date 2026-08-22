@@ -235,10 +235,35 @@ namespace designdb {
 ///
 /// One export that used to fail now succeeds: two unnamed ports in one module
 /// collided on a synthesized name and aborted on a UNIQUE constraint.
-/// v15 moves for one field pair and one reason: `hier_ref.resolved_inst_id`
-/// and `resolved_net_id` are no longer NULL for a path anchored at `$root`,
-/// and a v14 consumer read that NULL as "this reference cannot be resolved
-/// per occurrence" -- a statement about the reference rather than about the
+///
+/// v15 corrects two values, and moves the version for v14's reason.
+///
+/// The first: an instantiation written without an instance name no longer
+/// answers to the name of the instance holding it. slang leaves such a
+/// symbol's name empty and a hierarchical path built from an empty name ends
+/// at the PARENT, so the last segment WAS the parent's -- the defect v14
+/// fixed for anonymous gates and left standing for instantiations, because
+/// inventing a name for one was a separate decision. It is decided here: the
+/// synthesised `$def$n` segment now covers module instantiations and
+/// unresolved definitions as well, and all three kinds draw from one counter
+/// per scope, so a gate and an instantiation beside it cannot be handed one
+/// name twice.
+///
+/// A module instance name is mandatory, which makes this look like a case
+/// that cannot arise. It arises whenever a macro supplies the name and does
+/// not expand: veerwolf compiled without `TEC_RV_ICG has 302 such nodes, 32
+/// instances and 270 black boxes, every one of them carrying its parent's
+/// name. Two in one scope collided outright -- duplicate_path_count counted
+/// a collision the design does not have, and (parent_node_id, name) answered
+/// with two nodes. One alone was quieter and no better: `free_cg` under
+/// `free_cg` is one name twice, one level apart, and nothing in the source
+/// spells the second. `tree_node.name` is the only column that changes; the
+/// row counts of every table are what they were.
+///
+/// The second is a field pair: `hier_ref.resolved_inst_id` and
+/// `resolved_net_id` are no longer NULL for a path anchored at `$root`, and
+/// a v14 consumer read that NULL as "this reference cannot be resolved per
+/// occurrence" -- a statement about the reference rather than about the
 /// exporter.
 ///
 /// An absolute path names one object, seen from any occurrence of the body
@@ -278,6 +303,13 @@ inline constexpr int SchemaVersion = 15;
 /// counter per table in one process is cheaper and more legible than reading
 /// last_insert_rowid back per row. 0 in an id field spells "none" and is
 /// stored as NULL; real ids start at 1.
+///
+/// `src_file` is the exception, and the only one: it is written straight
+/// through addSourceFile, so its ids are SQLite's and its insert order is its
+/// id order. main.cpp interns those rows in path order for exactly that
+/// reason -- slang returns the buffers in the order its source loader
+/// finished reading files, which is a thread pool's completion order, and an
+/// id that follows it makes two exports of an unchanged design differ.
 ///
 /// Ranges use one encoding everywhere, unchanged from v7: a range is
 /// LSB-relative offsets into the flattened object (not declared indices), an

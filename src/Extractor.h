@@ -55,6 +55,13 @@ struct Stats {
     /// Instantiations whose module slang could not resolve. Recorded as
     /// unresolved tree nodes rather than dropped, and counted.
     int64_t unresolved = 0;
+    /// Instantiations written without an instance name. Counted where the
+    /// template is built, like `unresolved`, so this counts spellings in the
+    /// source rather than the nodes they stamp -- veerwolf's two of them
+    /// stamp 302 nodes. Each gets a synthesised `$def$n` tree segment; the
+    /// count is reported because a module instantiation must be named, so a
+    /// non-zero one usually means a macro did not expand.
+    int64_t anonymous = 0;
     /// Procedures the analysis says drive something but from which nothing
     /// could be extracted -- normally a statement slang marked bad, which
     /// takes its enclosing block with it. Counted per analyzed body.
@@ -62,6 +69,12 @@ struct Stats {
     /// Tree nodes whose (parent, name) was already taken. Non-zero means the
     /// design did not fully elaborate; a path lookup may be ambiguous.
     int64_t duplicatePaths = 0;
+    /// Instances that re-enter a module already on their own hierarchy path
+    /// -- an infinitely recursive instantiation, which is illegal RTL and
+    /// which slang reports as a fatal error. The instance is stamped; its
+    /// children are not, because the recursion has no end. Non-zero means the
+    /// tree stops short there.
+    int64_t recursiveInstances = 0;
     /// Call sites whose subroutine body was not instantiated because the
     /// module hit its expansion budget. Non-zero means the dataflow through
     /// those calls is incomplete -- reported rather than left to look like
