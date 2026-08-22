@@ -154,14 +154,21 @@ row.
 **`tree_node`** — `id, parent_node_id, name, node_kind, ordinal`. One path
 segment per node, `[i]` included for array elements (`u[0]`, `lane[3]`), so
 resolving `a.b[0].c` is one indexed lookup per segment against
-(parent_node_id, name) and no path strings are stored. An anonymous gate
-(`buf (y, a);`, the usual spelling in cell models) has no segment of its
-own in the source, so it gets a synthesised one — `$buf$0`: `$`-prefixed
-so it cannot collide with an identifier the source could have written,
-counted per scope so siblings differ. Without it an anonymous gate would
-answer to the name of the instance holding it, and (parent_node_id, name)
-would stop being a lookup. `ordinal` is the
-order among siblings. `node_kind`:
+(parent_node_id, name) and no path strings are stored. An instantiation
+written without an instance name has no segment of its own in the source,
+so it gets a synthesised one — `$buf$0`, `$rvclkhdr$1`: the definition
+name, `$`-prefixed so it cannot collide with an identifier the source
+could have written, and counted per scope so siblings differ. Gates
+(`buf (y, a);`, the usual spelling in cell models), UDPs, unresolved
+definitions and module instantiations all draw from one counter per scope.
+Without it such a node answers to the name of the instance holding it, and
+(parent_node_id, name) stops being a lookup. A gate or a UDP may be
+nameless by right; a module instantiation may not, so a synthesised
+`$def$n` on an `instance` node means the source did not fully survive
+preprocessing — usually a macro that supplied the name and did not expand.
+The definition inside the segment is a label, not a field: read the
+definition from `module.name` or `inst.unresolved_def`.
+`ordinal` is the order among siblings. `node_kind`:
 
 * `root` — a top instance; has an `inst` row, no parent.
 * `instance` — a resolved module/interface/program instance; has an `inst`
