@@ -161,6 +161,8 @@ scripts/                build-release.sh (the four release platforms),
                         designdb-coverage.py (what an export had to approximate),
                         export-real-designs.sh (the measurements table, from a
                         local checkout of the public designs),
+                        check-reproducible.py (export one design twice, fail if
+                        any row differs),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 

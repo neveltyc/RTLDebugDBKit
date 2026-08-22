@@ -70,6 +70,27 @@ jobs:
              +incdir+. +define+EXTRA_WIDTH=4 -o "$GITHUB_WORKSPACE/options.db")
           python3 scripts/verify-designdb.py options.db
 
+      # Two exports of one unchanged design, diffed row by row across every
+      # table. `src_file` ids used to follow slang's buffer order, which is
+      # the order a thread pool finished reading files in, so two exports of
+      # tinyriscv disagreed on 44 of 15,773 rows while holding the same
+      # design -- and a whole-database diff could not tell "the source
+      # changed" from "the exporter ran again".
+      #
+      # This is the general check and the weaker one here: it does not know
+      # what it is looking for, but the races it looks for need more files
+      # than these examples have. examples/options, at three files, came out
+      # in the same wrong order every time. The deterministic half is in
+      # verify-designdb.py above -- src_file ids must ascend with path, which
+      # options fails outright when the ids follow buffer order.
+      - name: Reproducible export
+        run: |
+          python3 scripts/check-reproducible.py ./build/rtl-designdb \
+            examples/constructs/constructs.sv
+          (cd examples/options && python3 ../../scripts/check-reproducible.py \
+             ../../build/rtl-designdb -f opts.f --single-unit +incdir+. \
+             +define+EXTRA_WIDTH=4)
+
   # The four release platforms, as workflow artifacts on every push. The same
   # workflow builds a tagged release, so a red push here is a release that
   # would have failed.
