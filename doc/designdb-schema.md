@@ -726,6 +726,11 @@ EDA standards already name:
 
 `src_file` holds every file slang actually read, absolute path and
 SHA-256, so a consumer can tell whether the database and the RTL diverged.
+Its rows are interned in path order, which is what lets two exports of an
+unchanged design be compared row for row: it is the one table whose ids come
+from SQLite rather than an extractor counter, so its insert order is its id
+order, and the order slang hands the buffers back in is the order a thread
+pool finished reading them.
 `file` holds the spellings rows carry — as written in the filelist —
 joined to their src_file. `meta` is the seal; its required keys are the
 `v_db_info` columns plus `tool`, except `top` — the space-separated names
