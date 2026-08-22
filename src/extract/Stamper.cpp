@@ -122,7 +122,12 @@ private:
     }
 
     /// Stamps one occurrence's template rows and recurses into its children.
+    /// Every module occurrence passes through here -- a top from run(), a
+    /// child from stampChildModule -- which is why the unanalysed count is
+    /// taken here and not beside either caller.
     void stampBody(Template& t, int64_t instId, std::vector<int64_t> ifaceBind) {
+        if (!t.analysedBody)
+            stats.unanalysedInsts++;
         // Scope nodes: index 0 is the instance itself; the rest are
         // generate levels, parents guaranteed to precede children.
         std::vector<int64_t> scopeNode(t.scopes.size(), instId);

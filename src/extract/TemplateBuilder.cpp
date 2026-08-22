@@ -27,6 +27,14 @@ TemplateSet TemplateBuilder::run() {
     for (auto inst : compilation.getRoot().topInstances)
         collect(*inst);
 
+    // What pass 1 grouped, before any of it is walked. A group whose chosen
+    // body has no AnalyzedScope yields a template with no procedure in it;
+    // see designdb::Stats for why that happens and why no row moves.
+    for (auto& [key, group] : groups) {
+        if (!analysis.getAnalyzedScope(*group.body))
+            stats.unanalysedBodies++;
+    }
+
     // Module rows: one per source definition, not per parameterisation.
     for (auto& [key, group] : groups)
         internModuleRow(group.body->getDefinition());
@@ -529,7 +537,14 @@ void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body)
     b.decl->collectDeclarations(body, 0);
     buildTermMaps(b, body);
 
+    // Recorded, not just used: a body with no AnalyzedScope yields no
+    // procedure here, and the rows it does produce -- nets, terminals,
+    // children -- look exactly like a module that has no always block and
+    // no continuous assignment. The stamper counts the occurrences that
+    // inherit the gap so the export can say so rather than let a consumer
+    // read absence as fact.
     if (auto* scope = analysis.getAnalyzedScope(body)) {
+        t.analysedBody = true;
         for (auto& proc : scope->procedures)
             buildProcedure(b, proc);
     }
