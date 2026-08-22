@@ -449,7 +449,11 @@ inline std::string leafSegment(const Symbol& sym) {
     }
     std::string out = needsEscaping(base) ? "\\" + std::string(base) + " "
                                           : std::string(base);
-    if (sym.kind == SymbolKind::Instance || sym.kind == SymbolKind::CheckerInstance) {
+    // Every kind InstanceSymbolBase covers, primitives included: `buf u[2:1]`
+    // spells its elements `u[1]` and `u[2]` exactly as `sub u[2:1]` does, and
+    // naming them from the bare array name gave one scope two nodes called
+    // `u`.
+    if (InstanceSymbolBase::isKind(sym.kind)) {
         auto& inst = sym.as<InstanceSymbolBase>();
         if (!inst.arrayPath.empty()) {
             SmallVector<ConstantRange, 8> dims;

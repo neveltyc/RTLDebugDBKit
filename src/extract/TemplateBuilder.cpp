@@ -1503,7 +1503,16 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
         // Anonymous gates get a synthesised segment instead, counted per
         // scope so siblings differ, and prefixed with '$' so it cannot
         // collide with an identifier the source could have written.
-        std::string name(prim.name);
+        //
+        // Through leafSegment, like every other child: taking `prim.name`
+        // raw skipped both of the things that function exists for. An array
+        // element's own name is the bare array name, so `buf u[2:1]` gave
+        // one scope two nodes called `u` -- and, once the empty-name branch
+        // below was reached instead, two called `$buf$n`, which `top.u[1]`
+        // cannot find either. And a name needing escaping arrived unescaped,
+        // so `buf \my.gate ()` wrote a node name with a dot in it: two path
+        // segments where the tree contracts one.
+        std::string name = leafSegment(prim);
         if (name.empty())
             name = anonSegment(b, p.scope, def.name);
         p.name = name;
