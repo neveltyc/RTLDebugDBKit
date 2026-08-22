@@ -77,7 +77,7 @@ granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v15:
+Release build, macOS arm64, against public designs, schema v16:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
