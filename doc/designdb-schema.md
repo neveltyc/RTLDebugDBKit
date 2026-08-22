@@ -259,7 +259,7 @@ which outer column is set — the kind first, then its pointer:
 |---|---|---|
 | `signal` | `outer_net_id` | a net of the parent instance |
 | `constant` | — | a tie-off; the term window is kept so the formal's bits tile without a gap |
-| `unconnected` | — | recorded, not omitted: absence would also mean "the exporter did not get this far" |
+| `unconnected` | — | recorded, not omitted: absence would also mean "the exporter did not get this far". Claimed only for a pin the parent left empty — a connection whose shape this schema cannot spell (a sequence expression against a black box) records the nets it reaches as `expression_operand` instead |
 | `expression_operand` | `outer_net_id` or `outer_hier_ref_id` | the actual is an expression; this row is one net it reads. `.en(state == RUN)` samples `state` but does not alias it to `en`; `map_exact` is 0 by construction |
 | `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. NULL when the binding has no per-occurrence object (an interface array element). No dataflow arc pretends to cross an interface binding |
 | `external_reference` | `outer_hier_ref_id` | tied to something with no name in the parent (`.p(u.g[7:4])`); the reference says what, with `access='connect'`. It crosses like any other connection once the reference resolves — with a `map_exact` of its own, so the arc is traceable bit by bit — while an upward tie (`.a(tb.glob)`) stays a recorded connection with no arc |
@@ -565,7 +565,12 @@ stmt_id, prim_id, term_id, map_exact, call_site_id, file_path,
 src_path, src_line, src_col`. `driver_kind`:
 
 * `data | control | primitive | procedure` — a `net_dep` row, kind carried
-  through.
+  through, including when it names no driver net. `primitive` with a NULL
+  `driver_net_id` is a gate with no input terminal (`pullup`, `pulldown`);
+  `procedure` with one is a call into a subroutine declared outside this
+  instance, whose formal is no net here. Only a `data` row without a source
+  is a `constant` — reporting a weak driver or an unnameable one as a
+  tie-off inflates a multiple-driver count with a conflict that is not one.
 * `connection` — the crossing: for an input/inout/ref terminal the
   parent-side net drives the child's internal net; for output/inout/ref the
   internal net drives the parent's. `inout` and `ref` arc both ways, one
@@ -587,7 +592,10 @@ src_path, src_line, src_col`. `driver_kind`:
   driver window is set: the referenced object's bits are known.
 * `alias` — an `alias` statement binds the two nets into one object. Both
   directions exist, so each is the other's driver and the other's load;
-  the kind excludes it from a multiple-driver count.
+  the kind excludes it from a multiple-driver count. `v_net_attachment`
+  spells the same exclusion as `alias_binding`, for the reason
+  `release_target` exists: the storage is a `stmt_target` row, and the
+  statement writes nothing.
 * `system_task` — a system task wrote the argument. `driver_net_id` is
   NULL, as for a constant, because the source is a file or a plusarg
   rather than a net; `stmt_id` names the call.
@@ -634,7 +642,8 @@ views cannot ask flatly — "what hangs off this net" — with
 `attachment_kind` naming the relation and exactly ONE of the seven typed
 id columns pointing at that relation's own row (the exclusive-arc shape
 `net_dep` uses, not one polymorphic id): `terminal_inside` /
-`actual_outside` → `term_id`; `written_by` / `release_target` →
+`actual_outside` → `term_id`; `written_by` / `release_target` /
+`alias_binding` →
 `stmt_target_id`; `read_by` → `assign_operand_id`; `condition` /
 `statement_read` → `expr_ref_id`; `event` → `proc_id`; `dep_in` /
 `dep_out` → `dep_id`; `named_from_outside` → `hier_ref_id`. `lo/hi/exact`
