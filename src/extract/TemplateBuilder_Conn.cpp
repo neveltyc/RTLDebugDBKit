@@ -442,6 +442,47 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
         if (expr && expr->kind == ExpressionKind::EmptyArgument)
             expr = nullptr;
         const TplLoc at = locator.locate(u.location);
+        // A connection that is not a simple expression at all.
+        // UninstantiatedDefSymbol hands its connections back as AssertionExpr
+        // precisely because the construct may be a sequence -- `.p(a ##1 b)`
+        // is legal against an unresolved name -- and only the Simple kind was
+        // unwrapped above. Everything else fell through with a null expression
+        // and was recorded as `unconnected`: an assertion that the parent
+        // wired NOTHING, where it plainly wired something, and the nets it
+        // named lost their load through that pin. The leaves are recordable
+        // even when the shape is not, so they go in as expression operands --
+        // which is what a connection whose expression is not a plain reference
+        // already is.
+        if (!expr && raw && raw->kind != AssertionExprKind::Simple) {
+            std::vector<Ref> seqRefs;
+            collectStatementRefs(*raw, seqRefs);
+            int64_t seqOrdinal = 0;
+            for (auto& r : seqRefs) {
+                if (!r.sym)
+                    continue;
+                TplConn tc;
+                tc.kind = "expression_operand";
+                tc.childTerm = termSlot;
+                tc.ordinal = seqOrdinal++;
+                tc.loc = at;
+                const int32_t netIdx = b.decl->netFor(*r.sym);
+                if (netIdx < 0) {
+                    const int32_t saved = b.curStmt;
+                    b.curStmt = -1;
+                    tc.hierRef = addHierRef(b, false, r, at, evalCtx, "connect");
+                    b.curStmt = saved;
+                }
+                else {
+                    tc.parentNet = netIdx;
+                    tc.netR = rangeOf(r);
+                    tc.netExact = r.exact ? 1 : 0;
+                    tc.mappingExact = 0;
+                }
+                c.conns.push_back(std::move(tc));
+            }
+            if (seqOrdinal > 0)
+                continue;
+        }
         if (!expr) {
             TplConn tc;
             tc.kind = "unconnected";
