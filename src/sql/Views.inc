@@ -1,15 +1,17 @@
-// The stable query interface: thirteen views, the consumption contract.
-// Their existence, column sets, column semantics, NULL rules and row
-// granularity are what a consumer may rely on; changing any of those bumps
-// the schema version, changing only how one is computed does not.
+// The stable query interface: fifteen views, the consumption contract.
+// Their existence, column sets and order, column semantics, NULL rules and
+// row granularity are what a consumer may rely on; changing any of those --
+// adding a column included, since the version integer is the only capability
+// signal a consumer has -- bumps the schema version, changing only how one is
+// computed does not.
 // verify-designdb.py asserts all of it on every export.
 //
 // Ground rules, revised from v8 for the instance-level model:
 //
 //   * A FACT view's row is one base-table row -- v_tree_node, v_net,
 //     v_term, v_term_map, v_net_conn, v_net_dep,
-//     v_stmt, v_stmt_target, v_stmt_operand -- and the
-//     verifier checks count(view) == count(base). Every internal join is
+//     v_stmt, v_stmt_target, v_stmt_operand, v_call_site, v_hier_ref -- and
+//     the verifier checks count(view) == count(base). Every internal join is
 //     against a primary key, so nothing fans out.
 //   * v_driver and v_load are COMPOSITE: UNION ALL branches discriminated by
 //     driver_kind/load_kind, each branch's row count reconcilable against
@@ -245,6 +247,9 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- every link of that side's chain is exact, passed through untouched when
 -- the other side does not narrow it, and degraded to exact=0 otherwise --
 -- the range is then an upper bound, which is what exact=0 means everywhere.
+-- outer_ref rides along for the outer end that was named hierarchically
+-- (`.p(u.g[7:4])`): the join that resolves such a tie to its net is already
+-- here, and both composite views want the spelling beside the net.
 CREATE VIEW v_conn_arc AS
 -- The outer end is either the connection's own net or, for a tie whose
 -- reference resolved, the net that reference landed on. Deriving it with
@@ -265,6 +270,7 @@ WITH seg AS (
         c.id                                   AS conn_id,
         c.conn_kind                            AS conn_kind,
         c.outer_net_id                         AS outer_net_id,
+        hr.path                                AS outer_ref,
         c.outer_lo                             AS c_net_lo,
         c.outer_hi                             AS c_net_hi,
         c.outer_exact                          AS c_net_exact,
@@ -304,6 +310,7 @@ WITH seg AS (
         c.id                                   AS conn_id,
         c.conn_kind                            AS conn_kind,
         hr.resolved_net_id                     AS outer_net_id,
+        hr.path                                AS outer_ref,
         hr.lo                                  AS c_net_lo,
         hr.hi                                  AS c_net_hi,
         hr.is_exact                            AS c_net_exact,
@@ -357,7 +364,7 @@ arc AS (
 )
 SELECT
     conn_id, conn_kind, term_id, term_inst_id, direction,
-    outer_net_id, inner_net_id,
+    outer_net_id, inner_net_id, outer_ref,
     CASE WHEN outer_net_id IS NULL THEN NULL
          WHEN outer_chain AND c_net_exact = 1 AND ilo IS NOT NULL
               THEN COALESCE(c_net_lo, 0) + ilo - COALESCE(c_lo, 0)
@@ -439,6 +446,17 @@ FROM arc;
 --                       terminal's own window is in v_term_map.
 --
 -- An unconnected terminal contributes no row.
+--
+-- driver_ref is how the driving end was SPELLED when it was reached by a
+-- hierarchical name, and NULL when it was not -- one meaning, two
+-- situations. On an 'external' row it is the only name there is, and the
+-- row was not self-sufficient without it: the path lived on a hier_ref the
+-- consumer had to reach through dep_id, outside the views that were the
+-- whole contract. On a crossing whose tie resolved
+-- (`.p(u.g[7:4])`) the driver net is named as well, and driver_ref says how
+-- it was written at the instantiation. v_hier_ref holds the rest of the
+-- reference -- access, resolution, window, location -- for the questions one
+-- denormalised column should not try to answer.
 CREATE VIEW v_driver AS
 SELECT
     d.tgt_net_id             AS signal_net_id,
@@ -450,6 +468,7 @@ SELECT
     d.src_net_id             AS driver_net_id,
     sn.inst_id               AS driver_inst_id,
     sn.name                  AS driver_name,
+    sh.path                  AS driver_ref,
     d.src_lo                 AS driver_lo,
     d.src_hi                 AS driver_hi,
     d.src_exact              AS driver_exact,
@@ -480,6 +499,7 @@ SELECT
 FROM net_dep d
 JOIN net tn              ON tn.id = d.tgt_net_id
 LEFT JOIN net sn         ON sn.id = d.src_net_id
+LEFT JOIN hier_ref sh    ON sh.id = d.src_hier_ref_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
 LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
@@ -488,7 +508,7 @@ UNION ALL
 SELECT
     a.inner_net_id, innet.inst_id, innet.name,
     a.inner_lo, a.inner_hi, a.inner_exact,
-    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
     CASE a.conn_kind
          WHEN 'expression_operand' THEN 'connection_expression'
@@ -507,7 +527,7 @@ UNION ALL
 SELECT
     a.outer_net_id, outnet.inst_id, outnet.name,
     a.outer_lo, a.outer_hi, a.outer_exact,
-    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
@@ -524,7 +544,7 @@ UNION ALL
 SELECT
     m.inner_net_id, n.inst_id, n.name,
     m.inner_lo, m.inner_hi, m.inner_exact,
-    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id,
     NULL, NULL,
@@ -562,6 +582,16 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 -- One read, one row: an expr_ref or assign_operand that a net_dep row
 -- already carries into 'dataflow' is not repeated as 'statement' -- the
 -- NOT EXISTS guards are that rule, and the verifier re-derives the counts.
+--
+-- load_ref is v_driver's driver_ref with the ends exchanged: how the LOAD
+-- end was spelled when it was reached by a hierarchical name, NULL when it
+-- was not. A dataflow row takes it from the dependency's target reference
+-- (`tb.glob = sig` reads sig into a name this instance does not own), a
+-- crossing from the resolved tie on whichever side is the load. The
+-- 'statement' branch never carries one: a read whose statement writes
+-- outward has as many outward targets as the statement has, and pairing the
+-- read with them is the cross product that would cost this view its one
+-- row per read.
 CREATE VIEW v_load AS
 SELECT
     d.src_net_id             AS signal_net_id,
@@ -573,6 +603,7 @@ SELECT
     d.tgt_net_id             AS load_net_id,
     tn.inst_id               AS load_inst_id,
     tn.name                  AS load_name,
+    th.path                  AS load_ref,
     d.tgt_lo                 AS load_lo,
     d.tgt_hi                 AS load_hi,
     d.tgt_exact              AS load_exact,
@@ -592,6 +623,7 @@ SELECT
 FROM net_dep d
 JOIN net sn              ON sn.id = d.src_net_id
 JOIN net tn              ON tn.id = d.tgt_net_id
+LEFT JOIN hier_ref th    ON th.id = d.tgt_hier_ref_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
 LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
@@ -600,7 +632,7 @@ UNION ALL
 SELECT
     a.outer_net_id, outnet.inst_id, outnet.name,
     a.outer_lo, a.outer_hi, a.outer_exact,
-    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
@@ -616,7 +648,7 @@ UNION ALL
 SELECT
     a.inner_net_id, innet.inst_id, innet.name,
     a.inner_lo, a.inner_hi, a.inner_exact,
-    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
@@ -633,7 +665,7 @@ UNION ALL
 SELECT
     pe.net_id, n.inst_id, n.name,
     NULL, NULL, 1,
-    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
     NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, NULL,
     f.path, sf.path, pe.line, pe.col
@@ -645,7 +677,7 @@ UNION ALL
 SELECT
     e.net_id, n.inst_id, n.name,
     e.lo, e.hi, e.is_exact,
-    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     CASE e.role WHEN 'wait' THEN 'wait'
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
@@ -662,7 +694,7 @@ UNION ALL
 SELECT
     o.net_id, n.inst_id, n.name,
     o.lo, o.hi, o.is_exact,
-    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
     NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, NULL,
     f.path, sf.path, s.line, s.col
@@ -676,7 +708,7 @@ UNION ALL
 SELECT
     m.inner_net_id, n.inst_id, n.name,
     m.inner_lo, m.inner_hi, m.inner_exact,
-    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id, NULL, NULL,
     f.path, sf.path, t.line, t.col
@@ -691,6 +723,13 @@ WHERE t.direction IN ('output', 'inout', 'ref');
 -- One row per stmt: the statement object. Targets and operands are
 -- v_stmt_target / v_stmt_operand rows keyed on stmt_id --
 -- one statement is ONE row here no matter how many targets it writes.
+--
+-- call_site_id is the body expansion this statement was walked for, the
+-- same tag v_net_dep and the two directional views carry. It was on the
+-- base table from v13 and missing here, which left the documented
+-- context-sensitive recipe -- "follow only the rows of one call's site" --
+-- unexecutable for a walk that starts at a statement rather than at a
+-- dependency.
 CREATE VIEW v_stmt AS
 SELECT
     s.id                    AS stmt_id,
@@ -706,6 +745,7 @@ SELECT
     s.assign_kind           AS assign_kind,
     s.delay                 AS delay,
     s.dropped_operand_count AS dropped_operand_count,
+    s.call_site_id          AS call_site_id,
     f.path                  AS file_path,
     sf.path                 AS src_path,
     s.line                  AS src_line,
@@ -716,7 +756,30 @@ LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN file f         ON f.id = s.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
--- One row per stmt_target.
+-- One row per stmt_target -- an lvalue, which is not the same thing as a
+-- write. target_kind says which, in the vocabulary v_net_attachment already
+-- contracts for the same three storage cases:
+--
+--   written_by       an assignment or a system task writes the net.
+--   release_target   a `release`/`deassign` names its lvalue and drives
+--                    NOTHING; the extractor gives it a target row and
+--                    deliberately no dependency, so this table is the only
+--                    place it appears -- and, without this column, the only
+--                    way to mistake it for a driver.
+--   alias_binding    an `alias` statement binds the net into one object
+--                    with another. Same storage, no write; v_driver keeps
+--                    it out of a driver count by kind, and this does the
+--                    same for a consumer starting from the statement side.
+--
+-- The CASE is v_net_attachment's, character for character; the verifier
+-- holds the two equal per target row, so the repetition cannot drift. It
+-- costs a join against stmt's primary key and no fan-out. v_stmt_operand
+-- has no counterpart: a read is a read whatever statement makes it.
+--
+-- call_site_id is the statement's, carried here so the row answers on its
+-- own which expansion wrote this net. The statement layer is where the
+-- question bites hardest -- one body walked for N calls is N sets of these
+-- rows over one set of formal nets.
 CREATE VIEW v_stmt_target AS
 SELECT
     a.id       AS target_id,
@@ -724,13 +787,22 @@ SELECT
     a.ordinal  AS ordinal,
     a.net_id   AS net_id,
     n.name     AS net_name,
+    CASE WHEN s.stmt_kind = 'release' THEN 'release_target'
+         WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
+         ELSE 'written_by' END AS target_kind,
     a.lo       AS tgt_lo,
     a.hi       AS tgt_hi,
-    a.is_exact AS tgt_exact
+    a.is_exact AS tgt_exact,
+    s.call_site_id AS call_site_id
 FROM stmt_target a
-JOIN net n ON n.id = a.net_id;
+JOIN net n ON n.id = a.net_id
+JOIN stmt s ON s.id = a.stmt_id;
 
--- One row per assign_operand.
+-- One row per assign_operand. call_site_id is its statement's, for the
+-- reason v_stmt carries one: a body called from N sites is N sets of these
+-- rows over one set of formal nets, and without the tag on the row itself a
+-- consumer starting here cannot tell the sets apart -- it would have to
+-- rejoin v_stmt for a column that statement already knows.
 CREATE VIEW v_stmt_operand AS
 SELECT
     o.id       AS operand_id,
@@ -740,9 +812,11 @@ SELECT
     n.name     AS net_name,
     o.lo       AS operand_lo,
     o.hi       AS operand_hi,
-    o.is_exact AS operand_exact
+    o.is_exact AS operand_exact,
+    s.call_site_id AS call_site_id
 FROM assign_operand o
-JOIN net n ON n.id = o.net_id;
+JOIN net n ON n.id = o.net_id
+JOIN stmt s ON s.id = o.stmt_id;
 
 -- Everything touching one net, one row per attachment: the structural
 -- adjacency that v_driver/v_load answer directionally, answered flatly --
@@ -878,4 +952,50 @@ SELECT
 FROM call_site cs
 JOIN inst i        ON i.id = cs.inst_id
 LEFT JOIN module m ON m.id = i.module_id;
+
+-- One row per hier_ref: a reference that leaves its instance, as written
+-- and -- where slang could settle it and the target is in this export --
+-- as resolved.
+--
+-- The contract handed consumers four pointers at this table before it
+-- handed them a way to follow one: v_net_dep's src_hier_ref_id and
+-- tgt_hier_ref_id, v_net_conn's outer_hier_ref_id, v_net_attachment's
+-- hier_ref_id. A published foreign key with nothing to resolve it against
+-- is a dangling reference in the contract itself, and the consumer that
+-- needed the path read the base table -- correctly, and outside every
+-- promise this schema makes.
+--
+-- driver_ref/load_ref answer the common case in one row, so a walk over
+-- either directional view never needs this. What is here is the rest of the
+-- reference, which no denormalised column should carry: access, where it
+-- landed, its window, its location.
+--
+-- ref_path rather than path: this view spells three different things
+-- 'path' -- the reference, the file as the filelist wrote it, and the file
+-- slang read -- and only prefixes keep them apart.
+CREATE VIEW v_hier_ref AS
+SELECT
+    h.id                AS hier_ref_id,
+    h.inst_id           AS inst_id,
+    i.module_id         AS module_id,
+    m.name              AS module_name,
+    h.stmt_id           AS stmt_id,
+    h.path              AS ref_path,
+    h.access            AS access,
+    h.resolved_inst_id  AS resolved_inst_id,
+    h.resolved_net_id   AS resolved_net_id,
+    rn.name             AS resolved_net_name,
+    h.lo                AS ref_lo,
+    h.hi                AS ref_hi,
+    h.is_exact          AS ref_exact,
+    f.path              AS file_path,
+    sf.path             AS src_path,
+    h.line              AS src_line,
+    h.col               AS src_col
+FROM hier_ref h
+JOIN inst i           ON i.id = h.inst_id
+LEFT JOIN module m    ON m.id = i.module_id
+LEFT JOIN net rn      ON rn.id = h.resolved_net_id
+LEFT JOIN file f      ON f.id = h.file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 )SQL"

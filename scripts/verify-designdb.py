@@ -6,7 +6,7 @@
 # build that links proves the slang pin resolves; this proves the exporter
 # still writes rows -- and that the rows keep every contract the schema
 # documents: the subtype bijections, the ownership rules, the provenance
-# matrix behind net_dep, the range discipline, and the fourteen stable views
+# matrix behind net_dep, the range discipline, and the fifteen stable views
 # with their exact columns and row formulas. CI runs it against examples/ on
 # every platform binary it builds, so the mode branches assert only what
 # those small designs must produce, not exact counts.
@@ -36,7 +36,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "15"
 
 
 def one(sql, *args):
@@ -677,7 +677,7 @@ for k in ("error_count", "unresolved_count", "empty_procedure_count",
 print("ok: v_db_info agrees with meta and casts its counts")
 
 # --------------------------------------------------------- view contract
-# The fourteen stable views: existence, exact columns in exact order, and row
+# The fifteen stable views: existence, exact columns in exact order, and row
 # formulas. v_conn_arc is scaffolding, not contract, and is deliberately
 # absent from this list.
 VIEW_COLUMNS = {
@@ -724,29 +724,29 @@ VIEW_COLUMNS = {
     "v_driver": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
         "signal_hi", "signal_exact", "driver_net_id", "driver_inst_id",
-        "driver_name", "driver_lo", "driver_hi", "driver_exact",
+        "driver_name", "driver_ref", "driver_lo", "driver_hi", "driver_exact",
         "driver_kind", "dep_id", "conn_id", "stmt_id",
         "prim_id", "term_id", "map_exact", "call_site_id", "file_path",
         "src_path", "src_line", "src_col"],
     "v_load": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
         "signal_hi", "signal_exact", "load_net_id", "load_inst_id",
-        "load_name", "load_lo", "load_hi", "load_exact", "load_kind",
-        "dep_id", "conn_id", "stmt_id", "proc_id",
+        "load_name", "load_ref", "load_lo", "load_hi", "load_exact",
+        "load_kind", "dep_id", "conn_id", "stmt_id", "proc_id",
         "term_id", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
     "v_stmt": [
         "stmt_id", "inst_id", "module_id", "module_name",
         "scope_node_id", "proc_id", "ordinal", "sequence",
         "stmt_kind", "construct", "assign_kind", "delay",
-        "dropped_operand_count", "file_path", "src_path", "src_line",
-        "src_col"],
+        "dropped_operand_count", "call_site_id",
+        "file_path", "src_path", "src_line", "src_col"],
     "v_stmt_target": [
         "target_id", "stmt_id", "ordinal", "net_id", "net_name",
-        "tgt_lo", "tgt_hi", "tgt_exact"],
+        "target_kind", "tgt_lo", "tgt_hi", "tgt_exact", "call_site_id"],
     "v_stmt_operand": [
         "operand_id", "stmt_id", "ordinal", "net_id", "net_name",
-        "operand_lo", "operand_hi", "operand_exact"],
+        "operand_lo", "operand_hi", "operand_exact", "call_site_id"],
     "v_net_attachment": [
         "net_id", "inst_id", "net_name", "attachment_kind",
         "lo", "hi", "exact", "stmt_id",
@@ -755,6 +755,11 @@ VIEW_COLUMNS = {
     "v_call_site": [
         "call_site_id", "inst_id", "module_id", "module_name",
         "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
+    "v_hier_ref": [
+        "hier_ref_id", "inst_id", "module_id", "module_name", "stmt_id",
+        "ref_path", "access", "resolved_inst_id", "resolved_net_id",
+        "resolved_net_name", "ref_lo", "ref_hi", "ref_exact",
+        "file_path", "src_path", "src_line", "src_col"],
 }
 for view, want in VIEW_COLUMNS.items():
     row = con.execute(
@@ -766,7 +771,7 @@ for view, want in VIEW_COLUMNS.items():
     if got != want:
         sys.exit(f"{view} columns diverge from the contract:\n"
                  f"  want {want}\n  got  {got}")
-print("ok: the fourteen stable views exist with their contracted columns")
+print("ok: the fifteen stable views exist with their contracted columns")
 
 # Fact views: one view row is one base row.
 for view, base in (
@@ -776,6 +781,7 @@ for view, base in (
     ("v_stmt_target", "stmt_target"),
     ("v_stmt_operand", "assign_operand"),
     ("v_call_site", "call_site"),
+    ("v_hier_ref", "hier_ref"),
 ):
     nv = one(f'SELECT count(*) FROM "{view}"')
     nb = one(f'SELECT count(*) FROM "{base}"')
@@ -899,6 +905,31 @@ check(one("""
     WHERE a.attachment_kind = 'alias_binding'
       AND s.stmt_kind != 'alias'""") == 0,
       "and alias_binding is exactly the aliases")
+# v_stmt_target draws the same three-way distinction from the statement
+# side, with the same CASE. Two copies of one derivation drift unless
+# something holds them together; this is that something. It also states the
+# distinction the target view lacked entirely until v15 -- the only path
+# that reaches a release is the one that starts here, and it was also the
+# only one that could mistake it for a driver.
+check(one("""
+    SELECT count(*) FROM v_stmt_target t
+    JOIN v_net_attachment a ON a.stmt_target_id = t.target_id
+    WHERE a.attachment_kind IS NOT t.target_kind""") == 0,
+      "v_stmt_target.target_kind agrees with v_net_attachment row for row")
+check(one("""
+    SELECT count(*) FROM v_stmt_target
+    WHERE target_kind NOT IN
+        ('written_by', 'release_target', 'alias_binding')""") == 0,
+      "and target_kind stays in that vocabulary")
+# The statement layer's call_site_id is the statement's, on all three views.
+# It is one column read three ways, so the only thing that can go wrong is
+# the join that carries it -- which is what this holds.
+for view, col in (("v_stmt", "stmt_id"), ("v_stmt_target", "target_id"),
+                  ("v_stmt_operand", "operand_id")):
+    check(one(f"""
+        SELECT count(*) FROM {view} v JOIN stmt s ON s.id = v.stmt_id
+        WHERE v.call_site_id IS NOT s.call_site_id""") == 0,
+          f"{view}.call_site_id is its statement's")
 # Exclusive arc, like net_dep: exactly one of the seven typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
@@ -975,10 +1006,55 @@ check(one("SELECT count(*) FROM v_driver WHERE driver_kind='external'") ==
       one("""SELECT count(*) FROM net_dep
              WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL"""),
       "external drivers are exactly the unresolved-source dependencies")
+# driver_ref/load_ref: the far end's spelling when it was named
+# hierarchically. On a dependency row that is exactly the dependency's own
+# reference on that end -- not "sometimes", or the column would be a hint
+# rather than an answer, and a consumer would have to keep the join it was
+# meant to retire.
+check(one("""
+    SELECT count(*) FROM v_driver v
+    JOIN net_dep d ON d.id = v.dep_id
+    WHERE (v.driver_ref IS NOT NULL) != (d.src_hier_ref_id IS NOT NULL)""") == 0,
+      "a dependency's driver_ref is exactly its source reference")
+check(one("""
+    SELECT count(*) FROM v_load v
+    JOIN net_dep d ON d.id = v.dep_id
+    WHERE (v.load_ref IS NOT NULL) != (d.tgt_hier_ref_id IS NOT NULL)""") == 0,
+      "and a dependency's load_ref is exactly its target reference")
+check(one("""
+    SELECT count(*) FROM v_driver v
+    JOIN net_dep d ON d.id = v.dep_id
+    JOIN v_hier_ref h ON h.hier_ref_id = d.src_hier_ref_id
+    WHERE v.driver_ref IS NOT h.ref_path""") == 0,
+      "and it carries that reference's path verbatim")
+# The promise the column exists for: an external driver has no net row, so
+# without this it names nothing at all.
+check(one("""
+    SELECT count(*) FROM v_driver
+    WHERE driver_kind = 'external' AND driver_ref IS NULL""") == 0,
+      "every external driver names the reference it reads")
+# A crossing's ref can only come from a tie that was written outward.
+check(one("""
+    SELECT count(*) FROM v_driver v
+    JOIN net_conn c ON c.id = v.conn_id
+    WHERE v.driver_ref IS NOT NULL AND c.outer_hier_ref_id IS NULL""") == 0,
+      "a crossing names a reference only where the tie was written outward")
+check(one("""
+    SELECT count(*) FROM v_load v
+    JOIN net_conn c ON c.id = v.conn_id
+    WHERE v.load_ref IS NOT NULL AND c.outer_hier_ref_id IS NULL""") == 0,
+      "on the load side too")
+# v_hier_ref resolves the four pointers the contract publishes at hier_ref
+# and had nothing to follow. Its one derived column must not invent a name
+# where the reference resolved to nothing, nor lose one where it did.
+check(one("""
+    SELECT count(*) FROM v_hier_ref
+    WHERE (resolved_net_name IS NOT NULL) != (resolved_net_id IS NOT NULL)""") == 0,
+      "v_hier_ref names a resolved net exactly when there is one")
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_kind IN ('constant', 'terminal', 'system_task')
-      AND (driver_name IS NOT NULL
+      AND (driver_name IS NOT NULL OR driver_ref IS NOT NULL
        OR driver_lo IS NOT NULL OR driver_hi IS NOT NULL
        OR driver_exact IS NOT NULL OR map_exact IS NOT NULL)""") == 0,
       "a driver-less row describes no driver end")
@@ -988,6 +1064,7 @@ check(one("""
 check(one("""
     SELECT count(*) FROM v_load
     WHERE load_net_id IS NULL AND (load_name IS NOT NULL
+       OR load_ref IS NOT NULL
        OR load_lo IS NOT NULL OR load_hi IS NOT NULL
        OR load_exact IS NOT NULL OR map_exact IS NOT NULL)""") == 0,
       "a target-less load describes no load end")
@@ -1028,7 +1105,8 @@ check(one("""
 for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
                   ("v_net_dep", "tgt_net_id"),
                   ("v_net_conn", "outer_net_id"),
-                  ("v_net_attachment", "net_id")):
+                  ("v_net_attachment", "net_id"),
+                  ("v_hier_ref", "resolved_net_id")):
     plan = con.execute(
         f"EXPLAIN QUERY PLAN SELECT * FROM {view} WHERE {col} = 1").fetchall()
     scanned = [r[3] for r in plan
@@ -1599,8 +1677,8 @@ if mode == "xmr":
     check(one("""
         SELECT count(*) FROM net_conn
         WHERE conn_kind='external_reference'
-          AND outer_hier_ref_id IS NOT NULL""") == 1,
-          "a port tied outward keeps its connection row")
+          AND outer_hier_ref_id IS NOT NULL""") == 2,
+          "a port tied outward keeps its connection row, in both directions")
     check(one("""
         SELECT count(*) FROM v_driver d
         JOIN v_tree_node t ON t.node_id = d.signal_inst_id
@@ -1618,6 +1696,44 @@ if mode == "xmr":
           AND d.driver_lo=4 AND d.driver_hi=7 AND d.driver_exact=1
           AND d.map_exact=1""") == 1,
           "bit for bit: the external tie is traceable at bit granularity")
+    # The tie names its net AND how the instantiation spelled it. The two
+    # are different answers: `g` is where the bits live, `u.g` is what the
+    # parent wrote, and only the second tells a reader why this net and not
+    # one of the parent's own.
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_tree_node t ON t.node_id = d.signal_inst_id
+        WHERE t.node_name='u_sink' AND d.signal_name='p'
+          AND d.driver_kind='connection' AND d.driver_name='g'
+          AND d.driver_ref='u.g'""") == 1,
+          "and the crossing says how the tie was written, not only where it lands")
+    # The mirror tie, on an output formal: u_sink2's `seen` drives u.split,
+    # so the hierarchically written end is the LOAD, and the spelling has to
+    # ride that side of the arc. The two branches place the same
+    # v_conn_arc column, and only a design with ties in both directions can
+    # tell a misplaced one from a correct one.
+    check(one("""
+        SELECT count(*) FROM v_load l
+        JOIN v_tree_node t ON t.node_id = l.signal_inst_id
+        WHERE t.node_name='u_sink2' AND l.signal_name='seen'
+          AND l.load_kind='connection' AND l.load_name='split'
+          AND l.load_ref='u.split'""") == 1,
+          "an output tied outward names its spelling on the load side")
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_tree_node t ON t.node_id = d.driver_inst_id
+        WHERE t.node_name='u_sink2' AND d.signal_name='split'
+          AND d.driver_kind='connection' AND d.driver_name='seen'
+          AND d.driver_ref IS NULL""") == 1,
+          "and the driver side of that same arc claims no spelling")
+    # v_conn_arc is scaffolding, so the connection's own reference is
+    # reachable in contract through v_net_conn's pointer.
+    check(one("""
+        SELECT count(*) FROM v_net_conn c
+        JOIN v_hier_ref h ON h.hier_ref_id = c.outer_hier_ref_id
+        WHERE c.conn_kind='external_reference' AND h.access='connect'
+          AND h.ref_path='u.g' AND h.resolved_net_name='g'""") == 1,
+          "and v_hier_ref resolves the connection's outward tie")
     check(one("""
         SELECT count(*) FROM v_driver d
         JOIN v_tree_node t ON t.node_id = d.signal_inst_id
@@ -1649,7 +1765,8 @@ if mode == "xmr":
     # what the RTL wrote, the dependencies take their own halves.
     check(one("""
         SELECT count(*) FROM hier_ref
-        WHERE path='u.split' AND lo IS NULL AND hi IS NULL AND is_exact=1""") == 1,
+        WHERE path='u.split' AND access='read'
+          AND lo IS NULL AND hi IS NULL AND is_exact=1""") == 1,
           "a split reference is recorded whole, once")
     check(one("""
         SELECT count(*) FROM v_net_dep
@@ -1759,13 +1876,28 @@ if mode == "external":
         SELECT count(*) FROM v_driver
         WHERE driver_kind='external' AND signal_name='o'""") >= 1,
           "an output driven by an upward reference is external")
+    # The window and the name, both off the v_driver row itself. Reading
+    # this used to mean dep_id -> net_dep -> hier_ref: two more queries per
+    # external row, the second of them against a base table the contract
+    # pointed at without wrapping.
     check(one("""
-        SELECT count(*) FROM v_driver v JOIN net_dep d ON d.id = v.dep_id
-        JOIN hier_ref h ON h.id = d.src_hier_ref_id
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='external' AND signal_name='nib'
+          AND driver_ref='tb_top.glob'
+          AND driver_lo=0 AND driver_hi=3 AND driver_exact=1""") >= 1,
+          "the windowed upward read keeps its window and names what it reads")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='external' AND driver_ref IS NULL""") == 0,
+          "and every external row in this design names its reference")
+    # The reference behind that spelling is reachable in contract now, and
+    # says the thing the kind depends on: it did not resolve here.
+    check(one("""
+        SELECT count(*) FROM v_driver v
+        JOIN v_hier_ref h ON h.ref_path = v.driver_ref
         WHERE v.driver_kind='external' AND v.signal_name='nib'
-          AND h.resolved_net_id IS NULL
-          AND v.driver_lo=0 AND v.driver_hi=3 AND v.driver_exact=1""") >= 1,
-          "the windowed upward read keeps its window on the external driver")
+          AND h.access='read' AND h.resolved_net_id IS NULL""") >= 1,
+          "and v_hier_ref resolves that spelling to an unresolved read")
     check(one("""
         SELECT count(*) FROM net_dep
         WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL
@@ -1848,6 +1980,57 @@ if mode == "callsite":
     check('b' in c2 and 'g2' in c2 and 'a' not in c2 and 'g1' not in c2,
           "call site 2's cone is b and g2, never a or g1", f"got {sorted(c2)}")
 
+    # The same answer without touching a base table. The cone above starts
+    # from net_dep because until v15 it had to: a walk that begins at a
+    # STATEMENT -- "which statements write r, and which call does each
+    # belong to" -- had no call_site_id to read, since only v_net_dep and
+    # the two directional views carried the tag and v_stmt did not. The
+    # documented recipe was unexecutable from the side a consumer falls back
+    # to when a dependency is missing. This asserts it is executable now.
+    sites_r = set(r[0] for r in con.execute("""
+        SELECT t.call_site_id FROM v_stmt_target t
+        JOIN v_net n ON n.net_id = t.net_id
+        WHERE n.net_name = 'r' AND t.target_kind = 'written_by'"""))
+    check({1, 2} <= sites_r and None in sites_r,
+          "the writes of r are one per call site plus the module-level one",
+          f"got {sorted(sites_r, key=lambda v: (v is not None, v))}")
+    # The shared formal, from the read side: ONE net, two operand rows, and
+    # only the tag separates them. A consumer that groups reads by net_id
+    # here without it offers a combination no call makes -- the same mixing
+    # call_site_id was introduced to prevent one layer down.
+    sites_v = set(r[0] for r in con.execute("""
+        SELECT o.call_site_id FROM v_stmt_operand o
+        JOIN v_net n ON n.net_id = o.net_id
+        WHERE n.net_name = 'bump.v'"""))
+    check(sites_v == {1, 2},
+          "the two reads of the shared formal are one per call site",
+          f"got {sorted(sites_v, key=lambda v: (v is not None, v))}")
+    check(one("""
+        SELECT count(DISTINCT o.net_id) FROM v_stmt_operand o
+        JOIN v_net n ON n.net_id = o.net_id
+        WHERE n.net_name = 'bump.v'""") == 1,
+          "over one formal net, which is what makes the tag necessary")
+    def view_cone(cs):
+        return set(r[0] for r in con.execute(f"""
+            WITH RECURSIVE c(n) AS (
+                SELECT t.net_id FROM v_stmt_target t
+                JOIN v_stmt s ON s.stmt_id = t.stmt_id
+                JOIN v_net n ON n.net_id = t.net_id
+                WHERE n.net_name='r' AND t.target_kind='written_by'
+                  AND s.call_site_id = {cs}
+                UNION
+                SELECT d.driver_net_id FROM c
+                JOIN v_driver d ON d.signal_net_id = c.n
+                WHERE d.driver_net_id IS NOT NULL
+                  AND (d.call_site_id = {cs} OR d.call_site_id IS NULL))
+            SELECT DISTINCT net_name FROM c JOIN v_net ON net_id = n""")) - {'r'}
+    v1, v2 = view_cone(1), view_cone(2)
+    check('a' in v1 and 'b' not in v1,
+          "and a cone built only from views keeps call site 1's argument",
+          f"got {sorted(v1)}")
+    check('b' in v2 and 'a' not in v2,
+          "and call site 2's", f"got {sorted(v2)}")
+
 if mode == "package":
     # A package is a pseudo-occurrence now: node_kind='package', a matching
     # inst with parent_inst_id NULL and a def_kind='package' module.
@@ -1875,13 +2058,36 @@ if mode == "package":
         SELECT count(DISTINCT driver_net_id) FROM v_driver
         WHERE driver_name='mask' AND driver_kind='data'""") == 1,
           "both readers are driven by the one package net")
+    # Three readers now: the two modules, and the package's own task body,
+    # whose write to `enable` reads `mask` from inside the package.
     check(one("""
         SELECT count(DISTINCT signal_inst_id) FROM v_driver
-        WHERE driver_name='mask' AND driver_kind='data'""") == 2,
-          "and there really are two distinct readers of it")
+        WHERE driver_name='mask' AND driver_kind='data'""") == 3,
+          "and there really are distinct readers of it")
     check(one("""
         SELECT count(*) FROM hier_ref
         WHERE path LIKE 'cfg_pkg::%' AND resolved_net_id IS NOT NULL""") >= 1,
           "the pkg:: reference is recorded as written and resolved")
+    # A task that lives in the package, called twice from one procedure. The
+    # body is walked per call, so its statement rows come in two sets -- and
+    # the statement layer is where a consumer meets code it did not write
+    # itself. "Which call does this statement belong to" had no answer from
+    # v_stmt before v15, for exactly the rows most in need of one.
+    check(one("""
+        SELECT count(*) FROM v_call_site
+        WHERE subroutine_name='arm' AND depth=1""") == 2,
+          "the package task is called from two call sites")
+    sites = set(r[0] for r in con.execute("""
+        SELECT s.call_site_id FROM v_stmt s
+        JOIN v_call_site cs ON cs.call_site_id = s.call_site_id
+        WHERE cs.subroutine_name='arm'"""))
+    check(len(sites) == 2,
+          "and its body's statements name one call site each",
+          f"got {sorted(sites)}")
+    check(one("""
+        SELECT count(DISTINCT src_line) FROM v_stmt s
+        JOIN v_call_site cs ON cs.call_site_id = s.call_site_id
+        WHERE cs.subroutine_name='arm'""") == 1,
+          "over one written statement, which is what the tag is for")
 
 print("OK")
