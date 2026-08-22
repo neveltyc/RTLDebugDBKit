@@ -26,18 +26,19 @@
 #   verify-designdb.py <design.db> typeparam    + examples/constructs/typeparam.sv facts
 #   verify-designdb.py <design.db> concatcursor + examples/constructs/concatcursor.sv facts
 #   verify-designdb.py <design.db> naming       + examples/constructs/naming.sv facts
+#   verify-designdb.py <design.db> outward      + examples/constructs/outward.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "anonymous", "xmr", "alias", "external", "package",
          "callsite", "recursion", "rootref", "typeparam", "concatcursor",
-         "naming",
+         "naming", "outward",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
          "paramfold", "portshape", "compound", "macroloc", "stmtgaps",
-         "patterncase", "outward", "aliascat")
+         "patterncase", "aliascat")
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]")
 
@@ -490,15 +491,45 @@ check(one("""
              OR d.tgt_hier_ref_id IS NOT NULL
              OR d.map_exact IS NULL
         WHEN 'procedure' THEN d.prim_id IS NOT NULL
-             OR d.stmt_target_id IS NOT NULL OR d.assign_operand_id IS NOT NULL
-             OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
-             -- The reading side names where the actual came from, exactly
-             -- as the doc promises: an argument reference or a resolved
-             -- outward one. The write-back direction (formal -> actual) has
-             -- neither, and is told apart by the formal being the source.
-             OR (d.expr_ref_id IS NOT NULL AND d.src_hier_ref_id IS NOT NULL)
+             OR d.assign_operand_id IS NOT NULL
+             OR CASE WHEN d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL
+                  -- The write-back of a call whose formal is no net of this
+                  -- instance -- a subroutine declared in a package, an
+                  -- interface or $unit. There is no source to name, which is
+                  -- the shape v_driver has documented since v14:
+                  -- `driver_kind='procedure'` with a NULL driver net. The
+                  -- stmt_target row beside it is what says the statement
+                  -- writes the actual, and the two are one fact: neither may
+                  -- stand without the other.
+                  THEN d.stmt_id IS NULL OR d.stmt_target_id IS NULL
+                       OR d.expr_ref_id IS NOT NULL
+                       OR d.tgt_hier_ref_id IS NOT NULL
+                       OR d.map_exact IS NOT NULL
+                  -- Every other procedure row names a source, and the
+                  -- write-back direction (formal -> actual) is told apart by
+                  -- the formal being it -- so no target row. The reading side
+                  -- names where the actual came from, exactly as the doc
+                  -- promises: an argument reference or a resolved outward
+                  -- one, never both.
+                  ELSE d.stmt_target_id IS NOT NULL
+                       OR (d.expr_ref_id IS NOT NULL
+                           AND d.src_hier_ref_id IS NOT NULL)
+                END
         ELSE 1 END""") == 0,
       "net_dep provenance columns match dep_kind")
+
+# The general form of what the write-back row above exists for: the two views
+# that answer "what writes this net" must answer alike. v_stmt_target and
+# v_net_attachment read stmt_target, v_driver reads net_dep -- and a call
+# through an unstamped formal used to produce the first without the second, so
+# a package task that plainly writes its output actual read as undriven.
+check(one("""
+    SELECT count(*) FROM v_stmt_target t
+    WHERE t.target_kind = 'written_by'
+      AND NOT EXISTS (SELECT 1 FROM v_driver d
+                      WHERE d.signal_net_id = t.net_id
+                        AND d.stmt_id = t.stmt_id)""") == 0,
+      "every written_by target is a driver of its net from its own statement")
 check(one("""
     SELECT count(*) FROM net_dep d JOIN hier_ref h ON h.id = d.src_hier_ref_id
     WHERE h.resolved_net_id IS NOT d.src_net_id""") == 0,
@@ -1678,6 +1709,34 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dep
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "outward":
+    # A call whose formal is no net of this instance still drives its output
+    # actual, and says so in both places: the target row that names the
+    # statement, and a dependency with no source -- there is no formal here to
+    # name as one -- which v_driver reports as `procedure` with a NULL driver.
+    for net in ("taken", "setb"):
+        check(one("""
+            SELECT count(*) FROM v_driver
+            WHERE signal_name = ? AND driver_kind = 'procedure'
+              AND driver_net_id IS NULL AND stmt_id IS NOT NULL""", net) == 1,
+              f"the package task drives {net} without naming a driver net")
+        check(one("""
+            SELECT count(*) FROM v_stmt_target t JOIN v_driver d
+              ON d.signal_net_id = t.net_id AND d.stmt_id = t.stmt_id
+            WHERE t.net_name = ? AND t.target_kind = 'written_by'""", net) == 1,
+              f"and the two views agree that that statement writes {net}")
+    # `setit` is the one with nothing to read: its statement has no reference
+    # of any kind, so the write-back is the only thing holding the target up.
+    check(one("""
+        SELECT count(*) FROM v_stmt s
+        WHERE s.stmt_kind = 'call'
+          AND EXISTS (SELECT 1 FROM v_stmt_target t
+                      WHERE t.stmt_id = s.stmt_id AND t.net_name = 'setb')
+          AND NOT EXISTS (SELECT 1 FROM hier_ref h WHERE h.stmt_id = s.stmt_id)
+          AND NOT EXISTS (SELECT 1 FROM expr_ref e WHERE e.stmt_id = s.stmt_id)
+        """) == 1,
+          "and it reads nothing at all, so nothing else stands in for it")
 
 if mode == "naming":
     # Every leaf comes through leafSegment, so an escaped name keeps slang's

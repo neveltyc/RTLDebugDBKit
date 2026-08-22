@@ -675,7 +675,8 @@ call_site_id, file_path, src_path, src_line, src_col`.
 ordinal, net_id, net_name, target_kind, tgt_lo, tgt_hi, tgt_exact,
 call_site_id`. An lvalue is not the same thing as a write, and
 `target_kind` says which, in `v_net_attachment`'s vocabulary and computed
-by the same expression: `written_by` (an assignment or a system task),
+by the same expression: `written_by` (an assignment, a system task, or a
+call writing its output actual),
 `release_target` (a `release`/`deassign` names its lvalue and drives
 nothing — this table is the only place it appears, so without the column
 it is also the only place it can be mistaken for a driver) and
@@ -963,9 +964,12 @@ exactly as two modules on one interface meet on the interface's net.
 
 Only package *variables* become nets. A package subroutine's formals are
 not among them, so a call that passes actuals through them records the
-actual as a `stmt_target` and no dataflow: the argument binding, the body's
-reads and the body's write to the formal are all `hier_ref` rows that
-resolve to nothing. A package subroutine that touches package variables
+write to the actual — a `stmt_target` and a `procedure` dependency with no
+source net, which `v_driver` reports as `driver_kind='procedure'` with a
+NULL driver — and no dataflow THROUGH the subroutine: the argument binding,
+the body's reads and the body's write to the formal are all `hier_ref` rows
+that resolve to nothing, so what the actual is written FROM is not
+recorded. A package subroutine that touches package variables
 only — `enable = |mask` — is a different matter and arcs normally. A
 package of nothing but
 `localparam`, `typedef` and functions is a node with no nets. `$unit`
