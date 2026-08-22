@@ -956,12 +956,28 @@ check(one("""
 # The statement layer's call_site_id is the statement's, on all three views.
 # It is one column read three ways, so the only thing that can go wrong is
 # the join that carries it -- which is what this holds.
-for view, col in (("v_stmt", "stmt_id"), ("v_stmt_target", "target_id"),
-                  ("v_stmt_operand", "operand_id")):
+for view in ("v_stmt", "v_stmt_target", "v_stmt_operand"):
     check(one(f"""
         SELECT count(*) FROM {view} v JOIN stmt s ON s.id = v.stmt_id
         WHERE v.call_site_id IS NOT s.call_site_id""") == 0,
           f"{view}.call_site_id is its statement's")
+# The directional views take the same tag wherever the row has a statement to
+# take it from. v_load's sensitivity, wait and statement arms read a base
+# table directly and used to write a literal NULL while their own statement
+# carried a tag -- which admits one call's read into every call's cone for a
+# consumer following the documented `= ? OR IS NULL` filter.
+#
+# A dependency is allowed one other answer: the summary arc of a CALL names
+# the site that call opens, and the calling statement itself belongs to no
+# site. Crossing and terminal rows have no statement and keep NULL.
+for view in ("v_driver", "v_load", "v_net_dep"):
+    check(one(f"""
+        SELECT count(*) FROM {view} v JOIN stmt s ON s.id = v.stmt_id
+        WHERE v.call_site_id IS NOT s.call_site_id
+          AND NOT EXISTS (SELECT 1 FROM call_site c
+                          WHERE c.id = v.call_site_id
+                            AND c.caller_stmt_id = v.stmt_id)""") == 0,
+          f"{view}.call_site_id is its statement's, or the call it opens")
 # Exclusive arc, like net_dep: exactly one of the seven typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
