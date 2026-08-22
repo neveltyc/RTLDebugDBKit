@@ -46,7 +46,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "15"
+SCHEMA_VERSION = "16"
 
 
 def one(sql, *args):

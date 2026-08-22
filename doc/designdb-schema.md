@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 15. The version is the *consumption contract*, not the DDL: a
+Schema version 16. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
