@@ -92,6 +92,19 @@ std::string TemplateBuilder::groupKey(const InstanceBodySymbol& body) const {
     return key;
 }
 
+    /// Groups one instance and descends into its children.
+    ///
+    /// The descent stops at an instance whose group is already on the branch
+    /// above it -- a module instantiating itself with identical parameters.
+    /// That is illegal, and slang says so, but it says so having already
+    /// elaborated the instance tree it was walking when it noticed: slang
+    /// bounds the *depth* at 128 and nothing else. One self-instantiation per
+    /// body is therefore 130-odd instances, and two is 2^128 -- an
+    /// elaborated tree this walk cannot finish, ever, on a design whose only
+    /// fault is one line of illegal RTL. The guard is a path set rather than
+    /// a visited set on purpose: a module legitimately instantiated twice by
+    /// one parent is two separate branches and must be collected on both,
+    /// and only a repeat *on the way down* is the impossible one.
 void TemplateBuilder::collect(const InstanceSymbol& inst) {
     auto& body = inst.getCanonicalBody() ? *inst.getCanonicalBody() : inst.body;
     auto key = groupKey(body);
@@ -103,7 +116,13 @@ void TemplateBuilder::collect(const InstanceSymbol& inst) {
     }
     offer(g, body);
     instanceGroup[&inst] = key;
+
+    // The instance itself is grouped either way -- it is a real occurrence
+    // and its body is a real template. Only the descent is cut.
+    if (!onPath.insert(key).second)
+        return;
     forEachInstance(inst.body, [&](const InstanceSymbol& child) { collect(child); });
+    onPath.erase(key);
 }
 
     /// The port list of one group, as terminal templates. A MultiPort (a

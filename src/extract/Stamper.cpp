@@ -9,6 +9,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -380,6 +381,27 @@ private:
         // this node stamped, so a resolved path can name a net by id.
         nodeTemplate.emplace(instId, std::make_pair(&t, base.net));
 
+        // Children, unless this occurrence is already one of its own
+        // ancestors. Pass 1 cuts the elaborated walk at such an instance, but
+        // the cut does not reach the templates it left behind: a body that
+        // instantiates itself with identical parameters is a group whose
+        // child names its own key, and the template graph therefore holds a
+        // cycle that this walk would unroll until the stack ran out -- which
+        // is what it did, as a segfault, on `module m; m u(); endmodule`.
+        //
+        // The rows above are already written, so the occurrence keeps its own
+        // nets, terminals and the connections its parent made to them, and
+        // only its children are missing. That is the whole of what can be
+        // said: the recursion has no depth of its own, and the ~130 levels
+        // slang elaborated before it noticed are its instantiation-depth
+        // limit, not a fact about the design. One level records that the
+        // module re-enters itself and where; a hundred and thirty would only
+        // dress up the limit as a hierarchy.
+        if (!onPath.insert(&t).second) {
+            stats.recursiveInstances++;
+            return;
+        }
+
         // Children: allocate every child's node id first, so an interface
         // binding to a later sibling has an id to point at.
         std::vector<int64_t> childNode(t.children.size(), 0);
@@ -431,6 +453,8 @@ private:
                 stampUnresolved(c, childNode[i], parentId, instId, ord, base);
             }
         }
+
+        onPath.erase(&t);
     }
 
     void stampChildModule(const TplChild& c, int64_t nodeId, int64_t parentNode,
@@ -830,6 +854,11 @@ private:
     int64_t hierRefCounter = 0;
     int64_t callSiteCounter = 0;
     int64_t rootOrdinal = 0;
+
+    /// The templates on the branch of the tree `stampBody` is currently
+    /// inside. A path set, not a visited set: one parent may legitimately
+    /// instantiate one module twice, and those are two branches, not a cycle.
+    std::unordered_set<const Template*> onPath;
 
     std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>> childByName;
     std::vector<ReplayJob> replayJobs;
