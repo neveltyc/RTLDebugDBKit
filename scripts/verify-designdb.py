@@ -21,12 +21,13 @@
 #   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
 #   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
 #   verify-designdb.py <design.db> rootref      + examples/constructs/rootref.sv facts
+#   verify-designdb.py <design.db> typeparam    + examples/constructs/typeparam.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "xmr", "alias", "external", "package", "callsite",
-         "rootref",
+         "rootref", "typeparam",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -1054,7 +1055,8 @@ if mode:
                 "compound": "compound", "macroloc": "macroloc",
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
                 "outward": "outward_tb", "naming": "naming",
-                "aliascat": "aliascat", "rootref": "rootref"}[mode]
+                "aliascat": "aliascat", "rootref": "rootref",
+                "typeparam": "typeparam"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1500,6 +1502,29 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dep
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "typeparam":
+    # slang folds the two spellings of one type onto a single body, so pass 1
+    # ends up with a group it never gets an analysed body for. The claim
+    # under test is that this costs nothing: all four flops are stamped, each
+    # with its procedure, and the status stays complete.
+    check(one("""
+        SELECT count(*) FROM inst i JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'reg1'""") == 4,
+          "both pairs stamp both flops")
+    check(one("""
+        SELECT count(*) FROM inst i JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'reg1'
+          AND NOT EXISTS (SELECT 1 FROM proc p WHERE p.inst_id = i.id)""") == 0,
+          "and every one of them carries its procedure")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'q' AND driver_name = 'd'
+          AND driver_kind = 'data'""") == 4,
+          "so all four flop outputs have the flop as their driver")
+    check(one("SELECT analysis_status FROM v_db_info") == "complete",
+          "a deduplicated parameterisation does not make the export partial")
+
 
 if mode == "rootref":
     # A $root path is absolute, and the two occurrences of one body that

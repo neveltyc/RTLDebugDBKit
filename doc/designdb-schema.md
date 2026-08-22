@@ -735,9 +735,13 @@ elaborates none.
 `analysis_status` is `complete | partial | hierarchy_only` and agrees with
 the counts beside it: errors, skipped procedures, duplicated paths (two
 siblings sharing one (parent, name) pair, so a path lookup stops resolving
-uniquely) and truncated call expansions make `partial`. Unresolved
-instantiations do not. `unresolved_count` counts unresolved
-instantiation *sites* (one per written instantiation, however many
+uniquely) and truncated call expansions make `partial`, as would an
+occurrence stamped from a module body the analysis never reached — it
+would have hierarchy and connections and no procedure at all, though no
+design measured here produces one. Unresolved instantiations do not make
+`partial`. `hierarchy_only` has one cause: the compilation was fatally
+errored, so slang analysed no dataflow to export. `unresolved_count`
+counts unresolved instantiation *sites* (one per written instantiation, however many
 occurrences stamp out); the per-occurrence picture is
 `tree_node.node_kind='unresolved'`. `config_digest` fingerprints the inputs;
 two exports with one digest saw the same filelist, defines and flags.
