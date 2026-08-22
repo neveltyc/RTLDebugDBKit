@@ -65,6 +65,30 @@ total_sf = one("SELECT count(*) FROM src_file")
 if total_sf == 0 or baddig:
     sys.exit(f"{baddig} of {total_sf} src_file row(s) lack a SHA-256 digest")
 
+# src_file ids ascend with path, which is the single-database form of "the
+# export is reproducible". The ids used to be handed out in the order slang's
+# source loader finished reading files -- a thread pool's completion order --
+# so exporting one unchanged design twice produced two different id columns
+# here and two different `file.src_file_id` columns pointing at them. Nothing
+# downstream reads an id's *value*, so the databases were equivalent and still
+# diffed, which is the one thing a digest-stamped export exists to make
+# possible.
+#
+# Checked here rather than only by diffing two exports because that diff is
+# probabilistic on a small design and this is not: three files are enough to
+# put them out of order, and examples/options is exactly that case.
+#
+# Compared as adjacent pairs in id order rather than by joining on id + 1,
+# so a gap in the ids -- which nothing produces today, but which an ignored
+# insert would -- does not silently skip the pair that straddles it.
+sf_rows = con.execute("SELECT id, path FROM src_file ORDER BY id").fetchall()
+unsorted = next((
+    (a, b) for a, b in zip(sf_rows, sf_rows[1:]) if b[1] < a[1]), None)
+check(unsorted is None, f"src_file ids assigned in path order ({total_sf} rows)",
+      "" if unsorted is None
+      else f"id {unsorted[0][0]} is {unsorted[0][1]!r} but id "
+           f"{unsorted[1][0]} is {unsorted[1][1]!r}")
+
 # Structural integrity -- catches corruption and generator bugs. The writer
 # leaves foreign_keys off for speed, so this is where the REFERENCES clauses
 # are actually enforced.
