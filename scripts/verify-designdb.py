@@ -1764,6 +1764,28 @@ if mode == "outward":
     check(one("""
         SELECT count(*) FROM v_stmt_target WHERE net_name = 'condb'""") == 0,
           "and takes no target row, a target being a place in a statement")
+    # The write is all it is. `condb` fills an `output` formal, so the
+    # condition never reads it, and nothing it gates depends on its value.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE dep_kind = 'control' AND src_name = 'condb'""") == 0,
+          "and gates nothing, an output actual being written and not read")
+    # The reference goes with the edge: a statement gated by that condition
+    # does not read condb either, in the calling procedure or in the body the
+    # call walks. The connection to the parent is the only load it has.
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name = 'condb' AND load_kind <> 'connection'""") == 0,
+          "and no statement reads it, the reference going with the edge")
+    # What the condition does read still gates: the drop takes the written
+    # actual, not the condition. `unit_cfg` is a $unit name, so it arrives as
+    # a control dependency with no source net and its reference beside it.
+    check(one("""
+        SELECT count(*) FROM v_net_dep d JOIN hier_ref h
+          ON h.id = d.src_hier_ref_id
+        WHERE d.dep_kind = 'control' AND d.tgt_name = 'hit'
+          AND d.src_net_id IS NULL AND h.path = 'unit_cfg'""") == 1,
+          "while the operand the condition does read gates what it decides")
 
     # `setit` is the one with nothing to read: its statement has no reference
     # of any kind, so the write-back is the only thing holding the target up.

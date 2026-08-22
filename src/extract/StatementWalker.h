@@ -288,11 +288,75 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         bindable = saved;
     }
 
+    /// The gating a control expression contributes: its references, less the
+    /// actuals a call inside it WRITES.
+    ///
+    /// A condition is gathered as one expression, and slang models an
+    /// `output` actual as an assignment inside the call, so `if (chk(a, y))`
+    /// puts y among the condition's operands. The condition does not read y --
+    /// the call writes it, and that write is a source-less `procedure`
+    /// dependency of its own. The drop matches the reference's own expression
+    /// rather than its symbol, so `chk(y, y)` keeps its read: the two
+    /// occurrences are two nodes.
+    ///
+    /// It happens before the expression is visited because the body of the
+    /// called subroutine is walked under this gating stack; after, a formal
+    /// the body assigns would take the same wrong source.
+    void collectGating(const Expression& expr) {
+        std::vector<Ref> refs;
+        collectRefs(expr, eval, refs);
+        std::set<const Expression*> written;
+        collectCallOutputs(expr, written);
+        if (!written.empty()) {
+            refs.erase(std::remove_if(refs.begin(), refs.end(),
+                                      [&](const Ref& r) {
+                                          return written.count(r.origin) > 0;
+                                      }),
+                       refs.end());
+        }
+        gating.insert(gating.end(), refs.begin(), refs.end());
+    }
+
+    /// The expressions a call inside `expr` writes without reading: the
+    /// actuals bound to an `output` formal. `inout` and `ref` are read as
+    /// well, so what they give a condition is a real read and stays. The
+    /// selectors stay too -- `chk(a, m[i])` reads i to decide where to write.
+    void collectCallOutputs(const Expression& expr,
+                            std::set<const Expression*>& out) {
+        struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
+            StatementWalker& self;
+            std::set<const Expression*>& out;
+            Finder(StatementWalker& self, std::set<const Expression*>& out) :
+                self(self), out(out) {}
+            void handle(const CallExpression& call) {
+                visitDefault(call);
+                auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
+                if (!sub || !*sub)
+                    return;
+                auto args = call.arguments();
+                auto formals = (*sub)->getArguments();
+                const size_t n = std::min(args.size(), formals.size());
+                for (size_t i = 0; i < n; i++) {
+                    if (!args[i] || !formals[i] ||
+                        formals[i]->direction != ArgumentDirection::Out)
+                        continue;
+                    std::vector<Ref> written;
+                    collectRefs(*args[i], self.eval, written,
+                                /*skipSelectors=*/true);
+                    for (auto& w : written)
+                        out.insert(w.origin);
+                }
+            }
+        };
+        Finder f(*this, out);
+        expr.visit(f);
+    }
+
     void handle(const ConditionalStatement& stmt) {
         const size_t mark = gating.size();
         visitGuarded([&] {
             for (auto& cond : stmt.conditions) {
-                collectRefs(*cond.expr, eval, gating);
+                collectGating(*cond.expr);
                 cond.expr->visit(*this);
             }
         });
@@ -305,11 +369,11 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const CaseStatement& stmt) {
         const size_t mark = gating.size();
         visitGuarded([&] {
-            collectRefs(stmt.expr, eval, gating);
+            collectGating(stmt.expr);
             stmt.expr.visit(*this);
             for (auto& item : stmt.items) {
                 for (auto* label : item.expressions) {
-                    collectRefs(*label, eval, gating);
+                    collectGating(*label);
                     label->visit(*this);
                 }
             }
@@ -339,7 +403,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             for (auto* init : stmt.initializers)
                 init->visit(*this);
             if (stmt.stopExpr) {
-                collectRefs(*stmt.stopExpr, eval, gating);
+                collectGating(*stmt.stopExpr);
                 stmt.stopExpr->visit(*this);
             }
             for (auto* step : stmt.steps)
@@ -356,7 +420,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const WhileLoopStatement& stmt) {
         const size_t mark = gating.size();
         visitGuarded([&] {
-            collectRefs(stmt.cond, eval, gating);
+            collectGating(stmt.cond);
             stmt.cond.visit(*this);
         });
         stmt.body.visit(*this);
@@ -371,7 +435,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const DoWhileLoopStatement& stmt) {
         const size_t mark = gating.size();
         visitGuarded([&] {
-            collectRefs(stmt.cond, eval, gating);
+            collectGating(stmt.cond);
             stmt.cond.visit(*this);
         });
         stmt.body.visit(*this);
@@ -381,7 +445,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const RepeatLoopStatement& stmt) {
         const size_t mark = gating.size();
         visitGuarded([&] {
-            collectRefs(stmt.count, eval, gating);
+            collectGating(stmt.count);
             stmt.count.visit(*this);
         });
         stmt.body.visit(*this);
@@ -556,11 +620,11 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const PatternCaseStatement& stmt) {
         const size_t mark = gating.size();
         visitGuarded([&] {
-            collectRefs(stmt.expr, eval, gating);
+            collectGating(stmt.expr);
             stmt.expr.visit(*this);
             for (auto& item : stmt.items) {
                 if (item.filter) {
-                    collectRefs(*item.filter, eval, gating);
+                    collectGating(*item.filter);
                     item.filter->visit(*this);
                 }
             }
