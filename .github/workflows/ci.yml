@@ -57,7 +57,7 @@ jobs:
         run: |
           ./build/rtl-designdb examples/basic/top.sv --top top -o design.db
           python3 scripts/verify-designdb.py design.db
-          for mode in constructs interfaces assertions hierarchy udp unresolved xmr alias external package callsite paramfold portshape compound macroloc stmtgaps patterncase outward; do
+          for mode in constructs interfaces assertions hierarchy udp unresolved xmr alias external package callsite paramfold portshape compound macroloc stmtgaps patterncase outward naming aliascat; do
             ./build/rtl-designdb "examples/constructs/$mode.sv" -o "$mode.db"
             python3 scripts/verify-designdb.py "$mode.db" "$mode"
           done

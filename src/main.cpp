@@ -296,8 +296,20 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if (a == "--check-constraints") opt.checkConstraints = true;
         else if (a == "--diag") {
             opt.showDiags = -1;
-            if (i + 1 < argc && std::isdigit((unsigned char)argv[i + 1][0]))
-                opt.showDiags = std::atoi(argv[++i]);
+            // The WHOLE token has to be a number, not just its first
+            // character. Files named `8bit_alu.sv` are ordinary, and testing
+            // one character consumed the next source file as the cap: atoi
+            // read 8, the file was never compiled, and its module came out as
+            // an unresolved instantiation with nothing saying a named source
+            // had been eaten by an option.
+            if (i + 1 < argc) {
+                const char* n = argv[i + 1];
+                bool allDigits = *n != '\0';
+                for (const char* c = n; *c && allDigits; c++)
+                    allDigits = std::isdigit((unsigned char)*c) != 0;
+                if (allDigits)
+                    opt.showDiags = std::atoi(argv[++i]);
+            }
         }
         else if (a == "-f" || a == "-file") { auto v = next(a.c_str()); if (!v) return false; opt.filelists.emplace_back(v); }
         else if (a == "-o")      { auto v = next("-o");      if (!v) return false; opt.output = v; }
