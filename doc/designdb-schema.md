@@ -733,6 +733,11 @@ EDA standards already name:
 
 `src_file` holds every file slang actually read, absolute path and
 SHA-256, so a consumer can tell whether the database and the RTL diverged.
+Its rows are interned in path order, which is what lets two exports of an
+unchanged design be compared row for row: it is the one table whose ids come
+from SQLite rather than an extractor counter, so its insert order is its id
+order, and the order slang hands the buffers back in is the order a thread
+pool finished reading them.
 `file` holds the spellings rows carry — as written in the filelist —
 joined to their src_file. `meta` is the seal; its required keys are the
 `v_db_info` columns plus `tool`, except `top` — the space-separated names
@@ -747,6 +752,13 @@ instantiation *sites* (one per written instantiation, however many
 occurrences stamp out); the per-occurrence picture is
 `tree_node.node_kind='unresolved'`. `config_digest` fingerprints the inputs;
 two exports with one digest saw the same filelist, defines and flags.
+
+A `hierarchy_only` database of an infinitely recursive design holds a
+*prefix* of the elaborated tree: an instance whose module is already one of
+its own ancestors keeps its own nets, terminals and incoming connections but
+has no children, because the recursion has no end. One such level is
+recorded per recursion, not the depth slang happened to reach before it
+rejected the design.
 
 ## What is not here
 
