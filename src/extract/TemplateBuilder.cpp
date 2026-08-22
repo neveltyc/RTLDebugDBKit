@@ -672,12 +672,6 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
         }
     }
 
-    std::unordered_set<const ValueSymbol*> inputPorts;
-    for (auto* d : proc.getDrivers()) {
-        if (d->isInputPort())
-            inputPorts.insert(&d->getSymbol());
-    }
-
     bool reached = false;
 
     StatementWalker walker(
@@ -688,8 +682,17 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
             bool firstTarget, const std::string& delay,
             const char* constructWord) {
             reached = true;
-            if (!dst.sym || inputPorts.count(dst.sym))
-                return;
+            // No input-port filter and no null-symbol guard, because neither
+            // could fire. slang builds every driver in AnalyzedProcedure and
+            // AnalysisManager with DriverFlags::None, so isInputPort() is
+            // false for all of them -- 3,945 procedure drivers across
+            // picorv32, tinyriscv and veerwolf, none of them an input port --
+            // and every Ref reaching this callback came from collectRefs or
+            // collectSlots, which never emit a null symbol. Skipping a first
+            // target here would also have been a trap: the second target of a
+            // concatenated left-hand side would then arrive with
+            // firstTarget=false and a stale curStmt, attaching its rows to the
+            // previous statement.
             const TplLoc at = locator.locate(where.start(), procAt);
             emitAssignment(b, dst, pairs, gating, at, seq, blocking,
                            dropped, inSubroutine, firstTarget, delay,
@@ -847,7 +850,10 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
     }
     TplStmtRef tr;
     tr.stmt = stmt;
-    tr.ordinal = int64_t(b.t->targets.size());
+    // Per statement, like every other target site. This one used the template
+    // vector's size, which is a global index leaked into a column the doc
+    // defines as "position in a declaration or extraction list".
+    tr.ordinal = b.targetOrdinal++;
     tr.net = netIdx;
     tr.r = rangeOf(r);
     const int32_t targetIdx = int32_t(b.t->targets.size());
@@ -1273,7 +1279,13 @@ void TemplateBuilder::buildNetInitialisers(Build& b, const InstanceBodySymbol& b
                                       dstSlot.positional && srcSlot.positional,
                                       srcSlot.ref});
         }
-        b.curScope = 0;
+        // The generate level that declares it, not the instance. forEachOfKind
+        // descends into generate blocks, so hard-coding 0 filed `wire w = …`
+        // inside `g[0]` under the instance node -- while the net row for the
+        // same declaration was filed correctly, so the two tables contradicted
+        // each other, and one generate iteration's initialiser could not be
+        // told from another's.
+        b.curScope = b.decl->scopeForSymbol(net);
         emitAssignment(b, dstSlot.ref, pairs, {}, at, /*seq=*/-1,
                        /*blocking=*/false, droppedConstants,
                        /*inSubroutine=*/false, /*firstTarget=*/true,
@@ -1306,25 +1318,43 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
         if (refs.size() < 2)
             return;
         const TplLoc at = locator.locate(al.location);
-        b.curScope = 0;
+        b.curScope = b.decl->scopeForSymbol(al);
         const int32_t stmt = newStmt(b, "alias", "alias", std::string(),
                                      /*seq=*/-1, std::string(), 0, at);
         if (stmt < 0)
             return;
 
         // One target and one operand per reference, in written order.
+        // `group` is which written side the reference came from. An alias
+        // binds the SIDES to each other, so two references of one
+        // concatenation are not aliases of each other -- `alias {a, b} = c`
+        // makes a and b different bits of c, not copies of one another.
         struct Side { int32_t target = -1; int32_t operand = -1;
-                      int32_t net = -1; Ref ref; };
+                      int32_t net = -1; int32_t group = -1; Ref ref; };
         std::vector<Side> sides;
+        // A side that is a concatenation is N references, not one. LRM 10.11
+        // allows `alias {a, b} = c;` and getNetReferences hands the
+        // concatenation back as a single expression yielding several refs --
+        // requiring exactly one dropped the whole side, so a and b were
+        // aliased to nothing and the statement carried no dependency at all.
+        // Each ref becomes its own side; what is lost is only which bits of
+        // the other side it meets, and that shows as a coarse mapping rather
+        // than a missing one.
+        bool anyMultiRef = false;
+        int32_t group = 0;
         for (auto* e : refs) {
             if (!e)
                 continue;
+            const int32_t thisGroup = group++;
             std::vector<Ref> got;
             collectRefs(*e, evalCtx, got, /*skipSelectors=*/true);
-            if (got.size() != 1 || !got[0].sym)
+            anyMultiRef = anyMultiRef || got.size() > 1;
+            for (auto& one : got) {
+            if (!one.sym)
                 continue;
             Side sd;
-            sd.ref = got[0];
+            sd.group = thisGroup;
+            sd.ref = one;
             sd.net = b.decl->netFor(*sd.ref.sym);
             if (sd.net < 0) {
                 // Nothing in this instance to bind; the reference is
@@ -1351,11 +1381,12 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
             sd.operand = int32_t(b.t->operands.size());
             b.t->operands.push_back(std::move(orow));
             sides.push_back(std::move(sd));
+            }
         }
 
         for (size_t i = 0; i < sides.size(); i++) {
             for (size_t j = 0; j < sides.size(); j++) {
-                if (i == j)
+                if (i == j || sides[i].group == sides[j].group)
                     continue;
                 TplDep d;
                 d.srcNet = sides[i].net;
@@ -1368,8 +1399,10 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
                 d.tgtR = rangeOf(sides[j].ref);
                 // An alias is bit for bit by definition; it is only
                 // coarse if a side could not be narrowed.
-                d.mappingExact =
-                    (sides[i].ref.exact && sides[j].ref.exact) ? 1 : 0;
+                d.mappingExact = (!anyMultiRef && sides[i].ref.exact &&
+                                  sides[j].ref.exact)
+                                     ? 1
+                                     : 0;
                 d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
             }

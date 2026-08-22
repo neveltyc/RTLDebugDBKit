@@ -383,9 +383,77 @@ inline std::string generateSegment(const GenerateBlockSymbol& block) {
 /// (`u[0]`) -- the one spelling a tree node's name must use, since an
 /// instance-array element's own `name` is the bare `u`.
 inline std::string leafSegment(const Symbol& sym) {
-    std::string full = sym.getHierarchicalPath();
-    const size_t dot = full.rfind('.');
-    return dot == std::string::npos ? full : full.substr(dot + 1);
+    // Built from the symbol, not by splitting its path on the last '.'.
+    // slang escapes a name that is not a plain identifier as `\name ` --
+    // verbatim, with no quoting of an embedded dot -- so `sub \u.1 ();`
+    // has a path with three dots, only the first of which is a separator.
+    // Splitting it named the tree node `1 `, and no path lookup could reach
+    // that instance.
+    //
+    // Same escaping rule and same array-index suffixes slang's own
+    // appendHierarchicalPath applies, so the segment matches what the rest of
+    // the path spells.
+    auto needsEscaping = [](std::string_view t) {
+        if (t.empty())
+            return false;
+        auto plain = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_';
+        };
+        if (!plain(t[0]) || (t[0] >= '0' && t[0] <= '9'))
+            return true;
+        for (size_t i = 1; i < t.size(); i++) {
+            if (!plain(t[i]) && t[i] != '$')
+                return true;
+        }
+        return false;
+    };
+    // An array element carries no name of its own -- slang spells `u[0]` as
+    // the ARRAY symbol's name plus the element's index suffix, with no
+    // separator between them -- so the base comes from the nearest named
+    // enclosing InstanceArraySymbol.
+    std::string_view base = sym.name;
+    if (base.empty()) {
+        for (auto* sc = sym.getParentScope(); sc; ) {
+            auto& owner = sc->asSymbol();
+            if (owner.kind != SymbolKind::InstanceArray)
+                break;
+            if (!owner.name.empty()) {
+                base = owner.name;
+                break;
+            }
+            sc = owner.getParentScope();
+        }
+    }
+    std::string out;
+    if (!base.empty()) {
+        out = needsEscaping(base) ? "\\" + std::string(base) + " "
+                                  : std::string(base);
+    }
+    if (sym.kind == SymbolKind::Instance || sym.kind == SymbolKind::CheckerInstance) {
+        auto& inst = sym.as<InstanceSymbolBase>();
+        if (!inst.arrayPath.empty()) {
+            SmallVector<ConstantRange, 8> dims;
+            inst.getArrayDimensions(dims);
+            if (dims.size() == inst.arrayPath.size()) {
+                for (size_t i = 0; i < dims.size(); i++)
+                    out += "[" + std::to_string(int32_t(inst.arrayPath[i]) +
+                                                dims[i].lower()) + "]";
+            }
+        }
+    }
+    if (out.empty()) {
+        // An instantiation with no name of its own -- slang leaves the name
+        // empty and the path then ends at the PARENT, so the last segment is
+        // the parent's name. That is what this has always returned for such a
+        // symbol, and it is left alone here: the path split is only wrong for
+        // an escaped name, which the branch above now handles, and inventing a
+        // name for an unnamed instantiation is a separate decision.
+        std::string full = sym.getHierarchicalPath();
+        const size_t dot = full.rfind('.');
+        return dot == std::string::npos ? full : full.substr(dot + 1);
+    }
+    return out;
 }
 
 /// Calls `fn` for every member of `scope` of kind `K`, descending through

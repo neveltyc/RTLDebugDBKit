@@ -227,7 +227,15 @@ for tbl in ("net", "proc", "stmt"):
         SELECT count(*) FROM "{tbl}" x JOIN owner o ON o.node = x.scope_node_id
         WHERE o.inst != x.inst_id""") == 0,
           f"{tbl}.scope_node_id lies inside its own instance")
-check(one("SELECT count(*) FROM tree_node WHERE instr(name, '.') > 0") == 0,
+# A dot means a second segment -- unless the name is an ESCAPED identifier,
+# which slang writes verbatim as `\name ` with no quoting, so `\u.1 ` is one
+# segment containing a dot. Splitting a path on its last dot used to name that
+# node `1`; the leaf comes from the symbol now, and this check has to admit the
+# result or it forbids the very thing that was fixed.
+check(one("""
+    SELECT count(*) FROM tree_node
+    WHERE instr(name, '.') > 0
+      AND NOT (substr(name, 1, 1) = char(92) AND substr(name, -1, 1) = ' ')""") == 0,
       "every tree node name is a single path segment")
 # A location is a file, a line and a column, and they come from one place or
 # they are not a location. Lines and columns are 1-based, so 0 in either is not

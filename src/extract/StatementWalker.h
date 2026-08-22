@@ -239,9 +239,24 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     void handle(const TimedStatement& stmt) {
         if (&stmt.timing != sensitivityTiming) {
             std::vector<std::pair<const Expression*, std::string>> raw;
-            collectEdgeEvents(&stmt.timing, raw);
+            // The `iff` qualifier travels too. collectEdgeEvents takes the
+            // vector for it and buildProcedure passes one for the sensitivity
+            // list; this path did not, so `@(posedge clk iff en)` written as a
+            // STATEMENT -- any initial, or a procedure whose sensitivity slang
+            // classifies as dynamic -- sampled en and recorded nothing about
+            // it. en had zero load rows anywhere.
+            std::vector<const Expression*> iffs;
+            collectEdgeEvents(&stmt.timing, raw, &iffs);
             for (auto& [expr, edge] : raw)
                 emitEvent(expr, edge, seq++, stmt.sourceRange);
+            if (!iffs.empty()) {
+                std::vector<Ref> reads;
+                for (auto* c : iffs)
+                    collectRefs(*c, eval, reads);
+                if (!reads.empty())
+                    emitRead(reads, gating, {}, "wait", "wait", seq++,
+                             stmt.sourceRange);
+            }
         }
         const std::string d = delayText(&stmt.timing);
         if (!d.empty()) {

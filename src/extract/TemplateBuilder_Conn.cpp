@@ -350,15 +350,16 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 // Tied to something with no name here. The row exists
                 // either way; what it is tied to is in hier_ref.
                 Ref r = cn.ref;
-                const bool drives = conn->port.kind == SymbolKind::Port &&
-                                    (conn->port.as<PortSymbol>().direction ==
-                                         ArgumentDirection::Out ||
-                                     conn->port.as<PortSymbol>().direction ==
-                                         ArgumentDirection::InOut);
+                // isWrite is false because the direction it would carry is
+                // discarded anyway: addHierRef prefers the explicit access,
+                // and "connect" is what a port tie is. The flag only feeds the
+                // dedup key, where each connection's own expression already
+                // separates it. Computing a direction here read as though it
+                // reached the row, and it never did.
                 const int32_t saved = b.curStmt;
                 b.curStmt = -1;
                 const int32_t href =
-                    addHierRef(b, drives, r, at, evalCtx, "connect");
+                    addHierRef(b, /*isWrite=*/false, r, at, evalCtx, "connect");
                 b.curStmt = saved;
                 tc.kind = cn.expression ? "expression_operand"
                                         : "external_reference";
