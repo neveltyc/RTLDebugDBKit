@@ -150,7 +150,8 @@ examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
                         cross-instance references, per-call-site tasks,
                         level-sensitive events, interfaces, assertions,
                         generate arrays, non-ANSI ports, net aliases, a
-                        deliberate black box -- exported and asserted by CI
+                        deliberate black box, instantiations with no instance
+                        name -- exported and asserted by CI
 examples/options/       not a construct fixture: two files, two tops, a macro
                         defined in one and used in the other, and a header
                         reachable only through +incdir+ -- so --single-unit,
@@ -161,6 +162,8 @@ scripts/                build-release.sh (the four release platforms),
                         designdb-coverage.py (what an export had to approximate),
                         export-real-designs.sh (the measurements table, from a
                         local checkout of the public designs),
+                        check-reproducible.py (export one design twice, fail if
+                        any row differs),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 

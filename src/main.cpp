@@ -8,6 +8,7 @@
 // and nothing else: configuration, project layout and output formatting belong
 // to whatever drives it, and this binary does the one job that has to be fast.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -518,7 +519,7 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
                               ast::Compilation& compilation,
                               analysis::AnalysisManager& analysis,
                               SourceManager& sourceManager,
-                              size_t numErrors, bool fatal, size_t numScopes) {
+                              size_t numErrors, bool fatal) {
     designdb::Stats stats;
     designdb::Writer writer(tmpPath, opt.checkConstraints);
     writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
@@ -542,11 +543,36 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     // point, headers pulled in by `include -- a `define changed in one of
     // those is exactly the case a digest exists to catch, and the filelist
     // does not change when it happens.
+    //
+    // Sorted by path, and not taken in the order slang hands the buffers
+    // back: the source loader reads files on a thread pool, so buffer ids
+    // fall in whatever order the reads finish. Interning in that order gave
+    // `src_file.id` -- and every `file.src_file_id` pointing at it -- a
+    // different value on every export of an unchanged design: 44 of
+    // tinyriscv's 15,773 rows moved between two runs of one binary.
+    //
+    // The rest of the exporter already pays for this property, since it is
+    // the one that lets two databases be compared at all: TemplateBuilder's
+    // group key is a source location rather than a pointer so that module
+    // ids do not follow an address, and `config_digest` exists so two
+    // exports can be told apart on their inputs. One table opting out was
+    // enough to make a whole-database diff answer "the exporter ran twice"
+    // where it was asked "did the design change". Path order is also the
+    // order a reader would expect to find the rows in.
+    //
+    // Deduplicated as well: one path can back more than one buffer -- 45 of
+    // them for tinyriscv's 28 files -- and `INSERT OR IGNORE` dropped the
+    // repeats only after fileDigest had re-read and re-hashed the file.
+    std::vector<std::string> sourcePaths;
     for (auto id : sourceManager.getAllBuffers()) {
         auto name = sourceManager.getFullPath(id);
-        if (name.empty())
-            continue;
-        auto path = name.string();
+        if (!name.empty())
+            sourcePaths.push_back(name.string());
+    }
+    std::sort(sourcePaths.begin(), sourcePaths.end());
+    sourcePaths.erase(std::unique(sourcePaths.begin(), sourcePaths.end()),
+                      sourcePaths.end());
+    for (auto& path : sourcePaths) {
         // slang names its synthesized buffers `<unnamed_bufferN>`; they are
         // not files and would land as rows with no digest, which reads as
         // "a source we could not hash" rather than "not a source".
@@ -581,11 +607,32 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     // black box, and a design that instantiates a vendor macro it has no
     // source for is complete as far as this tool can be. The count is
     // recorded so a consumer can decide for itself.
+    //
+    // `hierarchy_only` has one cause, and this is it. It used to read
+    // `fatal || numScopes == 0`, which said there were two --
+    // AnalysisManager::analyze() returns early only on hasFatalErrors(),
+    // and otherwise it enters every compilation unit before it reaches an
+    // instance, with Stats::numScopes counting those units too. A file of
+    // nothing but a comment reports 1 scope, a file holding one package
+    // reports 2, and main() has already refused an empty file list, so
+    // numScopes == 0 could only mean the `fatal` beside it. The second
+    // disjunct never chose anything, and the condition it was standing in
+    // for -- the analysis ran and some module got no dataflow out of it --
+    // had no test anywhere, nor a counter to build one from.
+    //
+    // stats.unanalysedInsts is that counter, and it enters here as
+    // `partial` rather than `hierarchy_only` because the condition is per
+    // module and the rest of the design is unaffected. It is a guard, not a
+    // branch this design takes: while slang's analysis descends what the
+    // template walk descends, an occurrence is stamped from an unanalysed
+    // body only when the compilation is fatally errored, and `fatal` above
+    // has already answered for that. See designdb::Stats for the two places
+    // the descents differ and why neither is reachable in the pinned slang.
     const char* analysisStatus;
-    if (fatal || numScopes == 0)
+    if (fatal)
         analysisStatus = "hierarchy_only";
     else if (numErrors || stats.emptyProcedures || stats.duplicatePaths ||
-             stats.truncatedCalls)
+             stats.truncatedCalls || stats.unanalysedInsts)
         analysisStatus = "partial";
     else
         analysisStatus = "complete";
@@ -669,6 +716,14 @@ void reportStats(const Options& opt, const designdb::Stats& stats) {
                      "be resolved; recorded as unresolved tree nodes\n",
                      (long long)stats.unresolved);
     }
+    if (stats.anonymous) {
+        std::fprintf(stderr,
+                     "note: %lld instantiation(s) carry no instance name; "
+                     "each holds a synthesised $def$n path segment rather "
+                     "than its parent's name. A module instantiation must be "
+                     "named, so a macro may not have expanded\n",
+                     (long long)stats.anonymous);
+    }
     if (stats.external) {
         std::fprintf(stderr,
                      "note: %lld reference(s) to symbols outside their own "
@@ -690,6 +745,33 @@ void reportStats(const Options& opt, const designdb::Stats& stats) {
                      "another; the design did not fully elaborate, so a path "
                      "lookup may be ambiguous\n",
                      (long long)stats.duplicatePaths);
+    }
+    if (stats.recursiveInstances) {
+        std::fprintf(stderr,
+                     "warning: %lld instance(s) re-enter a module that is "
+                     "already one of their own ancestors; the instantiation "
+                     "is infinitely recursive, so the tree stops there -- run "
+                     "with --diag\n",
+                     (long long)stats.recursiveInstances);
+    }
+    if (stats.unanalysedBodies && !stats.unanalysedInsts) {
+        // Only worth saying when the templates are the whole of it. When
+        // occurrences inherited the gap the warning below says so, and the
+        // fatally-errored run that produces it has already been reported.
+        std::fprintf(stderr,
+                     "note: %lld module body group(s) had no analysed body, "
+                     "so the templates built from them hold no procedure; "
+                     "nothing is stamped from them, and no row is missing\n",
+                     (long long)stats.unanalysedBodies);
+    }
+    if (stats.unanalysedInsts) {
+        std::fprintf(stderr,
+                     "warning: %lld of %lld instance(s) were stamped from a "
+                     "module body the analysis never reached; their procedures "
+                     "are absent, so they carry hierarchy and connections and "
+                     "no procedural dataflow\n",
+                     (long long)stats.unanalysedInsts,
+                     (long long)stats.instances);
     }
 }
 
@@ -764,14 +846,11 @@ int main(int argc, char** argv) {
 
         analysis::AnalysisManager analysis({}, pool);
         { Phase p("analyze", opt.timing); analysis.analyze(compilation); }
-        auto astats = analysis.getStats();
-        if (!fatal && astats.numScopes == 0) {
-            // analyze() returns silently when the compilation is fatally
-            // errored, so this is the only place the condition is visible.
-            std::fprintf(stderr, "warning: no scopes were analysed; the database "
-                                 "will have hierarchy but no dataflow\n");
-        }
-        else if (!opt.quiet) {
+        // Informational only. What the analysis actually yielded per module
+        // is not knowable here -- it is counted during extraction and
+        // reported by reportStats below.
+        if (!opt.quiet) {
+            auto astats = analysis.getStats();
             std::fprintf(stderr, "analysis: %zu scopes, %zu procedures, %.1f MB\n",
                          astats.numScopes, astats.numProcedures,
                          astats.memoryUsage / 1e6);
@@ -782,7 +861,7 @@ int main(int argc, char** argv) {
 
         const designdb::Stats stats =
             writeDatabase(opt, tmpPath, compilation, analysis, sourceManager,
-                          counts.errors, fatal, astats.numScopes);
+                          counts.errors, fatal);
         // The writer is destroyed with writeDatabase's frame, so the database
         // file is closed and complete before this runs.
         if (!publish(tmpPath, opt.output))

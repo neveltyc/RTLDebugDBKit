@@ -275,6 +275,11 @@ struct Template {
     std::unordered_map<const void*, TermSlot> termOf;
     std::unordered_map<std::string, int32_t> netIndex;   // name -> nets index
     bool hasResolvableRefs = false;
+    /// Whether the body this template was built from had an AnalyzedScope.
+    /// False means every procedure of the module is absent from it, so each
+    /// occurrence stamped from it carries hierarchy and connections and no
+    /// procedural dataflow at all.
+    bool analysedBody = false;
     bool built = false;
 };
 
