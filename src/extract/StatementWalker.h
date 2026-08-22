@@ -116,6 +116,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// `allocCallSite` mints a template call-site row for the entered call and
     /// returns its index. Both null outside a real build (dry runs).
     int32_t* callSiteSlot = nullptr;
+    /// The subroutine whose body is being walked, so `return` knows what it
+    /// writes. Null outside one.
+    const SubroutineSymbol* curSub = nullptr;
     std::function<int32_t(const SubroutineSymbol&, int64_t depth, bool bindable)>
         allocCallSite;
 
@@ -305,14 +308,29 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         gating.resize(mark);
     }
 
+    // The three loop handlers visit their condition under visitGuarded and
+    // then the BODY, rather than handing the whole statement to visitDefault.
+    // visitDefault walks the condition with bindable still true, so a call in
+    // a loop condition -- `while (pred(x))` -- was attributed to whatever
+    // statement happened to precede it, since curStmt there is a stale earlier
+    // one. handle(ConditionalStatement) has always got this right; the loops
+    // had not.
     void handle(const ForLoopStatement& stmt) {
         const size_t mark = gating.size();
-        if (stmt.stopExpr)
-            collectRefs(*stmt.stopExpr, eval, gating);
         const size_t loopMark = loopVars.size();
         for (auto* v : stmt.loopVars)
             loopVars.insert(v);
-        visitDefault(stmt);
+        visitGuarded([&] {
+            for (auto* init : stmt.initializers)
+                init->visit(*this);
+            if (stmt.stopExpr) {
+                collectRefs(*stmt.stopExpr, eval, gating);
+                stmt.stopExpr->visit(*this);
+            }
+            for (auto* step : stmt.steps)
+                step->visit(*this);
+        });
+        stmt.body.visit(*this);
         if (loopVars.size() != loopMark) {
             for (auto* v : stmt.loopVars)
                 loopVars.erase(v);
@@ -322,15 +340,36 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
 
     void handle(const WhileLoopStatement& stmt) {
         const size_t mark = gating.size();
-        collectRefs(stmt.cond, eval, gating);
-        visitDefault(stmt);
+        visitGuarded([&] {
+            collectRefs(stmt.cond, eval, gating);
+            stmt.cond.visit(*this);
+        });
+        stmt.body.visit(*this);
+        gating.resize(mark);
+    }
+
+    /// `do … while (c)` had no handler at all, so it fell to visitDefault,
+    /// which visits the condition -- and StatementWalker has no handler for a
+    /// bare value expression, so nothing was recorded: not the gating, not
+    /// even the read. The condition signal had zero load rows in the whole
+    /// database despite being read every iteration.
+    void handle(const DoWhileLoopStatement& stmt) {
+        const size_t mark = gating.size();
+        visitGuarded([&] {
+            collectRefs(stmt.cond, eval, gating);
+            stmt.cond.visit(*this);
+        });
+        stmt.body.visit(*this);
         gating.resize(mark);
     }
 
     void handle(const RepeatLoopStatement& stmt) {
         const size_t mark = gating.size();
-        collectRefs(stmt.count, eval, gating);
-        visitDefault(stmt);
+        visitGuarded([&] {
+            collectRefs(stmt.count, eval, gating);
+            stmt.count.visit(*this);
+        });
+        stmt.body.visit(*this);
         gating.resize(mark);
     }
 
@@ -404,7 +443,10 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         if (budget)
             (*budget)--;
         subDepth++;
+        const SubroutineSymbol* savedSub = curSub;
+        curSub = *sub;
         (*sub)->getBody().visit(*this);
+        curSub = savedSub;
         subDepth--;
         activeSubs.erase(*sub);
     }
@@ -477,10 +519,91 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // is the other half of a force, and leaving no row made "where
         // does the hijack end" unanswerable. The statement records its
         // lvalues and deliberately no dependency.
+        //
+        // The gating travels with it, for the same reason EmitRead's own
+        // comment gives for assertions: `if (g) force y = x; else release y;`
+        // recorded g on the force and nothing on the release, so "what decides
+        // when the hijack ends" -- the query this row exists for -- had no
+        // answer. visitDefault picks up reads in the lvalue's own selectors,
+        // the `i` in `release mem[i]`.
         std::vector<Ref> writes;
         collectRefs(s.lvalue, eval, writes, /*skipSelectors=*/true);
-        emitRead({}, {}, writes, "release",
+        emitRead({}, gating, writes, "release",
                  s.isRelease ? "release" : "deassign", seq++, s.sourceRange);
+        visitDefault(s);
+    }
+
+    /// `case … matches` had no handler, so it fell to visitDefault and
+    /// recorded nothing at all -- not the gating, not even a read of the
+    /// controlling expression, which had zero load rows in the whole database.
+    /// Modelled on handle(CaseStatement): the subject and each item's filter
+    /// are conditions, the item bodies are not.
+    void handle(const PatternCaseStatement& stmt) {
+        const size_t mark = gating.size();
+        visitGuarded([&] {
+            collectRefs(stmt.expr, eval, gating);
+            stmt.expr.visit(*this);
+            for (auto& item : stmt.items) {
+                if (item.filter) {
+                    collectRefs(*item.filter, eval, gating);
+                    item.filter->visit(*this);
+                }
+            }
+        });
+        for (auto& item : stmt.items)
+            item.stmt->visit(*this);
+        if (stmt.defaultCase)
+            stmt.defaultCase->visit(*this);
+        gating.resize(mark);
+    }
+
+    /// `return expr;` writes the subroutine's implicit result variable, and
+    /// slang does not synthesise that assignment -- ReturnStatement carries
+    /// only the expression, and the target is SubroutineSymbol::returnValVar.
+    /// With no handler the whole function body recorded nothing, so the two
+    /// legal spellings of one function disagreed: `f = a ^ k;` gave f its two
+    /// operands while `return a | k;` gave a net that nothing reads and no
+    /// statement row at all.
+    void handle(const ReturnStatement& stmt) {
+        if (!stmt.expr || !curSub || !curSub->returnValVar) {
+            visitDefault(stmt);
+            return;
+        }
+        Ref dst;
+        dst.sym = curSub->returnValVar;
+        dst.origin = stmt.expr;
+        dst.whole = true;
+        emitAssignmentLike(dst, *stmt.expr, stmt.sourceRange);
+        visitDefault(stmt);
+    }
+
+    /// One assignment-shaped emission with an explicit target, for the places
+    /// slang gives no AssignmentExpression to walk. The target is taken whole
+    /// and unpositioned -- `kNoWidth` pairs every operand with all of it and
+    /// makes `narrowed` a no-op -- which is the honest answer for a `return`:
+    /// the expression that produced the value carries between bits.
+    void emitAssignmentLike(const Ref& dst, const Expression& src,
+                            SourceRange where) {
+        std::vector<Slot> rhsSlots;
+        filteredConstants = 0;
+        collectSlots(src, eval, 0, rhsSlots);
+        collectAuxSlots(src, 0, rhsSlots, /*selectors=*/false);
+        const int64_t dropped = filteredConstants;
+        eval.reset();
+
+        const Slot dstSlot{dst, 0, kNoWidth, false};
+        std::vector<PairedSrc> pairs;
+        for (auto& srcSlot : rhsSlots) {
+            uint64_t lo = 0, hi = 0;
+            if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
+                continue;
+            pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
+                                      narrowed(dstSlot, lo, hi),
+                                      false, srcSlot.ref});
+        }
+        emitTarget(dst, pairs, gating, where, seq++, /*blocking=*/true,
+                   dropped, subDepth > 0, /*firstTarget=*/true, pendingDelay,
+                   constructOverride);
     }
 
     void handle(const AssignmentExpression& expr) {
