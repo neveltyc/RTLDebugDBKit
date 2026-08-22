@@ -115,4 +115,11 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     // hier_ref row -- the path that had no coverage at all until this.
     logic [7:0] ext_seen;
     sink u_sink (.p({u.g[7:4], 4'h0}), .seen(ext_seen));
+
+    // The same tie on an OUTPUT formal, which is the mirror image: the
+    // crossing runs the other way, so the end written hierarchically is the
+    // one being driven rather than the one driving. Its spelling therefore
+    // rides the LOAD side of the arc, and nothing in this design exercised
+    // that branch before.
+    sink u_sink2 (.p(8'h00), .seen(u.split));
 endmodule
