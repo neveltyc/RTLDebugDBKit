@@ -1759,6 +1759,21 @@ if mode == "concatcursor":
             WHERE src_name=? AND tgt_name='whole' AND tgt_lo=? AND tgt_hi=?
               AND tgt_exact=1""", name, lo, hi) == 1,
               f"and reading it back puts {name} at bits {hi}:{lo} of whole")
+    # A zero-width operand takes no position and does not stop the walk:
+    # the two operands beside it land where they would with the pad absent.
+    for name, lo, hi in (("a", 8, 15), ("b", 0, 7)):
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE src_name=? AND tgt_name='padded' AND tgt_lo=? AND tgt_hi=?
+              AND tgt_exact=1 AND map_exact=1""", name, lo, hi) == 1,
+              f"a zero-count pad leaves {name} at bits {hi}:{lo} of padded")
+    # And what the pad replicates is not read: it occupies no bits of the
+    # result, so an edge from it would be a dependency the RTL does not have.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name='clk' AND tgt_name='padded'""") == 0,
+          "and what it replicates reaches nothing")
+
     # No slot anywhere in this file carries a range only an unsigned wrap
     # could produce. The bound is not a big positive number: a wrapped cursor
     # lands just below 2^64 and SQLite stores the offsets as signed INTEGER,

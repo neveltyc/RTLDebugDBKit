@@ -307,6 +307,19 @@ namespace designdb {
 /// StatementWalker.h already had, so the two agree about when an operand
 /// walk stops meaning anything.
 ///
+/// The other half of that agreement is a value change, so it is not riding
+/// along. An operand of NO width used to stop both walks; it is not a stop
+/// in either now. `{0{x}}` is legal, slang keeps it among the operands with
+/// the void type, and a parameterised pad degenerates to it -- `{a, {PAD{x}},
+/// b}` at PAD = 0 -- so this is reached from ordinary RTL rather than from a
+/// malformed expression. It occupies no bits of the result, so the cursor
+/// does not move and the operands beside it keep their windows: `a` and `b`
+/// land on the same bits they would with the pad written out of the source,
+/// where before the whole concatenation degraded to one unpositioned
+/// reference per operand. And `x`, which the pad names but the
+/// concatenation does not read, no longer gets a `net_dep` at all -- an edge
+/// v14 recorded for a signal that reaches nothing.
+///
 /// The additions change no extraction and move no value; three of them are
 /// answers a consumer could not get from the views alone, all three reported
 /// from a real consumer.

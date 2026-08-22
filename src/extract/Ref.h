@@ -204,15 +204,24 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
             if (!op)
                 continue;
             const uint64_t w = exprWidthOf(*op);
-            // Two ways the walk down the operands can stop meaning anything,
-            // and the second used to be unguarded here though its twin in
-            // StatementWalker's collectAuxSlots has always tested for it: an
-            // operand of no width leaves the cursor where it was and gives
-            // the element no position, and an operand WIDER than what is left
-            // of the concatenation means the widths do not add up to the
-            // whole. `cursor -= w` on the second is an unsigned wrap, and the
-            // slots below it would carry bit ranges near 2^64 -- a garbage
-            // answer offered with the same confidence as a real one.
+            // An operand of no width is not an anomaly and does not stop
+            // anything: `{0{x}}` is legal, slang gives it the void type and
+            // keeps it among the operands, and an ordinary parameterised pad
+            // -- `{data, {PAD{1'b0}}, rest}` at PAD = 0 -- arrives here. It
+            // occupies no bits of the result, so it moves no cursor, the
+            // operands after it keep the positions they had, and nothing of
+            // it reaches the target: walking into it would record a
+            // dependency on a signal the concatenation does not read.
+            if (!w)
+                continue;
+            // An operand WIDER than what is left of the concatenation is the
+            // real stop, and it used to be unguarded here though its twin in
+            // StatementWalker's collectAuxSlots has always tested for it: the
+            // widths do not add up to the whole, `cursor -= w` is an unsigned
+            // wrap, and the slots below it would carry bit ranges near 2^64
+            // -- a garbage answer offered with the same confidence as a real
+            // one. The positional slots already emitted go with it, because a
+            // walk that has lost the cursor cannot vouch for them either.
             //
             // No expression is known to reach it: slang wraps every operand
             // whose width differs from its context in a Conversion, so a
@@ -226,7 +235,7 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
             // function. The two are aligned on the safe side rather than the
             // cheap one because the costs are not symmetric -- one more
             // comparison per operand against a silent wrap.
-            if (!w || w > cursor - base) {
+            if (w > cursor - base) {
                 out.resize(mark);
                 std::vector<Ref> rest;
                 collectRefs(expr, ctx, rest, skipSelectors);
