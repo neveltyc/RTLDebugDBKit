@@ -867,7 +867,8 @@ print("ok: v_net_attachment reconciles with its branch formula")
 check(one("""
     SELECT count(*) FROM v_net_attachment
     WHERE attachment_kind NOT IN ('terminal_inside','actual_outside',
-        'written_by','release_target','read_by','condition','statement_read',
+        'written_by','release_target','alias_binding','read_by','condition',
+        'statement_read',
         'event','dep_in','dep_out','named_from_outside')""") == 0,
       "attachment_kind stays in its vocabulary")
 # The bug two correct commits made together: release stores its lvalue as
@@ -884,6 +885,20 @@ check(one("""
     WHERE a.attachment_kind = 'release_target'
       AND s.stmt_kind != 'release'""") == 0,
       "and release_target is exactly the releases")
+# The same discipline for alias, and for the same reason: the storage is a
+# stmt_target row but the statement writes nothing. v_driver already excluded
+# it by kind; this side reported every alias side as written, so the two
+# disagreed about "who writes this net" -- on nets no assignment in the design
+# touches.
+check(one("""
+    SELECT count(*) FROM v_net_attachment a JOIN stmt s ON s.id = a.stmt_id
+    WHERE a.attachment_kind = 'written_by' AND s.stmt_kind = 'alias'""") == 0,
+      "no alias is mislabelled as a writer")
+check(one("""
+    SELECT count(*) FROM v_net_attachment a JOIN stmt s ON s.id = a.stmt_id
+    WHERE a.attachment_kind = 'alias_binding'
+      AND s.stmt_kind != 'alias'""") == 0,
+      "and alias_binding is exactly the aliases")
 # Exclusive arc, like net_dep: exactly one of the seven typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
@@ -901,6 +916,7 @@ check(one("""
         WHEN 'actual_outside'     THEN term_id IS NULL
         WHEN 'written_by'         THEN stmt_target_id IS NULL
         WHEN 'release_target'     THEN stmt_target_id IS NULL
+        WHEN 'alias_binding'      THEN stmt_target_id IS NULL
         WHEN 'read_by'            THEN assign_operand_id IS NULL
         WHEN 'condition'          THEN expr_ref_id IS NULL
         WHEN 'statement_read'     THEN expr_ref_id IS NULL
@@ -1455,7 +1471,7 @@ if mode == "unresolved":
     # Terminals for what the parent connected, direction unknown.
     check(one("""
         SELECT count(*) FROM term t JOIN tree_node n ON n.id = t.inst_id
-        WHERE n.node_kind='unresolved' AND t.direction IS NULL""") == 4,
+        WHERE n.node_kind='unresolved' AND t.direction IS NULL""") == 5,
           "the black box has a terminal per connection")
     check(one("""
         SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
@@ -1467,6 +1483,16 @@ if mode == "unresolved":
         JOIN tree_node n ON n.id = t.inst_id
         WHERE n.node_kind='unresolved' AND c.conn_kind='unconnected'""") == 1,
           "its unconnected pin is recorded as unconnected")
+    # And ONLY that pin. A sequence connection is not a simple expression, so
+    # it fell through with no expression at all and was recorded as absent --
+    # a claim the parent wired nothing, on a pin it wired two nets to. The
+    # leaves are recordable even when the shape is not.
+    check(one("""
+        SELECT count(*) FROM net_conn c JOIN term t ON t.id = c.term_id
+        JOIN tree_node n ON n.id = t.inst_id
+        WHERE n.node_kind='unresolved' AND t.name='seq'
+          AND c.conn_kind='expression_operand'""") == 2,
+          "a sequence connection names the nets it reaches")
     # The trace stops AT the box: mid still has its consumer.
     check(one("""
         SELECT count(*) FROM v_net_dep

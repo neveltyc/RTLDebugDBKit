@@ -807,8 +807,16 @@ JOIN hier_ref h ON h.id = c.outer_hier_ref_id
 JOIN net n ON n.id = h.resolved_net_id
 WHERE h.resolved_net_id IS NOT NULL
 UNION ALL
+-- `alias_binding` is its own kind for the reason `release_target` is: the
+-- storage is a stmt_target row, and the statement does not WRITE the net.
+-- An alias has no direction and no driver -- v_driver keeps it out of the
+-- driver count by giving it driver_kind='alias', and the doc's rule that
+-- "kinds keep counts right" only held on that side. Here every alias side
+-- was reported as written, so the same database answered "who writes this
+-- net" two ways, and named nets that no assignment in the design touches.
 SELECT a.net_id, n.inst_id, n.name,
        CASE WHEN s.stmt_kind = 'release' THEN 'release_target'
+            WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
             ELSE 'written_by' END,
        a.lo, a.hi, a.is_exact, a.stmt_id,
        NULL, a.id, NULL, NULL, NULL, NULL, NULL
