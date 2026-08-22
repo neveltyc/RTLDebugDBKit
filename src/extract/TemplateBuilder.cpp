@@ -100,6 +100,19 @@ std::string TemplateBuilder::groupKey(const InstanceBodySymbol& body) const {
     return key;
 }
 
+    /// Groups one instance and descends into its children.
+    ///
+    /// The descent stops at an instance whose group is already on the branch
+    /// above it -- a module instantiating itself with identical parameters.
+    /// That is illegal, and slang says so, but it says so having already
+    /// elaborated the instance tree it was walking when it noticed: slang
+    /// bounds the *depth* at 128 and nothing else. One self-instantiation per
+    /// body is therefore 130-odd instances, and two is 2^128 -- an
+    /// elaborated tree this walk cannot finish, ever, on a design whose only
+    /// fault is one line of illegal RTL. The guard is a path set rather than
+    /// a visited set on purpose: a module legitimately instantiated twice by
+    /// one parent is two separate branches and must be collected on both,
+    /// and only a repeat *on the way down* is the impossible one.
 void TemplateBuilder::collect(const InstanceSymbol& inst) {
     auto& body = inst.getCanonicalBody() ? *inst.getCanonicalBody() : inst.body;
     auto key = groupKey(body);
@@ -111,7 +124,13 @@ void TemplateBuilder::collect(const InstanceSymbol& inst) {
     }
     offer(g, body);
     instanceGroup[&inst] = key;
+
+    // The instance itself is grouped either way -- it is a real occurrence
+    // and its body is a real template. Only the descent is cut.
+    if (!onPath.insert(key).second)
+        return;
     forEachInstance(inst.body, [&](const InstanceSymbol& child) { collect(child); });
+    onPath.erase(key);
 }
 
     /// The port list of one group, as terminal templates. A MultiPort (a
@@ -550,6 +569,9 @@ void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body)
     }
     buildNetInitialisers(b, body);
     buildNetAliases(b, body);
+    // Primitives before children: an anonymous gate and an unnamed
+    // instantiation in one scope are siblings drawing from one counter, so
+    // the order they draw in is what their names are.
     buildPrimitives(b, body);
     buildChildren(b, body);
     stats.truncatedCalls += b.truncatedCalls;
@@ -1447,11 +1469,23 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
     });
 }
 
+std::string TemplateBuilder::anonSegment(Build& b, int32_t scopeIdx,
+                                         std::string_view defName) {
+    // A definition name that is not a plain identifier may hold a '.', and a
+    // tree node name holding one is a path with two segments -- the very
+    // thing an escaped name is written `\name ` to avoid. The name is
+    // decoration here: '$' and the counter are what make the segment unique
+    // and unspellable, so a dotted definition simply contributes nothing.
+    std::string_view label =
+        defName.find('.') == std::string_view::npos ? defName : std::string_view();
+    return "$" + std::string(label) + "$" +
+           std::to_string(b.anonSeq[scopeIdx]++);
+}
+
     /// Gate, switch and UDP instances: a tree node, a primitive row, and one
     /// dependency per LRM (input, output) pairing.
 void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) {
     EvalContext evalCtx(body);
-    std::unordered_map<int32_t, int> anonPrims;
     forEachOfKind<SymbolKind::PrimitiveInstance, PrimitiveInstanceSymbol>(
         body, [&](const PrimitiveInstanceSymbol& prim) {
         auto conns = prim.getPortConnections();
@@ -1470,10 +1504,8 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
         // scope so siblings differ, and prefixed with '$' so it cannot
         // collide with an identifier the source could have written.
         std::string name(prim.name);
-        if (name.empty()) {
-            auto& n = anonPrims[p.scope];
-            name = "$" + std::string(def.name) + "$" + std::to_string(n++);
-        }
+        if (name.empty())
+            name = anonSegment(b, p.scope, def.name);
         p.name = name;
         // slang labels only tran/tranif* as BiDiSwitch; the resistive
         // variants and the whole MOS family register as Fixed like any
