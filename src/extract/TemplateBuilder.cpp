@@ -288,8 +288,25 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
     std::string text = canonicalPath(r.origin, eval);
     if (text.empty())
         text = normalizedText(r.origin, sourceManager);
-    if (text.empty() || (text.find('.') == std::string::npos &&
-                         text.find("::") == std::string::npos)) {
+    // The symbol knows its own name, and that is always a usable path.
+    //
+    // Both spellings above can fail. canonicalPath has no case for a
+    // HierarchicalValue, so every cross-module reference falls to
+    // normalizedText -- which recovers text by slicing a source buffer and
+    // returns nothing when the reference's ends sit in different buffers, i.e.
+    // when any part of the name came from a macro. `q <= `TOP.glob` was
+    // therefore dropped where `q <= tb_top.glob` was recorded.
+    if (text.empty() && r.sym)
+        text = r.sym->getHierarchicalPath();
+    // Empty is the only reason left to drop one. There used to be a second --
+    // a path had to contain a '.' or a '::' -- which discarded every reference
+    // to a $unit-scope object, whose name is bare. Dropping it here produced no
+    // hier_ref, so the dependency became a net_dep with a null source AND a
+    // null reference: the exact shape v_driver classifies as a CONSTANT. The
+    // database then said a signal fed by an outward name was tied off, and the
+    // gating went with it, since a control dependency needs one of the two
+    // indices to survive.
+    if (text.empty()) {
         stats.external++;
         b.hierSeen.emplace(key, -1);
         return -1;
@@ -1111,10 +1128,44 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
                                       const TplLoc& at, EvalContext& evalCtx) {
     if (!formal.sym || !actual.sym)
         return;
-    const int32_t formalNet = b.decl->netFor(*formal.sym);
-    if (formalNet < 0)
-        return;
     const int32_t stmt = bindable ? b.curStmt : -1;
+    const int32_t formalNet = b.decl->netFor(*formal.sym);
+    if (formalNet < 0) {
+        // The formal is not a net of THIS body, which is what a subroutine
+        // declared in a package, an interface or $unit looks like from here.
+        // Dropping the binding took the actual with it -- and the actual is
+        // usually a perfectly good local net, so a task that plainly writes
+        // its argument left that argument with no driver at all.
+        //
+        // Only the actual's half is recorded. The formal cannot be: at a call
+        // site it is a symbol, not an expression, and the Ref built for it
+        // borrows the ACTUAL's origin -- so putting it through addHierRef
+        // names it with the actual's text and resolves it against the actual's
+        // target. Both wrong, and quietly so.
+        const int32_t actualIdx = b.decl->netFor(*actual.sym);
+        if (actualIdx < 0 || stmt < 0)
+            return;
+        if (reads)
+            addExprRef(b, stmt, actual, "call_argument", actualIdx);
+        if (writes) {
+            // The target row, and deliberately no dependency. A `procedure`
+            // arc names two nets and is told apart from the reading direction
+            // by the formal being its source -- and the formal is exactly what
+            // is missing here, so a source-less one would be a shape the kind
+            // does not have. What is true and recordable is that this
+            // statement writes the argument: `v_net_attachment` answers "what
+            // writes this net", while `v_driver` reports no arc because there
+            // is no nameable one. Better than the old behaviour, which
+            // recorded neither.
+            TplStmtRef tr;
+            tr.stmt = stmt;
+            tr.ordinal = b.targetOrdinal++;
+            tr.net = actualIdx;
+            tr.r = rangeOf(actual);
+            b.t->targets.push_back(std::move(tr));
+        }
+        return;
+    }
     const int32_t actualNet = b.decl->netFor(*actual.sym);
     if (actualNet < 0) {
         // An outward actual still binds: the dependency pairs here and
