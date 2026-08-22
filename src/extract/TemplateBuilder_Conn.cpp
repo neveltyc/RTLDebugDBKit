@@ -212,6 +212,13 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
     auto& childBody = child.getCanonicalBody() ? *child.getCanonicalBody()
                                                : child.body;
     Template& childT = templates[groupKey(childBody)];
+    // The child's OWN body, not the canonical one the template was built from:
+    // getPortConnections() hands back port symbols belonging to this instance,
+    // and when slang shares a canonical body those are different objects. The
+    // terminal INDICES agree -- same definition, same parameters, same port
+    // order -- which is what makes the positional lookup sound.
+    TermSlotMap childSlots;
+    collectTermSlots(child.body, childSlots);
     EvalContext evalCtx(child);
     const TplLoc instAt = locator.locate(child.location);
     bool inArray = false;
@@ -226,10 +233,20 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
         const TplLoc at = connExpr
                               ? locator.locate(connExpr->sourceRange.start(), instAt)
                               : instAt;
-        auto termIt = childT.termIndex.find(std::string(conn->port.name));
-        if (termIt == childT.termIndex.end())
+        // By symbol, never by name. slang's expandMultiPortConn hands back
+        // one PortConnection per MEMBER of a MultiPort, so `.p({hi, lo})`
+        // arrives as `hi` and `lo` -- names no terminal answers to; and two
+        // unnamed ports share the one synthesized name. Both cases used to
+        // miss here and the connection was dropped without a row.
+        auto slotIt = childSlots.find(static_cast<const void*>(&conn->port));
+        if (slotIt == childSlots.end())
             continue;
-        const int32_t termIdx = termIt->second;
+        const int32_t termIdx = slotIt->second.term;
+        // Where this symbol sits inside the terminal, and how wide it is. For
+        // an ordinary port both are the terminal's own; for a MultiPort member
+        // they are its window, and the connection's bits are relative to it.
+        const uint64_t termLsb = slotIt->second.lsb;
+        const int64_t slotWidth = slotIt->second.width;
         auto nextOrdinal = [&]() { return segOrdinal[termIdx]++; };
 
         if (conn->port.kind == SymbolKind::InterfacePort) {
@@ -245,10 +262,10 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 }
                 else if (auto* through =
                              passedThrough(*b.body, ifaceSym)) {
-                    auto ownIt = b.t->termIndex.find(
-                        std::string(through->name));
-                    if (ownIt != b.t->termIndex.end())
-                        tc.ifaceOwnTerm = ownIt->second;
+                    auto ownIt = b.t->termOf.find(
+                        static_cast<const void*>(through));
+                    if (ownIt != b.t->termOf.end())
+                        tc.ifaceOwnTerm = ownIt->second.term;
                 }
                 else {
                     // An interface array element or another synthesized
@@ -259,8 +276,9 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
             c.conns.push_back(std::move(tc));
             continue;
         }
-        if (conn->port.kind != SymbolKind::Port &&
-            conn->port.kind != SymbolKind::MultiPort)
+        // No MultiPort test: expandMultiPortConn means a connection's port is
+        // always a plain Port or an InterfacePort, never the MultiPort itself.
+        if (conn->port.kind != SymbolKind::Port)
             continue;
 
         if (!connExpr) {
@@ -295,7 +313,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
         // width is the authority; when the two disagree, every element's
         // position is unstatable and no mapping is per-bit -- the same
         // degradation a width-changing conversion already gets.
-        const int64_t declaredWidth = childT.terms[size_t(termIdx)].width;
+        const int64_t declaredWidth = slotWidth;
         const bool widthMismatch =
             formalWidth && declaredWidth > 0 &&
             uint64_t(declaredWidth) != formalWidth;
@@ -306,8 +324,17 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
             tc.loc = at;
             // The formal window, encoded as ranges are everywhere.
             if (!inArray && !widthMismatch && cn.windowExact && formalWidth) {
-                if (!(cn.winLo == 0 && cn.winHi + 1 >= formalWidth))
-                    tc.termR.bits = std::make_pair(cn.winLo, cn.winHi);
+                // Shifted into the terminal's own coordinates: a MultiPort
+                // member's window starts at its LSB within the terminal, and
+                // covering the whole member is not covering the whole terminal.
+                const bool wholeSlot =
+                    cn.winLo == 0 && cn.winHi + 1 >= formalWidth;
+                const bool wholeTerm =
+                    wholeSlot && termLsb == 0 &&
+                    slotWidth == childT.terms[size_t(termIdx)].width;
+                if (!wholeTerm)
+                    tc.termR.bits = std::make_pair(cn.winLo + termLsb,
+                                                   cn.winHi + termLsb);
                 tc.termExact = 1;
             }
             else {
@@ -323,15 +350,16 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 // Tied to something with no name here. The row exists
                 // either way; what it is tied to is in hier_ref.
                 Ref r = cn.ref;
-                const bool drives = conn->port.kind == SymbolKind::Port &&
-                                    (conn->port.as<PortSymbol>().direction ==
-                                         ArgumentDirection::Out ||
-                                     conn->port.as<PortSymbol>().direction ==
-                                         ArgumentDirection::InOut);
+                // isWrite is false because the direction it would carry is
+                // discarded anyway: addHierRef prefers the explicit access,
+                // and "connect" is what a port tie is. The flag only feeds the
+                // dedup key, where each connection's own expression already
+                // separates it. Computing a direction here read as though it
+                // reached the row, and it never did.
                 const int32_t saved = b.curStmt;
                 b.curStmt = -1;
                 const int32_t href =
-                    addHierRef(b, drives, r, at, evalCtx, "connect");
+                    addHierRef(b, /*isWrite=*/false, r, at, evalCtx, "connect");
                 b.curStmt = saved;
                 tc.kind = cn.expression ? "expression_operand"
                                         : "external_reference";
@@ -414,6 +442,47 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
         if (expr && expr->kind == ExpressionKind::EmptyArgument)
             expr = nullptr;
         const TplLoc at = locator.locate(u.location);
+        // A connection that is not a simple expression at all.
+        // UninstantiatedDefSymbol hands its connections back as AssertionExpr
+        // precisely because the construct may be a sequence -- `.p(a ##1 b)`
+        // is legal against an unresolved name -- and only the Simple kind was
+        // unwrapped above. Everything else fell through with a null expression
+        // and was recorded as `unconnected`: an assertion that the parent
+        // wired NOTHING, where it plainly wired something, and the nets it
+        // named lost their load through that pin. The leaves are recordable
+        // even when the shape is not, so they go in as expression operands --
+        // which is what a connection whose expression is not a plain reference
+        // already is.
+        if (!expr && raw && raw->kind != AssertionExprKind::Simple) {
+            std::vector<Ref> seqRefs;
+            collectStatementRefs(*raw, seqRefs);
+            int64_t seqOrdinal = 0;
+            for (auto& r : seqRefs) {
+                if (!r.sym)
+                    continue;
+                TplConn tc;
+                tc.kind = "expression_operand";
+                tc.childTerm = termSlot;
+                tc.ordinal = seqOrdinal++;
+                tc.loc = at;
+                const int32_t netIdx = b.decl->netFor(*r.sym);
+                if (netIdx < 0) {
+                    const int32_t saved = b.curStmt;
+                    b.curStmt = -1;
+                    tc.hierRef = addHierRef(b, false, r, at, evalCtx, "connect");
+                    b.curStmt = saved;
+                }
+                else {
+                    tc.parentNet = netIdx;
+                    tc.netR = rangeOf(r);
+                    tc.netExact = r.exact ? 1 : 0;
+                    tc.mappingExact = 0;
+                }
+                c.conns.push_back(std::move(tc));
+            }
+            if (seqOrdinal > 0)
+                continue;
+        }
         if (!expr) {
             TplConn tc;
             tc.kind = "unconnected";

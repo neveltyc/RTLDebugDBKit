@@ -453,9 +453,18 @@ SELECT
     d.src_lo                 AS driver_lo,
     d.src_hi                 AS driver_hi,
     d.src_exact              AS driver_exact,
+    -- `constant` is claimed only for a DATA row with no source, which is what
+    -- the contract above says and what the word means: a tie-off or a constant
+    -- right-hand side. Every other kind is carried through even without a
+    -- source, because for those a missing source is not a constant -- a
+    -- `pullup` has no input terminal and a call into a subroutine this
+    -- template cannot name has no nameable driver, and reporting either as a
+    -- tie-off inflates every multiple-driver count with a conflict that is
+    -- not one. The ELSE used to swallow them.
     CASE WHEN d.src_net_id IS NOT NULL THEN d.dep_kind
          WHEN d.src_hier_ref_id IS NOT NULL THEN 'external'
          WHEN s.stmt_kind = 'system_task' THEN 'system_task'
+         WHEN d.dep_kind != 'data' THEN d.dep_kind
          ELSE 'constant' END AS driver_kind,
     d.id                     AS dep_id,
     NULL                     AS conn_id,
@@ -798,8 +807,16 @@ JOIN hier_ref h ON h.id = c.outer_hier_ref_id
 JOIN net n ON n.id = h.resolved_net_id
 WHERE h.resolved_net_id IS NOT NULL
 UNION ALL
+-- `alias_binding` is its own kind for the reason `release_target` is: the
+-- storage is a stmt_target row, and the statement does not WRITE the net.
+-- An alias has no direction and no driver -- v_driver keeps it out of the
+-- driver count by giving it driver_kind='alias', and the doc's rule that
+-- "kinds keep counts right" only held on that side. Here every alias side
+-- was reported as written, so the same database answered "who writes this
+-- net" two ways, and named nets that no assignment in the design touches.
 SELECT a.net_id, n.inst_id, n.name,
        CASE WHEN s.stmt_kind = 'release' THEN 'release_target'
+            WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
             ELSE 'written_by' END,
        a.lo, a.hi, a.is_exact, a.stmt_id,
        NULL, a.id, NULL, NULL, NULL, NULL, NULL

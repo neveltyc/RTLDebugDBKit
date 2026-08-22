@@ -109,6 +109,66 @@ void TemplateBuilder::collect(const InstanceSymbol& inst) {
     /// The port list of one group, as terminal templates. A MultiPort (a
     /// non-ANSI `.p({hi, lo})` formal) is one terminal; its inside is the
     /// term_map segments built later.
+/// Where each port symbol of ONE body sits among that body's terminals.
+///
+/// Recomputed per body rather than stored once, because what a group's bodies
+/// share is the port ORDER, not the port symbols: slang gives identical
+/// instances a single canonical body, so a child's `conn->port` belongs to that
+/// child's own body while its template was built from the canonical one. A
+/// stored symbol-keyed map looks right on a design where nothing shares a body
+/// and silently drops every connection of every instance on one where something
+/// does.
+void TemplateBuilder::collectTermSlots(const InstanceBodySymbol& body,
+                                       TermSlotMap& out) {
+    int32_t termIdx = 0;
+    for (auto* portSym : body.getPortList()) {
+        if (!portSym)
+            continue;
+        auto width = [](const Type& ty) {
+            return ty.isIntegral() ? int64_t(ty.getBitWidth()) : int64_t(-1);
+        };
+        switch (portSym->kind) {
+            case SymbolKind::Port:
+                out.emplace(static_cast<const void*>(portSym),
+                            Template::TermSlot{
+                                termIdx, 0,
+                                width(portSym->as<PortSymbol>().getType())});
+                break;
+            case SymbolKind::MultiPort: {
+                auto& mp = portSym->as<MultiPortSymbol>();
+                out.emplace(static_cast<const void*>(portSym),
+                            Template::TermSlot{termIdx, 0, width(mp.getType())});
+                // Members MSB first, as a concatenation is written, so the
+                // cursor counts down to each member's LSB -- the same offsets
+                // buildTermMaps lays the inside out with, and the same ones
+                // slang's expandMultiPortConn accumulates walking the reverse.
+                uint64_t cursor =
+                    mp.getType().isIntegral() ? mp.getType().getBitWidth() : 0;
+                for (auto* member : mp.ports) {
+                    if (!member)
+                        continue;
+                    const uint64_t w = member->getType().isIntegral()
+                                           ? member->getType().getBitWidth()
+                                           : 0;
+                    if (w && w <= cursor)
+                        cursor -= w;
+                    out.emplace(static_cast<const void*>(member),
+                                Template::TermSlot{termIdx, cursor,
+                                                   w ? int64_t(w) : -1});
+                }
+                break;
+            }
+            case SymbolKind::InterfacePort:
+                out.emplace(static_cast<const void*>(portSym),
+                            Template::TermSlot{termIdx, 0, -1});
+                break;
+            default:
+                continue;   // no terminal, so no index consumed
+        }
+        termIdx++;
+    }
+}
+
 void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
     for (auto* portSym : body.getPortList()) {
         if (!portSym)
@@ -160,9 +220,9 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
         }
         if (term.name.empty())
             term.name = "<unnamed>";
-        t.termIndex.emplace(term.name, int32_t(t.terms.size()));
         t.terms.push_back(std::move(term));
     }
+    collectTermSlots(body, t.termOf);
 }
 
 int32_t TemplateBuilder::newStmt(Build& b, std::string kind, std::string construct,
@@ -228,8 +288,25 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
     std::string text = canonicalPath(r.origin, eval);
     if (text.empty())
         text = normalizedText(r.origin, sourceManager);
-    if (text.empty() || (text.find('.') == std::string::npos &&
-                         text.find("::") == std::string::npos)) {
+    // The symbol knows its own name, and that is always a usable path.
+    //
+    // Both spellings above can fail. canonicalPath has no case for a
+    // HierarchicalValue, so every cross-module reference falls to
+    // normalizedText -- which recovers text by slicing a source buffer and
+    // returns nothing when the reference's ends sit in different buffers, i.e.
+    // when any part of the name came from a macro. `q <= `TOP.glob` was
+    // therefore dropped where `q <= tb_top.glob` was recorded.
+    if (text.empty() && r.sym)
+        text = r.sym->getHierarchicalPath();
+    // Empty is the only reason left to drop one. There used to be a second --
+    // a path had to contain a '.' or a '::' -- which discarded every reference
+    // to a $unit-scope object, whose name is bare. Dropping it here produced no
+    // hier_ref, so the dependency became a net_dep with a null source AND a
+    // null reference: the exact shape v_driver classifies as a CONSTANT. The
+    // database then said a signal fed by an outward name was tied off, and the
+    // gating went with it, since a control dependency needs one of the two
+    // indices to survive.
+    if (text.empty()) {
         stats.external++;
         b.hierSeen.emplace(key, -1);
         return -1;
@@ -317,8 +394,8 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     if (hv.ref.isViaIfacePort() && !hv.ref.path.empty()) {
         const Symbol* first = hv.ref.path.front().symbol;
         if (first && first->kind == SymbolKind::InterfacePort) {
-            auto it = b.t->termIndex.find(std::string(first->name));
-            if (it != b.t->termIndex.end()) {
+            auto it = b.t->termOf.find(static_cast<const void*>(first));
+            if (it != b.t->termOf.end()) {
                 auto& ip = first->as<InterfacePortSymbol>();
                 auto [iface, modport] = ip.getConnection();
                 if (iface) {
@@ -326,7 +403,7 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
                     std::string rel;
                     if (splitBelow(full, ifacePrefix, rel)) {
                         row.resolve = TplHierRef::ViaIfaceTerm;
-                        row.ifaceTerm = it->second;
+                        row.ifaceTerm = it->second.term;
                         splitSegsAndNet(rel, *target, row);
                         return;
                     }
@@ -452,11 +529,10 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
     for (auto* portSym : body.getPortList()) {
         if (!portSym)
             continue;
-        auto termIt = b.t->termIndex.find(std::string(
-            portSym->name.empty() ? std::string_view("<unnamed>") : portSym->name));
-        if (termIt == b.t->termIndex.end())
+        auto termIt = b.t->termOf.find(static_cast<const void*>(portSym));
+        if (termIt == b.t->termOf.end())
             continue;
-        const int32_t termIdx = termIt->second;
+        const int32_t termIdx = termIt->second.term;
         int64_t ordinal = 0;
         auto addSeg = [&](int32_t netIdx, const TplRange& termR,
                          const TplRange& netR, bool mapping) {
@@ -471,31 +547,39 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
             m.mappingExact = mapping;
             b.t->termMaps.push_back(std::move(m));
         };
+        // The internal expression FIRST, and internalSymbol only as the
+        // fallback. The two are not alternatives: slang sets both when the
+        // port reference carries a select (`.p(hi[1:0])` gets an
+        // Expression::bindSelector into internalExpr and keeps hi as the
+        // symbol), so testing the symbol first took a 2-bit formal onto the
+        // whole of a 4-bit net and called the mapping exact -- a one-to-one
+        // claim across widths that cannot hold.
+        auto internalSegs = [&](const Expression& inner) {
+            std::vector<ConnRef> segs;
+            collectConnRefs(inner, evalCtx, segs);
+            for (auto& cn : segs) {
+                if (!cn.ref.sym)
+                    continue;
+                const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
+                if (netIdx < 0)
+                    continue;
+                TplRange termR;
+                const uint64_t fw = inner.type ? inner.type->getBitWidth() : 0;
+                if (cn.windowExact && fw &&
+                    !(cn.winLo == 0 && cn.winHi + 1 >= fw))
+                    termR.bits = std::make_pair(cn.winLo, cn.winHi);
+                termR.exact = cn.windowExact;
+                addSeg(netIdx, termR, rangeOf(cn.ref), cn.positional);
+            }
+        };
         if (portSym->kind == SymbolKind::Port) {
             auto& p = portSym->as<PortSymbol>();
-            if (p.internalSymbol && ValueSymbol::isKind(p.internalSymbol->kind)) {
+            if (auto* inner = p.getInternalExpr())
+                internalSegs(*inner);
+            else if (p.internalSymbol && ValueSymbol::isKind(p.internalSymbol->kind)) {
                 const int32_t netIdx =
                     b.decl->netFor(p.internalSymbol->as<ValueSymbol>());
                 addSeg(netIdx, TplRange{}, TplRange{}, true);
-            }
-            else if (auto* inner = p.getInternalExpr()) {
-                std::vector<ConnRef> segs;
-                collectConnRefs(*inner, evalCtx, segs);
-                for (auto& cn : segs) {
-                    if (!cn.ref.sym)
-                        continue;
-                    const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
-                    if (netIdx < 0)
-                        continue;
-                    TplRange termR;
-                    const uint64_t fw =
-                        inner->type ? inner->type->getBitWidth() : 0;
-                    if (cn.windowExact && fw &&
-                        !(cn.winLo == 0 && cn.winHi + 1 >= fw))
-                        termR.bits = std::make_pair(cn.winLo, cn.winHi);
-                    termR.exact = cn.windowExact;
-                    addSeg(netIdx, termR, rangeOf(cn.ref), cn.positional);
-                }
             }
         }
         else if (portSym->kind == SymbolKind::MultiPort) {
@@ -588,12 +672,6 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
         }
     }
 
-    std::unordered_set<const ValueSymbol*> inputPorts;
-    for (auto* d : proc.getDrivers()) {
-        if (d->isInputPort())
-            inputPorts.insert(&d->getSymbol());
-    }
-
     bool reached = false;
 
     StatementWalker walker(
@@ -604,8 +682,17 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
             bool firstTarget, const std::string& delay,
             const char* constructWord) {
             reached = true;
-            if (!dst.sym || inputPorts.count(dst.sym))
-                return;
+            // No input-port filter and no null-symbol guard, because neither
+            // could fire. slang builds every driver in AnalyzedProcedure and
+            // AnalysisManager with DriverFlags::None, so isInputPort() is
+            // false for all of them -- 3,945 procedure drivers across
+            // picorv32, tinyriscv and veerwolf, none of them an input port --
+            // and every Ref reaching this callback came from collectRefs or
+            // collectSlots, which never emit a null symbol. Skipping a first
+            // target here would also have been a trap: the second target of a
+            // concatenated left-hand side would then arrive with
+            // firstTarget=false and a stale curStmt, attaching its rows to the
+            // previous statement.
             const TplLoc at = locator.locate(where.start(), procAt);
             emitAssignment(b, dst, pairs, gating, at, seq, blocking,
                            dropped, inSubroutine, firstTarget, delay,
@@ -763,7 +850,10 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
     }
     TplStmtRef tr;
     tr.stmt = stmt;
-    tr.ordinal = int64_t(b.t->targets.size());
+    // Per statement, like every other target site. This one used the template
+    // vector's size, which is a global index leaked into a column the doc
+    // defines as "position in a declaration or extraction list".
+    tr.ordinal = b.targetOrdinal++;
     tr.net = netIdx;
     tr.r = rangeOf(r);
     const int32_t targetIdx = int32_t(b.t->targets.size());
@@ -1044,10 +1134,44 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
                                       const TplLoc& at, EvalContext& evalCtx) {
     if (!formal.sym || !actual.sym)
         return;
-    const int32_t formalNet = b.decl->netFor(*formal.sym);
-    if (formalNet < 0)
-        return;
     const int32_t stmt = bindable ? b.curStmt : -1;
+    const int32_t formalNet = b.decl->netFor(*formal.sym);
+    if (formalNet < 0) {
+        // The formal is not a net of THIS body, which is what a subroutine
+        // declared in a package, an interface or $unit looks like from here.
+        // Dropping the binding took the actual with it -- and the actual is
+        // usually a perfectly good local net, so a task that plainly writes
+        // its argument left that argument with no driver at all.
+        //
+        // Only the actual's half is recorded. The formal cannot be: at a call
+        // site it is a symbol, not an expression, and the Ref built for it
+        // borrows the ACTUAL's origin -- so putting it through addHierRef
+        // names it with the actual's text and resolves it against the actual's
+        // target. Both wrong, and quietly so.
+        const int32_t actualIdx = b.decl->netFor(*actual.sym);
+        if (actualIdx < 0 || stmt < 0)
+            return;
+        if (reads)
+            addExprRef(b, stmt, actual, "call_argument", actualIdx);
+        if (writes) {
+            // The target row, and deliberately no dependency. A `procedure`
+            // arc names two nets and is told apart from the reading direction
+            // by the formal being its source -- and the formal is exactly what
+            // is missing here, so a source-less one would be a shape the kind
+            // does not have. What is true and recordable is that this
+            // statement writes the argument: `v_net_attachment` answers "what
+            // writes this net", while `v_driver` reports no arc because there
+            // is no nameable one. Better than the old behaviour, which
+            // recorded neither.
+            TplStmtRef tr;
+            tr.stmt = stmt;
+            tr.ordinal = b.targetOrdinal++;
+            tr.net = actualIdx;
+            tr.r = rangeOf(actual);
+            b.t->targets.push_back(std::move(tr));
+        }
+        return;
+    }
     const int32_t actualNet = b.decl->netFor(*actual.sym);
     if (actualNet < 0) {
         // An outward actual still binds: the dependency pairs here and
@@ -1155,7 +1279,13 @@ void TemplateBuilder::buildNetInitialisers(Build& b, const InstanceBodySymbol& b
                                       dstSlot.positional && srcSlot.positional,
                                       srcSlot.ref});
         }
-        b.curScope = 0;
+        // The generate level that declares it, not the instance. forEachOfKind
+        // descends into generate blocks, so hard-coding 0 filed `wire w = …`
+        // inside `g[0]` under the instance node -- while the net row for the
+        // same declaration was filed correctly, so the two tables contradicted
+        // each other, and one generate iteration's initialiser could not be
+        // told from another's.
+        b.curScope = b.decl->scopeForSymbol(net);
         emitAssignment(b, dstSlot.ref, pairs, {}, at, /*seq=*/-1,
                        /*blocking=*/false, droppedConstants,
                        /*inSubroutine=*/false, /*firstTarget=*/true,
@@ -1188,25 +1318,43 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
         if (refs.size() < 2)
             return;
         const TplLoc at = locator.locate(al.location);
-        b.curScope = 0;
+        b.curScope = b.decl->scopeForSymbol(al);
         const int32_t stmt = newStmt(b, "alias", "alias", std::string(),
                                      /*seq=*/-1, std::string(), 0, at);
         if (stmt < 0)
             return;
 
         // One target and one operand per reference, in written order.
+        // `group` is which written side the reference came from. An alias
+        // binds the SIDES to each other, so two references of one
+        // concatenation are not aliases of each other -- `alias {a, b} = c`
+        // makes a and b different bits of c, not copies of one another.
         struct Side { int32_t target = -1; int32_t operand = -1;
-                      int32_t net = -1; Ref ref; };
+                      int32_t net = -1; int32_t group = -1; Ref ref; };
         std::vector<Side> sides;
+        // A side that is a concatenation is N references, not one. LRM 10.11
+        // allows `alias {a, b} = c;` and getNetReferences hands the
+        // concatenation back as a single expression yielding several refs --
+        // requiring exactly one dropped the whole side, so a and b were
+        // aliased to nothing and the statement carried no dependency at all.
+        // Each ref becomes its own side; what is lost is only which bits of
+        // the other side it meets, and that shows as a coarse mapping rather
+        // than a missing one.
+        bool anyMultiRef = false;
+        int32_t group = 0;
         for (auto* e : refs) {
             if (!e)
                 continue;
+            const int32_t thisGroup = group++;
             std::vector<Ref> got;
             collectRefs(*e, evalCtx, got, /*skipSelectors=*/true);
-            if (got.size() != 1 || !got[0].sym)
+            anyMultiRef = anyMultiRef || got.size() > 1;
+            for (auto& one : got) {
+            if (!one.sym)
                 continue;
             Side sd;
-            sd.ref = got[0];
+            sd.group = thisGroup;
+            sd.ref = one;
             sd.net = b.decl->netFor(*sd.ref.sym);
             if (sd.net < 0) {
                 // Nothing in this instance to bind; the reference is
@@ -1233,11 +1381,12 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
             sd.operand = int32_t(b.t->operands.size());
             b.t->operands.push_back(std::move(orow));
             sides.push_back(std::move(sd));
+            }
         }
 
         for (size_t i = 0; i < sides.size(); i++) {
             for (size_t j = 0; j < sides.size(); j++) {
-                if (i == j)
+                if (i == j || sides[i].group == sides[j].group)
                     continue;
                 TplDep d;
                 d.srcNet = sides[i].net;
@@ -1250,8 +1399,10 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
                 d.tgtR = rangeOf(sides[j].ref);
                 // An alias is bit for bit by definition; it is only
                 // coarse if a side could not be narrowed.
-                d.mappingExact =
-                    (sides[i].ref.exact && sides[j].ref.exact) ? 1 : 0;
+                d.mappingExact = (!anyMultiRef && sides[i].ref.exact &&
+                                  sides[j].ref.exact)
+                                     ? 1
+                                     : 0;
                 d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
             }
