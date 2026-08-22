@@ -71,21 +71,21 @@ real SoC is about 2× the folded file size.
 **[doc/designdb-schema.md](doc/designdb-schema.md) is the field reference** —
 every table and column, the bit-range encoding, the naming rules, what the
 schema deliberately does not record, and the known limits. Consumers start at
-its **stable query interface**: thirteen views (`v_tree_node`, `v_net`,
+its **stable query interface**: fifteen views (`v_tree_node`, `v_net`,
 `v_driver`, `v_load`, `v_stmt`, …) whose columns, NULL rules and row
 granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v13:
+Release build, macOS arm64, against public designs, schema v15:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 225 | 746 | 4,888 | 0.03 s | 1.07 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.04 s | 1.35 MB |
-| VeeRwolf (`veerwolf_core`) | 86 | 1,920 | 17,808 | 11,088 | 36,621 | 0.34 s | 10.7 MB |
+| picorv32 | 1 | 1 | 225 | 746 | 4,887 | 0.02 s | 1.07 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.03 s | 1.34 MB |
+| VeeRwolf (`veerwolf_core`) | 91 | 1,925 | 17,808 | 11,087 | 36,625 | 0.24 s | 10.5 MB |
 
-The instance-level expansion is the column to watch: VeeRwolf's 1,920
+The instance-level expansion is the column to watch: VeeRwolf's 1,925
 occurrences stamp out from 164 parameterised bodies (10× replication), and
 the database lands at roughly **2× the folded v9 file** rather than 10× —
 type text stays interned, and the biggest tables scale with statements, not
