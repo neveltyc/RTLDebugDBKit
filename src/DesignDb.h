@@ -236,16 +236,18 @@ namespace designdb {
 /// One export that used to fail now succeeds: two unnamed ports in one module
 /// collided on a synthesized name and aborted on a UNIQUE constraint.
 ///
-/// v15 corrects one more value, and moves the version for v14's reason. An
-/// instantiation written without an instance name no longer answers to the
-/// name of the instance holding it. slang leaves such a symbol's name empty
-/// and a hierarchical path built from an empty name ends at the PARENT, so
-/// the last segment WAS the parent's -- the defect v14 fixed for anonymous
-/// gates and left standing for instantiations, because inventing a name for
-/// one was a separate decision. It is decided here: the synthesised `$def$n`
-/// segment now covers module instantiations and unresolved definitions as
-/// well, and all three kinds draw from one counter per scope, so a gate and
-/// an instantiation beside it cannot be handed one name twice.
+/// v15 corrects two values, and moves the version for v14's reason.
+///
+/// The first: an instantiation written without an instance name no longer
+/// answers to the name of the instance holding it. slang leaves such a
+/// symbol's name empty and a hierarchical path built from an empty name ends
+/// at the PARENT, so the last segment WAS the parent's -- the defect v14
+/// fixed for anonymous gates and left standing for instantiations, because
+/// inventing a name for one was a separate decision. It is decided here: the
+/// synthesised `$def$n` segment now covers module instantiations and
+/// unresolved definitions as well, and all three kinds draw from one counter
+/// per scope, so a gate and an instantiation beside it cannot be handed one
+/// name twice.
 ///
 /// A module instance name is mandatory, which makes this look like a case
 /// that cannot arise. It arises whenever a macro supplies the name and does
@@ -257,6 +259,41 @@ namespace designdb {
 /// `free_cg` is one name twice, one level apart, and nothing in the source
 /// spells the second. `tree_node.name` is the only column that changes; the
 /// row counts of every table are what they were.
+///
+/// The second is a field pair: `hier_ref.resolved_inst_id` and
+/// `resolved_net_id` are no longer NULL for a path anchored at `$root`, and
+/// a v14 consumer read that NULL as "this reference cannot be resolved per
+/// occurrence" -- a statement about the reference rather than about the
+/// exporter.
+///
+/// An absolute path names one object, seen from any occurrence of the body
+/// that spells it, which is exactly the property that makes replay sound;
+/// the resolution machinery for it existed on both ends and was cut off in
+/// the middle. slang's HierarchicalReference::isUpward() is
+/// `upwardCount > 0 || path[0] is Root`, and the exporter tested it whole,
+/// so `$root.a.b.c` was dropped alongside the upward names it has nothing in
+/// common with. Both ends of a dependency through such a reference move
+/// with it: a `$root` READ was a `net_dep` with no source net that
+/// `v_driver` reported as `external`, and a `$root` WRITE could not be
+/// materialised at all -- the target net had no driver row of any kind, so a
+/// trace back from it said the design never wrote it. Both now carry the
+/// resolved net, like any downward reference.
+///
+/// Upward references are unchanged and still NULL, for the reason they
+/// always were: one analysed body cannot answer for surroundings that differ
+/// per occurrence.
+///
+/// Riding along, neither of them a contract change. `analysis_status` no
+/// longer tests slang's analysed-scope count, which could not be zero unless
+/// the compilation was fatally errored -- the branch beside it -- and
+/// `hierarchy_only` therefore has one cause rather than the two it named. It
+/// gains a `partial` disjunct in its place, for an occurrence stamped from a
+/// module body the analysis never reached; that is a guard against slang's
+/// descent and the template walk drifting apart, unreachable while they
+/// agree, and it fires on no design measured here. And the concatenation
+/// cursor walk in Ref.h gained the wider-than-remaining guard its twin in
+/// StatementWalker.h already had, so the two agree about when an operand
+/// walk stops meaning anything.
 inline constexpr int SchemaVersion = 15;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
