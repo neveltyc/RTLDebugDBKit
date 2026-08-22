@@ -487,12 +487,14 @@ asserts all of it on every export. Ground rules:
   `v_hier_ref` — and
   count(view) == count(base) is checked. Every internal join is against a
   primary key; nothing fans out.
-* Every id the contract publishes can be resolved inside the contract. A
-  view that names another row's id — `v_net_dep`'s two `*_hier_ref_id`,
-  `v_net_conn`'s `outer_hier_ref_id`, `v_net_attachment`'s typed columns —
-  has a view to follow it into. A published key with nothing to follow is a
-  dangling reference in the contract, which is what `hier_ref` was until
-  v15.
+* Not every id the contract publishes has a view to follow it into.
+  `expr_ref`, `proc` and `prim` are named by `v_net_attachment`,
+  `v_net_dep`, `v_driver` and `v_load` and have none — a consumer that needs
+  the row behind one of those ids reads the base table this document
+  describes. `hier_ref` was in that set and is no longer: four views point
+  at it (`v_net_dep`'s two `*_hier_ref_id`, `v_net_conn`'s
+  `outer_hier_ref_id`, `v_net_attachment`'s `hier_ref_id`) and it is the one
+  a trace meets on its ordinary path rather than when reaching for detail.
 * `v_driver`, `v_load` and `v_net_attachment` are COMPOSITE: UNION ALL
   branches discriminated by their kind column, each branch's row count
   reconcilable by a formula the verifier evaluates. The dependency, event,

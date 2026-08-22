@@ -270,6 +270,13 @@ WITH seg AS (
         c.id                                   AS conn_id,
         c.conn_kind                            AS conn_kind,
         c.outer_net_id                         AS outer_net_id,
+        -- Always NULL in practice: this branch is the connection's OWN net,
+        -- and the exporter writes outer_net_id and outer_hier_ref_id
+        -- exclusively. Spelled as the column rather than a literal NULL on
+        -- purpose -- a constant here stops SQLite flattening the compound
+        -- subquery, and `WHERE signal_net_id = ?` on v_driver goes from a
+        -- seek to a scan of seg. The verifier's plan check catches it, but
+        -- the reason belongs where the temptation is.
         hr.path                                AS outer_ref,
         c.outer_lo                             AS c_net_lo,
         c.outer_hi                             AS c_net_hi,
@@ -448,15 +455,18 @@ FROM arc;
 -- An unconnected terminal contributes no row.
 --
 -- driver_ref is how the driving end was SPELLED when it was reached by a
--- hierarchical name, and NULL when it was not -- one meaning, two
--- situations. On an 'external' row it is the only name there is, and the
--- row was not self-sufficient without it: the path lived on a hier_ref the
--- consumer had to reach through dep_id, outside the views that were the
--- whole contract. On a crossing whose tie resolved
--- (`.p(u.g[7:4])`) the driver net is named as well, and driver_ref says how
--- it was written at the instantiation. v_hier_ref holds the rest of the
--- reference -- access, resolution, window, location -- for the questions one
--- denormalised column should not try to answer.
+-- hierarchical name, and NULL when it was not -- one meaning wherever the
+-- far end has a spelling. On a dependency it is that dependency's
+-- src_hier_ref_id path: for a resolved reference (`assign q = u.x`) beside
+-- the net it landed on, and for an 'external' one instead of a net, where
+-- it is the ONLY name there is and the row was not self-sufficient without
+-- it -- the path lived on a hier_ref the consumer had to reach through
+-- dep_id, outside the views that were the whole contract. On a crossing
+-- whose tie resolved (`.p(u.g[7:4])`) it is what the instantiation wrote,
+-- and only on the arc whose DRIVER is that resolved net: the other
+-- direction of the same tie names it as the signal, not the driver.
+-- v_hier_ref holds the rest of the reference -- access, resolution, window,
+-- location -- for the questions one denormalised column should not answer.
 CREATE VIEW v_driver AS
 SELECT
     d.tgt_net_id             AS signal_net_id,
