@@ -518,7 +518,7 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
                               ast::Compilation& compilation,
                               analysis::AnalysisManager& analysis,
                               SourceManager& sourceManager,
-                              size_t numErrors, bool fatal, size_t numScopes) {
+                              size_t numErrors, bool fatal) {
     designdb::Stats stats;
     designdb::Writer writer(tmpPath, opt.checkConstraints);
     writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
@@ -581,11 +581,32 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     // black box, and a design that instantiates a vendor macro it has no
     // source for is complete as far as this tool can be. The count is
     // recorded so a consumer can decide for itself.
+    //
+    // `hierarchy_only` has one cause, and this is it. It used to read
+    // `fatal || numScopes == 0`, which said there were two --
+    // AnalysisManager::analyze() returns early only on hasFatalErrors(),
+    // and otherwise it enters every compilation unit before it reaches an
+    // instance, with Stats::numScopes counting those units too. A file of
+    // nothing but a comment reports 1 scope, a file holding one package
+    // reports 2, and main() has already refused an empty file list, so
+    // numScopes == 0 could only mean the `fatal` beside it. The second
+    // disjunct never chose anything, and the condition it was standing in
+    // for -- the analysis ran and some module got no dataflow out of it --
+    // had no test anywhere, nor a counter to build one from.
+    //
+    // stats.unanalysedInsts is that counter, and it enters here as
+    // `partial` rather than `hierarchy_only` because the condition is per
+    // module and the rest of the design is unaffected. It is a guard, not a
+    // branch this design takes: while slang's analysis descends what the
+    // template walk descends, an occurrence is stamped from an unanalysed
+    // body only when the compilation is fatally errored, and `fatal` above
+    // has already answered for that. See designdb::Stats for the two places
+    // the descents differ and why neither is reachable in the pinned slang.
     const char* analysisStatus;
-    if (fatal || numScopes == 0)
+    if (fatal)
         analysisStatus = "hierarchy_only";
     else if (numErrors || stats.emptyProcedures || stats.duplicatePaths ||
-             stats.truncatedCalls)
+             stats.truncatedCalls || stats.unanalysedInsts)
         analysisStatus = "partial";
     else
         analysisStatus = "complete";
@@ -691,6 +712,25 @@ void reportStats(const Options& opt, const designdb::Stats& stats) {
                      "lookup may be ambiguous\n",
                      (long long)stats.duplicatePaths);
     }
+    if (stats.unanalysedBodies && !stats.unanalysedInsts) {
+        // Only worth saying when the templates are the whole of it. When
+        // occurrences inherited the gap the warning below says so, and the
+        // fatally-errored run that produces it has already been reported.
+        std::fprintf(stderr,
+                     "note: %lld module body group(s) had no analysed body, "
+                     "so the templates built from them hold no procedure; "
+                     "nothing is stamped from them, and no row is missing\n",
+                     (long long)stats.unanalysedBodies);
+    }
+    if (stats.unanalysedInsts) {
+        std::fprintf(stderr,
+                     "warning: %lld of %lld instance(s) were stamped from a "
+                     "module body the analysis never reached; their procedures "
+                     "are absent, so they carry hierarchy and connections and "
+                     "no procedural dataflow\n",
+                     (long long)stats.unanalysedInsts,
+                     (long long)stats.instances);
+    }
 }
 
 } // namespace
@@ -764,14 +804,11 @@ int main(int argc, char** argv) {
 
         analysis::AnalysisManager analysis({}, pool);
         { Phase p("analyze", opt.timing); analysis.analyze(compilation); }
-        auto astats = analysis.getStats();
-        if (!fatal && astats.numScopes == 0) {
-            // analyze() returns silently when the compilation is fatally
-            // errored, so this is the only place the condition is visible.
-            std::fprintf(stderr, "warning: no scopes were analysed; the database "
-                                 "will have hierarchy but no dataflow\n");
-        }
-        else if (!opt.quiet) {
+        // Informational only. What the analysis actually yielded per module
+        // is not knowable here -- it is counted during extraction and
+        // reported by reportStats below.
+        if (!opt.quiet) {
+            auto astats = analysis.getStats();
             std::fprintf(stderr, "analysis: %zu scopes, %zu procedures, %.1f MB\n",
                          astats.numScopes, astats.numProcedures,
                          astats.memoryUsage / 1e6);
@@ -782,7 +819,7 @@ int main(int argc, char** argv) {
 
         const designdb::Stats stats =
             writeDatabase(opt, tmpPath, compilation, analysis, sourceManager,
-                          counts.errors, fatal, astats.numScopes);
+                          counts.errors, fatal);
         // The writer is destroyed with writeDatabase's frame, so the database
         // file is closed and complete before this runs.
         if (!publish(tmpPath, opt.output))

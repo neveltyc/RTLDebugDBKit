@@ -67,6 +67,49 @@ struct Stats {
     /// those calls is incomplete -- reported rather than left to look like
     /// a subroutine that reads and writes nothing.
     int64_t truncatedCalls = 0;
+    /// The (definition, parameters) groups pass 1 formed whose chosen body
+    /// the analysis manager never analysed, so the template built from one
+    /// holds no procedure at all.
+    ///
+    /// Non-zero on real designs -- 11 groups on veerwolf -- and it costs no
+    /// row. TemplateBuilder::collect() keys a group on `getCanonicalBody() ?:
+    /// body` but then descends `inst.body`, the NON-canonical one. For an
+    /// instance slang's cache folded onto an earlier body, that body was
+    /// never elaborated, so reaching its members() mints child instances of
+    /// its own with no canonical body set; their parameter text becomes a
+    /// group key that the canonical subtree does not produce, and no
+    /// analysed body is ever offered for it. Nothing is stamped from such a
+    /// group either, since every child key a template records comes from the
+    /// analysed body it was built from -- which is what makes it a note
+    /// rather than a warning. Reported because a template built and never
+    /// used is worth saying out loud, not because a query answers
+    /// differently.
+    int64_t unanalysedBodies = 0;
+    /// Occurrences stamped from such a template -- the case where the gap
+    /// above would reach the rows. Every procedure of the module would be
+    /// absent from that instance, leaving hierarchy, nets and connections
+    /// that read exactly like a module with no always block.
+    ///
+    /// Non-zero only when the compilation is fatally errored, where
+    /// analyze() returns before analysing anything and `analysis_status` is
+    /// already `hierarchy_only` for that reason. Otherwise zero on every
+    /// design measured, and the walk says why: the analysis analyses
+    /// `getCanonicalBody() ?: body` -- the very body groupKey is taken
+    /// against -- and descends into instances, instance arrays, generate
+    /// blocks and generate-array entries as the template walk does. So each
+    /// child a template names was analysed if its parent was, and the roots
+    /// are analysed by construction.
+    ///
+    /// The two descents are not identical, which is the reason to count
+    /// rather than trust: slang also skips an instance whose body carries
+    /// InstanceFlags::Uninstantiated and a generate array that is not
+    /// `valid`, and forEachOfKind tests neither. Both are unreachable in the
+    /// pinned slang -- an uninstantiated instantiation is an
+    /// UninstantiatedDefSymbol rather than an InstanceSymbol, and an invalid
+    /// generate array creates no entries to walk -- but they are slang's to
+    /// keep, not ours. If a revision descends differently, the export says
+    /// so instead of dropping every procedure of a module in silence.
+    int64_t unanalysedInsts = 0;
 };
 
 /// Extracts `compilation` into `writer`. `analysis` must already have run.

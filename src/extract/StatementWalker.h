@@ -780,6 +780,11 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 if (!op)
                     continue;
                 const uint64_t w = exprWidthOf(*op);
+                // The same two stops Ref.h's collectSlots takes, and for the
+                // same reason: no width means no position, and more width
+                // than the concatenation has left means `cursor -= w` wraps.
+                // From here on the elements ride the whole expression
+                // instead, which is imprecise where the wrap would be wrong.
                 if (!bad && (w == 0 || w > cursor - base))
                     bad = true;
                 if (bad) {

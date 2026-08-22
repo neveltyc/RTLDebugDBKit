@@ -20,11 +20,15 @@
 #   verify-designdb.py <design.db> unresolved   + examples/constructs/unresolved.sv facts
 #   verify-designdb.py <design.db> xmr          + examples/constructs/xmr.sv facts
 #   verify-designdb.py <design.db> alias        + examples/constructs/alias.sv facts
+#   verify-designdb.py <design.db> rootref      + examples/constructs/rootref.sv facts
+#   verify-designdb.py <design.db> typeparam    + examples/constructs/typeparam.sv facts
+#   verify-designdb.py <design.db> concatcursor + examples/constructs/concatcursor.sv facts
 import sqlite3
 import sys
 
 MODES = ("constructs", "interfaces", "assertions", "hierarchy", "udp",
          "unresolved", "xmr", "alias", "external", "package", "callsite",
+         "rootref", "typeparam", "concatcursor",
          # These carry no mode-specific assertions of their own; they are named
          # so CI can pass a mode uniformly and so the mode-gated universal
          # checks run for them too.
@@ -36,7 +40,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "15"
 
 
 def one(sql, *args):
@@ -1052,7 +1056,9 @@ if mode:
                 "compound": "compound", "macroloc": "macroloc",
                 "stmtgaps": "stmtgaps", "patterncase": "patterncase",
                 "outward": "outward_tb", "naming": "naming",
-                "aliascat": "aliascat"}[mode]
+                "aliascat": "aliascat", "rootref": "rootref",
+                "typeparam": "typeparam",
+                "concatcursor": "concatcursor"}[mode]
     check(top == want_top, f"meta.top is {want_top}", f"got {top!r}")
 
 
@@ -1498,6 +1504,130 @@ if mode == "unresolved":
         SELECT count(*) FROM v_net_dep
         WHERE src_name='mid' AND tgt_name='gnt'""") == 1,
           "the design around the hole keeps its dataflow")
+
+if mode == "typeparam":
+    # slang folds the two spellings of one type onto a single body, so pass 1
+    # ends up with a group it never gets an analysed body for. The claim
+    # under test is that this costs nothing: all four flops are stamped, each
+    # with its procedure, and the status stays complete.
+    check(one("""
+        SELECT count(*) FROM inst i JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'reg1'""") == 4,
+          "both pairs stamp both flops")
+    check(one("""
+        SELECT count(*) FROM inst i JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'reg1'
+          AND NOT EXISTS (SELECT 1 FROM proc p WHERE p.inst_id = i.id)""") == 0,
+          "and every one of them carries its procedure")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'q' AND driver_name = 'd'
+          AND driver_kind = 'data'""") == 4,
+          "so all four flop outputs have the flop as their driver")
+    check(one("SELECT analysis_status FROM v_db_info") == "complete",
+          "a deduplicated parameterisation does not make the export partial")
+
+
+if mode == "concatcursor":
+    # The cursor walk, in both directions. Every operand of the exact split
+    # takes its own eighth of the source, MSB first; a wrapped cursor would
+    # put one of them at an offset near 2^64 instead, so pinning all four is
+    # what makes the guard's arrival visible if it ever fires wrongly.
+    for name, lo, hi in (("a", 24, 31), ("b", 16, 23), ("c", 8, 15),
+                         ("f", 0, 7)):
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE src_name='d' AND tgt_name=? AND src_lo=? AND src_hi=?
+              AND src_exact=1 AND map_exact=1""", name, lo, hi) == 1,
+              f"the exact split gives {name} bits {hi}:{lo} of d")
+    # And the same concatenation read back, where the positions land on the
+    # target instead.
+    for name, lo, hi in (("a", 24, 31), ("b", 16, 23), ("c", 8, 15),
+                         ("f", 0, 7)):
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE src_name=? AND tgt_name='whole' AND tgt_lo=? AND tgt_hi=?
+              AND tgt_exact=1""", name, lo, hi) == 1,
+              f"and reading it back puts {name} at bits {hi}:{lo} of whole")
+    # No slot anywhere in this file carries a range only an unsigned wrap
+    # could produce. The bound is not a big positive number: a wrapped cursor
+    # lands just below 2^64 and SQLite stores the offsets as signed INTEGER,
+    # so it arrives NEGATIVE -- and the slot it belongs to keeps its own
+    # honest `hi`, leaving lo above hi. Both are what to look for.
+    check(one("""
+        SELECT count(*) FROM net_dep
+        WHERE src_lo < 0 OR src_hi < 0 OR tgt_lo < 0 OR tgt_hi < 0
+           OR src_lo > src_hi OR tgt_lo > tgt_hi""") == 0,
+          "no dependency carries a wrapped bit range")
+
+
+if mode == "rootref":
+    # A $root path is absolute, and the two occurrences of one body that
+    # spell it must land on the SAME object. A downward replay would have
+    # answered r0's own subtree for r0 and r1's for r1; there is nothing
+    # below either, so the give-away is that both rows resolve at all and
+    # resolve alike.
+    check(one("""
+        SELECT count(DISTINCT h.resolved_net_id) FROM hier_ref h
+        WHERE h.path='$root.rootref.u_leaf.q' AND h.access='read'""") == 1,
+          "one absolute path resolves to one net from every occurrence")
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='$root.rootref.u_leaf.q'
+          AND t.name='u_leaf' AND n.name='q'""") == 3,
+          "and it names u_leaf.q -- the write and both reads")
+    # The shortest absolute path there is: one tree segment, straight to a
+    # net of the root instance.
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='$root.rootref.own' AND t.name='rootref'
+          AND n.name='own'""") == 2,
+          "a one-segment absolute path resolves to the root's own net")
+    # The upward spelling of the same net stays unresolved: one analysed
+    # body cannot answer for surroundings it does not know.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path='rootref.u_leaf.q'
+          AND (resolved_inst_id IS NOT NULL OR resolved_net_id IS NOT NULL)
+        """) == 0,
+          "an upward path to the same net stays unresolved")
+    # What the resolution is for: the write becomes a driver instead of a
+    # dependency that could not be materialised, and the read becomes a load.
+    check(one("""
+        SELECT count(*) FROM v_driver v
+        JOIN tree_node t ON t.id = v.signal_inst_id
+        WHERE t.name='u_leaf' AND v.signal_name='q'
+          AND v.driver_name='d' AND v.driver_kind='data'""") == 1,
+          "the absolute write drives the far net")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='own' AND load_name='shallow_o'
+          AND load_kind='dataflow'""") == 2,
+          "and the absolute read loads the root's net, once per occurrence")
+    # The case that separates absolute from downward. rootref_below sits
+    # BELOW the path it spells, so the path does split below the one analysed
+    # body -- and a downward replay would answer each occurrence's own leaf.
+    # Both rows must name u_below_a's; the local `deep.q` beside them, which
+    # does follow the occurrence, is the control.
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN tree_node p ON p.id = d.parent_node_id
+        WHERE h.path='$root.rootref.u_below_a.deep.q'
+          AND d.name='deep' AND p.name='u_below_a'""") == 2,
+          "a $root path below the analysed body still names one leaf, "
+          "from both occurrences")
+    check(one("""
+        SELECT count(DISTINCT p.name) FROM hier_ref h
+        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN tree_node p ON p.id = d.parent_node_id
+        WHERE h.path='deep.q'""") == 2,
+          "while the local path beside it follows the occurrence")
+
 
 if mode == "xmr":
     # A downward read is a real dependency naming the reference it went
