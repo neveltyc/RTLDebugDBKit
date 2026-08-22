@@ -190,7 +190,52 @@ namespace designdb {
 /// consumer follows only one call's rows at each hop and keeps each call's
 /// real combination. Additive: the column is nullable and the table new, so
 /// a reader that ignores both is unaffected.
-inline constexpr int SchemaVersion = 13;
+///
+/// v14 is a correctness batch, and it moves the version because correcting a
+/// value is a contract change to anyone who read the old one. A branch-
+/// condition audit of the extractor found 26 defects; what follows is what a
+/// v13 consumer can no longer assume.
+///
+/// `driver_kind` keeps its vocabulary but loses a NULL rule: `primitive` and
+/// `procedure` may now name no driver net. v_driver's ELSE was claiming
+/// `constant` for any source-less row, against its own contract ("kind carried
+/// through; a DATA row with no source is 'constant'"), so a `pullup` -- which
+/// has no input terminal -- read as a tie-off and inflated every
+/// multiple-driver count with a conflict that was not one.
+///
+/// `attachment_kind` gains `alias_binding`, for the reason `release_target`
+/// exists: the storage is a stmt_target row and the statement writes nothing.
+/// v_driver already excluded an alias by kind, so the two views answered "who
+/// writes this net" differently, and v_net_attachment named nets no assignment
+/// in the design touches.
+///
+/// `conn_kind` stops saying `unconnected` about a pin the parent wired. A
+/// black box's connections arrive as AssertionExpr because the construct may
+/// be a sequence; only the simple kind was unwrapped, so `.p(a ##1 b)`
+/// recorded absence. Its leaves are `expression_operand` rows now.
+///
+/// Values that were simply wrong, and change: `col` was 0 on every row whose
+/// location came from a macro (208 of veerwolf's 11,087 statements) because
+/// slang's getColumnNumber takes a file location and was handed an expansion;
+/// `stmt.scope_node_id` pointed at the instance for a net initialiser or an
+/// alias inside a generate block, contradicting the `net` row for the same
+/// declaration; `stmt_target.ordinal` was a template index rather than a
+/// position within its statement; `tree_node.name` split an escaped identifier
+/// on the dot inside it; and `map_exact` claimed a one-to-one map across
+/// unequal widths at a port carrying a select, while claiming none at all for
+/// an output argument that was whole-to-whole.
+///
+/// Rows that were missing and now exist -- additive, but they change what a
+/// query returns: the self-read of a compound assignment (`a += b` reads a,
+/// and `d <<= 2` had reported a CONSTANT driver on a signal fed by itself),
+/// the body of a function written with `return`, the conditions of `do while`
+/// and `case matches`, the outside of a MultiPort or unnamed-port connection,
+/// and every outward reference whose path had no dot -- a $unit name, or one
+/// built by a macro -- which had been dropped and read as `constant`.
+///
+/// One export that used to fail now succeeds: two unnamed ports in one module
+/// collided on a synthesized name and aborted on a UNIQUE constraint.
+inline constexpr int SchemaVersion = 14;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
