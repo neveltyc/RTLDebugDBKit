@@ -29,6 +29,7 @@
 # export-real-designs.sh exactly; the fixture list comes from
 # verify-designdb.py --list-modes so it stays named in one place.
 import argparse
+import collections
 import os
 import sqlite3
 import subprocess
@@ -201,9 +202,11 @@ def compare_case(name, old_db, new_db, triage):
             oo, on, samples = diff_sorted(old_rows, new_rows)
             note = ""
             if triage:
-                bo = rows_of(po, t, co_cols, drop_ids=True)
-                bn = rows_of(pn, t, cn_cols, drop_ids=True)
-                note = ("ids renumbered only" if sorted(bo) == sorted(bn)
+                # Multiset equality; sorting would trip over NULLs, which
+                # Python will not order against integers.
+                bo = collections.Counter(rows_of(po, t, co_cols, drop_ids=True))
+                bn = collections.Counter(rows_of(pn, t, cn_cols, drop_ids=True))
+                note = ("ids renumbered only" if bo == bn
                         else "content differs beyond ids")
             diffs.append((t, oo, on, samples, note))
     return diffs

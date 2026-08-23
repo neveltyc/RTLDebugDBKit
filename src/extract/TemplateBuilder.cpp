@@ -274,14 +274,6 @@ int32_t TemplateBuilder::newStmt(Build& b, std::string kind, std::string constru
     b.targetOrdinal = 0;
     b.operandOrdinal = 0;
     b.exprOrdinal = 0;
-    // All three condition vectors, always together: they are indexed in
-    // lockstep by the target loop, so clearing two of them leaves the
-    // third holding an earlier statement's entries and every later
-    // lookup reads the wrong slot -- a control edge attributed to the
-    // wrong signal, or dropped, with nothing in the row to show for it.
-    b.curControlRefs.clear();
-    b.curControlHrefs.clear();
-    b.curControlSrcs.clear();
     return idx;
 }
 
@@ -735,49 +727,15 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
 
     bool reached = false;
 
-    // The walk hands over self-contained nodes; these four handlers are the
-    // receiver's filing logic, unchanged from the callback era, and the
-    // dispatcher below is a shim that reconstructs the old calling shapes --
-    // firstTarget from a target's position in its owning node, the folded
-    // formal Ref from the Bind node's two halves -- so this phase moves the
-    // interface without moving a row. The emission rework consumes the nodes
-    // directly and retires the shim.
+    // The walk hands over self-contained nodes and the receiver files them
+    // directly. An assignment node owns its targets, so the statement row
+    // and its control reads happen once in fileAssignment -- no firstTarget
+    // flag, no Build-wide condition vectors. No input-port filter and no
+    // null-symbol guard on the way in, because neither could fire: slang
+    // builds every driver with DriverFlags::None, and every Ref in a node
+    // came from collectRefs or collectSlots, which never emit a null symbol.
     GateTable gates;
 
-    // ---- one assignment target with its pairs and gating
-    auto onTarget =
-        [&](const Ref& dst, const std::vector<PairedSrc>& pairs,
-            const std::vector<Ref>& gating, SourceRange where, int64_t seq,
-            bool blocking, int64_t dropped, bool inSubroutine,
-            bool firstTarget, const std::string& delay,
-            const char* constructWord) {
-            reached = true;
-            // No input-port filter and no null-symbol guard, because neither
-            // could fire. slang builds every driver in AnalyzedProcedure and
-            // AnalysisManager with DriverFlags::None, so isInputPort() is
-            // false for all of them -- 3,945 procedure drivers across
-            // picorv32, tinyriscv and veerwolf, none of them an input port --
-            // and every Ref reaching this callback came from collectRefs or
-            // collectSlots, which never emit a null symbol. Skipping a first
-            // target here would also have been a trap: the second target of a
-            // concatenated left-hand side would then arrive with
-            // firstTarget=false and a stale curStmt, attaching its rows to the
-            // previous statement.
-            const TplLoc at = locator.locate(where.start(), procAt);
-            emitAssignment(b, dst, pairs, gating, at, seq, blocking,
-                           dropped, inSubroutine, firstTarget, delay,
-                           isContinuous,
-                           constructWord ? constructWord : construct,
-                           evalCtx);
-        };
-    // ---- a call site's actual bound to its formal
-    auto onBinding =
-        [&](const Ref& formal, const Ref& actual, bool reads, bool writes,
-            bool oneToOne, bool bindable, SourceRange where) {
-            reached = true;
-            emitCallBinding(b, formal, actual, reads, writes, oneToOne,
-                            bindable, locator.locate(where.start(), procAt), evalCtx);
-        };
     // ---- a statement-level event control (a wait)
     auto onEvent =
         [&](const Expression* e, const std::string& edge, int64_t seq,
@@ -792,15 +750,15 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                          [&]() { return s; });
         };
     // ---- a statement that reads without writing anything nameable
-    auto onRead =
+    auto fileReadLike =
         [&](const std::vector<Ref>& reads, const std::vector<Ref>& gating,
             const std::vector<Ref>& writes, const std::string& stmtKind,
-            const std::string& construct2, int64_t seq, SourceRange where) {
+            const std::string& construct2, int64_t seq, int64_t dropped,
+            SourceRange where) {
             const TplLoc at = locator.locate(where.start(), procAt);
-            filteredConstants = 0;
             const int32_t s = newStmt(b, stmtKind, construct2,
-                                      std::string(), seq, std::string(), 0,
-                                      at);
+                                      std::string(), seq, std::string(),
+                                      dropped, at);
             const std::string role = stmtKind == "assertion" ? "assertion"
                                      : stmtKind == "wait"    ? "wait"
                                      : stmtKind == "system_task"
@@ -840,25 +798,20 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                 [&](auto&& n) {
                     using T = std::decay_t<decltype(n)>;
                     if constexpr (std::is_same_v<T, AssignmentNode>) {
-                        for (size_t i = 0; i < n.targets.size(); i++) {
-                            auto& t = n.targets[i];
-                            onTarget(t.dst, t.pairs, gates.refs(n.gate),
-                                     n.where, n.seq, n.blocking, n.dropped,
-                                     n.inSubroutine, /*firstTarget=*/i == 0,
-                                     n.delay, n.constructWord);
-                        }
+                        reached = true;
+                        fileAssignment(b, n.targets, gates.refs(n.gate),
+                                       locator.locate(n.where.start(), procAt),
+                                       n.seq, n.blocking, n.dropped,
+                                       n.inSubroutine, n.delay, isContinuous,
+                                       n.constructWord ? n.constructWord
+                                                       : construct,
+                                       evalCtx);
                     }
                     else if constexpr (std::is_same_v<T, BindNode>) {
-                        // The folded Ref of the callback era: the formal's
-                        // symbol wearing the actual's expression, bound
-                        // whole and exact.
-                        Ref formal;
-                        formal.sym = n.formal;
-                        formal.origin = n.actualOrigin;
-                        formal.cover = BitInterval::whole();
-                        formal.exact = true;
-                        onBinding(formal, n.actual, n.reads, n.writes,
-                                  n.oneToOne, n.bindable, n.where);
+                        reached = true;
+                        fileBinding(b, n,
+                                    locator.locate(n.where.start(), procAt),
+                                    evalCtx);
                     }
                     else if constexpr (std::is_same_v<T, EventNode>) {
                         onEvent(n.expr, n.edge, n.seq, n.where);
@@ -868,17 +821,19 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                             n.kind == ReadNode::Kind::Assertion ? "assertion"
                             : n.kind == ReadNode::Kind::Wait    ? "wait"
                                                                 : "call";
-                        onRead(n.reads, gates.refs(n.gate), {}, kind,
-                               n.construct, n.seq, n.where);
+                        fileReadLike(n.reads, gates.refs(n.gate), {}, kind,
+                                     n.construct, n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, SystemTaskNode>) {
-                        onRead(n.reads, gates.refs(n.gate), n.writes,
-                               "system_task", n.construct, n.seq, n.where);
+                        fileReadLike(n.reads, gates.refs(n.gate), n.writes,
+                                     "system_task", n.construct, n.seq,
+                                     n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReleaseNode>) {
-                        onRead({}, gates.refs(n.gate), n.lvalues, "release",
-                               n.isRelease ? "release" : "deassign", n.seq,
-                               n.where);
+                        fileReadLike({}, gates.refs(n.gate), n.lvalues,
+                                     "release",
+                                     n.isRelease ? "release" : "deassign",
+                                     n.seq, n.dropped, n.where);
                     }
                 },
                 std::move(node));
@@ -1056,43 +1011,47 @@ void TemplateBuilder::addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
 
     /// One target of one assignment statement, with its statement row on the
     /// first target, its operand rows, and the dependencies that pair them.
-void TemplateBuilder::emitAssignment(Build& b, const Ref& dst,
-                                     const std::vector<PairedSrc>& pairs,
-                                     const std::vector<Ref>& gating, const TplLoc& at,
+void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& targets,
+                                     const std::vector<Ref>& gate, const TplLoc& at,
                                      int64_t seq, bool blocking, int64_t dropped,
-                                     bool inSubroutine, bool firstTarget,
-                                     const std::string& delay, bool isContinuous,
-                                     const std::string& construct, EvalContext& evalCtx) {
-    int32_t stmt = b.curStmt;
-    if (firstTarget) {
-        const bool continuous = isContinuous && !inSubroutine;
-        stmt = newStmt(b, "assignment", construct,
-                       continuous ? "continuous"
-                                  : (blocking ? "blocking" : "nonblocking"),
-                       seq, delay, dropped, at);
-        // The control reads gate every target of the statement; recorded
-        // once, reused by each target's control dependencies. An outward
-        // condition is a hier_ref; its dependency onto each target is
-        // paired here and materialised when the reference resolves.
-        for (auto& g : gating) {
-            if (!g.sym)
-                continue;
-            const int32_t netIdx = b.decl->netFor(*g.sym);
-            if (netIdx < 0) {
-                b.curControlRefs.push_back(-1);
-                b.curControlHrefs.push_back(
-                    addHierRef(b, false, g, at, evalCtx));
-            }
-            else {
-                b.curControlRefs.push_back(
-                    addExprRef(b, stmt, g, "control", netIdx));
-                b.curControlHrefs.push_back(-1);
-            }
-            b.curControlSrcs.push_back(g);
-        }
-    }
-    if (stmt < 0)
+                                     bool inSubroutine, const std::string& delay,
+                                     bool isContinuous, const std::string& construct,
+                                     EvalContext& evalCtx) {
+    if (targets.empty())
         return;
+    const bool continuous = isContinuous && !inSubroutine;
+    const int32_t stmt = newStmt(b, "assignment", construct,
+                                 continuous ? "continuous"
+                                            : (blocking ? "blocking" : "nonblocking"),
+                                 seq, delay, dropped, at);
+    // The control reads gate every target of the statement; recorded once,
+    // reused by each target's control dependencies. An outward condition is
+    // a hier_ref; its dependency onto each target is paired here and
+    // materialised when the reference resolves. One record per condition --
+    // the three Build-wide vectors this replaces were indexed in lockstep
+    // by a per-target callback and cleared as a trio in newStmt.
+    struct ControlRec {
+        int32_t exprRef = -1;
+        int32_t href = -1;
+        Ref src;
+    };
+    std::vector<ControlRec> controls;
+    for (auto& g : gate) {
+        if (!g.sym)
+            continue;
+        ControlRec c;
+        c.src = g;
+        const int32_t netIdx = b.decl->netFor(*g.sym);
+        if (netIdx < 0)
+            c.href = addHierRef(b, false, g, at, evalCtx);
+        else
+            c.exprRef = addExprRef(b, stmt, g, "control", netIdx);
+        controls.push_back(std::move(c));
+    }
+
+    for (auto& rec : targets) {
+    const Ref& dst = rec.dst;
+    const std::vector<PairedSrc>& pairs = rec.pairs;
 
     // The target row, or the outward write.
     int32_t targetIdx = -1;
@@ -1210,13 +1169,11 @@ void TemplateBuilder::emitAssignment(Build& b, const Ref& dst,
     // target through its branch, whichever side of the boundary either
     // end lives on.
     if (haveTarget) {
-        for (size_t i = 0; i < b.curControlSrcs.size(); i++) {
-            auto& src = b.curControlSrcs[i];
-            const int32_t ctrlRef = b.curControlRefs[i];
-            const int32_t ctrlHref = b.curControlHrefs[i];
-            if (ctrlRef < 0 && ctrlHref < 0)
+        for (auto& c : controls) {
+            auto& src = c.src;
+            if (c.exprRef < 0 && c.href < 0)
                 continue;
-            if (ctrlRef >= 0 && targetIdx >= 0) {
+            if (c.exprRef >= 0 && targetIdx >= 0) {
                 const int32_t srcNet = b.decl->netFor(*src.sym);
                 if (srcNet < 0)
                     continue;
@@ -1224,7 +1181,7 @@ void TemplateBuilder::emitAssignment(Build& b, const Ref& dst,
                 d.srcNet = srcNet;
                 d.tgtNet = dstNet;
                 d.stmt = stmt;
-                d.exprRef = ctrlRef;
+                d.exprRef = c.exprRef;
                 d.targetRef = targetIdx;
                 d.kind = "control";
                 d.srcR = rangeOf(src);
@@ -1237,11 +1194,11 @@ void TemplateBuilder::emitAssignment(Build& b, const Ref& dst,
                 TplCrossDep d;
                 d.kind = "control";
                 d.stmt = stmt;
-                d.srcNet = ctrlRef >= 0 ? b.decl->netFor(*src.sym) : -1;
-                d.srcHref = ctrlHref;
+                d.srcNet = c.exprRef >= 0 ? b.decl->netFor(*src.sym) : -1;
+                d.srcHref = c.href;
                 d.tgtNet = dstNet;
                 d.tgtHref = tgtHref;
-                d.exprRef = ctrlRef;
+                d.exprRef = c.exprRef;
                 d.targetRef = targetIdx;
                 d.srcR = rangeOf(src);
                 d.tgtR = rangeOf(dst);
@@ -1251,19 +1208,23 @@ void TemplateBuilder::emitAssignment(Build& b, const Ref& dst,
             }
         }
     }
+    }
 }
 
     /// One call binding: the actual and the formal coupled by argument
     /// direction. The formal is a subroutine-scope net (`bump.v`); the
     /// body's own statements belong to the calling procedure, and are
     /// walked once per call site so each carries its caller's gating.
-void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& actual,
-                                      bool reads, bool writes, bool oneToOne, bool bindable,
-                                      const TplLoc& at, EvalContext& evalCtx) {
-    if (!formal.sym || !actual.sym)
+void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
+                                  EvalContext& evalCtx) {
+    const Ref& actual = n.actual;
+    const bool reads = n.reads;
+    const bool writes = n.writes;
+    const bool oneToOne = n.oneToOne;
+    if (!n.formal || !actual.sym)
         return;
-    const int32_t stmt = bindable ? b.curStmt : -1;
-    const int32_t formalNet = b.decl->netFor(*formal.sym);
+    const int32_t stmt = n.bindable ? b.curStmt : -1;
+    const int32_t formalNet = b.decl->netFor(*n.formal);
     if (formalNet < 0) {
         // The formal is not a net of THIS body, which is what a subroutine
         // declared in a package, an interface or $unit looks like from here.
@@ -1271,11 +1232,11 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
         // usually a perfectly good local net, so a task that plainly writes
         // its argument left that argument with no driver at all.
         //
-        // Only the actual's half is recorded. The formal cannot be: at a call
-        // site it is a symbol, not an expression, and the Ref built for it
-        // borrows the ACTUAL's origin -- so putting it through addHierRef
-        // names it with the actual's text and resolves it against the actual's
-        // target. Both wrong, and quietly so.
+        // Only the actual's half is recorded. The formal cannot be: at a
+        // call site it is a symbol with no expression of its own, so there
+        // is no reference text to file a hier_ref under -- the node carries
+        // the two halves apart precisely so nobody resolves the formal
+        // against the actual's spelling again.
         const int32_t actualIdx = b.decl->netFor(*actual.sym);
         if (actualIdx < 0)
             return;
@@ -1292,14 +1253,12 @@ void TemplateBuilder::emitCallBinding(Build& b, const Ref& formal, const Ref& ac
             // v_driver said nothing did. A package task that plainly writes
             // its output actual read as undriven.
             //
-            // The formal cannot be named as the source: at a call site it is
-            // a symbol rather than an expression, and the Ref built for it
-            // borrows the ACTUAL's origin, so putting it through addHierRef
-            // names it with the actual's text and resolves it against the
-            // actual's target. Both wrong, and quietly so. A NULL source is
-            // the honest answer and the one the vocabulary already has --
-            // `data` is the kind that must not be used here, since a
-            // source-less `data` row is what `constant` means.
+            // The formal cannot be named as the source: at a call site it
+            // is a symbol with no expression of its own, so there is no
+            // reference text to resolve. A NULL source is the honest answer
+            // and the one the vocabulary already has -- `data` is the kind
+            // that must not be used here, since a source-less `data` row is
+            // what `constant` means.
             // A call written inside a CONDITION belongs to no statement this
             // schema records, so there is no stmt_target to hang the write
             // on -- stmt_target.stmt_id is NOT NULL, and rightly, since a
@@ -1446,11 +1405,10 @@ void TemplateBuilder::buildNetInitialisers(Build& b, const InstanceBodySymbol& b
         // each other, and one generate iteration's initialiser could not be
         // told from another's.
         b.curScope = b.decl->scopeForSymbol(net);
-        emitAssignment(b, dstSlot.ref, pairs, {}, at, /*seq=*/-1,
-                       /*blocking=*/false, droppedConstants,
-                       /*inSubroutine=*/false, /*firstTarget=*/true,
-                       std::string(), /*isContinuous=*/true, "assign",
-                       evalCtx);
+        fileAssignment(b, {TargetRecord{dstSlot.ref, std::move(pairs)}}, {},
+                       at, /*seq=*/-1, /*blocking=*/false, droppedConstants,
+                       /*inSubroutine=*/false, std::string(),
+                       /*isContinuous=*/true, "assign", evalCtx);
         b.curStmt = -1;
     });
 }
