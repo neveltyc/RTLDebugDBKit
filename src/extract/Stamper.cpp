@@ -81,6 +81,12 @@ private:
         std::vector<int64_t> ifaceBind; // term index -> bound iface inst id
     };
 
+    /// A template-local index as a database id: base + index + 1, with the
+    /// null index (-1) as SQL's 0-means-NULL. The spelling existed 18 times.
+    static int64_t stampId(int64_t base, int64_t idx) {
+        return idx < 0 ? 0 : base + idx + 1;
+    }
+
     /// One queued cross-instance dependency of one occurrence, written once
     /// the occurrence's references resolve.
     struct CrossJob {
@@ -269,9 +275,9 @@ private:
             CallSiteRow row;
             row.id = base.callSite + int64_t(i) + 1;
             row.instId = instId;
-            row.callerStmtId = cs.callerStmt < 0 ? 0 : base.stmt + cs.callerStmt + 1;
+            row.callerStmtId = stampId(base.stmt, cs.callerStmt);
             row.parentCallSiteId =
-                cs.parentCallSite < 0 ? 0 : base.callSite + cs.parentCallSite + 1;
+                stampId(base.callSite, cs.parentCallSite);
             row.subroutineName = cs.subName;
             row.depth = cs.depth;
             writer.addCallSite(row);
@@ -284,7 +290,7 @@ private:
             row.id = base.stmt + int64_t(i) + 1;
             row.instId = instId;
             row.scopeNodeId = scopeNode[size_t(s.scope)];
-            row.procedureId = s.proc < 0 ? 0 : base.proc + s.proc + 1;
+            row.procedureId = stampId(base.proc, s.proc);
             row.ordinal = int64_t(i);
             row.sequence = s.sequence;
             row.statementKind = s.kind;
@@ -292,7 +298,7 @@ private:
             row.assignmentKind = s.assignKind;
             row.delay = s.delay;
             row.droppedOperandCount = s.dropped;
-            row.callSiteId = s.callSite < 0 ? 0 : base.callSite + s.callSite + 1;
+            row.callSiteId = stampId(base.callSite, s.callSite);
             row.fileId = s.loc.fileId;
             row.line = s.loc.line;
             row.column = s.loc.column;
@@ -339,8 +345,8 @@ private:
             ProcEventRow row;
             row.id = base.procEvent + int64_t(i) + 1;
             row.procedureId = base.proc + e.proc + 1;
-            row.stmtId = e.stmt < 0 ? 0 : base.stmt + e.stmt + 1;
-            row.netId = e.net < 0 ? 0 : base.net + e.net + 1;
+            row.stmtId = stampId(base.stmt, e.stmt);
+            row.netId = stampId(base.net, e.net);
             row.eventKind = e.eventKind;
             row.edgeKind = e.edgeKind;
             row.fileId = e.loc.fileId;
@@ -357,12 +363,12 @@ private:
             }
             NetDepRow row;
             row.id = base.dep + inlineIdx++ + 1;
-            row.sourceNetId = d.src.net < 0 ? 0 : base.net + d.src.net + 1;
+            row.sourceNetId = stampId(base.net, d.src.net);
             row.targetNetId = base.net + d.tgt.net + 1;
-            row.stmtId = d.stmt < 0 ? 0 : base.stmt + d.stmt + 1;
-            row.assignOperandId = d.operandRef < 0 ? 0 : base.operand + d.operandRef + 1;
-            row.stmtTargetId = d.targetRef < 0 ? 0 : base.target + d.targetRef + 1;
-            row.exprRefId = d.exprRef < 0 ? 0 : base.exprRef + d.exprRef + 1;
+            row.stmtId = stampId(base.stmt, d.stmt);
+            row.assignOperandId = stampId(base.operand, d.operandRef);
+            row.stmtTargetId = stampId(base.target, d.targetRef);
+            row.exprRefId = stampId(base.exprRef, d.exprRef);
             row.primitiveId = d.prim < 0 ? 0 : primNode[size_t(d.prim)];
             row.dependencyKind = d.kind;
             row.sourceBits = d.srcR.bits;
@@ -370,7 +376,7 @@ private:
             row.targetBits = d.tgtR.bits;
             row.targetExact = d.tgtR.exact;
             row.mappingExact = d.mappingExact;
-            row.callSiteId = d.callSite < 0 ? 0 : base.callSite + d.callSite + 1;
+            row.callSiteId = stampId(base.callSite, d.callSite);
             writer.addNetDep(row);
         }
         stats.deps += inlineIdx;
@@ -706,7 +712,7 @@ private:
             HierRefRow row;
             row.id = job.rowId;
             row.instId = job.instNode;
-            row.stmtId = ref.stmt < 0 ? 0 : job.base.stmt + ref.stmt + 1;
+            row.stmtId = stampId(job.base.stmt, ref.stmt);
             row.path = ref.path;
             row.access = ref.access;
             row.bits = ref.r.bits;
@@ -808,12 +814,12 @@ private:
                 continue;
             }
             row.id = ++depCounter;
-            row.stmtId = d.stmt < 0 ? 0 : job.base.stmt + d.stmt + 1;
+            row.stmtId = stampId(job.base.stmt, d.stmt);
             row.assignOperandId =
-                d.operandRef < 0 ? 0 : job.base.operand + d.operandRef + 1;
+                stampId(job.base.operand, d.operandRef);
             row.stmtTargetId =
-                d.targetRef < 0 ? 0 : job.base.target + d.targetRef + 1;
-            row.exprRefId = d.exprRef < 0 ? 0 : job.base.exprRef + d.exprRef + 1;
+                stampId(job.base.target, d.targetRef);
+            row.exprRefId = stampId(job.base.exprRef, d.exprRef);
             row.dependencyKind = d.kind;
             row.sourceBits = d.srcR.bits;
             row.sourceExact = d.srcR.exact ? 1 : 0;
@@ -821,7 +827,7 @@ private:
             row.targetExact = d.tgtR.exact;
             row.mappingExact = d.mappingExact;
             row.callSiteId =
-                d.callSite < 0 ? 0 : job.base.callSite + d.callSite + 1;
+                stampId(job.base.callSite, d.callSite);
             writer.addNetDep(row);
             stats.deps++;
         }

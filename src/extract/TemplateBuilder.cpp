@@ -156,15 +156,15 @@ void TemplateBuilder::collectTermSlots(const InstanceBodySymbol& body,
         };
         switch (portSym->kind) {
             case SymbolKind::Port:
-                out.emplace(static_cast<const void*>(portSym),
-                            Template::TermSlot{
+                out.emplace(portSym,
+                            TermSlot{
                                 termIdx, 0,
                                 width(portSym->as<PortSymbol>().getType())});
                 break;
             case SymbolKind::MultiPort: {
                 auto& mp = portSym->as<MultiPortSymbol>();
-                out.emplace(static_cast<const void*>(portSym),
-                            Template::TermSlot{termIdx, 0, width(mp.getType())});
+                out.emplace(portSym,
+                            TermSlot{termIdx, 0, width(mp.getType())});
                 // Members MSB first, as a concatenation is written, so the
                 // cursor counts down to each member's LSB -- the same offsets
                 // buildTermMaps lays the inside out with, and the same ones
@@ -179,8 +179,8 @@ void TemplateBuilder::collectTermSlots(const InstanceBodySymbol& body,
                                            ? member->getType().getBitWidth()
                                            : 0;
                     const auto window = w ? cursor.advance(w) : std::nullopt;
-                    out.emplace(static_cast<const void*>(member),
-                                Template::TermSlot{termIdx,
+                    out.emplace(member,
+                                TermSlot{termIdx,
                                                    window ? window->lo
                                                           : cursor.position(),
                                                    w ? int64_t(w) : -1});
@@ -188,8 +188,8 @@ void TemplateBuilder::collectTermSlots(const InstanceBodySymbol& body,
                 break;
             }
             case SymbolKind::InterfacePort:
-                out.emplace(static_cast<const void*>(portSym),
-                            Template::TermSlot{termIdx, 0, -1});
+                out.emplace(portSym,
+                            TermSlot{termIdx, 0, -1});
                 break;
             default:
                 continue;   // no terminal, so no index consumed
@@ -251,7 +251,7 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
             term.name = "<unnamed>";
         t.terms.push_back(std::move(term));
     }
-    collectTermSlots(body, t.termOf);
+    collectTermSlots(body, termSlots[&t]);
 }
 
 int32_t TemplateBuilder::newStmt(Build& b, std::string kind, std::string construct,
@@ -433,8 +433,8 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     if (hv.ref.isViaIfacePort() && !hv.ref.path.empty()) {
         const Symbol* first = hv.ref.path.front().symbol;
         if (first && first->kind == SymbolKind::InterfacePort) {
-            auto it = b.t->termOf.find(static_cast<const void*>(first));
-            if (it != b.t->termOf.end()) {
+            auto it = b.termOf->find(first);
+            if (it != b.termOf->end()) {
                 auto& ip = first->as<InterfacePortSymbol>();
                 auto [iface, modport] = ip.getConnection();
                 if (iface) {
@@ -552,6 +552,7 @@ void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body)
 
     Build b;
     b.t = &t;
+    b.termOf = &termSlots[&t];
     b.body = &body;
     b.decl = &decl;
 
@@ -589,8 +590,8 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
     for (auto* portSym : body.getPortList()) {
         if (!portSym)
             continue;
-        auto termIt = b.t->termOf.find(static_cast<const void*>(portSym));
-        if (termIt == b.t->termOf.end())
+        auto termIt = b.termOf->find(portSym);
+        if (termIt == b.termOf->end())
             continue;
         const int32_t termIdx = termIt->second.term;
         int64_t ordinal = 0;
