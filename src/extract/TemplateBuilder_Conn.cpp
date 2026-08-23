@@ -40,8 +40,8 @@ void TemplateBuilder::collectConnRefs(const Expression& expr, EvalContext& ctx,
                 cr.windowExact = true;
                 cr.positional =
                     !isExpr && refs.size() == 1 && r.exact &&
-                    (r.whole ? bitWidthOf(*r.sym) == width
-                             : r.hi - r.lo + 1 == width);
+                    (r.cover.isRange() ? r.cover.bounds().width() == width
+                                       : bitWidthOf(*r.sym) == width);
             }
             out.push_back(std::move(cr));
         }
@@ -114,6 +114,11 @@ void TemplateBuilder::collectConnRefs(const Expression& expr, EvalContext& ctx,
                 if (have.insert(s).second) {
                     Ref r;
                     r.sym = s;
+                    // Parity with the pre-BitInterval default: a read found
+                    // without bounds claimed the whole object exactly. The
+                    // claim is unaudited and the emission rework revisits it.
+                    r.cover = BitInterval::whole();
+                    r.exact = true;
                     refs.push_back(r);
                 }
             }

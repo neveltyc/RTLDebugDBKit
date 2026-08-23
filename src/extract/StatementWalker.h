@@ -550,6 +550,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             Ref formal;
             formal.sym = formals[i];
             formal.origin = args[i];
+            // Parity with the pre-BitInterval default: a formal is bound
+            // whole and exact. Genuine here -- a call fills the formal
+            // entirely -- though this Ref's two halves describing two
+            // objects is the trap the Bind node later untangles.
+            formal.cover = BitInterval::whole();
+            formal.exact = true;
             // An output or inout actual is not args[i]: Expression::bindLValue
             // wraps it in an AssignmentExpression whose left is the actual and
             // whose right is an EmptyArgumentExpression. Unwrapped, every such
@@ -573,8 +579,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 const bool oneToOne =
                     actuals.size() == 1 && fw != 0 &&
                     isPlainReference(*actualExpr) && actuals[0].exact &&
-                    (actuals[0].whole ? bitWidthOf(*actuals[0].sym) == fw
-                                      : actuals[0].hi - actuals[0].lo + 1 == fw);
+                    (actuals[0].cover.isRange()
+                         ? actuals[0].cover.bounds().width() == fw
+                         : bitWidthOf(*actuals[0].sym) == fw);
                 emitBinding(formal, a, reads, writes, oneToOne, bindable,
                             expr.sourceRange);
             }
@@ -651,16 +658,19 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         Ref dst;
         dst.sym = curSub->returnValVar;
         dst.origin = stmt.expr;
-        dst.whole = true;
+        // A return writes all of the implicit result variable; whole and
+        // exact is the genuine answer here, not a parity default.
+        dst.cover = BitInterval::whole();
+        dst.exact = true;
         emitAssignmentLike(dst, *stmt.expr, stmt.sourceRange);
         visitDefault(stmt);
     }
 
     /// One assignment-shaped emission with an explicit target, for the places
     /// slang gives no AssignmentExpression to walk. The target is taken whole
-    /// and unpositioned -- `kNoWidth` pairs every operand with all of it and
-    /// makes `narrowed` a no-op -- which is the honest answer for a `return`:
-    /// the expression that produced the value carries between bits.
+    /// and unpositioned -- an unplaced slot pairs every operand with all of it
+    /// and makes `narrowed` a no-op -- which is the honest answer for a
+    /// `return`: the expression that produced the value carries between bits.
     void emitAssignmentLike(const Ref& dst, const Expression& src,
                             SourceRange where) {
         std::vector<Slot> rhsSlots;
@@ -670,14 +680,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         const int64_t dropped = filteredConstants;
         eval.reset();
 
-        const Slot dstSlot{dst, 0, kNoWidth, false};
+        const Slot dstSlot = Slot::unpositioned(dst);
         std::vector<PairedSrc> pairs;
         for (auto& srcSlot : rhsSlots) {
-            uint64_t lo = 0, hi = 0;
-            if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
+            std::optional<BitRange> span;
+            if (!slotsOverlap(dstSlot, srcSlot, span))
                 continue;
-            pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
-                                      narrowed(dstSlot, lo, hi),
+            pairs.push_back(PairedSrc{narrowed(srcSlot, span),
+                                      narrowed(dstSlot, span),
                                       false, srcSlot.ref});
         }
         emitTarget(dst, pairs, gating, where, seq++, /*blocking=*/true,
@@ -723,6 +733,11 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 Ref r;
                 r.sym = &root->as<ValueExpressionBase>().symbol;
                 r.origin = root;
+                // Parity with the pre-BitInterval default: a target recovered
+                // by hand claimed the whole object exactly. The claim is
+                // unaudited and the emission rework revisits it.
+                r.cover = BitInterval::whole();
+                r.exact = true;
                 targets.push_back(r);
             }
             else {
@@ -736,7 +751,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         if (lhsSlots.size() != targets.size()) {
             lhsSlots.clear();
             for (auto& t : targets)
-                lhsSlots.push_back(Slot{t, 0, kNoWidth, false});
+                lhsSlots.push_back(Slot::unpositioned(t));
         }
 
         std::vector<Slot> rhsSlots;
@@ -784,11 +799,11 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 continue;
             std::vector<PairedSrc> pairs;
             for (auto& srcSlot : rhsSlots) {
-                uint64_t lo = 0, hi = 0;
-                if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
+                std::optional<BitRange> span;
+                if (!slotsOverlap(dstSlot, srcSlot, span))
                     continue;
-                pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
-                                          narrowed(dstSlot, lo, hi),
+                pairs.push_back(PairedSrc{narrowed(srcSlot, span),
+                                          narrowed(dstSlot, span),
                                           dstSlot.positional && srcSlot.positional,
                                           srcSlot.ref});
             }
@@ -871,7 +886,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                     else
                         collectCallReads(*op, reads);
                     for (auto& r : reads)
-                        out.push_back(Slot{r, 0, kNoWidth, false});
+                        out.push_back(Slot::unpositioned(r));
                     continue;
                 }
                 cursor -= w;
@@ -893,9 +908,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             collectCallReads(expr, reads);
         for (auto& r : reads) {
             if (width)
-                out.push_back(Slot{r, base, base + width - 1, false});
+                out.push_back(Slot::at(r, BitRange(base, base + width - 1), false));
             else
-                out.push_back(Slot{r, 0, kNoWidth, false});
+                out.push_back(Slot::unpositioned(r));
         }
     }
 };
