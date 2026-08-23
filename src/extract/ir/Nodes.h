@@ -116,7 +116,11 @@ struct EventNode {
 };
 
 /// A statement whose whole effect is to read: an assertion, a wait
-/// condition, a user call's own arguments.
+/// condition, a user call's own arguments. `dropped` counts the operands
+/// filtered as compile-time constants -- the assignment path always counted
+/// its own, while the read path reset the counter and never looked, so a
+/// read-only statement's dropped operands were reported as zero however
+/// many there were.
 struct ReadNode {
     enum class Kind { Assertion, Wait, Call };
     std::vector<Ref> reads;
@@ -124,6 +128,7 @@ struct ReadNode {
     std::string construct;
     GateId gate = 0;
     int64_t seq = 0;
+    int64_t dropped = 0;
     slang::SourceRange where;
 };
 
@@ -135,6 +140,7 @@ struct SystemTaskNode {
     std::string construct;
     GateId gate = 0;
     int64_t seq = 0;
+    int64_t dropped = 0;
     slang::SourceRange where;
 };
 
@@ -144,6 +150,7 @@ struct ReleaseNode {
     bool isRelease = true;
     GateId gate = 0;
     int64_t seq = 0;
+    int64_t dropped = 0;
     slang::SourceRange where;
 };
 

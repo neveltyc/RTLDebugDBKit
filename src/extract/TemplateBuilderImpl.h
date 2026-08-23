@@ -71,6 +71,7 @@
 #include "extract/DeclIndex.h"
 #include "extract/Ref.h"
 #include "extract/SymbolText.h"
+#include "extract/ir/Nodes.h"
 
 using namespace slang;
 using namespace slang::ast;
@@ -126,9 +127,6 @@ private:
         int64_t targetOrdinal = 0; // per-stmt ordinals
         int64_t operandOrdinal = 0;
         int64_t exprOrdinal = 0;
-        std::vector<int32_t> curControlRefs;   // control expr_refs of curStmt
-        std::vector<int32_t> curControlHrefs;  // outward conditions, as hierRefs
-        std::vector<Ref> curControlSrcs;
         /// Next ordinal for a synthesised `$def$n` segment, per scope index.
         /// One counter for anonymous gates and unnamed instantiations alike:
         /// they are siblings in the tree, and one sequence per scope makes
@@ -278,23 +276,23 @@ private:
                       EvalContext& evalCtx,
                       const std::function<int32_t()>& readStmt);
 
-    /// One target of one assignment statement, with its statement row on the
-    /// first target, its operand rows, and the dependencies that pair them.
-    void emitAssignment(Build& b, const Ref& dst,
-                        const std::vector<PairedSrc>& pairs,
-                        const std::vector<Ref>& gating, const TplLoc& at,
+    /// One assignment statement, owning its targets: the statement row, the
+    /// control reads recorded once and reused by every target's control
+    /// dependencies, and per target its row, its operand rows, and the
+    /// dependencies that pair them.
+    void fileAssignment(Build& b, const std::vector<TargetRecord>& targets,
+                        const std::vector<Ref>& gate, const TplLoc& at,
                         int64_t seq, bool blocking, int64_t dropped,
-                        bool inSubroutine, bool firstTarget,
-                        const std::string& delay, bool isContinuous,
-                        const std::string& construct, EvalContext& evalCtx);
+                        bool inSubroutine, const std::string& delay,
+                        bool isContinuous, const std::string& construct,
+                        EvalContext& evalCtx);
 
     /// One call binding: the actual and the formal coupled by argument
     /// direction. The formal is a subroutine-scope net (`bump.v`); the
     /// body's own statements belong to the calling procedure, and are
     /// walked once per call site so each carries its caller's gating.
-    void emitCallBinding(Build& b, const Ref& formal, const Ref& actual,
-                         bool reads, bool writes, bool oneToOne, bool bindable,
-                         const TplLoc& at, EvalContext& evalCtx);
+    void fileBinding(Build& b, const BindNode& n, const TplLoc& at,
+                     EvalContext& evalCtx);
 
     /// `wire w = a & b;` -- the LRM's continuous assignment spelled as a
     /// declaration, through the same slot machinery as `assign`.
