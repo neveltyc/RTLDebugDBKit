@@ -35,6 +35,7 @@
 
 #include "extract/Ref.h"
 #include "extract/SymbolText.h"
+#include "extract/ir/Nodes.h"
 
 namespace designdb::detail {
 
@@ -49,45 +50,18 @@ using namespace slang::ast;
 // the operand and target rows) rather than a stream of independent edges.
 
 struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood> {
-    /// One assignment target with everything that reaches it. `firstTarget`
-    /// opens the statement; the remaining targets of a concatenated left-hand
-    /// side share it.
-    using EmitTarget = std::function<void(
-        const Ref& dst, const std::vector<PairedSrc>& pairs,
-        const std::vector<Ref>& gating, SourceRange where, int64_t seq,
-        bool blocking, int64_t dropped, bool inSubroutine, bool firstTarget,
-        const std::string& delay, const char* constructWord)>;
-    /// A call site's actual bound to its formal, by argument direction.
-    /// `bindable` is false when the call sits in a control expression, which
-    /// belongs to no statement this schema records.
-    using EmitCallBinding = std::function<void(const Ref& formal, const Ref& actual,
-                                               bool reads, bool writes,
-                                               bool oneToOne, bool bindable,
-                                               SourceRange where)>;
-    /// A statement-level event control (a wait, not sensitivity).
-    using EmitEvent = std::function<void(const Expression* expr, const std::string& edge,
-                                         int64_t seq, SourceRange where)>;
-    /// A statement that reads without writing anything nameable: an
-    /// assertion, a wait condition, a call, a system task.
-    ///
-    /// The gating stack comes with it. A condition was only ever recorded
-    /// while building an assignment's control dependencies, so a branch
-    /// holding nothing but `$display` or an assertion dropped its
-    /// condition entirely -- `if (gate) $display(payload);` knew about
-    /// payload and not about gate, in any procedure, implicit sensitivity
-    /// or not. There is no target for a dependency here, but the read is
-    /// real and belongs to the statement it gates.
-    using EmitRead = std::function<void(const std::vector<Ref>& reads,
-                                        const std::vector<Ref>& gating,
-                                        const std::vector<Ref>& writes,
-                                        const std::string& stmtKind,
-                                        const std::string& construct, int64_t seq,
-                                        SourceRange where)>;
+    /// The walk's one output: a stream of self-contained nodes
+    /// (extract/ir/Nodes.h). An assignment arrives owning its targets; a
+    /// read-only statement arrives with its gate, because a branch holding
+    /// nothing but `$display` or an assertion used to drop its condition
+    /// entirely -- `if (gate) $display(payload);` knew about payload and
+    /// not about gate.
+    using EmitNode = std::function<void(Node&&)>;
 
-    EmitTarget emitTarget;
-    EmitCallBinding emitBinding;
-    EmitEvent emitEvent;
-    EmitRead emitRead;
+    EmitNode emit;
+    /// The interned gating contexts, owned by the receiver so it outlives
+    /// the walk and the nodes that reference into it.
+    GateTable& gates;
     EvalContext& eval;
     const TimingControl* sensitivityTiming = nullptr;
     /// The delay control in force for statements below a `#d` timed statement,
@@ -122,33 +96,35 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     std::function<int32_t(const SubroutineSymbol&, int64_t depth, bool bindable)>
         allocCallSite;
 
-    StatementWalker(EmitTarget t, EmitCallBinding b, EmitEvent e, EmitRead r,
-                    EvalContext& eval) :
-        emitTarget(std::move(t)), emitBinding(std::move(b)),
-        emitEvent(std::move(e)), emitRead(std::move(r)), eval(eval) {}
+    StatementWalker(GateTable& gates, EmitNode emit, EvalContext& eval) :
+        emit(std::move(emit)), gates(gates), eval(eval) {}
+
+    /// The gating stack as it stands, interned.
+    GateId gateId() { return gates.intern(gating); }
 
     void handle(const ImmediateAssertionStatement& stmt) {
         std::vector<Ref> reads;
         collectRefs(stmt.cond, eval, reads);
-        emitRead(reads, gating, {}, "assertion",
-                 assertionWord(stmt.assertionKind), seq++,
-                 stmt.sourceRange);
+        emit(ReadNode{std::move(reads), ReadNode::Kind::Assertion,
+                      assertionWord(stmt.assertionKind), gateId(), seq++,
+                      stmt.sourceRange});
         visitDefault(stmt);
     }
 
     void handle(const ConcurrentAssertionStatement& stmt) {
         std::vector<Ref> reads;
         collectStatementRefs(stmt.propertySpec, reads);
-        emitRead(reads, gating, {}, "assertion",
-                 assertionWord(stmt.assertionKind), seq++,
-                 stmt.sourceRange);
+        emit(ReadNode{std::move(reads), ReadNode::Kind::Assertion,
+                      assertionWord(stmt.assertionKind), gateId(), seq++,
+                      stmt.sourceRange});
         visitDefault(stmt);
     }
 
     void handle(const WaitStatement& stmt) {
         std::vector<Ref> reads;
         collectRefs(stmt.cond, eval, reads);
-        emitRead(reads, gating, {}, "wait", "wait", seq++, stmt.sourceRange);
+        emit(ReadNode{std::move(reads), ReadNode::Kind::Wait, "wait", gateId(),
+                      seq++, stmt.sourceRange});
         visitDefault(stmt);
     }
 
@@ -187,7 +163,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                        }),
                         reads.end());
         }
-        const bool sys = call.isSystemCall();
         // A system task that writes an argument -- $readmemh into a memory,
         // $sscanf into a variable, $cast into its destination -- really does
         // drive it, and slang models the write as an assignment inside the
@@ -195,9 +170,15 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // so only the system case needs targets of its own; without them the
         // argument read as undriven and its procedure as one that wrote
         // nothing at all.
-        emitRead(reads, gating, sys ? writeRefs : std::vector<Ref>{},
-                 sys ? "system_task" : "call", callWord(call), seq++,
-                 stmt.sourceRange);
+        if (call.isSystemCall()) {
+            emit(SystemTaskNode{std::move(reads), std::move(writeRefs),
+                                callWord(call), gateId(), seq++,
+                                stmt.sourceRange});
+        }
+        else {
+            emit(ReadNode{std::move(reads), ReadNode::Kind::Call,
+                          callWord(call), gateId(), seq++, stmt.sourceRange});
+        }
         visitDefault(stmt);
     }
 
@@ -248,14 +229,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             std::vector<const Expression*> iffs;
             collectEdgeEvents(&stmt.timing, raw, &iffs);
             for (auto& [expr, edge] : raw)
-                emitEvent(expr, edge, seq++, stmt.sourceRange);
+                emit(EventNode{expr, edge, seq++, stmt.sourceRange});
             if (!iffs.empty()) {
                 std::vector<Ref> reads;
                 for (auto* c : iffs)
                     collectRefs(*c, eval, reads);
                 if (!reads.empty())
-                    emitRead(reads, gating, {}, "wait", "wait", seq++,
-                             stmt.sourceRange);
+                    emit(ReadNode{std::move(reads), ReadNode::Kind::Wait,
+                                  "wait", gateId(), seq++, stmt.sourceRange});
             }
         }
         const std::string d = delayText(&stmt.timing);
@@ -470,10 +451,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             if (loopVars.count(dst.sym))
                 continue;
             // Reads and writes the same bits of the same object -- as
-            // positional as a mapping gets.
-            emitTarget(dst, {PairedSrc{dst, dst, true, dst}}, gating, expr.sourceRange,
-                       seq++, true, 0, subDepth > 0, /*firstTarget=*/true,
-                       pendingDelay, constructOverride);
+            // positional as a mapping gets. Each target is its own
+            // statement, as it always was here.
+            emit(AssignmentNode{{TargetRecord{dst, {PairedSrc{dst, dst, true, dst}}}},
+                                gateId(), expr.sourceRange, seq++,
+                                /*blocking=*/true, 0, subDepth > 0,
+                                pendingDelay, constructOverride});
         }
         visitDefault(expr);
     }
@@ -547,15 +530,10 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             const bool reads = dir == ArgumentDirection::In ||
                                dir == ArgumentDirection::InOut ||
                                dir == ArgumentDirection::Ref;
-            Ref formal;
-            formal.sym = formals[i];
-            formal.origin = args[i];
-            // Parity with the pre-BitInterval default: a formal is bound
-            // whole and exact. Genuine here -- a call fills the formal
-            // entirely -- though this Ref's two halves describing two
-            // objects is the trap the Bind node later untangles.
-            formal.cover = BitInterval::whole();
-            formal.exact = true;
+            // The formal and the actual travel as their own fields now; the
+            // old interface folded them into one Ref whose sym was the
+            // formal and whose origin was the actual's expression -- the
+            // trap two receiver comments document.
             // An output or inout actual is not args[i]: Expression::bindLValue
             // wraps it in an AssignmentExpression whose left is the actual and
             // whose right is an EmptyArgumentExpression. Unwrapped, every such
@@ -575,13 +553,13 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 // Whole-to-whole only when the actual IS a reference filling
                 // the formal -- the same leaf rule every positional claim
                 // answers to.
-                const uint64_t fw = formal.sym ? bitWidthOf(*formal.sym) : 0;
+                const uint64_t fw = bitWidthOf(*formals[i]);
                 const bool oneToOne =
                     actuals.size() == 1 && isPlainReference(*actualExpr) &&
                     coverFillsWidth(actuals[0].cover, actuals[0].exact, fw,
                                     bitWidthOf(*actuals[0].sym));
-                emitBinding(formal, a, reads, writes, oneToOne, bindable,
-                            expr.sourceRange);
+                emit(BindNode{formals[i], args[i], a, reads, writes, oneToOne,
+                              bindable, expr.sourceRange});
             }
         }
     }
@@ -612,8 +590,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // the `i` in `release mem[i]`.
         std::vector<Ref> writes;
         collectRefs(s.lvalue, eval, writes, /*skipSelectors=*/true);
-        emitRead({}, gating, writes, "release",
-                 s.isRelease ? "release" : "deassign", seq++, s.sourceRange);
+        emit(ReleaseNode{std::move(writes), s.isRelease, gateId(), seq++,
+                         s.sourceRange});
         visitDefault(s);
     }
 
@@ -688,9 +666,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                       narrowed(dstSlot, span),
                                       false, srcSlot.ref});
         }
-        emitTarget(dst, pairs, gating, where, seq++, /*blocking=*/true,
-                   dropped, subDepth > 0, /*firstTarget=*/true, pendingDelay,
-                   constructOverride);
+        emit(AssignmentNode{{TargetRecord{dst, std::move(pairs)}}, gateId(),
+                            where, seq++, /*blocking=*/true, dropped,
+                            subDepth > 0, pendingDelay, constructOverride});
     }
 
     void handle(const AssignmentExpression& expr) {
@@ -791,7 +769,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
 
         const int64_t stmtSeq = seq++;
-        bool firstTarget = true;
+        std::vector<TargetRecord> records;
         for (auto& dstSlot : lhsSlots) {
             if (loopVars.count(dstSlot.ref.sym))
                 continue;
@@ -805,10 +783,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                           dstSlot.positional && srcSlot.positional,
                                           srcSlot.ref});
             }
-            emitTarget(dstSlot.ref, pairs, gating, expr.sourceRange, stmtSeq,
-                       expr.isBlocking(), droppedConstants, subDepth > 0,
-                       firstTarget, delay, constructOverride);
-            firstTarget = false;
+            records.push_back(TargetRecord{dstSlot.ref, std::move(pairs)});
+        }
+        // One node owning every target of the statement -- what the old
+        // firstTarget flag reconstructed. No targets, no statement.
+        if (!records.empty()) {
+            emit(AssignmentNode{std::move(records), gateId(), expr.sourceRange,
+                                stmtSeq, expr.isBlocking(), droppedConstants,
+                                subDepth > 0, delay, constructOverride});
         }
 
         visitDefault(expr);
