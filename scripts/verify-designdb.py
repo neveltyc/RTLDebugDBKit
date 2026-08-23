@@ -1893,6 +1893,25 @@ if mode == "procedural":
         WHERE dep_kind='procedure' AND tgt_name='scratch'
           AND map_exact=1""") == 1,
           "a whole-to-whole output argument maps one-to-one")
+    # And an output argument whose actual is NOT the formal's type, which is
+    # the one that arrives wrapped in a Conversion. Both actuals are driven
+    # by the same task through the same formal, so both must show exactly
+    # one driver and it must be the procedure binding. `nib` showed two: the
+    # binding, plus a source-less row that v_driver renders as a constant
+    # tie-off, because the copy-back was recognised by expression kind and
+    # only the bare form has that kind.
+    for actual, exact in (("scratch", 1), ("nib", 0)):
+        kinds = sorted(r[0] for r in con.execute("""
+            SELECT driver_kind FROM v_driver d JOIN net n ON n.id = d.signal_net_id
+            WHERE n.name = ?""", (actual,)))
+        check(kinds == ["procedure"],
+              f"the task is {actual}'s only driver, and it is the binding",
+              f"got {kinds}")
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE dep_kind='procedure' AND tgt_name=? AND src_name='pass.o'
+              AND map_exact=?""", actual, exact) == 1,
+              f"{actual} binds the formal with map_exact={exact}")
 
 
 if mode == "structural":
