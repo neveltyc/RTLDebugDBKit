@@ -174,6 +174,9 @@ scripts/                build-release.sh (the four release platforms),
                         local checkout of the public designs),
                         check-reproducible.py (export one design twice, fail if
                         any row differs),
+                        diff-designdb.py (export one corpus with two binaries,
+                        fail on any row diff not declared expected -- the
+                        migration gate for internal refactors),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 
