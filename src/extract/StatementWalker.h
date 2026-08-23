@@ -577,11 +577,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 // answers to.
                 const uint64_t fw = formal.sym ? bitWidthOf(*formal.sym) : 0;
                 const bool oneToOne =
-                    actuals.size() == 1 && fw != 0 &&
-                    isPlainReference(*actualExpr) && actuals[0].exact &&
-                    (actuals[0].cover.isRange()
-                         ? actuals[0].cover.bounds().width() == fw
-                         : bitWidthOf(*actuals[0].sym) == fw);
+                    actuals.size() == 1 && isPlainReference(*actualExpr) &&
+                    coverFillsWidth(actuals[0].cover, actuals[0].exact, fw,
+                                    bitWidthOf(*actuals[0].sym));
                 emitBinding(formal, a, reads, writes, oneToOne, bindable,
                             expr.sourceRange);
             }
@@ -850,48 +848,30 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// The reads that ride an element without occupying its bits -- a call's
     /// free reads on the right, a selector's index reads on the left -- each
     /// pinned to the WINDOW of the element they ride, never positional.
+    ///
+    /// The element loop and its two corner rules are ir/PositionWalk.h's,
+    /// shared with collectSlots. The recovery here: from the overflow on,
+    /// each element's reads ride unpositioned -- imprecise exactly where the
+    /// wrap would have been wrong.
     void collectAuxSlots(const Expression& expr, uint64_t base,
                          std::vector<Slot>& out, bool selectors) {
         const uint64_t width = exprWidthOf(expr);
-        const bool elementwise =
-            expr.kind == ExpressionKind::Concatenation ||
-            expr.kind == ExpressionKind::SimpleAssignmentPattern;
-        if (elementwise && width) {
-            auto ops = expr.kind == ExpressionKind::Concatenation
-                           ? expr.as<ConcatenationExpression>().operands()
-                           : expr.as<SimpleAssignmentPatternExpression>().elements();
-            uint64_t cursor = base + width;
-            bool bad = false;
-            for (auto* op : ops) {
-                if (!op)
-                    continue;
-                const uint64_t w = exprWidthOf(*op);
-                // Skipped for the reason Ref.h's collectSlots skips it: an
-                // operand of no width occupies no bits, so it moves no
-                // cursor, the elements after it keep their positions, and
-                // reading into it would record what the concatenation does
-                // not read.
-                if (!bad && w == 0)
-                    continue;
-                // The stop Ref.h takes as well: more width than the
-                // concatenation has left means `cursor -= w` wraps. From here
-                // on the elements ride the whole expression instead, which is
-                // imprecise where the wrap would be wrong.
-                if (!bad && w > cursor - base)
-                    bad = true;
-                if (bad) {
+        if (isElementwise(expr) && width) {
+            walkElements(
+                expr, base, width, exprWidthOf,
+                [&](const Expression& op, BitRange window) {
+                    collectAuxSlots(op, window.lo, out, selectors);
+                },
+                []() {},
+                [&](const Expression& op) {
                     std::vector<Ref> reads;
                     if (selectors)
-                        collectLeftSelectorRefs(*op, reads);
+                        collectLeftSelectorRefs(op, reads);
                     else
-                        collectCallReads(*op, reads);
+                        collectCallReads(op, reads);
                     for (auto& r : reads)
                         out.push_back(Slot::unpositioned(r));
-                    continue;
-                }
-                cursor -= w;
-                collectAuxSlots(*op, cursor, out, selectors);
-            }
+                });
             return;
         }
         if (expr.kind == ExpressionKind::Conversion) {
