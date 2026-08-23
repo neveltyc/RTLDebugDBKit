@@ -1,9 +1,16 @@
 name: CI
 
+# `push` is limited to main so a branch with an open pull request is not built
+# twice for one commit; work in progress is covered by the `pull_request` event.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+
+# One run per ref. A second push supersedes the first rather than racing it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -11,6 +18,11 @@ jobs:
     # bundled amalgamation builds a sqlite3.c of our own and the system one
     # builds no C at all, so a C-language defect in the project() call is
     # invisible to whichever half is not run.
+    #
+    # Only the bundled half runs the fixtures. The two configurations link
+    # different SQLite libraries against one writer and one schema, so the rows
+    # they produce are the same rows; the system half proves it builds and
+    # exports, and the sweep below would be the same assertions twice.
     name: build (${{ matrix.sqlite }} sqlite)
     runs-on: ubuntu-latest
     strategy:
@@ -19,14 +31,21 @@ jobs:
         include:
           - sqlite: bundled
             cmake_flags: ""
+            fixtures: true
           - sqlite: system
             cmake_flags: "-DDESIGNDB_SYSTEM_SQLITE=ON"
+            fixtures: false
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
     steps:
       - uses: actions/checkout@v4
+
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsqlite3-dev
+          sudo apt-get install -y ninja-build libsqlite3-dev ccache
+
       # slang is a large dependency and the pin is exact, so the key is the
       # CMakeLists that carries it: the cache is reused until the pin moves.
       - name: Cache CPM sources
@@ -35,31 +54,50 @@ jobs:
           path: ~/.cache/CPM
           key: cpm-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-
+
+      # The CPM cache holds slang's SOURCE; this holds its OBJECTS, which is
+      # where the time goes. A push that changes only the harness recompiles
+      # nothing of the dependency. Keyed per run so the cache is always
+      # written, restored from the newest prefix match.
+      - name: Cache ccache objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ matrix.sqlite }}-${{ github.run_id }}
+          restore-keys: ccache-${{ runner.os }}-${{ matrix.sqlite }}-
+
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCPM_SOURCE_CACHE=~/.cache/CPM
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           ${{ matrix.cmake_flags }}
+
       - name: Build
-        run: cmake --build build -j"$(nproc)"
+        run: |
+          cmake --build build -j"$(nproc)"
+          ccache --show-stats
+
       # A build that links proves the pin resolves; it does not prove the
-      # exporter still writes a database. Export and read back: the basic
-      # example for the hollow check, and the constructs family for the
-      # facts the schema contracts -- self-feedback, primitives, UDPs and
-      # switches, port bit windows, waits and delays, interface bindings,
-      # cross-instance dataflow through resolved hierarchical references,
-      # per-call-site task expansion, level-sensitive events, design
-      # boundary endpoints, generate arrays, non-ANSI ports, a deliberate
-      # black box, instantiations with no instance name, and a hierarchy
-      # that instantiates itself -- illegal RTL that must still export, and
-      # exit, rather than run off the stack. No --top on the constructs
-      # family, so meta.top's slang-elected spelling is what gets asserted.
-      - name: Export and read back
+      # exporter still writes a database. The system-sqlite half stops here.
+      - name: Smoke export
+        if: ${{ !matrix.fixtures }}
         run: |
           ./build/rtl-designdb examples/basic/top.sv --top top -o design.db
           python3 scripts/verify-designdb.py design.db
-          for mode in constructs interfaces assertions hierarchy udp unresolved anonymous xmr alias external package callsite recursion paramfold portshape compound macroloc stmtgaps patterncase outward naming aliascat rootref typeparam concatcursor paramrec; do
+
+      # Export and read back: the basic example for the hollow check, then one
+      # fixture per construct family. The mode list comes from the verifier, so
+      # adding a fixture does not mean editing this loop. No --top for the
+      # family, so meta.top's slang-elected spelling is what gets asserted.
+      - name: Export and read back
+        if: matrix.fixtures
+        run: |
+          ./build/rtl-designdb examples/basic/top.sv --top top -o design.db
+          python3 scripts/verify-designdb.py design.db
+          for mode in $(python3 scripts/verify-designdb.py --list-modes); do
             ./build/rtl-designdb "examples/constructs/$mode.sv" -o "$mode.db"
             python3 scripts/verify-designdb.py "$mode.db" "$mode"
           done
@@ -71,33 +109,33 @@ jobs:
           (cd examples/options && ../../build/rtl-designdb -f opts.f --single-unit \
              +incdir+. +define+EXTRA_WIDTH=4 -o "$GITHUB_WORKSPACE/options.db")
           python3 scripts/verify-designdb.py options.db
-          # Five files listed in reverse alphabetical order -- the one example
-          # with enough entries to reach slang's threaded source loader, which
-          # is where src_file id order stops being deterministic on its own.
           (cd examples/reorder && ../../build/rtl-designdb -f reorder.f \
              -o "$GITHUB_WORKSPACE/reorder.db")
           python3 scripts/verify-designdb.py reorder.db
 
+      # What keeps the fixture set driven by the schema rather than by
+      # whichever constructs happened to break once: every value the schema
+      # publishes -- the enum domains and the four view vocabularies -- must
+      # be produced by some database above. A value with no fixture is a
+      # branch a consumer may write and nothing exercises; a value no input
+      # can reach does not belong in the domain at all.
+      - name: Published values have fixtures
+        if: matrix.fixtures
+        run: python3 scripts/verify-designdb.py --domain-coverage ./*.db
+
       # Two exports of one unchanged design, diffed row by row across every
-      # table. `src_file` ids used to follow slang's buffer order, which is
-      # the order a thread pool finished reading files in, so two exports of
-      # tinyriscv disagreed on 44 of 15,773 rows while holding the same
-      # design -- and a whole-database diff could not tell "the source
-      # changed" from "the exporter ran again".
-      #
-      # It does not know what it is looking for, which is the point -- but the
-      # races it looks for need slang's THREADED source loader, and that
-      # starts at four filelist entries (SourceLoader::MinFilesForThreading).
-      # examples/constructs is one file and examples/options is two, so both
-      # read serially and came out in the same order every time; a revert of
-      # the path sort left them green. examples/reorder exists for this: five
-      # files in reverse alphabetical order, which fails 9 runs in 10 against
-      # a binary that interns in buffer order.
+      # table. It does not know what it is looking for, which is the point --
+      # but the races it looks for need slang's THREADED source loader, and
+      # that starts at four filelist entries. examples/constructs is one file
+      # and examples/options two, so both read serially; examples/reorder is
+      # five in reverse alphabetical order and exists for this. Its filelist
+      # carries the reasoning.
       #
       # The deterministic half is in verify-designdb.py above -- src_file ids
       # must ascend with path -- and options and reorder both fail it outright
       # when the ids follow the buffers.
       - name: Reproducible export
+        if: matrix.fixtures
         run: |
           python3 scripts/check-reproducible.py ./build/rtl-designdb \
             examples/constructs/constructs.sv

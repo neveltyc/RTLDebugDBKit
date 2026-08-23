@@ -1,13 +1,11 @@
-// Dataflow that crosses an instance boundary by NAME rather than by port.
-// The occurrence model can resolve these to the real object, so they must
-// become real dependencies -- a hierarchical write that produced only a
-// hier_ref row left the target reading as constant-driven, which is a wrong
+// LRM 23.8 -- dataflow that crosses an instance boundary by NAME rather than
+// by port. The occurrence model resolves these to the real object, so they
+// must become real dependencies: a hierarchical write that produces only a
+// hier_ref row leaves the target reading as constant-driven, which is a wrong
 // answer rather than a missing one.
 //
-// Also here: a task called from two places under different conditions, and
-// a signal that appears only in a sensitivity list.
-//
-// Passes scripts/check-rtl.sh (Verilator and Icarus both).
+// Also here: a task called from two places under different conditions, and a
+// signal that appears only in a sensitivity list.
 
 module leaf;
     logic x;
@@ -46,9 +44,9 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
 
     // TWO statements gated by DOWNWARD conditions, in one procedure. The
     // second is the case that matters: the per-statement condition vectors
-    // are indexed in lockstep, so a stale entry here attributes gate2's
-    // edge to gate1's signal, or drops it -- silently, and consistently
-    // enough to look like a fact.
+    // are indexed in lockstep, so a stale entry here attributes the second
+    // statement's gating to the first's signal, or drops it -- silently, and
+    // consistently enough to look like a fact.
     logic [1:0] gated;
     always_ff @(posedge clk) begin
         if (u.en)  gated[0] <= a;
@@ -71,9 +69,9 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     always @(sens_only)
         tick <= ~tick;
 
-    // A condition gating statements that write nothing this instance
-    // names. There is no dependency to hang it on, so it used to vanish
-    // entirely -- in any procedure, implicit sensitivity or not.
+    // A condition gating statements that write nothing this instance names.
+    // There is no dependency to hang it on, so without a reference of its own
+    // it vanishes entirely -- in any procedure, implicit sensitivity or not.
     always @* begin
         if (quiet_gate)
             $display("%0b", d[0]);
@@ -101,10 +99,10 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     initial $readmemh("nonexistent.hex", loaded_mem);
 
     // The same write, but the memory lives in another instance -- and a
-    // constant driving an outward target. Both had a source of a kind the
-    // schema cannot name AND a target it could only reach by reference, so
-    // both used to record the reference and no driver at all: a trace back
-    // from the far net said nothing ever wrote it.
+    // constant driving an outward target. Both have a source of a kind the
+    // schema cannot name AND a target it can only reach by reference, so
+    // recording the reference alone leaves no driver: a trace back from the
+    // far net says nothing ever wrote it.
     initial $readmemh("nonexistent.hex", u.far_mem);
     assign u.tied = 8'h5A;
     assign far_o = u.far_mem[0][0] ^ u.tied[0];
@@ -112,14 +110,14 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     // A port connection tied to something with no name in this instance,
     // beside a constant that tiles the rest of the formal. The tie resolves
     // downward, so it crosses as a real arc rather than stopping at the
-    // hier_ref row -- the path that had no coverage at all until this.
+    // hier_ref row.
     logic [7:0] ext_seen;
     sink u_sink (.p({u.g[7:4], 4'h0}), .seen(ext_seen));
 
     // The same tie on an OUTPUT formal, which is the mirror image: the
     // crossing runs the other way, so the end written hierarchically is the
     // one being driven rather than the one driving. Its spelling therefore
-    // rides the LOAD side of the arc, and nothing in this design exercised
-    // that branch before.
+    // rides the LOAD side of the arc -- the branch a design with ties in only
+    // one direction never reaches.
     sink u_sink2 (.p(8'h00), .seen(u.split));
 endmodule

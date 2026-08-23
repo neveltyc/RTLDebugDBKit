@@ -3,46 +3,41 @@
 //
 // check-rtl: expect-fail icarus -- no output arguments on a function
 //
-// References that leave the instance and had no path to be stored under.
+// References that leave the instance and have no dotted path to be stored
+// under. A reference with no hier_ref row leaves a net_dep with a null source
+// AND a null reference -- exactly the shape v_driver classifies as a CONSTANT,
+// so the database would claim a signal fed from outside is tied off, and the
+// gating would go with it.
 //
-// A reference only got a hier_ref row if its recovered text contained a '.'
-// or a '::'. Two shapes fail that and were dropped entirely -- and a dropped
-// reference leaves a net_dep with a null source AND a null reference, which is
-// exactly the shape v_driver classifies as a CONSTANT. The database said a
-// signal fed from outside was tied off, and the gating went with it.
+// Three shapes, three causes:
 //
-//   * a $unit-scope object, whose name is bare;
+//   * a $unit-scope object, whose name is bare -- no '.' and no '::' to
+//     recognise it by;
 //   * a name built partly by a macro. canonicalPath has no case for a
-//     hierarchical value, so every cross-module reference falls back to
-//     slicing the source buffer -- which returns nothing when the reference's
-//     ends sit in different buffers. `\`TOPNAME.glob` was dropped where
-//     `outward_tb.glob` was recorded, for the same reference.
+//     hierarchical value, so a cross-module reference falls back to slicing
+//     the source buffer, which returns nothing when the reference's ends sit
+//     in different buffers. `\`TOPNAME.glob` and `outward_tb.glob` are the
+//     same reference and only the second survives that. The symbol knows its
+//     own name in both cases, which is what the fallback uses.
+//   * a subroutine declared outside the instance body -- here in a package.
+//     Its formal is not a net of this module, so the binding has no source to
+//     name. What holds `taken` up is the write-back: a dependency with no
+//     source beside the target row that says the statement writes the actual.
+//     Recording either without the other leaves v_stmt_target and
+//     v_net_attachment naming the statement while v_driver names nothing.
 //
-// The symbol knows its own name in both cases, so that is the fallback now.
-//
-// Third shape, unrelated cause: a subroutine declared outside the instance
-// body -- here in a package. Its formal is not a net of this module, and the
-// binding used to be dropped whole, taking the actual with it, so `taken` had
-// no driver at all. Recording only the write-back's TARGET row, which came
-// next, left the two views that answer "what writes this net" disagreeing:
-// v_stmt_target and v_net_attachment named the statement, v_driver named
-// nothing. The dependency beside it carries no source -- the formal is not a
-// net here to name -- which is the shape v_driver documents as
-// `driver_kind='procedure'` with a NULL driver.
-//
-// `setit` is the same shape with the reading half removed. It matters because
-// the input actual of `bump` is itself an outward name, so `bump`'s statement
-// has an unresolved read on it -- and the invariant that every target has a
-// dependency was satisfied by that read rather than by the write-back. With
-// no argument to read, nothing stands in.
+// `setit` is the third shape with the reading half removed. It matters because
+// `bump`'s input actual is itself an outward name, so `bump`'s statement has
+// an unresolved read on it -- and "every target has a dependency" is satisfied
+// by that read rather than by the write-back. With no argument to read,
+// nothing stands in.
 //
 // `chk` is the same write from a CONDITION, which belongs to no statement this
 // schema records. There is no stmt_target to hang it on -- a target is a
 // position within a statement -- so the dependency goes out on its own, with
 // no source, no statement and no target row: "something writes this, and the
-// database cannot say what or where". That is the answer the null-source
-// discipline is for, and it beats the one this used to give, which was that
-// nothing wrote it at all.
+// database cannot say what or where", which is what the null-source discipline
+// is for.
 
 `define TOPNAME outward_tb
 

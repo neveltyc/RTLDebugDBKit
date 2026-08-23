@@ -68,7 +68,7 @@ CREATE TABLE module(
     id              INTEGER PRIMARY KEY,
     name            TEXT NOT NULL,
     def_kind        TEXT NOT NULL
-        /*!*/CHECK(def_kind IN ('module','interface','program','checker','package'))/*!*/,
+        /*!*/CHECK(def_kind IN ('module','interface','program','package'))/*!*/,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
     col             INTEGER,
@@ -280,7 +280,7 @@ CREATE TABLE proc(
     name           TEXT,
     proc_kind      TEXT NOT NULL
         /*!*/CHECK(proc_kind IN ('always','always_ff','always_comb','always_latch',
-                                 'initial','final','task','function'))/*!*/,
+                                 'initial','final'))/*!*/,
     ordinal        INTEGER NOT NULL,
     file_id        INTEGER REFERENCES file(id),
     line           INTEGER,

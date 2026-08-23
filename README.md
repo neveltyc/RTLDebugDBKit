@@ -77,7 +77,7 @@ granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v16:
+Release build, macOS arm64, against public designs, schema v17:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -146,19 +146,29 @@ src/extract/            the export, in layers. Ref/SymbolText/Template are the
                         one-function interface
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
-examples/constructs/    self-feedback, primitives, UDPs, waits, delays,
-                        cross-instance references, per-call-site tasks,
-                        level-sensitive events, interfaces, assertions,
-                        generate arrays, non-ANSI ports, net aliases, a
-                        deliberate black box, instantiations with no instance
-                        name -- exported and asserted by CI
+examples/constructs/    one fixture per LRM construct family, each exported
+                        and asserted by CI under its own verifier mode:
+                        expressions and assignments, procedural statements and
+                        subroutines, modules ports and generate,
+                        parameterisation, hierarchical names, packages,
+                        primitives, interfaces, assertions, and the
+                        deliberately invalid -- a missing definition, an
+                        unnamed instantiation, a module that instantiates
+                        itself. A family that needs a lint waiver gets a file
+                        of its own, because the waiver covers a whole file
 examples/options/       not a construct fixture: two files, two tops, a macro
                         defined in one and used in the other, and a header
                         reachable only through +incdir+ -- so --single-unit,
                         +define+ and the config digest have something to be
                         wrong about. Exported and asserted by CI
+examples/reorder/       also not a construct fixture: five files in reverse
+                        alphabetical order, the one example long enough to
+                        reach slang's threaded source loader and so the only
+                        one that can catch src_file ids following the buffers
 scripts/                build-release.sh (the four release platforms),
-                        verify-designdb.py (read an export back, fail if hollow),
+                        verify-designdb.py (read an export back, fail if hollow
+                        or malformed; --list-modes names the fixture set,
+                        --domain-coverage checks the corpus against it),
                         designdb-coverage.py (what an export had to approximate),
                         export-real-designs.sh (the measurements table, from a
                         local checkout of the public designs),
@@ -167,12 +177,16 @@ scripts/                build-release.sh (the four release platforms),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 
-[CI](.github/workflows/ci.yml) builds both SQLite configurations on every push,
-exports `examples/basic/top.sv`, and reads the database back — a build that
-links proves the slang pin resolves, not that the exporter still writes rows.
-The same push builds all four release binaries
-([binaries.yml](.github/workflows/binaries.yml)) and repeats the export on
-each platform — the Linux pair builds inside an Alpine container and then
+[CI](.github/workflows/ci.yml) builds both SQLite configurations, exports the
+whole of `examples/` and reads each database back — a build that links proves
+the slang pin resolves, not that the exporter still writes rows. It then checks
+the corpus against the schema:
+every value the published domains name, and every word in the four view
+vocabularies, has to be produced by some fixture, so the test set is driven by
+the contract rather than by whichever constructs happened to break once. The
+same push builds all four release binaries
+([binaries.yml](.github/workflows/binaries.yml)) and repeats the export sweep
+on each platform — the Linux pair builds inside an Alpine container and then
 runs on the bare glibc runner, so a dynamic dependency that crept into the
 "static" binary fails in CI rather than on a farm.
 [release.yml](.github/workflows/release.yml) ships exactly that pipeline's
@@ -180,8 +194,9 @@ output when a `v*` tag is pushed.
 
 ## Testing RTL
 
-Anything used as a test case should pass `scripts/check-rtl.sh <file.sv> [top]`
-first, which runs it past Verilator and Icarus. They disagree in both
+Every fixture passes `scripts/check-rtl.sh <file.sv> [top]`, which CI runs
+over `examples/` on every push and which anything used as a test case should
+pass first. It runs the file past Verilator and Icarus. They disagree in both
 directions — Verilator accepts a continuous assign with a variable index that
 Icarus correctly rejects, Icarus rejects an unpacked array slice that Verilator
 correctly accepts — so disagreement is a prompt to read the LRM, not a verdict.
@@ -197,7 +212,16 @@ RTL, so a file may declare that one of them cannot accept it:
 
 The declared failure then counts as a pass, and the tool *accepting* the file
 counts as a failure — so the marker cannot outlive the limitation it records.
-`examples/constructs/interfaces.sv` is the only file that carries one.
+Both directions being checked is also why this stays a developer gate rather
+than a CI one: the marker set is only well defined against one pinned pair of
+front ends, and the versions here track Homebrew's. Ubuntu 24.04's Verilator
+5.020 rejects four files this set does not waive.
+
+A fixture that is deliberately invalid RTL declares both, for the same reason
+read the other way: `recursion.sv` and `incomplete.sv` MUST be rejected, and a
+front end that starts accepting one is reported as stale rather than quietly
+waived. The marker waives a whole file, which is why a construct family that
+needs one lives in a file of its own.
 
 ## Licence
 
