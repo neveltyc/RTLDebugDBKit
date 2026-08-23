@@ -264,7 +264,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
         // arrives as `hi` and `lo` -- names no terminal answers to; and two
         // unnamed ports share the one synthesized name. Both cases used to
         // miss here and the connection was dropped without a row.
-        auto slotIt = childSlots.find(static_cast<const void*>(&conn->port));
+        auto slotIt = childSlots.find(&conn->port);
         if (slotIt == childSlots.end())
             continue;
         const int32_t termIdx = slotIt->second.term;
@@ -288,9 +288,8 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 }
                 else if (auto* through =
                              passedThrough(*b.body, ifaceSym)) {
-                    auto ownIt = b.t->termOf.find(
-                        static_cast<const void*>(through));
-                    if (ownIt != b.t->termOf.end())
+                    auto ownIt = b.termOf->find(through);
+                    if (ownIt != b.termOf->end())
                         tc.ifaceOwnTerm = ownIt->second.term;
                 }
                 else {

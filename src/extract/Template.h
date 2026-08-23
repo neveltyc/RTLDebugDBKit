@@ -8,8 +8,8 @@
 // template-local index -- an int32_t position in one of these vectors, never a
 // database id. Stamping turns each into (index + that occurrence's base).
 //
-// Plain data: no slang types at all, and the only thing it knows about the AST
-// is Ref, for rangeOf.
+// Plain data: no slang types, no AST vocabulary -- the claim used to be a
+// comment and is now an include list.
 
 #pragma once
 
@@ -19,8 +19,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include "extract/Ref.h"
 
 namespace designdb::detail {
 
@@ -71,14 +69,6 @@ struct TplRange {
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
 };
-
-inline TplRange rangeOf(const Ref& r) {
-    TplRange out;
-    if (r.sym && r.cover.isRange())
-        out.bits = std::make_pair(r.cover.lo(), r.cover.hi());
-    out.exact = r.sym ? r.exact : true;
-    return out;
-}
 
 struct TplScope {          // a generate level below the instance; 0 = the body
     int32_t parent = -1;
@@ -293,25 +283,9 @@ struct Template {
     std::vector<TplDep> deps;
     std::vector<TplHierRef> hierRefs;
     std::vector<TplChild> children;
-    /// Where a port symbol sits in this template's terminals.
-    ///
-    /// Terminals are found by symbol, never by name -- there was a name map
-    /// here and every one of its lookups was wrong in some case. A port name
-    /// is not unique (two unnamed ports collapse onto one synthesized
-    /// `<unnamed>`), and for a MultiPort it is not even the name the
-    /// connection carries: slang's expandMultiPortConn hands back one
-    /// PortConnection per MEMBER, so `.p({hi, lo})` arrives as `hi` and `lo`,
-    /// neither of which is a terminal. Identity works for both.
-    ///
-    /// `lsb` and `width` describe the SYMBOL, not the terminal: a MultiPort
-    /// member occupies its own window of the terminal it belongs to, and a
-    /// connection's bits are relative to that window.
-    struct TermSlot {
-        int32_t term = -1;
-        uint64_t lsb = 0;
-        int64_t width = -1;
-    };
-    std::unordered_map<const void*, TermSlot> termOf;
+    // The port-symbol -> terminal-slot map moved to the builder (pass-1
+    // state, slang-keyed); its story -- terminals found by symbol, never by
+    // name -- travels with TermSlot in TemplateBuilderImpl.h.
     std::unordered_map<std::string, int32_t> netIndex;   // name -> nets index
     bool hasResolvableRefs = false;
     /// Whether the body this template was built from had an AnalyzedScope.
