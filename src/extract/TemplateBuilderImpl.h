@@ -79,6 +79,17 @@ using namespace slang::analysis;
 
 namespace designdb::detail {
 
+/// A Ref's coverage in the template row encoding: bits only when a specific
+/// run is known, exactness as claimed. Lived in Template.h until the IR
+/// severed Template from the AST vocabulary.
+inline TplRange rangeOf(const Ref& r) {
+    TplRange out;
+    if (r.sym && r.cover.isRange())
+        out.bits = std::make_pair(r.cover.lo(), r.cover.hi());
+    out.exact = r.sym ? r.exact : true;
+    return out;
+}
+
 class TemplateBuilder {
 public:
     TemplateBuilder(Compilation& comp, AnalysisManager& mgr, Writer& w,
@@ -98,9 +109,33 @@ private:
         const InstanceBodySymbol* body = nullptr;
     };
 
+    /// Where a port symbol sits in a body's terminals.
+    ///
+    /// Terminals are found by symbol, never by name -- there was a name map
+    /// once and every one of its lookups was wrong in some case: a port name
+    /// is not unique (two unnamed ports collapse onto one synthesized
+    /// `<unnamed>`), and a MultiPort's connections arrive per MEMBER, so
+    /// `.p({hi, lo})` hands back `hi` and `lo`, neither of which is a
+    /// terminal. The key is the common Symbol base because a PortSymbol and
+    /// a MultiPortSymbol member must share one map.
+    ///
+    /// `lsb` and `width` describe the SYMBOL, not the terminal: a MultiPort
+    /// member occupies its own window of the terminal it belongs to, and a
+    /// connection's bits are relative to that window.
+    struct TermSlot {
+        int32_t term = -1;
+        uint64_t lsb = 0;
+        int64_t width = -1;
+    };
+    /// Port symbol -> terminal slot, for one body. See collectTermSlots'
+    /// definition for why the CHILD side recomputes rather than sharing.
+    using TermSlotMap = std::unordered_map<const Symbol*, TermSlot>;
+
     /// Per-build state that does not belong in the finished template.
     struct Build {
         Template* t = nullptr;
+        /// The canonical body's port-slot map (termSlots[t]).
+        const TermSlotMap* termOf = nullptr;
         const InstanceBodySymbol* body = nullptr;
         /// The declaration index for this body. Owns what used to be
         /// netOf/scopeOf, and is the only thing here that hands out net
@@ -181,11 +216,12 @@ private:
 
     // ---------------------------------------------------------- terminals
 
-    /// Port symbol -> terminal slot, for one body. See the definition for why
-    /// this cannot be a stored, shared map.
-    using TermSlotMap = std::unordered_map<const void*, Template::TermSlot>;
     static void collectTermSlots(const InstanceBodySymbol& body,
                                  TermSlotMap& out);
+
+    /// The canonical body's own slot map, one per template -- pass-1 state
+    /// that lived on Template and made its "no slang types" claim false.
+    std::unordered_map<const Template*, TermSlotMap> termSlots;
 
     /// The port list of one group, as terminal templates. A MultiPort (a
     /// non-ANSI `.p({hi, lo})` formal) is one terminal; its inside is the
