@@ -735,8 +735,17 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
 
     bool reached = false;
 
-    StatementWalker walker(
-        // ---- one assignment target with its pairs and gating
+    // The walk hands over self-contained nodes; these four handlers are the
+    // receiver's filing logic, unchanged from the callback era, and the
+    // dispatcher below is a shim that reconstructs the old calling shapes --
+    // firstTarget from a target's position in its owning node, the folded
+    // formal Ref from the Bind node's two halves -- so this phase moves the
+    // interface without moving a row. The emission rework consumes the nodes
+    // directly and retires the shim.
+    GateTable gates;
+
+    // ---- one assignment target with its pairs and gating
+    auto onTarget =
         [&](const Ref& dst, const std::vector<PairedSrc>& pairs,
             const std::vector<Ref>& gating, SourceRange where, int64_t seq,
             bool blocking, int64_t dropped, bool inSubroutine,
@@ -760,15 +769,17 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                            isContinuous,
                            constructWord ? constructWord : construct,
                            evalCtx);
-        },
-        // ---- a call site's actual bound to its formal
+        };
+    // ---- a call site's actual bound to its formal
+    auto onBinding =
         [&](const Ref& formal, const Ref& actual, bool reads, bool writes,
             bool oneToOne, bool bindable, SourceRange where) {
             reached = true;
             emitCallBinding(b, formal, actual, reads, writes, oneToOne,
                             bindable, locator.locate(where.start(), procAt), evalCtx);
-        },
-        // ---- a statement-level event control (a wait)
+        };
+    // ---- a statement-level event control (a wait)
+    auto onEvent =
         [&](const Expression* e, const std::string& edge, int64_t seq,
             SourceRange where) {
             if (procIdx < 0)
@@ -779,8 +790,9 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                                       at);
             addProcEvent(b, procIdx, s, e, edge, "wait", at, evalCtx,
                          [&]() { return s; });
-        },
-        // ---- a statement that reads without writing anything nameable
+        };
+    // ---- a statement that reads without writing anything nameable
+    auto onRead =
         [&](const std::vector<Ref>& reads, const std::vector<Ref>& gating,
             const std::vector<Ref>& writes, const std::string& stmtKind,
             const std::string& construct2, int64_t seq, SourceRange where) {
@@ -819,6 +831,57 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                 else
                     recordSystemWrite(b, s, w, at, evalCtx);
             }
+        };
+
+    StatementWalker walker(
+        gates,
+        [&](Node&& node) {
+            std::visit(
+                [&](auto&& n) {
+                    using T = std::decay_t<decltype(n)>;
+                    if constexpr (std::is_same_v<T, AssignmentNode>) {
+                        for (size_t i = 0; i < n.targets.size(); i++) {
+                            auto& t = n.targets[i];
+                            onTarget(t.dst, t.pairs, gates.refs(n.gate),
+                                     n.where, n.seq, n.blocking, n.dropped,
+                                     n.inSubroutine, /*firstTarget=*/i == 0,
+                                     n.delay, n.constructWord);
+                        }
+                    }
+                    else if constexpr (std::is_same_v<T, BindNode>) {
+                        // The folded Ref of the callback era: the formal's
+                        // symbol wearing the actual's expression, bound
+                        // whole and exact.
+                        Ref formal;
+                        formal.sym = n.formal;
+                        formal.origin = n.actualOrigin;
+                        formal.cover = BitInterval::whole();
+                        formal.exact = true;
+                        onBinding(formal, n.actual, n.reads, n.writes,
+                                  n.oneToOne, n.bindable, n.where);
+                    }
+                    else if constexpr (std::is_same_v<T, EventNode>) {
+                        onEvent(n.expr, n.edge, n.seq, n.where);
+                    }
+                    else if constexpr (std::is_same_v<T, ReadNode>) {
+                        const char* kind =
+                            n.kind == ReadNode::Kind::Assertion ? "assertion"
+                            : n.kind == ReadNode::Kind::Wait    ? "wait"
+                                                                : "call";
+                        onRead(n.reads, gates.refs(n.gate), {}, kind,
+                               n.construct, n.seq, n.where);
+                    }
+                    else if constexpr (std::is_same_v<T, SystemTaskNode>) {
+                        onRead(n.reads, gates.refs(n.gate), n.writes,
+                               "system_task", n.construct, n.seq, n.where);
+                    }
+                    else if constexpr (std::is_same_v<T, ReleaseNode>) {
+                        onRead({}, gates.refs(n.gate), n.lvalues, "release",
+                               n.isRelease ? "release" : "deassign", n.seq,
+                               n.where);
+                    }
+                },
+                std::move(node));
         },
         evalCtx);
     walker.sensitivityTiming = sens.timingControl;
