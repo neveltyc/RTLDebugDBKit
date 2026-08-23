@@ -169,18 +169,20 @@ void TemplateBuilder::collectTermSlots(const InstanceBodySymbol& body,
                 // cursor counts down to each member's LSB -- the same offsets
                 // buildTermMaps lays the inside out with, and the same ones
                 // slang's expandMultiPortConn accumulates walking the reverse.
-                uint64_t cursor =
-                    mp.getType().isIntegral() ? mp.getType().getBitWidth() : 0;
+                MsbCursor cursor(0, mp.getType().isIntegral()
+                                        ? mp.getType().getBitWidth()
+                                        : 0);
                 for (auto* member : mp.ports) {
                     if (!member)
                         continue;
                     const uint64_t w = member->getType().isIntegral()
                                            ? member->getType().getBitWidth()
                                            : 0;
-                    if (w && w <= cursor)
-                        cursor -= w;
+                    const auto window = w ? cursor.advance(w) : std::nullopt;
                     out.emplace(static_cast<const void*>(member),
-                                Template::TermSlot{termIdx, cursor,
+                                Template::TermSlot{termIdx,
+                                                   window ? window->lo
+                                                          : cursor.position(),
                                                    w ? int64_t(w) : -1});
                 }
                 break;
@@ -644,10 +646,10 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
             // Members are declared MSB first, exactly as a concatenation
             // is written; each maps whole onto its own window.
             auto& mp = portSym->as<MultiPortSymbol>();
-            uint64_t total = mp.getType().isIntegral()
-                                 ? mp.getType().getBitWidth()
-                                 : 0;
-            uint64_t cursor = total;
+            const uint64_t total = mp.getType().isIntegral()
+                                       ? mp.getType().getBitWidth()
+                                       : 0;
+            MsbCursor cursor(0, total);
             for (auto* member : mp.ports) {
                 if (!member || !member->internalSymbol ||
                     !ValueSymbol::isKind(member->internalSymbol->kind))
@@ -658,10 +660,11 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
                                        : 0;
                 TplRange termR;
                 bool mapping = false;
-                if (total && w && w <= cursor) {
-                    cursor -= w;
-                    if (!(cursor == 0 && w == total))
-                        termR.bits = std::make_pair(cursor, cursor + w - 1);
+                const auto window =
+                    (total && w) ? cursor.advance(w) : std::nullopt;
+                if (window) {
+                    if (!(window->lo == 0 && w == total))
+                        termR.bits = std::make_pair(window->lo, window->hi);
                     termR.exact = true;
                     mapping = true;
                 }
