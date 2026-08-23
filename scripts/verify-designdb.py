@@ -146,7 +146,10 @@ if sys.argv[1:2] == ["--domain-coverage"]:
     sys.exit(0)
 
 if sys.argv[1:2] == ["--list-modes"]:
-    print("\n".join(MODES))
+    # Written as bytes, not print()d: this is a machine-readable list, and text
+    # mode on Windows would translate each newline to CRLF -- which a shell's
+    # $(...) keeps, so the caller builds "<mode>\r.sv" and opens nothing.
+    sys.stdout.buffer.write(("\n".join(MODES) + "\n").encode())
     sys.exit(0)
 if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MODES):
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]\n"
