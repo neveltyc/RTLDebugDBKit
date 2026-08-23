@@ -41,12 +41,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Explicit rather than relying on the image: a missing ccache would make
-      # the cache below a silent no-op instead of a failure.
-      - name: Install ccache
-        if: runner.os == 'macOS'
-        run: brew list ccache >/dev/null 2>&1 || brew install ccache
-
       # slang is a large dependency and the pin is exact, so the key is the
       # CMakeLists that carries it: the cache is reused until the pin moves.
       # macOS only. The Linux builds run inside the script's Alpine container,
@@ -61,39 +55,26 @@ jobs:
           key: cpm-${{ matrix.target }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ matrix.target }}-
 
-      # Objects rather than sources, which is where the time goes. macOS only,
-      # for the same two reasons as above: the Linux compile happens inside a
-      # container this cache cannot reach, and MSVC is not a ccache target.
-      # CMake reads the launcher from the environment, so build-release.sh
-      # needs no argument for it.
-      - name: Cache ccache objects
-        if: runner.os == 'macOS'
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-${{ matrix.target }}-${{ github.run_id }}
-          restore-keys: ccache-${{ matrix.target }}-
-
       # The Linux targets go through the script's docker path — the runner
       # itself stays glibc, because JavaScript actions cannot run in an
       # Alpine container on arm64 runners, and the build must not care what
       # the runner is made of anyway. That split is also the proof the smoke
       # test below relies on: built against musl in the container, executed
       # against glibc on the runner.
+      # No compiler cache here, deliberately. Installing ccache on the macOS
+      # runner puts Homebrew's fmt on the prefix slang's CMake searches, and
+      # slang then links that instead of the version it pins -- which against
+      # this target's `CMAKE_OSX_DEPLOYMENT_TARGET=11.0` fails to compile,
+      # because fmt delegates to std::format and to_chars(long double) is
+      # unavailable that far back. A release build is not the place to mutate
+      # the toolchain for a cache; ci.yml, which builds nothing for release,
+      # is where ccache lives.
       - name: Build release binary
         run: |
           if [ "$RUNNER_OS" == "macOS" ]; then
             export CPM_SOURCE_CACHE="$HOME/.cache/CPM"
-            if command -v ccache >/dev/null; then
-              export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" CCACHE_MAXSIZE=500M
-              export CMAKE_C_COMPILER_LAUNCHER=ccache
-              export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-            fi
           fi
           bash scripts/build-release.sh --target ${{ matrix.target }}
-          if [ "$RUNNER_OS" == "macOS" ] && command -v ccache >/dev/null; then
-            ccache --show-stats
-          fi
 
       # Every platform runs the binary it just built: export the example
       # designs and read the databases back. For the Linux pair this runs on
