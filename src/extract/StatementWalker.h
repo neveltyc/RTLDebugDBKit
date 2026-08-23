@@ -104,27 +104,30 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
 
     void handle(const ImmediateAssertionStatement& stmt) {
         std::vector<Ref> reads;
+        filteredConstants = 0;
         collectRefs(stmt.cond, eval, reads);
         emit(ReadNode{std::move(reads), ReadNode::Kind::Assertion,
                       assertionWord(stmt.assertionKind), gateId(), seq++,
-                      stmt.sourceRange});
+                      filteredConstants, stmt.sourceRange});
         visitDefault(stmt);
     }
 
     void handle(const ConcurrentAssertionStatement& stmt) {
         std::vector<Ref> reads;
+        filteredConstants = 0;
         collectStatementRefs(stmt.propertySpec, reads);
         emit(ReadNode{std::move(reads), ReadNode::Kind::Assertion,
                       assertionWord(stmt.assertionKind), gateId(), seq++,
-                      stmt.sourceRange});
+                      filteredConstants, stmt.sourceRange});
         visitDefault(stmt);
     }
 
     void handle(const WaitStatement& stmt) {
         std::vector<Ref> reads;
+        filteredConstants = 0;
         collectRefs(stmt.cond, eval, reads);
         emit(ReadNode{std::move(reads), ReadNode::Kind::Wait, "wait", gateId(),
-                      seq++, stmt.sourceRange});
+                      seq++, filteredConstants, stmt.sourceRange});
         visitDefault(stmt);
     }
 
@@ -148,6 +151,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
         auto& call = stmt.expr.as<CallExpression>();
         std::vector<Ref> reads;
+        filteredConstants = 0;
         collectRefs(stmt.expr, eval, reads);
         if (call.isSystemCall()) {
             std::set<const SubroutineSymbol*> active;
@@ -173,11 +177,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         if (call.isSystemCall()) {
             emit(SystemTaskNode{std::move(reads), std::move(writeRefs),
                                 callWord(call), gateId(), seq++,
-                                stmt.sourceRange});
+                                filteredConstants, stmt.sourceRange});
         }
         else {
             emit(ReadNode{std::move(reads), ReadNode::Kind::Call,
-                          callWord(call), gateId(), seq++, stmt.sourceRange});
+                          callWord(call), gateId(), seq++, filteredConstants,
+                          stmt.sourceRange});
         }
         visitDefault(stmt);
     }
@@ -232,11 +237,13 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 emit(EventNode{expr, edge, seq++, stmt.sourceRange});
             if (!iffs.empty()) {
                 std::vector<Ref> reads;
+                filteredConstants = 0;
                 for (auto* c : iffs)
                     collectRefs(*c, eval, reads);
                 if (!reads.empty())
                     emit(ReadNode{std::move(reads), ReadNode::Kind::Wait,
-                                  "wait", gateId(), seq++, stmt.sourceRange});
+                                  "wait", gateId(), seq++, filteredConstants,
+                                  stmt.sourceRange});
             }
         }
         const std::string d = delayText(&stmt.timing);
@@ -589,9 +596,10 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // answer. visitDefault picks up reads in the lvalue's own selectors,
         // the `i` in `release mem[i]`.
         std::vector<Ref> writes;
+        filteredConstants = 0;
         collectRefs(s.lvalue, eval, writes, /*skipSelectors=*/true);
         emit(ReleaseNode{std::move(writes), s.isRelease, gateId(), seq++,
-                         s.sourceRange});
+                         filteredConstants, s.sourceRange});
         visitDefault(s);
     }
 
