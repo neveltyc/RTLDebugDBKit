@@ -159,7 +159,13 @@ private:
         base.exprRef = exprRefCounter; exprRefCounter += int64_t(t.exprRefs.size());
         base.procEvent = procEventCounter;
         procEventCounter += int64_t(t.procEvents.size());
-        base.dep = depCounter;         depCounter += int64_t(t.deps.size());
+        // Only the all-local rows take ids from the reserved block; a row
+        // with an outward end is deferred to the final pass and numbered
+        // there, exactly as when the two lifecycles were two vectors.
+        const int64_t inlineDeps = int64_t(std::count_if(
+            t.deps.begin(), t.deps.end(),
+            [](const TplDep& d) { return !d.deferred(); }));
+        base.dep = depCounter;         depCounter += inlineDeps;
         base.hierRef = hierRefCounter; hierRefCounter += int64_t(t.hierRefs.size());
         base.callSite = callSiteCounter;
         callSiteCounter += int64_t(t.callSites.size());
@@ -342,12 +348,17 @@ private:
             row.column = e.loc.column;
             writer.addProcEvent(row);
         }
+        int64_t inlineIdx = 0;
         for (size_t i = 0; i < t.deps.size(); i++) {
             auto& d = t.deps[i];
+            if (d.deferred()) {
+                crossJobs.push_back(CrossJob{&t, i, base});
+                continue;
+            }
             NetDepRow row;
-            row.id = base.dep + int64_t(i) + 1;
-            row.sourceNetId = d.srcNet < 0 ? 0 : base.net + d.srcNet + 1;
-            row.targetNetId = base.net + d.tgtNet + 1;
+            row.id = base.dep + inlineIdx++ + 1;
+            row.sourceNetId = d.src.net < 0 ? 0 : base.net + d.src.net + 1;
+            row.targetNetId = base.net + d.tgt.net + 1;
             row.stmtId = d.stmt < 0 ? 0 : base.stmt + d.stmt + 1;
             row.assignOperandId = d.operandRef < 0 ? 0 : base.operand + d.operandRef + 1;
             row.stmtTargetId = d.targetRef < 0 ? 0 : base.target + d.targetRef + 1;
@@ -355,14 +366,14 @@ private:
             row.primitiveId = d.prim < 0 ? 0 : primNode[size_t(d.prim)];
             row.dependencyKind = d.kind;
             row.sourceBits = d.srcR.bits;
-            row.sourceExact = d.srcNet < 0 ? -1 : (d.srcR.exact ? 1 : 0);
+            row.sourceExact = d.src.net < 0 ? -1 : (d.srcR.exact ? 1 : 0);
             row.targetBits = d.tgtR.bits;
             row.targetExact = d.tgtR.exact;
             row.mappingExact = d.mappingExact;
             row.callSiteId = d.callSite < 0 ? 0 : base.callSite + d.callSite + 1;
             writer.addNetDep(row);
         }
-        stats.deps += int64_t(t.deps.size());
+        stats.deps += inlineIdx;
 
         // Hierarchical reference rows are written in the final pass, once
         // every subtree they may land in exists; ids are fixed now because
@@ -379,8 +390,6 @@ private:
             job.ifaceBind = ifaceBind;
             replayJobs.push_back(std::move(job));
         }
-        for (size_t i = 0; i < t.crossDeps.size(); i++)
-            crossJobs.push_back(CrossJob{&t, i, base});
         stats.hierRefs += int64_t(t.hierRefs.size());
 
         // For hierarchical-reference replay: which template (and net base)
@@ -770,14 +779,14 @@ private:
         // NULL source net and the reference on the source end; v_driver
         // reports it as 'external'.
         for (auto& job : crossJobs) {
-            const TplCrossDep& d = job.t->crossDeps[job.idx];
+            const TplDep& d = job.t->deps[job.idx];
             NetDepRow row;
             row.id = 0;   // assigned below once the row is known writable
-            if (d.srcNet >= 0) {
-                row.sourceNetId = job.base.net + d.srcNet + 1;
+            if (d.src.net >= 0) {
+                row.sourceNetId = job.base.net + d.src.net + 1;
             }
-            else if (d.srcHref >= 0) {
-                row.sourceHierRefId = job.base.hierRef + d.srcHref + 1;
+            else if (d.src.href >= 0) {
+                row.sourceHierRefId = job.base.hierRef + d.src.href + 1;
                 auto it = resolvedNet.find(row.sourceHierRefId);
                 if (it != resolvedNet.end())
                     row.sourceNetId = it->second;
@@ -785,11 +794,11 @@ private:
             else if (!d.sourceless) {
                 continue;
             }
-            if (d.tgtNet >= 0) {
-                row.targetNetId = job.base.net + d.tgtNet + 1;
+            if (d.tgt.net >= 0) {
+                row.targetNetId = job.base.net + d.tgt.net + 1;
             }
-            else if (d.tgtHref >= 0) {
-                row.targetHierRefId = job.base.hierRef + d.tgtHref + 1;
+            else if (d.tgt.href >= 0) {
+                row.targetHierRefId = job.base.hierRef + d.tgt.href + 1;
                 auto it = resolvedNet.find(row.targetHierRefId);
                 if (it == resolvedNet.end())
                     continue;

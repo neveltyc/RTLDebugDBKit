@@ -341,7 +341,7 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
     row.loc = at;
     fillResolution(b, row, r);
     const int32_t idx = int32_t(b.t->hierRefs.size());
-    if (row.resolve != TplHierRef::None)
+    if (row.resolvable())
         b.t->hasResolvableRefs = true;
     b.t->hierRefs.push_back(std::move(row));
     b.hierSeen.emplace(key, idx);
@@ -395,8 +395,10 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
         return;
     auto& hv = e->as<HierarchicalValueExpression>();
     const Symbol* target = hv.ref.target;
-    if (!target || !r.sym)
+    if (!target || !r.sym) {
+        row.resolve = TplHierRef::Failed;
         return;
+    }
     // slang's isUpward() is true for two unrelated shapes, and only one of
     // them is unresolvable here: a name that climbed OUT of this body
     // (upwardCount > 0), and a name anchored at $root. The first is a
@@ -408,16 +410,21 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // ones and left Absolute unreachable.
     const bool fromRoot = !hv.ref.path.empty() && hv.ref.path.front().symbol &&
                           hv.ref.path.front().symbol->kind == SymbolKind::Root;
-    if (!fromRoot && hv.ref.isUpward())
+    if (!fromRoot && hv.ref.isUpward()) {
+        row.resolve = TplHierRef::Upward;
         return;
+    }
     // A modport port stands for the net behind it: the reference
     // resolves to that net, not to the modport's own symbol -- whose
     // path carries the modport level (`bus.src.vld`) that the stamped
     // net names do not.
     if (target->kind == SymbolKind::ModportPort) {
         auto* inner = target->as<ModportPortSymbol>().internalSymbol;
-        if (!inner)
-            return;   // an explicit modport expression names no one net
+        if (!inner) {
+            // An explicit modport expression names no one net.
+            row.resolve = TplHierRef::Failed;
+            return;
+        }
         target = inner;
     }
     std::string full = target->getHierarchicalPath();
@@ -442,6 +449,7 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
                 }
             }
         }
+        row.resolve = TplHierRef::Failed;
         return;
     }
     // A $root path must not be re-read as a downward one even when it does
@@ -494,7 +502,7 @@ void TemplateBuilder::splitSegsAndNet(const std::string& rel, const Symbol& targ
         s = sym.getParentScope();
     }
     if (!owner) {
-        row.resolve = TplHierRef::None;
+        row.resolve = TplHierRef::Failed;
         return;
     }
     std::string ownerPath = owner->getHierarchicalPath();
@@ -502,7 +510,7 @@ void TemplateBuilder::splitSegsAndNet(const std::string& rel, const Symbol& targ
     std::string treePath;
     std::string targetFull = target.getHierarchicalPath();
     if (!splitBelow(targetFull, ownerPath, netRel)) {
-        row.resolve = TplHierRef::None;
+        row.resolve = TplHierRef::Failed;
         return;
     }
     // The tree part is what remains of `rel` once the net part (and its
@@ -519,7 +527,7 @@ void TemplateBuilder::splitSegsAndNet(const std::string& rel, const Symbol& targ
         treePath.clear();
     }
     else {
-        row.resolve = TplHierRef::None;
+        row.resolve = TplHierRef::Failed;
         return;
     }
     row.netName = netRel;
@@ -917,14 +925,14 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
         b.curStmt = saved;
         if (href < 0)
             return;
-        TplCrossDep d;
+        TplDep d;
         d.kind = "data";
         d.sourceless = true;
         d.stmt = stmt;
-        d.tgtHref = href;
+        d.tgt.href = href;
         d.tgtR = rangeOf(r);
         d.callSite = b.curCallSite;
-        b.t->crossDeps.push_back(std::move(d));
+        b.t->deps.push_back(std::move(d));
         return;
     }
     TplStmtRef tr;
@@ -938,8 +946,8 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
     const int32_t targetIdx = int32_t(b.t->targets.size());
     b.t->targets.push_back(std::move(tr));
     TplDep d;
-    d.srcNet = -1;
-    d.tgtNet = netIdx;
+    d.src.net = -1;
+    d.tgt.net = netIdx;
     d.stmt = stmt;
     d.targetRef = targetIdx;
     d.kind = "data";
@@ -1101,8 +1109,8 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
         anySource = anySource || srcNet >= 0 || srcHref >= 0;
         if (srcNet >= 0 && targetIdx >= 0) {
             TplDep d;
-            d.srcNet = srcNet;
-            d.tgtNet = dstNet;
+            d.src.net = srcNet;
+            d.tgt.net = dstNet;
             d.stmt = stmt;
             d.operandRef = operandIdx;
             d.targetRef = targetIdx;
@@ -1117,20 +1125,20 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             b.t->deps.push_back(std::move(d));
         }
         else if (srcNet >= 0 || srcHref >= 0) {
-            TplCrossDep d;
+            TplDep d;
             d.kind = "data";
             d.stmt = stmt;
-            d.srcNet = srcNet;
-            d.srcHref = srcHref;
-            d.tgtNet = dstNet;
-            d.tgtHref = tgtHref;
+            d.src.net = srcNet;
+            d.src.href = srcHref;
+            d.tgt.net = dstNet;
+            d.tgt.href = tgtHref;
             d.operandRef = operandIdx;
             d.targetRef = targetIdx;
             d.srcR = rangeOf(p.src);
             d.tgtR = rangeOf(p.tgt);
             d.mappingExact = p.mapExact ? 1 : 0;
             d.callSite = b.curCallSite;
-            b.t->crossDeps.push_back(std::move(d));
+            b.t->deps.push_back(std::move(d));
         }
     }
     // `q <= 8'h0`: nothing at all reaches the target, and the
@@ -1141,8 +1149,8 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
     if (haveTarget && !anySource) {
         if (targetIdx >= 0) {
             TplDep d;
-            d.srcNet = -1;
-            d.tgtNet = dstNet;
+            d.src.net = -1;
+            d.tgt.net = dstNet;
             d.stmt = stmt;
             d.targetRef = targetIdx;
             d.kind = "data";
@@ -1155,14 +1163,14 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             // Gating the constant row on a LOCAL target left every
             // outward constant write with no driver whatsoever, so a
             // trace back from the far net said nothing wrote it.
-            TplCrossDep d;
+            TplDep d;
             d.kind = "data";
             d.sourceless = true;
             d.stmt = stmt;
-            d.tgtHref = tgtHref;
+            d.tgt.href = tgtHref;
             d.tgtR = rangeOf(dst);
             d.callSite = b.curCallSite;
-            b.t->crossDeps.push_back(std::move(d));
+            b.t->deps.push_back(std::move(d));
         }
     }
     // Control dependencies: each recorded condition read reaches this
@@ -1178,8 +1186,8 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
                 if (srcNet < 0)
                     continue;
                 TplDep d;
-                d.srcNet = srcNet;
-                d.tgtNet = dstNet;
+                d.src.net = srcNet;
+                d.tgt.net = dstNet;
                 d.stmt = stmt;
                 d.exprRef = c.exprRef;
                 d.targetRef = targetIdx;
@@ -1191,20 +1199,20 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
                 b.t->deps.push_back(std::move(d));
             }
             else {
-                TplCrossDep d;
+                TplDep d;
                 d.kind = "control";
                 d.stmt = stmt;
-                d.srcNet = c.exprRef >= 0 ? b.decl->netFor(*src.sym) : -1;
-                d.srcHref = c.href;
-                d.tgtNet = dstNet;
-                d.tgtHref = tgtHref;
+                d.src.net = c.exprRef >= 0 ? b.decl->netFor(*src.sym) : -1;
+                d.src.href = c.href;
+                d.tgt.net = dstNet;
+                d.tgt.href = tgtHref;
                 d.exprRef = c.exprRef;
                 d.targetRef = targetIdx;
                 d.srcR = rangeOf(src);
                 d.tgtR = rangeOf(dst);
                 d.mappingExact = 0;
                 d.callSite = b.curCallSite;
-                b.t->crossDeps.push_back(std::move(d));
+                b.t->deps.push_back(std::move(d));
             }
         }
     }
@@ -1277,8 +1285,8 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
                 b.t->targets.push_back(std::move(tr));
             }
             TplDep d;
-            d.srcNet = -1;
-            d.tgtNet = actualIdx;
+            d.src.net = -1;
+            d.tgt.net = actualIdx;
             d.stmt = stmt;
             d.targetRef = targetIdx;
             d.kind = "procedure";
@@ -1302,26 +1310,26 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         if (href < 0)
             return;
         if (reads) {
-            TplCrossDep d;
+            TplDep d;
             d.kind = "procedure";
             d.stmt = stmt;
-            d.srcHref = href;
-            d.tgtNet = formalNet;
+            d.src.href = href;
+            d.tgt.net = formalNet;
             d.srcR = rangeOf(actual);
             d.mappingExact = oneToOne ? 1 : 0;
             d.callSite = b.curCallSite;
-            b.t->crossDeps.push_back(std::move(d));
+            b.t->deps.push_back(std::move(d));
         }
         if (writes) {
-            TplCrossDep d;
+            TplDep d;
             d.kind = "procedure";
             d.stmt = stmt;
-            d.srcNet = formalNet;
-            d.tgtHref = href;
+            d.src.net = formalNet;
+            d.tgt.href = href;
             d.tgtR = rangeOf(actual);
             d.mappingExact = oneToOne ? 1 : 0;
             d.callSite = b.curCallSite;
-            b.t->crossDeps.push_back(std::move(d));
+            b.t->deps.push_back(std::move(d));
         }
         return;
     }
@@ -1330,8 +1338,8 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         if (stmt >= 0)
             exprIdx = addExprRef(b, stmt, actual, "call_argument", actualNet);
         TplDep d;
-        d.srcNet = actualNet;
-        d.tgtNet = formalNet;
+        d.src.net = actualNet;
+        d.tgt.net = formalNet;
         d.stmt = stmt;
         d.exprRef = exprIdx;
         d.kind = "procedure";
@@ -1342,8 +1350,8 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
     }
     if (writes) {
         TplDep d;
-        d.srcNet = formalNet;
-        d.tgtNet = actualNet;
+        d.src.net = formalNet;
+        d.tgt.net = actualNet;
         d.stmt = stmt;
         d.kind = "procedure";
         d.tgtR = rangeOf(actual);
@@ -1507,8 +1515,8 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
                 if (i == j || sides[i].group == sides[j].group)
                     continue;
                 TplDep d;
-                d.srcNet = sides[i].net;
-                d.tgtNet = sides[j].net;
+                d.src.net = sides[i].net;
+                d.tgt.net = sides[j].net;
                 d.stmt = stmt;
                 d.operandRef = sides[i].operand;
                 d.targetRef = sides[j].target;
@@ -1667,8 +1675,8 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
                     continue;
                 }
                 TplDep d;
-                d.srcNet = srcNet;
-                d.tgtNet = dstNet;
+                d.src.net = srcNet;
+                d.tgt.net = dstNet;
                 d.prim = primIdx;
                 d.kind = "primitive";
                 d.srcR = rangeOf(src);
@@ -1688,8 +1696,8 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
             // the gate as the driver, as `q <= 8'h0` is named.
             if (!anyInput) {
                 TplDep d;
-                d.srcNet = -1;
-                d.tgtNet = dstNet;
+                d.src.net = -1;
+                d.tgt.net = dstNet;
                 d.prim = primIdx;
                 d.kind = "primitive";
                 d.tgtR = rangeOf(dst);

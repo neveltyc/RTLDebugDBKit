@@ -179,18 +179,42 @@ struct TplPrim {
     TplLoc loc;
 };
 
+/// One end of a dependency: a net of this instance, a reference that leaves
+/// it (a hierRefs index), or nothing at all -- a constant source, or the
+/// deliberate no-source of a system task's write. Never both at once.
+struct TplEnd {
+    int32_t net = -1;
+    int32_t href = -1;
+
+    bool local() const { return net >= 0; }
+    bool outward() const { return href >= 0; }
+};
+
+/// One dependency, paired where the statement was walked -- per (source
+/// element, target element), never by joining afterwards. A row whose ends
+/// are all local stamps inline with its occurrence's reserved id block; a
+/// row with an outward end is deferred until the final pass, when the
+/// occurrence's references have resolved. The old model kept those two
+/// lifecycles as two structs sharing eleven fields; the endpoint type makes
+/// the split a predicate instead.
 struct TplDep {
-    int32_t srcNet = -1;     // -1 = constant source
-    int32_t tgtNet = 0;
+    TplEnd src, tgt;
+    /// True when the dependency has no source BY DESIGN -- a system task
+    /// writing across the boundary. Without it, "no source reference" and
+    /// "the source reference did not resolve" look alike, and the second
+    /// must be dropped while the first must not.
+    bool sourceless = false;
     int32_t stmt = -1;
     int32_t operandRef = -1;
     int32_t targetRef = -1;
     int32_t exprRef = -1;
     int32_t prim = -1;
-    std::string kind;
+    std::string kind;        // data | control | procedure | primitive | alias
     TplRange srcR, tgtR;
     int mappingExact = -1;
     int32_t callSite = -1;   // the call-site expansion, or -1 at module level
+
+    bool deferred() const { return src.outward() || tgt.outward(); }
 };
 
 /// Replay data for one outward reference: how to find the target from an
@@ -201,41 +225,26 @@ struct TplHierRef {
     std::string access;      // read | write | connect
     TplRange r;
     TplLoc loc;
+    /// How the reference resolves per occurrence -- or why it does not.
+    /// The first three all stamp NULL resolved ids; they are spelled apart
+    /// because "nothing to resolve", "tried and could not" and "must not
+    /// guess" are different facts, and one name for all three left the
+    /// resolver's five bare returns indistinguishable.
     enum ResolveKind {
-        None,                // slang gave no target usable per occurrence
+        NotHierarchical,     // a bare or package-free name; nothing to walk
+        Failed,              // a target existed and no replay could be built
+        Upward,              // climbs out of the analysed body; a guess is
+                             // worse than a NULL, so deliberately unresolved
         Downward,            // segs descend from the occurrence's own node
         Absolute,            // segs descend from the design root
         ViaIfaceTerm,        // segs descend from the interface bound to term
         Package              // segs[0] names a package; netName its member
-    } resolve = None;
+    } resolve = NotHierarchical;
     int32_t ifaceTerm = -1;  // ViaIfaceTerm: which of this template's terms
     std::vector<std::string> segs;   // tree segments to descend
     std::string netName;     // scope-relative net name at the target instance
-};
 
-/// One dependency with at least one end outside the instance, paired where
-/// the statement was walked -- per (source element, target element), never
-/// by joining afterwards -- and materialised once the occurrence's
-/// references resolve. An end is a local net index or a hierRefs index,
-/// never both.
-struct TplCrossDep {
-    std::string kind;        // data | control | procedure
-    /// True when the dependency has no source BY DESIGN -- a system task
-    /// writing across the boundary. Without it, "no source reference" and
-    /// "the source reference did not resolve" look alike, and the second
-    /// must be dropped while the first must not.
-    bool sourceless = false;
-    int32_t stmt = -1;
-    int32_t srcNet = -1;
-    int32_t srcHref = -1;
-    int32_t tgtNet = -1;
-    int32_t tgtHref = -1;
-    int32_t operandRef = -1;
-    int32_t targetRef = -1;
-    int32_t exprRef = -1;
-    TplRange srcR, tgtR;
-    int mappingExact = -1;
-    int32_t callSite = -1;   // the call-site expansion, or -1 at module level
+    bool resolvable() const { return resolve >= Downward; }
 };
 
 struct TplConn {
@@ -283,7 +292,6 @@ struct Template {
     std::vector<TplPrim> prims;
     std::vector<TplDep> deps;
     std::vector<TplHierRef> hierRefs;
-    std::vector<TplCrossDep> crossDeps;
     std::vector<TplChild> children;
     /// Where a port symbol sits in this template's terminals.
     ///
