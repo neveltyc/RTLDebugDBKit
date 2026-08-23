@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -37,6 +38,8 @@
 #include "slang/ast/types/Type.h"
 #include "slang/numeric/ConstantValue.h"
 #include "slang/numeric/SVInt.h"
+
+#include "ir/Bits.h"
 
 namespace designdb::detail {
 
@@ -63,35 +66,40 @@ inline bool isConstantSymbol(const ValueSymbol& sym) {
 
 struct Ref {
     const ValueSymbol* sym = nullptr;
-    uint64_t lo = 0;
-    uint64_t hi = 0;
-    bool whole = true;
-    bool exact = true;
+    /// Which bits of the object this reference covers. Defaults to the
+    /// honest answer for a reference nobody has bounded yet; the old
+    /// encoding defaulted to "all of it, exactly", which is how a dropped
+    /// fill read as a fact.
+    BitInterval cover = BitInterval::unknown();
+    bool exact = false;
     /// The expression the reference was written as; consulted when the symbol
     /// lives outside the instance (hier_ref text) and for resolution replay.
     const Expression* origin = nullptr;
+
+    /// True when no specific run of bits is stored -- the whole object, or
+    /// an unknown part of it. Every reader that keys "emit NULL bits" off
+    /// the old `whole` flag means exactly this.
+    bool whole() const { return !cover.isRange(); }
 };
 
 inline uint64_t bitWidthOf(const ValueSymbol& sym) {
     return sym.getType().getSelectableWidth();
 }
 
-/// Builds a Ref from one of slang's value paths.
-inline Ref refOf(const ValuePath& path) {
+/// Builds a Ref from one of slang's value paths; nullopt when the path has
+/// no root symbol to refer to.
+inline std::optional<Ref> refOf(const ValuePath& path) {
+    const ValueSymbol* sym = path.rootSymbol();
+    if (!sym)
+        return std::nullopt;
     Ref r;
-    r.sym = path.rootSymbol();
-    if (!r.sym)
-        return r;
+    r.sym = sym;
     r.origin = path.fullExpr;
-    r.exact = path.isFullyStatic();
-    if (!path.lsp) {
-        r.exact = false;
+    if (!path.lsp)
         return r;
-    }
-    r.lo = path.lspBounds.first;
-    r.hi = path.lspBounds.second;
-    const uint64_t width = bitWidthOf(*r.sym);
-    r.whole = width == 0 || (r.lo == 0 && r.hi + 1 >= width);
+    r.exact = path.isFullyStatic();
+    r.cover = BitInterval::forBounds(path.lspBounds.first, path.lspBounds.second,
+                                     bitWidthOf(*sym));
     return r;
 }
 
@@ -104,14 +112,14 @@ inline void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Re
     ValuePath::visitPaths(
         expr, ctx,
         [&](const ValuePath& path) {
-            Ref r = refOf(path);
-            if (!r.sym)
+            auto r = refOf(path);
+            if (!r)
                 return;
-            if (isConstantSymbol(*r.sym)) {
+            if (isConstantSymbol(*r->sym)) {
                 filteredConstants++;
                 return;
             }
-            out.push_back(r);
+            out.push_back(*r);
         },
         skipSelectors);
 }
@@ -120,13 +128,18 @@ inline void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Re
 /// makes `{a, b} = {x, y}` answerable without the v7 cross product.
 struct Slot {
     Ref ref;
-    uint64_t lo = 0;
-    uint64_t hi = 0;
-    /// True when the reference's own bits map one-to-one onto [lo, hi].
+    /// The window of the enclosing assignment this reference sits in, or
+    /// nullopt when the walk could not place it. The old encoding spelled
+    /// "unplaced" as a hand-written {0, ~uint64_t{0}} pair at eight sites.
+    std::optional<BitRange> pos;
+    /// True when the reference's own bits map one-to-one onto `pos`.
     bool positional = false;
-};
 
-constexpr uint64_t kNoWidth = ~uint64_t{0};
+    static Slot unpositioned(Ref r) { return Slot{std::move(r), std::nullopt, false}; }
+    static Slot at(Ref r, BitRange window, bool positional) {
+        return Slot{std::move(r), window, positional};
+    }
+};
 
 /// How many subroutine bodies one module may instantiate across all its
 /// procedures.
@@ -240,7 +253,7 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
                 std::vector<Ref> rest;
                 collectRefs(expr, ctx, rest, skipSelectors);
                 for (auto& r : rest)
-                    out.push_back(Slot{r, 0, kNoWidth, false});
+                    out.push_back(Slot::unpositioned(r));
                 return;
             }
             cursor -= w;
@@ -262,41 +275,48 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
     collectRefs(expr, ctx, refs, skipSelectors);
     if (!width) {
         for (auto& r : refs)
-            out.push_back(Slot{r, 0, kNoWidth, false});
+            out.push_back(Slot::unpositioned(r));
         return;
     }
     const bool positional =
         isPlainReference(expr) && refs.size() == 1 && refs[0].exact &&
-        (refs[0].whole ? bitWidthOf(*refs[0].sym) == width
-                       : refs[0].hi - refs[0].lo + 1 == width);
+        (refs[0].cover.isRange() ? refs[0].cover.bounds().width() == width
+                                 : bitWidthOf(*refs[0].sym) == width);
     for (auto& r : refs)
-        out.push_back(Slot{r, base, base + width - 1, positional});
+        out.push_back(Slot::at(r, BitRange(base, base + width - 1), positional));
 }
 
-inline bool slotsOverlap(const Slot& a, const Slot& b, uint64_t& lo, uint64_t& hi) {
-    if (a.hi == kNoWidth || b.hi == kNoWidth) {
-        lo = 0;
-        hi = kNoWidth;
+/// Whether two slots of one assignment touch the same bits. False means
+/// disjoint; true with a window means exactly that overlap; true with
+/// nullopt means either side was never placed, so the overlap is unbounded.
+inline bool slotsOverlap(const Slot& a, const Slot& b, std::optional<BitRange>& span) {
+    if (!a.pos || !b.pos) {
+        span = std::nullopt;
         return true;
     }
-    lo = std::max(a.lo, b.lo);
-    hi = std::min(a.hi, b.hi);
-    return lo <= hi;
+    const uint64_t lo = std::max(a.pos->lo, b.pos->lo);
+    const uint64_t hi = std::min(a.pos->hi, b.pos->hi);
+    if (lo > hi)
+        return false;
+    span = BitRange(lo, hi);
+    return true;
 }
 
-/// The reference narrowed to the part of it landing in [lo, hi] of the
+/// The reference narrowed to the part of it landing in `span` of the
 /// assignment. Only meaningful for a positional slot.
-inline Ref narrowed(const Slot& s, uint64_t lo, uint64_t hi) {
+inline Ref narrowed(const Slot& s, const std::optional<BitRange>& span) {
     Ref r = s.ref;
-    if (!s.positional || s.hi == kNoWidth || hi == kNoWidth || !r.sym)
+    if (!s.positional || !s.pos || !span || !r.sym)
         return r;
-    if (lo <= s.lo && hi >= s.hi)
+    if (span->lo <= s.pos->lo && span->hi >= s.pos->hi)
         return r;
-    const uint64_t offset = r.whole ? 0 : r.lo;
-    r.lo = offset + (lo - s.lo);
-    r.hi = offset + (hi - s.lo);
-    const uint64_t total = bitWidthOf(*r.sym);
-    r.whole = total == 0 || (r.lo == 0 && r.hi + 1 >= total);
+    // A positional slot's reference is exact (that is what positional
+    // asserts), so its cover is Whole or Range, never Unknown; an offset of
+    // zero reproduces the old whole-object arithmetic.
+    const uint64_t offset = r.cover.isRange() ? r.cover.lo() : 0;
+    r.cover = BitInterval::forBounds(offset + (span->lo - s.pos->lo),
+                                     offset + (span->hi - s.pos->lo),
+                                     bitWidthOf(*r.sym));
     return r;
 }
 
@@ -346,9 +366,9 @@ struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::All
         Ref r;
         r.sym = &e.symbol;
         r.origin = &e;
-        // No bounds computed here: the whole object is an upper bound, and
-        // storing it as exact would state uncertainty as fact.
-        r.exact = false;
+        // No bounds computed here -- and now the type says so: unknown() is
+        // the collector's honest answer, where the old encoding borrowed
+        // whole=true and relied on exact=false to keep the two apart.
         out.push_back(r);
     }
 };

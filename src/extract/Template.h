@@ -74,8 +74,8 @@ struct TplRange {
 
 inline TplRange rangeOf(const Ref& r) {
     TplRange out;
-    if (r.sym && !r.whole)
-        out.bits = std::make_pair(r.lo, r.hi);
+    if (r.sym && r.cover.isRange())
+        out.bits = std::make_pair(r.cover.lo(), r.cover.hi());
     out.exact = r.sym ? r.exact : true;
     return out;
 }

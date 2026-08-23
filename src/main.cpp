@@ -860,7 +860,14 @@ int main(int argc, char** argv) {
         }
 
         analysis::AnalysisManager analysis({}, pool);
+        // The analysis contract: the compilation is frozen while the manager's
+        // worker threads read it, and unfrozen after, because extraction still
+        // elaborates lazily. slang's own driver does exactly this pair; a
+        // Release build never noticed the missing half because the check is
+        // an assert (AnalysisManager.cpp, "compilation.isFrozen()").
+        compilation.freeze();
         { Phase p("analyze", opt.timing); analysis.analyze(compilation); }
+        compilation.unfreeze();
         // Informational only. What the analysis actually yielded per module
         // is not knowable here -- it is counted during extraction and
         // reported by reportStats below.
