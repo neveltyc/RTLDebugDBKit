@@ -693,7 +693,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // which v_driver reports as a CONSTANT tie-off on a signal the task
         // plainly drives. The real record is the `procedure` dependency
         // from the formal, which bindArguments already makes.
-        if (expr.right().kind == ExpressionKind::EmptyArgument) {
+        //
+        // Ask slang rather than testing the kind: the placeholder is not
+        // always bare. bindLValue gives it the FORMAL's type and then
+        // fromComponents converts it to the ACTUAL's, so an actual of any
+        // other type -- a narrower variable, a different sign -- arrives
+        // wrapped in a Conversion, and a raw kind test lets exactly those
+        // calls back through to the tie-off it exists to prevent.
+        if (expr.isLValueArg()) {
             visitDefault(expr);
             return;
         }

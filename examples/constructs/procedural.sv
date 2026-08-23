@@ -40,7 +40,7 @@
 //               only posedge and negedge silently records the level-sensitive
 //               spelling as one of them or as none.
 //
-//   macroloc    two slang calls that answer wrongly when asked wrongly.
+//   macroloc    slang calls that answer wrongly when asked wrongly.
 //               getFileName and getLineNumber expand a macro location
 //               internally; getColumnNumber does not -- its precondition is a
 //               FILE location, and a macro location's buffer holds an
@@ -51,6 +51,18 @@
 //               AssignmentExpression, so a plain-reference test on the raw
 //               argument sees the wrapper and claims map_exact=0 for every
 //               output binding -- including one exactly as wide as its formal.
+//               The two output arguments are also the pair that separates
+//               recognising that wrapper by expression kind from asking
+//               AssignmentExpression::isLValueArg. bindLValue types the
+//               placeholder from the FORMAL and fromComponents converts it to
+//               the ACTUAL, so `scratch` -- same type -- arrives bare, while
+//               `nib` arrives inside a Conversion. A kind test matches only
+//               the first, and the second falls through to ordinary
+//               assignment handling: no operands on the right side, hence a
+//               source-less dependency, hence the constant tie-off in
+//               v_driver that this guard exists to prevent. Only an actual
+//               whose type differs from its formal reaches the wrapped form,
+//               which is why the same-width control alone did not catch it.
 
 module compound (input logic clk, input logic [7:0] x,
                  output logic [7:0] explicit_self, compound_self, shift_self,
@@ -113,16 +125,31 @@ endmodule
 `define DRIVE(D, S) assign D = (S)
 
 module macroloc (input logic [7:0] a, output logic [7:0] via_macro, direct,
-                 output logic [7:0] out_arg);
+                 output logic [7:0] out_arg, output logic [3:0] narrow_arg);
     `DRIVE(via_macro, a);        // the row for this must carry a real column
     assign direct = a;           // the control, one line below, never expanded
 
     logic [7:0] scratch;
+    logic [3:0] nib;
     task automatic pass(input logic [7:0] i, output logic [7:0] o);
         o = i;
     endtask
-    always_comb pass(a, scratch);   // whole-to-whole, so map_exact must be 1
+    always_comb begin
+        pass(a, scratch);   // whole-to-whole, so map_exact must be 1
+        // The same copy-back, with an actual the formal's type does not
+        // match. bindLValue builds the placeholder from the FORMAL's type
+        // and fromComponents then converts it to the ACTUAL's, so this one
+        // reaches the walk wrapped in a Conversion where `scratch` above
+        // arrives bare -- and a copy-back recognised by expression kind
+        // rather than by AssignmentExpression::isLValueArg sees only the
+        // bare form. The wrapped one fell through to ordinary assignment
+        // handling, whose right side has no operands, and `nib` gained a
+        // source-less dependency on top of its real `procedure` one: a
+        // CONSTANT tie-off in v_driver on a signal the task plainly drives.
+        pass(a, nib);       // narrower, so map_exact must be 0 -- and this
+    end                     // must remain its ONLY driver
     assign out_arg = scratch;
+    assign narrow_arg = nib;
 endmodule
 
 module procedural (input logic clk, input logic [7:0] x, k,
@@ -132,7 +159,8 @@ module procedural (input logic clk, input logic [7:0] x, k,
                    output logic [7:0] assign_style, ret_style,
                    output logic [7:0] matched, looped, sum, output logic held,
                    output logic [7:0] latched, both_q,
-                   output logic [7:0] via_macro, direct, out_arg);
+                   output logic [7:0] via_macro, direct, out_arg,
+                   output logic [3:0] narrow_arg);
     compound u_cmp (.clk(clk), .x(x), .explicit_self(explicit_self),
                     .compound_self(compound_self), .shift_self(shift_self),
                     .masked(masked));
@@ -142,5 +170,5 @@ module procedural (input logic clk, input logic [7:0] x, k,
     evkinds  u_ev  (.en(en), .ev(ev), .d(x), .latched(latched),
                     .both_q(both_q));
     macroloc u_mac (.a(x), .via_macro(via_macro), .direct(direct),
-                    .out_arg(out_arg));
+                    .out_arg(out_arg), .narrow_arg(narrow_arg));
 endmodule
