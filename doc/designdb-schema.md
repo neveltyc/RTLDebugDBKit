@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 16. The version is the *consumption contract*, not the DDL: a
+Schema version 17. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
@@ -149,10 +149,9 @@ table follow.
 
 **`module`** — `id, name, def_kind, file_id, line, column`, unique on
 (name, file_id, line). `def_kind` is `module | interface | program |
-checker | package` (a package's pseudo-occurrence carries a `module` row of
-its own, see *Packages*). However many parameterisations elaborate, the
-definition is one
-row.
+package` (a package's pseudo-occurrence carries a `module` row of its own,
+see *Packages*). However many parameterisations elaborate, the definition is
+one row.
 
 **`tree_node`** — `id, parent_node_id, name, node_kind, ordinal`. One path
 segment per node, `[i]` included for array elements (`u[0]`, `lane[3]`), so
@@ -1023,9 +1022,9 @@ at query time over tags rather than baked into the stored graph.
 The tag is on all six views a walk meets: `v_net_dep`, `v_driver` and
 `v_load` for the dependency path, and `v_stmt`, `v_stmt_target` and
 `v_stmt_operand` for the statement path — the one a consumer falls back to
-when a dependency did not survive its unresolvable sources. Until v15 the
-statement layer carried it on the base table and not on the views, which
-left the recipe unexecutable from exactly that side. It is also the layer
+when a dependency did not survive its unresolvable sources. The statement
+layer carries the tag on its views as well as its base table, or the recipe
+is unexecutable from exactly that side. It is also the layer
 where the question is asked without tracing at all: "which call does this
 statement in a shared package or interface body belong to" is a lookup, and
 had no answer.

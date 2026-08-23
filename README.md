@@ -77,7 +77,7 @@ granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v16:
+Release build, macOS arm64, against public designs, schema v17:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -146,12 +146,12 @@ src/extract/            the export, in layers. Ref/SymbolText/Template are the
                         one-function interface
 doc/designdb-schema.md  the field reference
 examples/basic/         RTL small enough to read, exported by CI
-examples/constructs/    one fixture per construct family, each exported and
-                        asserted by CI under its own verifier mode: net and
-                        expression forms, procedural statements, subroutines
-                        and call sites, hierarchical names and packages, gates
-                        switches and UDPs, interfaces, assertions,
-                        parameterisation, port shapes, generate arrays, and the
+examples/constructs/    one fixture per LRM construct family, each exported
+                        and asserted by CI under its own verifier mode:
+                        expressions and assignments, procedural statements and
+                        subroutines, modules ports and generate,
+                        parameterisation, hierarchical names, packages,
+                        primitives, interfaces, assertions, and the
                         deliberately invalid -- a missing definition, an
                         unnamed instantiation, a module that instantiates
                         itself. A family that needs a lint waiver gets a file
@@ -167,7 +167,8 @@ examples/reorder/       also not a construct fixture: five files in reverse
                         one that can catch src_file ids following the buffers
 scripts/                build-release.sh (the four release platforms),
                         verify-designdb.py (read an export back, fail if hollow
-                        or malformed; --list-modes names the fixture set),
+                        or malformed; --list-modes names the fixture set,
+                        --domain-coverage checks the corpus against it),
                         designdb-coverage.py (what an export had to approximate),
                         export-real-designs.sh (the measurements table, from a
                         local checkout of the public designs),
@@ -179,7 +180,11 @@ scripts/                build-release.sh (the four release platforms),
 [CI](.github/workflows/ci.yml) builds both SQLite configurations, lints every
 fixture past both front ends, exports the whole of `examples/` and reads each
 database back — a build that links proves the slang pin resolves, not that the
-exporter still writes rows. The same push builds all four release binaries
+exporter still writes rows. It then checks the corpus against the schema:
+every value the published domains name, and every word in the four view
+vocabularies, has to be produced by some fixture, so the test set is driven by
+the contract rather than by whichever constructs happened to break once. The
+same push builds all four release binaries
 ([binaries.yml](.github/workflows/binaries.yml)) and repeats the export sweep
 on each platform — the Linux pair builds inside an Alpine container and then
 runs on the bare glibc runner, so a dynamic dependency that crept into the
@@ -209,10 +214,10 @@ The declared failure then counts as a pass, and the tool *accepting* the file
 counts as a failure — so the marker cannot outlive the limitation it records.
 
 A fixture that is deliberately invalid RTL declares both, for the same reason
-read the other way: `recursion.sv`, `anonymous.sv` and `unresolved.sv` MUST be
-rejected, and a front end that starts accepting one is reported as stale rather
-than quietly waived. The marker waives a whole file, which is why a construct
-family that needs one lives in a file of its own.
+read the other way: `recursion.sv` and `incomplete.sv` MUST be rejected, and a
+front end that starts accepting one is reported as stale rather than quietly
+waived. The marker waives a whole file, which is why a construct family that
+needs one lives in a file of its own.
 
 ## Licence
 
