@@ -958,6 +958,10 @@ void TemplateBuilder::addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
             Ref r;
             r.sym = &vs;
             r.origin = expr;
+            // Parity with the pre-BitInterval default: an event reference
+            // that leaves the instance claimed the whole object exactly.
+            r.cover = BitInterval::whole();
+            r.exact = true;
             const int32_t saved = b.curStmt;
             b.curStmt = stmtIdx;
             addHierRef(b, false, r, at, evalCtx);
@@ -1342,30 +1346,30 @@ void TemplateBuilder::buildNetInitialisers(Build& b, const InstanceBodySymbol& b
             std::set<const SubroutineSymbol*> active;
             collectCallReadsInto(*init, active, callReads);
             for (auto& r : callReads)
-                rhs.push_back(Slot{r, 0, kNoWidth, false});
+                rhs.push_back(Slot::unpositioned(r));
         }
         const int64_t droppedConstants = filteredConstants;
         evalCtx.reset();
 
         const uint64_t netWidth = bitWidthOf(net);
-        Slot dstSlot;
-        dstSlot.ref.sym = &net;
-        if (netWidth) {
-            dstSlot.hi = netWidth - 1;
-            dstSlot.positional = true;
-        }
-        else {
-            dstSlot.hi = kNoWidth;
-        }
+        Ref dstRef;
+        dstRef.sym = &net;
+        // A net initialiser drives all of the net; whole and exact is the
+        // genuine answer, not a parity default.
+        dstRef.cover = BitInterval::whole();
+        dstRef.exact = true;
+        const Slot dstSlot = netWidth
+                                 ? Slot::at(dstRef, BitRange(0, netWidth - 1), true)
+                                 : Slot::unpositioned(dstRef);
         std::vector<PairedSrc> pairs;
         for (auto& srcSlot : rhs) {
             if (!srcSlot.ref.sym)
                 continue;
-            uint64_t lo = 0, hi = 0;
-            if (!slotsOverlap(dstSlot, srcSlot, lo, hi))
+            std::optional<BitRange> span;
+            if (!slotsOverlap(dstSlot, srcSlot, span))
                 continue;
-            pairs.push_back(PairedSrc{narrowed(srcSlot, lo, hi),
-                                      narrowed(dstSlot, lo, hi),
+            pairs.push_back(PairedSrc{narrowed(srcSlot, span),
+                                      narrowed(dstSlot, span),
                                       dstSlot.positional && srcSlot.positional,
                                       srcSlot.ref});
         }
@@ -1647,10 +1651,10 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
                 d.tgtR = rangeOf(dst);
                 const bool oneBit =
                     src.exact && dst.exact &&
-                    (src.whole ? bitWidthOf(*src.sym) == 1
-                               : src.hi == src.lo) &&
-                    (dst.whole ? bitWidthOf(*dst.sym) == 1
-                               : dst.hi == dst.lo);
+                    (src.cover.isRange() ? src.cover.bounds().width() == 1
+                                         : bitWidthOf(*src.sym) == 1) &&
+                    (dst.cover.isRange() ? dst.cover.bounds().width() == 1
+                                         : bitWidthOf(*dst.sym) == 1);
                 d.mappingExact = oneBit ? 1 : 0;
                 d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
