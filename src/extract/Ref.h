@@ -40,6 +40,7 @@
 #include "slang/numeric/SVInt.h"
 
 #include "ir/Bits.h"
+#include "ir/PositionWalk.h"
 
 namespace designdb::detail {
 
@@ -197,68 +198,34 @@ inline bool isPlainReference(const Expression& e) {
 /// occupies. Concatenations and simple assignment patterns are positioned
 /// element by element, MSB first; conversions are transparent when width-
 /// preserving or truncating and degrade to range-level when widening.
+///
+/// The element loop, its zero-width rule and its overflow guard live in
+/// ir/PositionWalk.h, shared with every other positioned walk. The recovery
+/// here: the positional slots this level already emitted are dropped -- a
+/// walk that has lost the cursor cannot vouch for them, and appending would
+/// leave one reference in `out` twice with two contradictory windows -- and
+/// the whole expression rides unpositioned instead. No well-formed
+/// expression reaches it (slang wraps width mismatches in Conversions), but
+/// the wrap it prevents handed out bit ranges near 2^64 before 728b07b.
 inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base,
                          std::vector<Slot>& out, bool skipSelectors = false) {
     const uint64_t width = exprWidthOf(expr);
 
-    const bool elementwise = expr.kind == ExpressionKind::Concatenation ||
-                             expr.kind == ExpressionKind::SimpleAssignmentPattern;
-    if (elementwise && width) {
-        auto ops = expr.kind == ExpressionKind::Concatenation
-                       ? expr.as<ConcatenationExpression>().operands()
-                       : expr.as<SimpleAssignmentPatternExpression>().elements();
-        uint64_t cursor = base + width;
-        // Where this expression's slots start, so the fallback below can
-        // drop the positional ones already emitted for the operands ahead
-        // of the one that stopped the walk. Appending to them instead would
-        // leave one reference in `out` twice with two contradictory windows.
+    if (isElementwise(expr) && width) {
         const size_t mark = out.size();
-        for (auto* op : ops) {
-            if (!op)
-                continue;
-            const uint64_t w = exprWidthOf(*op);
-            // An operand of no width is not an anomaly and does not stop
-            // anything: `{0{x}}` is legal, slang gives it the void type and
-            // keeps it among the operands, and an ordinary parameterised pad
-            // -- `{data, {PAD{1'b0}}, rest}` at PAD = 0 -- arrives here. It
-            // occupies no bits of the result, so it moves no cursor, the
-            // operands after it keep the positions they had, and nothing of
-            // it reaches the target: walking into it would record a
-            // dependency on a signal the concatenation does not read.
-            if (!w)
-                continue;
-            // An operand WIDER than what is left of the concatenation is the
-            // real stop, and it used to be unguarded here though its twin in
-            // StatementWalker's collectAuxSlots has always tested for it: the
-            // widths do not add up to the whole, `cursor -= w` is an unsigned
-            // wrap, and the slots below it would carry bit ranges near 2^64
-            // -- a garbage answer offered with the same confidence as a real
-            // one. The positional slots already emitted go with it, because a
-            // walk that has lost the cursor cannot vouch for them either.
-            //
-            // No expression is known to reach it: slang wraps every operand
-            // whose width differs from its context in a Conversion, so a
-            // well-formed concatenation adds up by construction, and a
-            // malformed one loses its type and arrives here with width 0.
-            // Probed over the constructs fixtures, a concatenation torture
-            // file (packed and unpacked patterns, replication, streaming,
-            // string concatenation, truncating and widening conversions,
-            // unresolved names and types, out-of-range selects) and
-            // picorv32, tinyriscv and veerwolf: not once, in either
-            // function. The two are aligned on the safe side rather than the
-            // cheap one because the costs are not symmetric -- one more
-            // comparison per operand against a silent wrap.
-            if (w > cursor - base) {
+        walkElements(
+            expr, base, width, exprWidthOf,
+            [&](const Expression& op, BitRange window) {
+                collectSlots(op, ctx, window.lo, out, skipSelectors);
+            },
+            [&]() {
                 out.resize(mark);
                 std::vector<Ref> rest;
                 collectRefs(expr, ctx, rest, skipSelectors);
                 for (auto& r : rest)
                     out.push_back(Slot::unpositioned(r));
-                return;
-            }
-            cursor -= w;
-            collectSlots(*op, ctx, cursor, out, skipSelectors);
-        }
+            },
+            [](const Expression&) { /* the fallback above covered the rest */ });
         return;
     }
 
@@ -279,9 +246,9 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
         return;
     }
     const bool positional =
-        isPlainReference(expr) && refs.size() == 1 && refs[0].exact &&
-        (refs[0].cover.isRange() ? refs[0].cover.bounds().width() == width
-                                 : bitWidthOf(*refs[0].sym) == width);
+        isPlainReference(expr) && refs.size() == 1 &&
+        coverFillsWidth(refs[0].cover, refs[0].exact, width,
+                        bitWidthOf(*refs[0].sym));
     for (auto& r : refs)
         out.push_back(Slot::at(r, BitRange(base, base + width - 1), positional));
 }

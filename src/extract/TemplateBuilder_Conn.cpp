@@ -39,9 +39,8 @@ void TemplateBuilder::collectConnRefs(const Expression& expr, EvalContext& ctx,
                 cr.winHi = base + width - 1;
                 cr.windowExact = true;
                 cr.positional =
-                    !isExpr && refs.size() == 1 && r.exact &&
-                    (r.cover.isRange() ? r.cover.bounds().width() == width
-                                       : bitWidthOf(*r.sym) == width);
+                    !isExpr && refs.size() == 1 &&
+                    coverFillsWidth(r.cover, r.exact, width, bitWidthOf(*r.sym));
             }
             out.push_back(std::move(cr));
         }
@@ -58,19 +57,26 @@ void TemplateBuilder::collectConnRefs(const Expression& expr, EvalContext& ctx,
             return;
         }
         case ExpressionKind::Concatenation: {
-            auto ops = expr.as<ConcatenationExpression>().operands();
-            uint64_t cursor = base + width;
-            bool bad = degraded || width == 0;
-            for (auto* op : ops) {
-                if (!op)
-                    continue;
-                const uint64_t w = exprWidthOf(*op);
-                if (!bad && (w == 0 || w > cursor - base))
-                    bad = true;
-                if (!bad)
-                    cursor -= w;
-                collectConnRefs(*op, ctx, out, bad ? 0 : cursor, bad);
+            if (degraded || width == 0) {
+                for (auto* op : expr.as<ConcatenationExpression>().operands())
+                    if (op)
+                        collectConnRefs(*op, ctx, out, 0, true);
+                return;
             }
+            // The shared walk supplies the two corner rules this copy used
+            // to answer differently: a zero-width operand now moves no
+            // cursor and poisons nothing -- it used to degrade the whole
+            // side, though the members after it keep their positions -- and
+            // a width overflow degrades the rest, as before.
+            walkElements(
+                expr, base, width, exprWidthOf,
+                [&](const Expression& op, BitRange window) {
+                    collectConnRefs(op, ctx, out, window.lo, false);
+                },
+                []() {},
+                [&](const Expression& op) {
+                    collectConnRefs(op, ctx, out, 0, true);
+                });
             return;
         }
         case ExpressionKind::Replication: {
