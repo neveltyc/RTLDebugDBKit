@@ -7,10 +7,11 @@
 // the front end, not evidence about this file. slang and Verilator accept it,
 // and check-rtl.sh will fail if Icarus ever starts to.
 //
-// What it exercises: an interface port binding (port.conn_kind=4, with the
-// declared modport), interface_port symbol rows, and interface member
-// references from inside the connected modules -- which leave their module
-// and land in hier_ref.
+// What it exercises: an interface port binding (net_conn.conn_kind='interface',
+// naming the interface instance, with the declared modport on the terminal),
+// interface terminals (term.term_kind='interface'), and interface member
+// references from inside the connected modules -- which leave their module and
+// land in hier_ref.
 
 interface simple_bus(input logic clk);
     logic       vld;
@@ -32,10 +33,10 @@ module relay(simple_bus.src bus);
 endmodule
 
 // Two outward writes, each fed by a different local signal, on one line. The
-// write lands in hier_ref and the read in stmt_read, so before those rows
-// carried a statement ordinal the two were indistinguishable: `bus.vld` could
-// be read as fed by `ready` or by `payload`, and so could `bus.data`. This is
-// the shape interface RTL mostly is -- a modport driver computing from local
+// write lands in hier_ref and the read in assign_operand, and only the
+// statement they share tells them apart: without it `bus.vld` reads as fed by
+// `ready` or by `payload` indifferently, and so does `bus.data`. This is the
+// shape interface RTL mostly is -- a modport driver computing from local
 // state -- which is why it is the case worth pinning.
 module driver_pair(simple_bus.src bus, input logic ready, input logic [7:0] payload);
     assign bus.vld = ready; assign bus.data = payload;

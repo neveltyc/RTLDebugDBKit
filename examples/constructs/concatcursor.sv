@@ -10,14 +10,13 @@
 // stop at all -- it occupies no bits, so the cursor does not move and the
 // operands beside it keep the positions they had.
 //
-// No expression here reaches the stop, and none is known to:
-// slang wraps every operand whose width differs from its context in a
-// conversion, so a well-formed concatenation adds up by construction, and a
-// malformed one loses its type and arrives with width 0 instead. What this
-// file holds is the shapes that come closest -- truncation, widening,
-// replication, streaming, packed patterns, unpacked targets, string
-// concatenation -- so that the guard that was added to match its twin is
-// shown not to have narrowed any of them.
+// No expression here reaches the stop, and none is known to: slang wraps every
+// operand whose width differs from its context in a conversion, so a
+// well-formed concatenation adds up by construction, and a malformed one loses
+// its type and arrives with width 0 instead. What this file holds is the
+// shapes that come closest -- truncation, widening, replication, streaming,
+// packed patterns, unpacked targets -- so the guard is shown not to have
+// narrowed any of them.
 
 typedef struct packed { logic [3:0] hi; logic [3:0] lo; } cc_pair_t;
 

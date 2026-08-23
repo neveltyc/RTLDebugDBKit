@@ -8,8 +8,9 @@
 // accept it, and check-rtl.sh will fail if Icarus ever starts to.
 //
 // What it exercises: an assertion writes nothing, so its reads fit in no table
-// keyed on a target -- `edge` needs a `dst` and `assign_operand` needs an
-// `assignment` row. Without `stmt_read` every signal a property checks reads as
+// keyed on a target -- `net_dep` needs a target net and `assign_operand` needs
+// an assignment statement. They are recorded as `expr_ref` rows with
+// role='assertion'; without those, every signal a property checks reads as
 // though no part of the design looked at it, which for verification-heavy RTL
 // is most of what the file says.
 

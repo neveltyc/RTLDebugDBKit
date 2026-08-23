@@ -61,6 +61,14 @@ jobs:
       # the runner is made of anyway. That split is also the proof the smoke
       # test below relies on: built against musl in the container, executed
       # against glibc on the runner.
+      # No compiler cache here, deliberately. Installing ccache on the macOS
+      # runner puts Homebrew's fmt on the prefix slang's CMake searches, and
+      # slang then links that instead of the version it pins -- which against
+      # this target's `CMAKE_OSX_DEPLOYMENT_TARGET=11.0` fails to compile,
+      # because fmt delegates to std::format and to_chars(long double) is
+      # unavailable that far back. A release build is not the place to mutate
+      # the toolchain for a cache; ci.yml, which builds nothing for release,
+      # is where ccache lives.
       - name: Build release binary
         run: |
           if [ "$RUNNER_OS" == "macOS" ]; then
@@ -73,25 +81,21 @@ jobs:
       # the bare glibc runner, so a dynamic dependency that crept into the
       # "static" binary fails here instead of on someone's farm.
       #
-      # `recursion` is here and not only in CI because its failure mode was a
-      # stack overflow, which is the one thing that is genuinely per-platform:
-      # glibc, musl and macOS do not give a thread the same stack. `paramrec`
-      # rides with it as the control -- a stack that runs out early would cut
-      # a legal hierarchy rather than crash, and only the control says so.
+      # The whole fixture set rather than a chosen few. An export costs tens of
+      # milliseconds, so the sweep is seconds per platform, and what it covers
+      # is exactly what a second platform can differ about: `recursion` walks
+      # until a thread's stack runs out and glibc, musl and macOS do not give a
+      # thread the same stack, while every fixture carries file paths, and
+      # Windows spells those differently. The mode list comes from the
+      # verifier, so there is no second list to keep in step.
       - name: Export and read back
         run: |
           ${{ matrix.bin }} examples/basic/top.sv --top top -o design.db
           ${{ matrix.python }} scripts/verify-designdb.py design.db
-          ${{ matrix.bin }} examples/constructs/constructs.sv -o constructs.db
-          ${{ matrix.python }} scripts/verify-designdb.py constructs.db constructs
-          ${{ matrix.bin }} examples/constructs/interfaces.sv -o interfaces.db
-          ${{ matrix.python }} scripts/verify-designdb.py interfaces.db interfaces
-          ${{ matrix.bin }} examples/constructs/assertions.sv -o assertions.db
-          ${{ matrix.python }} scripts/verify-designdb.py assertions.db assertions
-          ${{ matrix.bin }} examples/constructs/recursion.sv -o recursion.db
-          ${{ matrix.python }} scripts/verify-designdb.py recursion.db recursion
-          ${{ matrix.bin }} examples/constructs/paramrec.sv -o paramrec.db
-          ${{ matrix.python }} scripts/verify-designdb.py paramrec.db paramrec
+          for mode in $(${{ matrix.python }} scripts/verify-designdb.py --list-modes); do
+            ${{ matrix.bin }} "examples/constructs/$mode.sv" -o "$mode.db"
+            ${{ matrix.python }} scripts/verify-designdb.py "$mode.db" "$mode"
+          done
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

@@ -1,18 +1,18 @@
-// The v2 constructs the basic example never reaches: self-feedback,
-// primitives, statement-level waits, downward hierarchical references,
-// part-select and expression port connections, force/release. It also spans
-// two files -- a macro at the top and an `include`d task body -- because a
-// row's file and line are only provably paired when the statement and its
-// procedure live in different files.
+// The constructs the basic example never reaches: self-feedback, primitives,
+// statement-level waits, downward hierarchical references, part-select and
+// expression port connections, force/release. It also spans two files -- a
+// macro at the top and an `include`d task body -- because a row's file and
+// line are only provably paired when the statement and its procedure live in
+// different files.
 //
-// Passes scripts/check-rtl.sh (Verilator and Icarus both). Interface
-// constructs live in interfaces.sv, which Icarus does not implement yet.
+// One construct family per module, and the families that need a lint waiver
+// live in files of their own: check-rtl's expect-fail marker waives a whole
+// file, so anything declared here would take the rest of it with it.
 
-// The driver it expands to is the first one this file contributes, which is
-// the case that matters: the exporter learns a file's on-disk origin from the
-// first row that mentions it, and a macro body is not a file. Getting that
-// wrong left the whole file with no digest to check it against -- and only
-// when the macro came first, so a macro further down would not have caught it.
+// The first row this file contributes comes out of a macro body, which is the
+// case that matters: the exporter learns a file's on-disk origin from the
+// first row that mentions it, and a macro body is not a file. A macro further
+// down the file would not reach that path.
 `define DECLARE_TRACE(nm) logic [7:0] nm; assign nm = 8'h5A;
 
 module counter(input logic clk, input logic rst_n, output logic [7:0] cnt);
@@ -29,11 +29,11 @@ module decode(input logic [3:0] idx, output logic [15:0] onehot);
     assign onehot = 16'b1 << idx;
 endmodule
 
-// v10 facts: a delay is a statement's normalised text, never a number this
-// tool pretends to evaluate; an undeclared name on a continuous assign's
-// left is a real net row with is_implicit set; and one source reaching one
-// target from two statements stays two dependencies -- the occurrence
-// granularity the old deduplicated edge model erased.
+// A delay is a statement's normalised text, never a number this tool pretends
+// to evaluate; an undeclared name on a continuous assign's left is a real net
+// row with is_implicit set; and one source reaching one
+// target from two statements stays two dependencies -- one row per
+// occurrence, not one per (source, target) pair.
 module timing_pair(input logic a, input logic b, output logic r2);
     assign #3 dly_w = a;                    // implicit net, delayed assign
     logic q1;
@@ -48,9 +48,9 @@ module timing_pair(input logic a, input logic b, output logic r2);
     always_comb unused_ok = dly_r;
 endmodule
 
-// A net declared with an initialiser is a continuous assignment by the LRM,
+// LRM 6.8 -- a net declared with an initialiser is a continuous assignment,
 // but slang models it as a net carrying an expression rather than as an
-// `assign`, so it reached no procedure and `w`/`s` had no driver at all.
+// `assign`, so it belongs to no procedure and needs its own path to a driver.
 module netinit(input logic a, input logic b, output logic y);
     wire w = a & b;
     wire (strong1, weak0) s = a;
@@ -73,9 +73,9 @@ module checks(input logic clk, input logic req, input logic ack);
 endmodule
 
 // Statements whose whole effect is to read. Nothing here writes anything the
-// module can name, so before these were recorded the signals came back as
-// ones no part of the design had ever looked at -- while the source prints
-// them and waits on them.
+// module can name, so unless the read itself is recorded the signals come back
+// as ones no part of the design ever looked at -- while the source prints them
+// and waits on them.
 module observers(input logic clk, input logic [7:0] watched, input logic done);
     logic [7:0] loaded [0:1];
     initial begin
@@ -97,28 +97,28 @@ module gates(input logic a, input logic b, input logic en, output logic y);
     bufif1 g_bufz(zt, yi, en);              // enable terminal
     pullup g_pu  (pu);                      // no input terminal at all
     // One net on both terminals, different bits: real dataflow, and the case
-    // that a same-symbol self-pairing guard threw away -- and then reported as
-    // a gate driving sr[1] from nothing.
+    // a guard against self-pairing by symbol throws away -- leaving a gate
+    // that drives sr[1] from nothing.
     buf    g_sr0 (sr[1], sr[0]);
     buf    g_sr1 (sr[2], sr[1]);
     assign y = zt;
 endmodule
 
-// Two assignments to one target, on one line, under a condition. All of
-// `edge` and `assignment` agree on module, dst, file and line here, so joining
-// the two tables on those columns pairs each statement with every edge --
-// including the branch condition's. `assign_operand` is what separates them,
-// and the database asserts that it does.
+// Two assignments to one target, on one line, under a condition. `net_dep`
+// and `stmt` agree on instance, target, file and line here, so anything that
+// pairs them on those columns matches each statement with every dependency --
+// including the branch condition's. `stmt_id` is what separates them, and the
+// database asserts that it does.
 module branches(input logic clk, input logic c, input logic [7:0] a,
                 input logic [7:0] b, output logic [7:0] sel);
     always_ff @(posedge clk) begin if (c) sel <= a; else sel <= b; end
 endmodule
 
 // Concatenated assignment: both sides are positioned, so the halves correspond.
-// Pairing every target with every operand made `swap_lo -> packed_hi` and
-// `swap_hi -> packed_lo` -- not conservative but wrong, and marked exact on both
-// ends like the two real edges. `bits` is the other half of it: the operands of
-// one concatenation land in their own slices of the target rather than each
+// Pairing every target with every operand adds `swap_lo -> packed_hi` and
+// `swap_hi -> packed_lo` -- not conservative but wrong, and exact on both ends
+// like the two real dependencies. `bits` is the other half of it: the operands
+// of one concatenation land in their own slices of the target rather than each
 // driving all of it.
 module packing(input logic [3:0] swap_hi, input logic [3:0] swap_lo,
                output logic [3:0] packed_hi, output logic [3:0] packed_lo,
@@ -128,8 +128,8 @@ module packing(input logic [3:0] swap_hi, input logic [3:0] swap_lo,
 endmodule
 
 // A dynamic select: which bit of `bus` reaches `q` is decided at runtime, so
-// the source range is an upper bound (source_exact=0) and no per-bit mapping
-// can be claimed (mapping_exact=0). The index is read as data in its own right.
+// the source range is an upper bound (src_exact=0) and no per-bit mapping can
+// be claimed (map_exact=0). The index is read as data in its own right.
 module pick(input logic [7:0] bus, input logic [2:0] i, output logic q);
     assign q = bus[i];
 endmodule
@@ -137,24 +137,22 @@ endmodule
 // The bit-precision model crossing the instance boundary. A concatenated
 // connection puts each element in its own slice of the formal -- without the
 // formal-side window, hi and lo both read as attached to all of q, and the
-// per-bit precision edges carry ended at every port.
+// per-bit precision a dependency carries ends at every port.
 module bytesink(input logic [7:0] q);
 endmodule
 module bytesource(output logic [7:0] q);
     assign q = 8'hC3;
 endmodule
-// A composite formal (`module m(.p({hi, lo}))`) is the fourth window shape and
-// already slices the OUTER side per sub-port. It cannot live here: Verilator
-// rejects complex ports outright, and check-rtl's expect-fail marker waives a
-// whole file rather than one module. slang handles it, and the exporter's
-// windows were verified against it by hand -- see the v9 commit.
+// A composite formal (`module m(.p({hi, lo}))`) is the fourth window shape.
+// It lives in portshape.sv rather than here: Verilator rejects complex ports
+// outright, and the waiver for that would cover this whole file.
 
 // A read's load_kind is its semantics, not which table stored it. A plain
-// event (`@(posedge clk)`) fits proc_event.signal; a selected-bit event can
-// not, and its reads travel through stmt_read -- yet `@(posedge clks[2])` is
-// as much a sensitivity read as the plain spelling, and `wait (clks[0])` and
-// a statement-level `@(posedge clks[1]);` are both waits. The view must say
-// so regardless of the storage split.
+// event (`@(posedge clk)`) fits proc_event.net_id; a selected-bit event
+// cannot, and its reads travel through expr_ref -- yet `@(posedge clks[2])`
+// is as much a sensitivity read as the plain spelling, and `wait (clks[0])`
+// and a statement-level `@(posedge clks[1]);` are both waits. The view must
+// say so regardless of the storage split.
 module evkinds(input logic [2:0] clks, input logic d, output logic q);
     always_ff @(posedge clks[2]) q <= d;
     initial begin
@@ -228,15 +226,16 @@ module constructs;
     logic pk;
     pick u_pick(.bus(stim), .i(cnt_o[2:0]), .q(pk));
     // One instance carrying the two connection kinds nothing else here has:
-    // a port tied to a constant (conn_kind=1) and a port left unconnected
-    // (conn_kind=2). Recorded rather than omitted -- "nobody connected it"
-    // must stay distinct from "the exporter did not get that far".
+    // a port tied to a constant (conn_kind='constant') and a port left
+    // unconnected (conn_kind='unconnected'). Recorded rather than omitted --
+    // "nobody connected it" must stay distinct from "the exporter did not get
+    // that far".
     pick u_pick2(.bus(8'h5A), .i(cnt_o[2:0]), .q());
 
     // A generate loop is a naming level of its own: the tree holds g_rep[0]
-    // and g_rep[1] as nodes with neither module nor child row, while the
-    // folded `child` rows under `constructs` spell the whole path
-    // (`g_rep[0].u_dec`). The two spellings are what instance.child relates.
+    // and g_rep[1] as node_kind='generate' nodes with no inst row, and the
+    // instance below each carries `u_dec` as its own single segment. Walking
+    // the two levels is what spells the whole path, `g_rep[0].u_dec`.
     for (genvar gi = 0; gi < 2; gi++) begin : g_rep
         logic [15:0] oh_g;
         decode u_dec(.idx(stim[3:0]), .onehot(oh_g));

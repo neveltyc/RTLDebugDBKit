@@ -3,32 +3,30 @@
 //
 // check-rtl: expect-fail icarus -- no support for escaped identifiers here
 //
-// Names and scopes that were derived by splitting strings.
+// LRM 5.6.1 escaped identifiers and LRM 23.3.2 instance arrays -- the names
+// that are wrong if a leaf segment is recovered by splitting a string.
 //
 //   * an escaped identifier may contain a '.', because slang writes it
-//     verbatim as `\name ` with no quoting. Taking the leaf by splitting the
-//     hierarchical path on the last dot named `\u.1 `'s tree node `1`, and no
-//     path lookup could reach that instance. The leaf comes from the symbol
-//     now, with the same escaping rule and the same array-index suffixes
-//     slang applies, so `u[0]` still spells `u[0]`.
+//     verbatim as `\name ` with no quoting. Splitting the hierarchical path on
+//     its last dot names `\u.1 `'s tree node `1`, and no path lookup reaches
+//     that instance. The leaf has to come from the symbol, with slang's own
+//     escaping rule and array-index suffixes, so `u[0]` still spells `u[0]`.
 //
-//   * a GATE took neither. Its name came from the symbol's own `name` rather
-//     than through the same function, and an instance array's element carries
-//     the bare array name there -- so `buf p [1:0]` spelled both elements `p`,
-//     one scope with two nodes of one name, and `top.p[1]` was unreachable by
-//     the only lookup the tree has. An escaped gate name arrived unescaped
-//     with it, so `\g.1 ` wrote a node name holding a dot: two path segments
-//     where a node is one.
+//   * a GATE is the same symbol base and must spell its leaf the same way. Its
+//     own `name` carries neither: an instance array's element holds the bare
+//     array name there, so `buf p [1:0]` spells both elements `p` -- one scope,
+//     two nodes, one name, and `top.p[1]` unreachable by the only lookup the
+//     tree has. An escaped gate name arrives unescaped with it, so `\g.1 `
+//     writes a node name holding a dot: two path segments where a node is one.
 //
-//   * a net initialiser and an alias inside a generate block were filed under
-//     the INSTANCE rather than the generate level that declares them, while
-//     the net rows for the same declarations were filed correctly -- so the
-//     two tables contradicted each other and `g[0]`'s initialiser could not be
-//     told from `g[1]`'s.
+//   * a net initialiser and an alias inside a generate block belong to the
+//     generate level that declares them, not to the instance. The net rows for
+//     the same declarations are filed by scope, so filing these by instance
+//     makes the two tables contradict each other and `g[0]`'s initialiser
+//     indistinguishable from `g[1]`'s.
 //
-//
-// (`alias {a, b} = c;` had the same class of bug and lives in aliascat.sv,
-// which Verilator cannot lint.)
+// (`alias {a, b} = c;` is the same class of name recovery and lives in
+// aliascat.sv, which Verilator cannot lint.)
 
 module naming_leaf; endmodule
 
