@@ -129,6 +129,16 @@ jobs:
              -o "$GITHUB_WORKSPACE/reorder.db")
           python3 scripts/verify-designdb.py reorder.db
 
+      # What keeps the fixture set driven by the schema rather than by
+      # whichever constructs happened to break once: every value the schema
+      # publishes -- the enum domains and the four view vocabularies -- must
+      # be produced by some database above. A value with no fixture is a
+      # branch a consumer may write and nothing exercises; a value no input
+      # can reach does not belong in the domain at all.
+      - name: Published values have fixtures
+        if: matrix.fixtures
+        run: python3 scripts/verify-designdb.py --domain-coverage ./*.db
+
       # Two exports of one unchanged design, diffed row by row across every
       # table. It does not know what it is looking for, which is the point --
       # but the races it looks for need slang's THREADED source loader, and

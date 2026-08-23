@@ -410,7 +410,19 @@ namespace designdb {
 /// along with the `expr_ref` per gated statement that claimed the same read.
 /// The write is untouched. `inout` and `ref` actuals are read as well as
 /// written and still gate, as do a written actual's selectors.
-inline constexpr int SchemaVersion = 16;
+///
+/// v17 narrows two published value domains to what a producer can write.
+/// Nothing that was exported stops being exported and no row changes; the
+/// DDL a consumer reads back does, which is why it moves the version.
+///
+/// `module.def_kind` loses `checker`. slang's DefinitionKind is Module,
+/// Interface and Program -- a checker is a symbol kind, not a definition kind
+/// -- so no input reaches that value and an exhaustive consumer had a branch
+/// nothing could take. `proc.proc_kind` loses `task` and `function` for the
+/// same reason and one more: the doc has said since v2 that task and function
+/// bodies get no procedure row, their statements belonging to the calling
+/// procedure, so the constraint contradicted the contract beside it.
+inline constexpr int SchemaVersion = 17;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -434,11 +446,11 @@ inline constexpr int SchemaVersion = 16;
 /// exact=false is "somewhere inside it, unknown where", and a present range
 /// with exact=false is an upper bound rather than the bits actually touched.
 
-/// One source definition: module, interface, program or checker.
+/// One source definition: module, interface or program.
 struct ModuleRow {
     int64_t id = 0;
     std::string name;
-    std::string definitionKind;   // module | interface | program | checker
+    std::string definitionKind;   // module | interface | program
     int64_t fileId = 0;
     uint32_t line = 0;
     uint32_t column = 0;
