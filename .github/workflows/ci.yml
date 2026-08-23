@@ -46,10 +46,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build libsqlite3-dev ccache
 
-      - name: Install RTL front ends
-        if: matrix.fixtures
-        run: sudo apt-get install -y verilator iverilog
-
       # slang is a large dependency and the pin is exact, so the key is the
       # CMakeLists that carries it: the cache is reused until the pin moves.
       - name: Cache CPM sources
@@ -83,18 +79,6 @@ jobs:
         run: |
           cmake --build build -j"$(nproc)"
           ccache --show-stats
-
-      # Anything used as a fixture has to be valid RTL first: several
-      # "defects" chased during development were invalid RTL written by hand.
-      # A file may declare that a front end cannot accept it, and the script
-      # fails on a declaration that has outlived its reason, so the markers
-      # cannot rot.
-      - name: Lint the fixtures
-        if: matrix.fixtures
-        run: |
-          rc=0
-          for f in examples/*/*.sv; do bash scripts/check-rtl.sh "$f" || rc=1; done
-          exit $rc
 
       # A build that links proves the pin resolves; it does not prove the
       # exporter still writes a database. The system-sqlite half stops here.

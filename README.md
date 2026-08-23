@@ -177,10 +177,10 @@ scripts/                build-release.sh (the four release platforms),
                         check-rtl.sh (validate RTL against Verilator and Icarus)
 ```
 
-[CI](.github/workflows/ci.yml) builds both SQLite configurations, lints every
-fixture past both front ends, exports the whole of `examples/` and reads each
-database back — a build that links proves the slang pin resolves, not that the
-exporter still writes rows. It then checks the corpus against the schema:
+[CI](.github/workflows/ci.yml) builds both SQLite configurations, exports the
+whole of `examples/` and reads each database back — a build that links proves
+the slang pin resolves, not that the exporter still writes rows. It then checks
+the corpus against the schema:
 every value the published domains name, and every word in the four view
 vocabularies, has to be produced by some fixture, so the test set is driven by
 the contract rather than by whichever constructs happened to break once. The
@@ -212,6 +212,10 @@ RTL, so a file may declare that one of them cannot accept it:
 
 The declared failure then counts as a pass, and the tool *accepting* the file
 counts as a failure — so the marker cannot outlive the limitation it records.
+Both directions being checked is also why this stays a developer gate rather
+than a CI one: the marker set is only well defined against one pinned pair of
+front ends, and the versions here track Homebrew's. Ubuntu 24.04's Verilator
+5.020 rejects four files this set does not waive.
 
 A fixture that is deliberately invalid RTL declares both, for the same reason
 read the other way: `recursion.sv` and `incomplete.sv` MUST be rejected, and a

@@ -31,6 +31,17 @@
 # is not evidence the RTL is wrong. It is deliberately not a blanket waiver: a
 # declared failure that starts passing fails this script too, so the marker
 # cannot outlive the limitation it documents.
+#
+# That two-sidedness is why this is a developer gate and not a CI one: a marker
+# is a claim about a PARTICULAR front end version, and both directions of the
+# claim are checked, so the whole set is only well defined against one pinned
+# pair. The markers here track what Homebrew ships -- Verilator 5.048 and
+# Icarus 13.0 as of this writing. Ubuntu 24.04 packages Verilator 5.020, which
+# rejects four files this set does not waive: `alias` statements (alias.sv,
+# naming.sv), a `##` cycle delay in a sequence (assertions.sv), and
+# force/release on a port (procedural.sv). Running this in CI therefore means
+# pinning the front ends to the pair the markers were written against, not
+# taking whatever the distro ships.
 
 set -u
 file="${1:?usage: check-rtl.sh <file.sv> [top]}"
