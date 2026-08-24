@@ -147,7 +147,7 @@ table follow.
 
 ### Hierarchy
 
-**`module`** — `id, name, def_kind, file_id, line, column`, unique on
+**`module`** — `id, name, def_kind, file_id, line, col`, unique on
 (name, file_id, line). `def_kind` is `module | interface | program |
 package` (a package's pseudo-occurrence carries a `module` row of its own,
 see *Packages*). However many parameterisations elaborate, the definition is
@@ -226,8 +226,13 @@ statement's rows.
 **`net`** — every object that can be driven, read or wired: nets and
 variables, of the instance body and its generate scopes, and — because a
 dependency end is an id and an id must exist — subroutine formals, locals
-and block variables, named by their scope-relative dotted path (`bump.v`,
-`g[0].sig`). Parameters, type parameters and specparams are *not* here:
+and block variables. `name` is the dotted path relative to `inst_id`,
+generate and subroutine segments included (`g[0].sig`, `bump.v`): a net's
+full path is its **instance's** tree path plus `name`. `scope_node_id` is
+the instance or generate node that declares it — the filter for "signals
+of this scope", never the name's anchor: prefixing the scope node's path
+onto `name` counts every generate segment twice (`top.g[0].g[0].sig`).
+Parameters, type parameters and specparams are *not* here:
 they are not connectivity. `decl_kind` is
 the net type's own word (`wire`, `wand`, `trireg`, a user-defined nettype's
 name) or `variable`. `is_implicit=1` marks a net slang created for an
@@ -235,7 +240,6 @@ undeclared identifier under the active `` `default_nettype ``; its location
 is the first use. `width` is the flattened bit width, NULL when the type is
 not integral — bit *offsets* still index the flattened space slang computes
 for unpacked objects, so ranges on a NULL-width net remain meaningful.
-`scope_node_id` is the instance or generate node that declares it.
 
 **`term`** — one terminal per port, in port-list order (`ordinal`). The
 root's terminals are the design's top-level ports; a child's are the pins
@@ -325,10 +329,13 @@ call (NULL for a call in a control expression). See *Tracing across calls*.
 {x,y}` is ONE row however many targets it writes. `stmt_kind` is
 `assignment | assertion | wait | call | system_task | event_control |
 alias | release`;
-`construct` the construct's own word (`assign`, `always_ff`, `assert`,
-`$display`, `call`, `sensitivity`, `wait` — and `force`/`proc_assign` on
-the assignment a `force` or procedural `assign` makes, `release`/
-`deassign` on a release row). `assign_kind` (`continuous |
+`construct` the construct's own word: on an assignment it is the enclosing
+procedure's (`always_ff` for a clocked assignment, `assign` for a
+continuous one), except `force`/`proc_assign` on the assignment a `force`
+or procedural `assign` makes; `assert`, `$display`, `sensitivity`,
+`wait` on their statement kinds; on a `call` row it is `call` for a user
+subroutine and the method's own word (`push_back`) for a built-in method;
+`release`/`deassign` on a release row. `assign_kind` (`continuous |
 blocking | nonblocking`) is set exactly on assignments; `sequence` is
 execution order within the procedure (NULL outside one, and on the
 procedure-header `event_control` row that holds a non-plain sensitivity's
@@ -418,7 +425,9 @@ holds the copies equal.
 ### Leaving the instance
 
 **`hier_ref`** — one row per (reference, direction, statement) that leaves
-its instance: an XMR, an interface member, a package item. `path` is the
+its instance: an XMR, an interface member, a package item. Distinct
+bit-selects of one path are distinct references — the select lives in
+`lo/hi`, not in `path` — so the triple alone is not a key. `path` is the
 canonical text as written (selects resolved to the constants they
 elaborated to, whitespace and comments removed); `access` is
 `read | write | connect`. The statement is part of the identity because a
@@ -442,9 +451,10 @@ when the export can replay the reference —
   bound to;
 * package items (`pkg::mask`): resolved to the package's net (see
   *Packages*), the same for a bare name imported from the package;
-* upward references and interface-array bindings: NULL. The one analysed
-  body speaks for occurrences whose surroundings may differ, so the target
-  is not resolved per occurrence.
+* upward references, and members reached through an interface array that
+  is the module's own port: NULL. The one analysed body speaks for
+  occurrences whose surroundings may differ, so the target is not resolved
+  per occurrence.
 
 NULL `resolved_*` means not resolved here. A dependency whose source went
 through an unresolved reference is still written and surfaces in `v_driver`
@@ -498,7 +508,12 @@ asserts all of it on every export. Ground rules:
   `expr_ref`, `proc` and `prim` are named by `v_net_attachment`,
   `v_net_dep`, `v_driver` and `v_load` and have none — a consumer that needs
   the row behind one of those ids reads the base table this document
-  describes. `hier_ref` was in that set and is no longer: four views point
+  describes. For `prim` that is only `prim_kind`: the node's name, def_name
+  and location are already in `v_tree_node` (`node_kind='primitive'`).
+  `inst_param` and `module` likewise have no views — parameter and
+  definition queries read the base tables. The fifteen views are the stable
+  surface, not the whole answerable surface. `hier_ref` was in that set
+  and is no longer: four views point
   at it (`v_net_dep`'s two `*_hier_ref_id`, `v_net_conn`'s
   `outer_hier_ref_id`, `v_net_attachment`'s `hier_ref_id`) and it is the one
   a trace meets on its ordinary path rather than when reaching for detail.
@@ -521,7 +536,13 @@ asserts all of it on every export. Ground rules:
   one point query per hop, so a scan per hop would be a scan per net in
   the cone. The verifier asserts the query plan itself; a change to how a
   view is computed that regresses this fails the export rather than
-  shipping a database that answers slowly.
+  shipping a database that answers slowly. The guarantee does not carry
+  into a recursive CTE: SQLite cannot push the recursion's current value
+  down into a compound view, so a cone written as one recursive query
+  materialises the whole view once and probes the copy. A closure that
+  must stay index-fast issues one point query per hop from the
+  application; the recursive form trades that for a single statement and
+  one up-front materialisation.
 * Explicit column lists, never `SELECT *`; no transitive closure — a
   fan-in cone is the consumer's recursive query, one step per row here.
 
@@ -544,7 +565,9 @@ have no location.
 param_signature, scope_node_id, net_name, decl_kind, data_type,
 width, is_implicit, file_path, src_path, src_line, src_col`.
 No direction column — direction belongs to terminals, and a net's port-ness
-is one `v_term_map` join away.
+is one `v_term_map` join away. A net's full path is its `inst_id`'s tree
+path plus `net_name` — never `scope_node_id`'s, which repeats the generate
+segments `net_name` already carries (see `net`).
 
 **`v_term`** — one row per terminal: `term_id, inst_id,
 module_id, module_name, term_name, term_kind, direction, data_type,
@@ -713,6 +736,16 @@ selection, count-reconciled; a point query by `net_id` seeks on every
 branch; and the verifier holds that exactly one typed id is non-null per
 row and is the one `attachment_kind` implies.
 
+No location columns — eleven kinds sit at eleven different "where"s, and
+one column would overload NULL again. The location is one join away
+through the id the kind implies: the statement kinds (`written_by`,
+`read_by`, `condition`, `statement_read`, `release_target`,
+`alias_binding`) through `stmt_id` against `v_stmt`; `terminal_inside` and
+`actual_outside` through `term_id` against `v_term` (the connection's own
+site is in `v_net_conn`); `event` through the `proc_event` base row;
+`dep_in`/`dep_out` through `dep_id` against `v_net_dep`;
+`named_from_outside` through `hier_ref_id` against `v_hier_ref`.
+
 **`v_call_site`** — one row per subroutine-body expansion: `call_site_id,
 inst_id, module_id, module_name, caller_stmt_id, parent_call_site_id,
 subroutine_name, depth`. The context a `stmt`, a `stmt_target`, an
@@ -778,6 +811,11 @@ ordinal, sequence, signature, width).
 * Kinds, directions and roles are their words. The words are a wire format
   fixed by this schema, not slang's enum printer. Enum values and meta keys
   are data, not identifiers: they stay full words.
+* Names are stored as SystemVerilog spells them: an escaped identifier
+  keeps its backslash and its terminating space (`\g.1 `), and may contain
+  `.` and `[`. A path is therefore assembled segment by segment from
+  `tree_node` and never split on `.` — a joined path string does not
+  round-trip.
 * `ordinal` is position in a declaration or extraction list; `sequence` is
   execution order inside a procedure. Neither is an identity.
 
@@ -855,6 +893,14 @@ no dataflow, not that the hierarchy stops early.
   effect" is not evaluable from a waveform by SQL. The conditions are
   recorded — as `control` dependencies with their expression references —
   and the evaluation is the reader's.
+* No rows for control-flow constructs. `if`, `case`, loops and blocks are
+  not statements here and `stmt` has no parent-statement column; a
+  procedure's shape is `sequence` order plus each statement's gating. The
+  complete source of "what gates this statement" is its `expr_ref` rows
+  with `role='control'` — flatly, `v_net_attachment` rows with
+  `attachment_kind='condition'` and this `stmt_id` — not its `control`
+  dependencies: a gated statement that drives nothing (a `release`) has
+  gating and no dependencies at all.
 * No source text. The file, line and column are here; the text is in the
   file.
 * No expression trees, no temporaries. `assign y = (a & b) | c` is three
@@ -874,6 +920,9 @@ no dataflow, not that the hierarchy stops early.
   lvalues and driving nothing. What is still absent is any judgement of
   which driver "wins" while a force is active — that is simulation, not
   structure.
+* Checkers are not modelled: a `checker` instantiation produces no rows —
+  no tree node, no nets, none of its assertions — and no `meta` count
+  reports it.
 * Variable initialisers (`logic [7:0] c = 0`) are not drivers; net
   initialisers (`wire w = a & b`) are, because the LRM says so.
 
@@ -886,9 +935,11 @@ no dataflow, not that the hierarchy stops early.
   the far object has no row: a trace ends at the reference text. `$unit`
   compilation-unit items are the same. (Package variables do resolve — see
   *Packages*.)
-* Interface-array element bindings (`.b(arr[k])`) have no per-occurrence
-  instance id; `outer_intf_inst_id` stays NULL and the member references
-  through them stay text-only.
+* An interface array as a module's OWN port (`simple_bus bus_arr[2]`)
+  binds as a single `net_conn` row with `outer_intf_inst_id` NULL, and
+  member references through it stay text-only. An element binding written
+  in the parent (`.b(arr[k])`) resolves per occurrence like any other
+  interface port.
 * Clocking blocks are not modelled: a clocking block declares no nets and
   gets no rows, and a `cb.sig` reference has no special handling. Virtual
   interfaces likewise — a `virtual interface` handle is a run-time value,
@@ -944,6 +995,16 @@ statements their ordinary rows. What differs is the boundary:
   `net_dep` whose far end is that interface's net. Two modules on one
   interface meet at those nets, which is where a trace crosses.
 
+* A subroutine DECLARED in the interface and called through a port
+  (`bus.stamp(d)`) is walked, like every subroutine, at the call site — so
+  its statements are the caller's rows, and the interface variables its
+  body names resolve through the same terminal a member reference takes.
+  The arcs land on the interface instance's nets, cross-instance, gated by
+  whatever gated the call. Its FORMALS are not nets of the interface —
+  nothing walks that body's own subroutines — so what an argument
+  contributes stays an unresolved reference, `driver_kind='external'`,
+  exactly as a package subroutine's formal does (see *Packages*).
+
 So "what drives `axi_if.master`'s `vld`" is `v_driver` on the interface
 instance's own net.
 
@@ -990,7 +1051,11 @@ walk over it:
 * **Recursion terminates by dedup, not by direction.** A recursive CTE
   with `UNION` (never `UNION ALL`) carries a visited set for free; a
   `tran a b` (a↔b, two rows) or an aliased pair then costs one revisit
-  that dedups away, not a loop.
+  that dedups away, not a loop. The visited set must be the net id and
+  nothing else: one extra column that varies per hop — a depth, a path —
+  makes every `(net, depth)` pair novel and the bidirectional arcs bounce
+  forever. A depth is computed outside the cone, `MIN() GROUP BY net`,
+  never carried through it.
 * **Pairs share provenance.** The two arcs of one switch share `prim_id`;
   the two directions of one inout crossing share `conn_id`; an alias
   pair shares `stmt_id`. Treat rows with one provenance id as one
@@ -1000,6 +1065,23 @@ walk over it:
   counts by its kind; an inout bus with N modules on it has N potential
   drivers, and the schema reports that. Resolving which one wins is
   simulation, not structure.
+
+A driver *count* counts sources, not rows: an arc is one (source element,
+target element) pair, so `y = a + b` is two rows sharing one `stmt_id` and
+one inout crossing is two rows sharing one `conn_id`. Deduplicate by the
+provenance id and exclude the kinds that gate or bind rather than drive:
+
+```sql
+SELECT signal_net_id,
+       count(DISTINCT COALESCE('s'||stmt_id, 'c'||conn_id,
+                               'p'||prim_id, 't'||term_id)) AS drivers
+FROM v_driver
+WHERE driver_kind NOT IN ('alias', 'terminal', 'control')
+GROUP BY signal_net_id HAVING drivers > 1;
+```
+
+`control` is out with `alias`: a condition gates its target, it does not
+drive it.
 
 ## Tracing across calls
 

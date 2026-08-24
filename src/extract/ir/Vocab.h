@@ -9,8 +9,8 @@
 // enum; the word appears where a row becomes SQL.
 //
 // Domains the schema publishes as OPEN stay strings and are absent here:
-// stmt.construct takes a system task's own name, net.decl_kind a
-// user-defined nettype's.
+// stmt.construct takes a system task's or built-in method's own name,
+// net.decl_kind a user-defined nettype's.
 //
 // slang/util/Util.h is the only dependency, for SLANG_UNREACHABLE; this
 // header stays clear of the AST vocabulary so Template.h can hold rows
@@ -117,6 +117,21 @@ inline const char* word(DefKind k) {
         case DefKind::Interface: return "interface";
         case DefKind::Program:   return "program";
         case DefKind::Package:   return "package";
+    }
+    SLANG_UNREACHABLE;
+}
+
+enum class NodeKind : uint8_t {
+    Root, Instance, Generate, Primitive, Unresolved, Package
+};
+inline const char* word(NodeKind k) {
+    switch (k) {
+        case NodeKind::Root:       return "root";
+        case NodeKind::Instance:   return "instance";
+        case NodeKind::Generate:   return "generate";
+        case NodeKind::Primitive:  return "primitive";
+        case NodeKind::Unresolved: return "unresolved";
+        case NodeKind::Package:    return "package";
     }
     SLANG_UNREACHABLE;
 }

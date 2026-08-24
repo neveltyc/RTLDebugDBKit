@@ -50,6 +50,7 @@ MODES = {
     "naming": "naming",
     "incomplete": "incomplete",
     "recursion": "recursion",
+    "modport": "modport_top",
 }
 
 # Every closed value domain the schema publishes, as (table, column, values,
@@ -464,6 +465,38 @@ check(one("""
     WHERE (n.id IS NOT NULL AND n.inst_id != p.inst_id)
        OR (s.id IS NOT NULL AND COALESCE(s.proc_id, 0) != e.proc_id)""") == 0,
       "proc_event stays inside its procedure")
+# The ids are computed as base + index per instance, so the one error the
+# REFERENCES clauses cannot see is a wrong base: an id that lands on a
+# perfectly valid row of ANOTHER instance. These two joins are where that
+# error becomes visible for the two per-instance references the block
+# above does not already cover.
+check(one("""
+    SELECT count(*) FROM stmt s JOIN proc p ON p.id = s.proc_id
+    WHERE p.inst_id != s.inst_id""") == 0,
+      "a statement's procedure belongs to its own instance")
+check(one("""
+    SELECT count(*) FROM hier_ref h JOIN stmt s ON s.id = h.stmt_id
+    WHERE s.inst_id != h.inst_id""") == 0,
+      "a hier_ref's statement belongs to its own instance")
+
+# ------------------------------------------------------------- ordinals
+# Dense 0..n-1 per parent. The UNIQUE constraints stop duplicates on the
+# statement children; nothing stops a list that starts past 0 or skips --
+# which is what a producer indexing the wrong list looks like -- and the
+# tables without a UNIQUE get their duplicate check here too.
+ORDINALS = (("tree_node", "parent_node_id"), ("inst_param", "inst_id"),
+            ("term", "inst_id"), ("term_map", "term_id"),
+            ("net_conn", "term_id"), ("proc", "inst_id"),
+            ("stmt", "inst_id"), ("stmt_target", "stmt_id"),
+            ("assign_operand", "stmt_id"), ("expr_ref", "stmt_id"))
+for tbl, parent in ORDINALS:
+    check(one(f"""
+        SELECT count(*) FROM (
+          SELECT 1 FROM "{tbl}" GROUP BY "{parent}"
+          HAVING min(ordinal) != 0
+              OR max(ordinal) != count(*) - 1
+              OR count(DISTINCT ordinal) != count(*))""") == 0,
+          f"{tbl}.ordinal is dense per {parent}")
 check(one("""
     SELECT count(*) FROM proc_event
     WHERE (event_kind = 'sensitivity') != (stmt_id IS NULL)""") == 0,
@@ -794,6 +827,13 @@ check(one("""
     SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
     WHERE h.resolved_inst_id IS NULL OR n.inst_id != h.resolved_inst_id""") == 0,
       "a resolved net lies inside its resolved instance")
+# The two resolved columns answer together or not at all. An instance
+# without a net names where the reference landed and not what it landed on,
+# which is a third state for consumers written against "resolved or NULL".
+check(one("""
+    SELECT count(*) FROM hier_ref
+    WHERE (resolved_inst_id IS NULL) != (resolved_net_id IS NULL)""") == 0,
+      "a reference resolves to both halves or to neither")
 check(one("""
     SELECT count(*) FROM net_conn c JOIN hier_ref h ON h.id = c.outer_hier_ref_id
     WHERE h.access != 'connect'""") == 0,
@@ -829,11 +869,14 @@ check(one("""
       "connection columns match conn_kind")
 
 # ------------------------------------------------------------------ meta
-required = ["schema_version", "analysis_status", "error_count",
-            "unresolved_count", "empty_procedure_count", "duplicate_path_count",
-            "recursion_count", "truncated_call_count", "unanalysed_inst_count",
-            "tool", "tool_version", "slang_version", "producer_revision",
-            "config_digest"]
+# The doc states the required set as a rule -- the v_db_info columns plus
+# `tool`, minus `top` -- so it is derived here rather than hand-copied:
+# a column added to the view then demands its meta key without this list
+# needing to know.
+required = [r[1] for r in con.execute("PRAGMA table_info(v_db_info)")
+            if r[1] != "top"] + ["tool"]
+if required == ["tool"]:
+    fatal("v_db_info is missing")
 meta = dict(con.execute("SELECT key, value FROM meta"))
 # Fatal rather than collected: every check below indexes these keys.
 missing = [k for k in required if k not in meta or meta[k] is None]
@@ -1583,10 +1626,74 @@ if mode == "constructs":
         WHERE s.name='a' AND t.name='r2' AND d.dep_kind='data'""") == 2,
           "the same pair from two statements stays two dependencies")
 
+if mode == "modport":
+    # An explicit modport port (`output .d(data)`) resolves past the rename
+    # to the net behind it, exactly as a named port does -- and the renamed
+    # net is driven through it.
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path = 'p.d' AND h.access = 'write' AND n.name = 'data'""") == 1,
+          "an explicit modport port resolves to the net it renames")
+    check(one("""
+        SELECT count(*) FROM v_driver v JOIN net n ON n.id = v.signal_net_id
+        WHERE n.name = 'data' AND v.driver_kind = 'constant'
+          AND v.signal_inst_id = (SELECT resolved_inst_id FROM hier_ref
+                                  WHERE path = 'p.d')""") == 1,
+          "and the renamed net is driven through it")
+    # The select form keeps the port's own geometry, which is not the
+    # net's: it stays unresolved rather than claiming bits of `data` the
+    # reference does not touch.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path = 'p.n' AND resolved_net_id IS NULL""") == 1,
+          "a selected connection stays honestly unresolved")
+
 if mode == "interfaces":
     check(one("""
         SELECT count(*) FROM term WHERE term_kind='interface'""") >= 3,
           "interface terminals")
+    # A task declared in the interface, called through a port: its body is
+    # walked in the CALLER's template, so its bare names belong to a body
+    # the caller cannot place. They resolve through the bound terminal, and
+    # the interface's own nets carry the dataflow -- the write cross-instance
+    # from the statement that made the call.
+    for path, access, net in (("data", "write", "data"), ("vld", "read", "vld")):
+        check(one("""
+            SELECT count(*) FROM hier_ref h
+            JOIN net n ON n.id = h.resolved_net_id
+            JOIN tree_node t ON t.id = h.resolved_inst_id
+            WHERE h.path = ? AND h.access = ? AND n.name = ?
+              AND t.name = 'bus3'""", path, access, net) == 1,
+              f"the interface task's {path} resolves to the bound instance")
+    check(one("""
+        SELECT count(*) FROM v_driver v
+        JOIN tree_node t ON t.id = v.signal_inst_id
+        WHERE t.name = 'bus3' AND v.signal_name = 'data'
+          AND v.driver_name = 'vld' AND v.driver_kind = 'data'""") == 1,
+          "and the interface's own net carries the task's dataflow")
+    # The formal is no net of the interface -- nothing walks that body's
+    # subroutines -- so it stays wholly unresolved rather than naming an
+    # instance it cannot name a net in.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path = 'x' AND resolved_inst_id IS NULL
+          AND resolved_net_id IS NULL""") >= 1,
+          "while its formal resolves to neither half")
+    # Two terminals of one module reaching one interface: the call does not
+    # say which port it went through, and the occurrence that binds them
+    # apart would take the write to the wrong instance. Unresolved from
+    # BOTH occurrences -- a missing answer, never a wrong one.
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'stamp_pair' AND h.path = 'data'
+          AND h.resolved_inst_id IS NOT NULL""") == 0,
+          "an ambiguous interface binding resolves to no instance at all")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'stamp_pair' AND h.path = 'data'""") == 2,
+          "and both occurrences still record the reference")
     check(one("""
         SELECT count(*) FROM term
         WHERE term_kind='interface' AND modport IS NOT NULL""") >= 2,
@@ -2160,6 +2267,12 @@ if mode == "patterncase":
 
 
 if mode == "outward":
+    # A built-in method registers as a system call in slang, but nothing
+    # leaves the language: the row says `call`, with the method's own word.
+    check(one("""
+        SELECT count(*) FROM stmt
+        WHERE stmt_kind = 'call' AND construct = 'push_back'""") == 1,
+          "a built-in method is a call, not a system task")
     # A call whose formal is no net of this instance still drives its output
     # actual, and says so in both places: the target row that names the
     # statement, and a dependency with no source -- there is no formal here to
@@ -2242,6 +2355,26 @@ if mode == "naming":
         SELECT count(*) FROM tree_node
         WHERE name IN ('u', 'p')""") == 0,
           "and no node answers to the bare name of an array")
+    # A generate label is a segment like any other: escaped, and spelled as
+    # the net path beside it spells the same level.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node par
+          ON par.id = t.parent_node_id
+        WHERE par.name = 'naming' AND t.node_kind = 'generate'
+          AND t.name = '\\gn.1 '""") == 1,
+          "an escaped generate label keeps slang's spelling")
+    check(one("""
+        SELECT count(*) FROM net n JOIN tree_node t ON t.id = n.scope_node_id
+        WHERE t.name = '\\gn.1 ' AND n.name = '\\gn.1 .gw'""") == 1,
+          "and the net under it spells the same segment")
+    # A reference path keeps the escape and its terminating space: without
+    # them `\u.1 .v` respells as `u.1.v`, a different identifier.
+    check(one("""
+        SELECT count(*) FROM hier_ref WHERE path = '\\u.1 .v'""") == 1,
+          "a reference through an escaped name keeps its terminator")
+    check(one("""
+        SELECT count(*) FROM hier_ref WHERE path IN ('u.1.v', '\\u.1.v')""") == 0,
+          "and never a respelling of it")
 
 if mode == "concatcursor":
     # An unpacked-array range select: slang's bounds cover one element
@@ -2275,6 +2408,32 @@ if mode == "concatcursor":
             WHERE src_name=? AND tgt_name='whole' AND tgt_lo=? AND tgt_hi=?
               AND tgt_exact=1""", name, lo, hi) == 1,
               f"and reading it back puts {name} at bits {hi}:{lo} of whole")
+    # A streaming operand's window survives as an UPPER BOUND, never exact:
+    # the stream permutes bits, so which of a[5:0] reach either half is
+    # unknown, and exact would claim bits that never arrive.
+    for tgt in ("sh", "sl"):
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE src_name='a' AND tgt_name=? AND src_lo=0 AND src_hi=5
+              AND src_exact=0""", tgt) == 1,
+              f"a streamed read reaches {tgt} as an upper bound")
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name IN ('a','b') AND tgt_name IN ('sh','sl')
+          AND src_exact=1""") == 0,
+          "and no streamed pairing claims exact source bits")
+    # The mirror, a streaming TARGET: the written windows are the unknown.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name='a' AND tgt_name='sm0' AND tgt_exact=0""") == 1,
+          "a streamed write reaches its target as an upper bound")
+    # A named pattern positions per member exactly as the simple one does.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name='a' AND tgt_name='packed_o' AND tgt_lo=4 AND tgt_hi=7
+          AND map_exact=1""") == 1,
+          "a named pattern member lands on its own window")
+
     # A zero-width operand takes no position and does not stop the walk:
     # the two operands beside it land where they would with the pad absent.
     for name, lo, hi in (("a", 8, 15), ("b", 0, 7)):
@@ -2415,6 +2574,15 @@ if mode == "xmr":
         WHERE src_name='wide' AND tgt_name='slice_o'
           AND src_lo=0 AND src_hi=3""") == 1,
           "a part-select of a downward reference keeps its bits")
+    # A select spelled through the genvar: the stored path carries each
+    # iteration's constant, so the two iterations are two keys.
+    for path in ("u_arr[1].x", "u_arr[2].x"):
+        check(one("""
+            SELECT count(*) FROM hier_ref
+            WHERE path = ? AND access = 'read'""", path) == 1,
+              f"the genvar select resolves to {path}")
+    check(one("SELECT count(*) FROM hier_ref WHERE path LIKE '%k+1%'") == 0,
+          "and no path keeps the unexpanded spelling")
     # A control dependency whose target is outward.
     check(one("""
         SELECT count(*) FROM v_net_dep

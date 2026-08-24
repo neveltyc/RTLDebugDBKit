@@ -309,12 +309,12 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
         text = normalizedText(r.origin, sourceManager);
     // The symbol knows its own name, and that is always a usable path.
     //
-    // Both spellings above can fail. canonicalPath has no case for a
-    // HierarchicalValue, so every cross-module reference falls to
-    // normalizedText -- which recovers text by slicing a source buffer and
-    // returns nothing when the reference's ends sit in different buffers, i.e.
-    // when any part of the name came from a macro. `q <= `TOP.glob` was
-    // therefore dropped where `q <= tb_top.glob` was recorded.
+    // Both spellings above can fail. canonicalPath declines an upward
+    // reference, which then falls to normalizedText -- and that recovers
+    // text by slicing a source buffer, returning nothing when the
+    // reference's ends sit in different buffers, i.e. when any part of the
+    // name came from a macro. `q <= `TOP.glob` was therefore dropped where
+    // `q <= tb_top.glob` was recorded.
     if (text.empty() && r.sym)
         text = r.sym->getHierarchicalPath();
     // Empty is the only reason left to drop one. There used to be a second --
@@ -378,6 +378,58 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
             }
         }
     }
+    // A subroutine declared in an INTERFACE is walked in the caller's
+    // template, so the names in its body -- the interface's own variables,
+    // and the formals declared beside them -- arrive here as bare
+    // NamedValues that netFor cannot place: no hierarchical expression to
+    // follow, and no path text saying which interface they belong to. The
+    // route is the terminal the interface is bound to, exactly the one
+    // `bus.vld` takes; what picks the terminal is the BODY the symbol is
+    // declared in, since each interface instance gets its own body and its
+    // own copy of the subroutine. Without this the interface's own nets
+    // read as undriven while a task plainly wrote them.
+    if (!hv && r.sym) {
+        if (auto* owner = declaringInstanceBody(*r.sym);
+            owner && owner != b.body && b.termOf) {
+            const Symbol* only = nullptr;
+            int32_t onlyTerm = -1;
+            int matches = 0;
+            for (auto& [portSym, slot] : *b.termOf) {
+                if (!portSym || portSym->kind != SymbolKind::InterfacePort)
+                    continue;
+                auto [iface, modport] = portSym->as<InterfacePortSymbol>().getConnection();
+                if (!iface || iface->kind != SymbolKind::Instance)
+                    continue;
+                // The occurrence's OWN body, never the canonical one: the
+                // subroutine symbol the walk holds belongs to the instance
+                // it was reached through, and two instances that share a
+                // canonical body still have their own. Comparing canonically
+                // matched both ports for one reference and neither for the
+                // other.
+                if (&iface->as<InstanceSymbol>().body != owner)
+                    continue;
+                matches++;
+                if (!only) {
+                    only = iface;
+                    onlyTerm = slot.term;
+                }
+            }
+            // Two terminals reaching one interface here says nothing about
+            // the next occurrence, which may bind them apart -- and the call
+            // does not record which port it went through, so there is no
+            // tie-break. `u(.a(i), .b(i))` analysed, `u(.a(i), .b(j))`
+            // stamped: the terminal picked here would send the write to j.
+            // A NULL is the honest answer, and it keeps the choice off
+            // hash-map order.
+            if (only && onlyTerm >= 0 && matches == 1) {
+                row.resolve = TplHierRef::ViaIfaceTerm;
+                row.ifaceTerm = onlyTerm;
+                if (!segsFromAncestry(nullptr, only, *r.sym, row))
+                    row.resolve = TplHierRef::Failed;
+            }
+        }
+        return;
+    }
     if (!hv)
         return;   // nothing hierarchical to walk; NotHierarchical stands
     const Symbol* target = hv->ref.target;
@@ -405,9 +457,20 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // path carries the modport level (`bus.src.vld`) that the stamped
     // net names do not.
     if (target->kind == SymbolKind::ModportPort) {
-        auto* inner = target->as<ModportPortSymbol>().internalSymbol;
+        auto& mp = target->as<ModportPortSymbol>();
+        const Symbol* inner = mp.internalSymbol;
+        // An explicit port (`output .d(data)`) has no internalSymbol; the
+        // connection expression says what stands behind it. Only a plain
+        // name resolves: through a select or a composition the port's bit
+        // geometry is not the net's, and this row's range -- spelled on the
+        // port -- replayed onto the net would claim bits the reference
+        // does not touch.
         if (!inner) {
-            // An explicit modport expression names no one net.
+            if (auto* conn = mp.getConnectionExpr();
+                conn && conn->kind == ExpressionKind::NamedValue)
+                inner = &conn->as<NamedValueExpression>().symbol;
+        }
+        if (!inner) {
             row.resolve = TplHierRef::Failed;
             return;
         }
@@ -564,10 +627,9 @@ bool TemplateBuilder::segsFromAncestry(const InstanceBodySymbol* stopBody,
                                   SymbolKind::GenerateBlockArray) {
                     auto& arr =
                         parent->asSymbol().as<GenerateBlockArraySymbol>();
-                    std::string base(arr.name);
-                    if (base.empty())
-                        base = arr.getExternalName();
-                    level = base + level;
+                    level = escapedSegment(arr.name.empty()
+                                               ? arr.getExternalName()
+                                               : arr.name) + level;
                     up = arr.getParentScope();
                 }
                 else {

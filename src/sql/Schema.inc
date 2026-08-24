@@ -30,12 +30,17 @@
 // exact=0 is an upper bound rather than the bits actually touched.
 //
 // The REFERENCES clauses document the joins; they are not enforced at runtime,
-// since `PRAGMA foreign_keys` is left at its default of off. The verifier runs
-// `foreign_key_check` on every export -- the ids are all issued by one process
-// in one pass, and paying a lookup per inserted row to re-verify them is the
-// wrong side of that trade.
+// since `PRAGMA foreign_keys` is left at its default of off. Turning it on
+// would not merely cost a lookup per inserted row -- it would fail the export:
+// `net_conn.outer_hier_ref_id` and `call_site.caller_stmt_id` are written
+// before the rows they reference, and no clause here is DEFERRABLE. The
+// verifier's `foreign_key_check` on the finished file reaches the same
+// conclusion the per-row check would, after the forward references have
+// landed.
 R"SQL(
-CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+-- value NOT NULL so v_db_info's MAX(CASE...) pivot keeps one meaning for
+-- NULL: the key is missing, never "present but empty".
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE src_file(
     id      INTEGER PRIMARY KEY,
@@ -151,12 +156,17 @@ CREATE TABLE prim(
     col             INTEGER);
 
 -- One connectable object in one instance: a net or a variable -- anything
--- that can be driven, read or wired. Parameters, type parameters and
+-- that can be driven, read or wired. `name` is the dotted path relative to
+-- inst_id, generate and subroutine segments included (`g[0].sig`), so a
+-- net's full path is its INSTANCE's tree path plus `name`. scope_node_id is
+-- the node that declares it -- the filter for "signals of this scope",
+-- never the name's anchor: prefixing the scope node's path onto `name`
+-- counts every generate segment twice. Parameters, type parameters and
 -- interface ports are NOT here: they are not connectable, and v9 mixing them
 -- into `symbol` made every "signals of this scope" query filter them out.
 --
--- Subroutine formals and locals ARE here (name is the scope-relative dotted
--- path, `bump.v`): a call binds actuals to formals and `net_dep` ends are
+-- Subroutine formals and locals ARE here (name spells the subroutine
+-- segment, `bump.v`): a call binds actuals to formals and `net_dep` ends are
 -- ids, so a formal without a row would be a dependency with a dangling end.
 -- Their scope_node_id is the nearest tree_node, since a subroutine is not a
 -- hierarchy level.
@@ -270,9 +280,10 @@ CREATE TABLE net_conn(
     col                INTEGER,
     UNIQUE(term_id, ordinal));
 
--- One procedure: an always/initial/final block, or a task/function body.
--- v9 named these with a bare per-module integer that was not a key in any
--- table; this is the object that integer was gesturing at.
+-- One procedure: an always/initial/final block. Task and function bodies
+-- get no row; their statements belong to the calling procedure. v9 named
+-- these with a bare per-module integer that was not a key in any table;
+-- this is the object that integer was gesturing at.
 CREATE TABLE proc(
     id             INTEGER PRIMARY KEY,
     inst_id        INTEGER NOT NULL REFERENCES inst(id),
@@ -312,8 +323,9 @@ CREATE TABLE call_site(
 -- claiming one statement and a statement writing only outward was no row at
 -- all. Here it is one row regardless.
 --
--- sequence is execution order within the procedure, NULL exactly when
--- proc_id is NULL (a continuous assign has no execution order).
+-- sequence is execution order within the procedure, NULL outside one (a
+-- continuous assign has no execution order) and on the procedure-header
+-- event_control row that holds a non-plain sensitivity's reads.
 -- assign_kind is NULL for non-assignments. delay is the delay control's
 -- normalised source text (`#3`, `#(rise, fall)`), not a number this tool
 -- pretended to evaluate; NULL when there is none.
