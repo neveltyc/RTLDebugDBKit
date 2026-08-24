@@ -920,6 +920,9 @@ no dataflow, not that the hierarchy stops early.
   lvalues and driving nothing. What is still absent is any judgement of
   which driver "wins" while a force is active — that is simulation, not
   structure.
+* Checkers are not modelled: a `checker` instantiation produces no rows —
+  no tree node, no nets, none of its assertions — and no `meta` count
+  reports it.
 * Variable initialisers (`logic [7:0] c = 0`) are not drivers; net
   initialisers (`wire w = a & b`) are, because the LRM says so.
 
