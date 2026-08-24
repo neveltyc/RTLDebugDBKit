@@ -500,6 +500,14 @@ namespace designdb {
 /// is a source-less `data` arc, which is what `constant` means, anchored
 /// by a target row on the calling statement -- the discipline every other
 /// source-less arc already follows.
+///
+/// A system task called inside a CONDITION writes its argument like any
+/// other, and recorded nothing: v_driver tells a system write from a
+/// tie-off by the statement it came from, and a call in a condition
+/// belongs to none, so the write had no attribution to be given. It now
+/// gets a `stmt` row of its own -- what the procedure-header
+/// `event_control` row already is for reads with nowhere to belong. Only
+/// the write travels with it; what the condition reads is gating already.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
