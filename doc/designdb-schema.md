@@ -255,8 +255,8 @@ the connection names them — so "connected to a black box" stays distinct
 from "unconnected".
 
 **`term_map`** — the INSIDE of a terminal (VPI's lowConn): which nets of
-its own instance it stands for, one row per segment, keyed (term_id,
-ordinal). An ANSI port is one whole-to-whole segment with `map_exact=1`; a
+its own instance it stands for, one row per segment, `id` its own and
+(term_id, ordinal) unique. An ANSI port is one whole-to-whole segment with `map_exact=1`; a
 port expression produces one segment per element with its window of the
 terminal (`term_lo/term_hi`) and of the net (`inner_lo/inner_hi`). Both
 nets belong to the terminal's own instance; the outside is `net_conn`'s
@@ -575,7 +575,7 @@ module_id, module_name, term_name, term_kind, direction, data_type,
 width, ordinal, modport, file_path, src_path, src_line,
 src_col`.
 
-**`v_term_map`** — one row per inside segment: `term_id,
+**`v_term_map`** — one row per inside segment: `term_map_id, term_id,
 term_inst_id, term_name, map_ordinal, inner_net_id,
 inner_net_name, term_lo, term_hi, term_exact, inner_lo, inner_hi,
 inner_exact, map_exact`.
@@ -721,17 +721,20 @@ which expansion it belongs to.
 
 **`v_net_attachment`** — everything touching one net, one row per
 attachment: `net_id, inst_id, net_name, attachment_kind, lo, hi, exact,
-stmt_id, term_id, stmt_target_id, assign_operand_id, expr_ref_id,
-proc_id, dep_id, hier_ref_id`. The structural adjacency the directional
-views cannot ask flatly — "what hangs off this net" — with
-`attachment_kind` naming the relation and exactly ONE of the seven typed
+stmt_id, term_map_id, conn_id, stmt_target_id, assign_operand_id,
+expr_ref_id, proc_id, dep_id, hier_ref_id`. The structural adjacency the
+directional views cannot ask flatly — "what hangs off this net" — with
+`attachment_kind` naming the relation and exactly ONE of the eight typed
 id columns pointing at that relation's own row (the exclusive-arc shape
-`net_dep` uses, not one polymorphic id): `terminal_inside` /
-`actual_outside` → `term_id`; `written_by` / `release_target` /
-`alias_binding` →
+`net_dep` uses, not one polymorphic id): `terminal_inside` →
+`term_map_id`; `actual_outside` → `conn_id`; `written_by` /
+`release_target` / `alias_binding` →
 `stmt_target_id`; `read_by` → `assign_operand_id`; `condition` /
 `statement_read` → `expr_ref_id`; `event` → `proc_id`; `dep_in` /
-`dep_out` → `dep_id`; `named_from_outside` → `hier_ref_id`. `lo/hi/exact`
+`dep_out` → `dep_id`; `named_from_outside` → `hier_ref_id`. The two
+wiring kinds name the segment, not the terminal: one pin takes several —
+`.q({2{r}})` tiles it twice — and a terminal id cannot tell those rows
+apart. `lo/hi/exact`
 are this net's window in the attachment. Each branch is one base
 selection, count-reconciled; a point query by `net_id` seeks on every
 branch; and the verifier holds that exactly one typed id is non-null per
@@ -741,9 +744,9 @@ No location columns — eleven kinds sit at eleven different "where"s, and
 one column would overload NULL again. The location is one join away
 through the id the kind implies: the statement kinds (`written_by`,
 `read_by`, `condition`, `statement_read`, `release_target`,
-`alias_binding`) through `stmt_id` against `v_stmt`; `terminal_inside` and
-`actual_outside` through `term_id` against `v_term` (the connection's own
-site is in `v_net_conn`); `event` through the `proc_event` base row;
+`alias_binding`) through `stmt_id` against `v_stmt`; `terminal_inside` through
+`term_map_id` against `v_term_map` and `actual_outside` through `conn_id`
+against `v_net_conn`; `event` through the `proc_event` base row;
 `dep_in`/`dep_out` through `dep_id` against `v_net_dep`;
 `named_from_outside` through `hier_ref_id` against `v_hier_ref`.
 
