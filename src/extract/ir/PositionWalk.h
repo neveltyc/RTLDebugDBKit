@@ -55,20 +55,38 @@ private:
 };
 
 /// Whether `expr` is walked element by element.
+///
+/// The walk is MSB-first, so an expression qualifies only when its own
+/// element order runs that way. Getting this wrong is not a lost position
+/// but an inverted one, claimed exact.
+///
+/// * A concatenation is written most significant first, always.
+/// * A simple assignment pattern lists elements in written order, which is
+///   declaration order: for a PACKED aggregate that is MSB-first. For an
+///   unpacked one it is the opposite -- element zero sits at the LOW
+///   offsets -- so those are not walked.
+/// * A structured pattern orders its elements by the target's shape rather
+///   than by what was written: a packed struct's by declaration (MSB
+///   first), but an ARRAY's by ascending index, which is LSB-first in both
+///   packed and unpacked form. Only the packed-struct case qualifies.
+///   A `default` or type setter disqualifies it separately: that is ONE
+///   written expression standing for several members, and positioning it
+///   would turn one recorded read into a row per member.
 inline bool isElementwise(const slang::ast::Expression& expr) {
     using namespace slang::ast;
-    if (expr.kind == ExpressionKind::Concatenation ||
-        expr.kind == ExpressionKind::SimpleAssignmentPattern)
+    if (expr.kind == ExpressionKind::Concatenation)
         return true;
-    // A structured pattern whose every element is its own written setter
-    // positions exactly like a simple one: elements() is the per-member
-    // list in declaration order. A default or type setter is ONE written
-    // expression standing for several members -- positioning it would turn
-    // one recorded read into a row per member, a granularity this schema
-    // does not claim.
+    if (!expr.type)
+        return false;
+    const Type& ct = expr.type->getCanonicalType();
+    const bool unpacked =
+        ct.isUnpackedArray() || ct.isUnpackedStruct() || ct.isUnpackedUnion();
+    if (expr.kind == ExpressionKind::SimpleAssignmentPattern)
+        return !unpacked;
     if (expr.kind == ExpressionKind::StructuredAssignmentPattern) {
         auto& p = expr.as<StructuredAssignmentPatternExpression>();
-        return !p.defaultSetter && p.typeSetters.empty();
+        return !unpacked && ct.isStruct() && !p.defaultSetter &&
+               p.typeSetters.empty();
     }
     return false;
 }

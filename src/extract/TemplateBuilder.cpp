@@ -457,9 +457,16 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
         // port -- replayed onto the net would claim bits the reference
         // does not touch.
         if (!inner) {
+            // A plain name resolves; a constant does not. `modport m(input
+            // .k(K))` renames a parameter, which has no net row, and taking
+            // it as the target resolved the instance while leaving the net
+            // NULL -- a half-answer the resolved pair does not allow.
             if (auto* conn = mp.getConnectionExpr();
-                conn && conn->kind == ExpressionKind::NamedValue)
-                inner = &conn->as<NamedValueExpression>().symbol;
+                conn && conn->kind == ExpressionKind::NamedValue) {
+                auto& sym = conn->as<NamedValueExpression>().symbol;
+                if (!isConstantSymbol(sym))
+                    inner = &sym;
+            }
         }
         if (!inner) {
             row.resolve = TplHierRef::Failed;

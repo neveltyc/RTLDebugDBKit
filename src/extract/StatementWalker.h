@@ -190,9 +190,13 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         //
         // A built-in METHOD (`q.push_back(x)`, `q.delete()`) registers as a
         // system call in slang but is not a system task: nothing leaves the
-        // language, and stmt_kind has `call` for exactly this. The `$`
-        // prefix is what separates the two vocabularies.
-        if (call.isSystemCall() && call.getSubroutineName().starts_with('$')) {
+        // language, and stmt_kind has `call` for exactly this. What separates
+        // the two is the `$` prefix OR a written argument -- `randomize(a)`
+        // carries no `$` and still drives a from outside anything the model
+        // names, and classifying it by the prefix alone dropped its write
+        // entirely, since only this branch carries writeRefs.
+        if (call.isSystemCall() &&
+            (call.getSubroutineName().starts_with('$') || !writeRefs.empty())) {
             emit(SystemTaskNode{std::move(reads), std::move(writeRefs),
                                 callWord(call), gateId(), seq++,
                                 filteredConstants, stmt.sourceRange});
@@ -351,19 +355,27 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// statement-level one. It gets a row of its own -- the same answer the
     /// procedure-header `event_control` row is to reads with no statement.
     /// Only the write travels; what the condition reads is gating already.
+    ///
+    /// One row per OUTERMOST call, carrying everything it writes, which is
+    /// the shape a statement-level call has. Emitting per nested call
+    /// instead recorded an inner write twice: once for the inner call and
+    /// again for the outer, whose collection reaches through it.
     void emitSystemWritesIn(const Expression& expr) {
         struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
             StatementWalker& self;
             explicit Finder(StatementWalker& self) : self(self) {}
             void handle(const CallExpression& call) {
-                visitDefault(call);
-                if (!call.isSystemCall())
+                if (!call.isSystemCall()) {
+                    visitDefault(call);
                     return;
+                }
                 std::set<const ValueSymbol*> syms;
                 std::vector<Ref> writes;
                 self.collectWrittenTargets(call, syms, &writes);
-                if (writes.empty())
+                if (writes.empty()) {
+                    visitDefault(call);
                     return;
+                }
                 self.emit(SystemTaskNode{{}, std::move(writes),
                                          callWord(call), self.gateId(),
                                          self.seq++, 0, call.sourceRange});
@@ -677,7 +689,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // then had no driver at all -- while the same tie-off
             // written as a port connection records one. The formal is
             // tied off; say so.
-            if (reads &&
+            //
+            // Constant, not merely nameless: `t($urandom())` also yields no
+            // slot, and it holds the formal at no value at all. Calling
+            // that a tie-off states the one thing `constant` means and the
+            // one thing it is not.
+            if (reads && actualExpr->eval(eval) &&
                 std::none_of(actualSlots.begin(), actualSlots.end(),
                              [](const Slot& s) { return s.ref.sym != nullptr; })) {
                 emit(BindNode{formals[i], args[i], PairedSrc{{}, formalSlot.ref,
