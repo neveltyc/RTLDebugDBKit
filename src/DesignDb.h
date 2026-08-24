@@ -482,6 +482,16 @@ namespace designdb {
 /// of them the base tables'. All four are now `lo`/`hi`/`is_exact`; the
 /// prefixed form stays where a row really has two ends, as `v_net_dep`
 /// does.
+///
+/// Two statements that produced no rows at all now do. `-> ev` is what
+/// makes an event happen, and without it an event variable had waiters and
+/// no cause -- a trace back said nothing in the design touches it.
+/// `stmt_kind` gains `trigger`, the target names the event, and the arc is
+/// source-less like a system task's, surfacing as `driver_kind='trigger'`:
+/// nothing FEEDS an event, so `constant` would have said it is tied off.
+/// `disable` gains a kind for a different reason -- it names a block, not
+/// a net -- but the same one underneath: the condition gating it was a
+/// read with no statement to belong to, and vanished with the statement.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.

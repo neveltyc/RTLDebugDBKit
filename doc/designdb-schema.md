@@ -329,7 +329,7 @@ call (NULL for a call in a control expression). See *Tracing across calls*.
 **`stmt`** — one row per statement or statement-level construct; `{a,b} =
 {x,y}` is ONE row however many targets it writes. `stmt_kind` is
 `assignment | assertion | wait | call | system_task | event_control |
-alias | release`;
+alias | release | trigger | disable`;
 `construct` the construct's own word: on an assignment it is the enclosing
 procedure's (`always_ff` for a clocked assignment, `assign` for a
 continuous one), except `force`/`proc_assign` on the assignment a `force`
@@ -681,6 +681,10 @@ rest of the reference is `v_hier_ref`. `driver_kind`:
 * `system_task` — a system task wrote the argument. `driver_net_id` is
   NULL, as for a constant, because the source is a file or a plusarg
   rather than a net; `stmt_id` names the call.
+* `trigger` — a `-> ev` statement fired the event. `driver_net_id` is
+  NULL as for a `system_task`, because nothing feeds an event: the cause
+  is control reaching the statement, and `stmt_id` names it. Distinct
+  from `constant`, which would say the event is held at a value.
 * `terminal` — the design boundary. A root instance's input/inout/ref
   terminal drives the net it stands for: `driver_net_id` is NULL (the
   world outside the export is the driver) and `term_id` names the pin.
@@ -950,6 +954,14 @@ no dataflow, not that the hierarchy stops early.
   operands, three dependencies onto `y`, `map_exact=0`, and no
   fabricated `tmp` net. A consumer that needs the expression's shape reads
   the source at the location the row names.
+* `-> ev` records as `stmt_kind='trigger'` naming the event it fires,
+  the same shape a system task's write has: a target and a source-less
+  dependency, surfacing in `v_driver` as `trigger`. Nothing feeds an
+  event — the cause is control reaching the statement — so the kind is
+  distinct from `constant`, which would say the event is tied off.
+  `disable` records as `stmt_kind='disable'`; it names a block rather
+  than a net, so it carries only the condition that gated it, which
+  otherwise had no statement to be a read of.
 * A system task that writes an argument — `$readmemh` into a memory,
   `$sscanf` or `$value$plusargs` into a variable, `$cast` into its
   destination — records a target and a source-less dependency, surfacing

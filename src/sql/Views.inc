@@ -527,6 +527,11 @@ SELECT
     CASE WHEN d.src_net_id IS NOT NULL THEN d.dep_kind
          WHEN d.src_hier_ref_id IS NOT NULL THEN 'external'
          WHEN s.stmt_kind = 'system_task' THEN 'system_task'
+         -- `-> ev` names what it triggers and nothing that feeds it:
+         -- the cause is control reaching the statement, which is no
+         -- net. Calling that a tie-off would say the event is held at
+         -- a constant, the opposite of what a trigger does.
+         WHEN s.stmt_kind = 'trigger' THEN 'trigger'
          WHEN d.dep_kind != 'data' THEN d.dep_kind
          ELSE 'constant' END AS driver_kind,
     d.id                     AS dep_id,

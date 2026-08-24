@@ -81,7 +81,8 @@ inline const char* word(Edge e) {
 }
 
 enum class StmtKind : uint8_t {
-    Assignment, Assertion, Wait, Call, SystemTask, EventControl, Alias, Release
+    Assignment, Assertion, Wait, Call, SystemTask, EventControl, Alias, Release,
+    Trigger, Disable
 };
 inline const char* word(StmtKind k) {
     switch (k) {
@@ -93,6 +94,8 @@ inline const char* word(StmtKind k) {
         case StmtKind::EventControl: return "event_control";
         case StmtKind::Alias:        return "alias";
         case StmtKind::Release:      return "release";
+        case StmtKind::Trigger:      return "trigger";
+        case StmtKind::Disable:      return "disable";
     }
     SLANG_UNREACHABLE;
 }

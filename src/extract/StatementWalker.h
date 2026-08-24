@@ -518,6 +518,25 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         visitDefault(expr);
     }
 
+    /// `-> ev`. Without a row the event had loads and no cause at all,
+    /// and the condition gating the trigger had no statement to hang on.
+    void handle(const EventTriggerStatement& stmt) {
+        std::vector<Ref> events;
+        filteredConstants = 0;
+        collectRefs(stmt.target, eval, events, /*skipSelectors=*/true);
+        emit(TriggerNode{std::move(events), gateId(), seq++,
+                         filteredConstants, stmt.sourceRange});
+        visitDefault(stmt);
+    }
+
+    /// `disable blk`. It names a block, not a net, so the row exists for
+    /// its gating: the condition reaching it is a read of that signal.
+    void handle(const DisableStatement& stmt) {
+        emit(ReadNode{{}, ReadNode::Kind::Disable, "disable", gateId(),
+                      seq++, 0, stmt.sourceRange});
+        visitDefault(stmt);
+    }
+
     void handle(const CallExpression& expr) {
         visitDefault(expr);
         auto sub = std::get_if<const SubroutineSymbol*>(&expr.subroutine);

@@ -348,7 +348,7 @@ CREATE TABLE stmt(
     stmt_kind             TEXT NOT NULL
         /*!*/CHECK(stmt_kind IN ('assignment','assertion','wait','call',
                                  'system_task','event_control','alias',
-                                 'release'))/*!*/,
+                                 'release','trigger','disable'))/*!*/,
     construct             TEXT,
     assign_kind           TEXT
         /*!*/CHECK(assign_kind IN ('continuous','blocking','nonblocking'))/*!*/,
