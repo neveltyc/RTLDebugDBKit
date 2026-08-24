@@ -2277,6 +2277,26 @@ if mode == "naming":
         SELECT count(*) FROM tree_node
         WHERE name IN ('u', 'p')""") == 0,
           "and no node answers to the bare name of an array")
+    # A generate label is a segment like any other: escaped, and spelled as
+    # the net path beside it spells the same level.
+    check(one("""
+        SELECT count(*) FROM tree_node t JOIN tree_node par
+          ON par.id = t.parent_node_id
+        WHERE par.name = 'naming' AND t.node_kind = 'generate'
+          AND t.name = '\\gn.1 '""") == 1,
+          "an escaped generate label keeps slang's spelling")
+    check(one("""
+        SELECT count(*) FROM net n JOIN tree_node t ON t.id = n.scope_node_id
+        WHERE t.name = '\\gn.1 ' AND n.name = '\\gn.1 .gw'""") == 1,
+          "and the net under it spells the same segment")
+    # A reference path keeps the escape and its terminating space: without
+    # them `\u.1 .v` respells as `u.1.v`, a different identifier.
+    check(one("""
+        SELECT count(*) FROM hier_ref WHERE path = '\\u.1 .v'""") == 1,
+          "a reference through an escaped name keeps its terminator")
+    check(one("""
+        SELECT count(*) FROM hier_ref WHERE path IN ('u.1.v', '\\u.1.v')""") == 0,
+          "and never a respelling of it")
 
 if mode == "concatcursor":
     # An unpacked-array range select: slang's bounds cover one element
@@ -2450,6 +2470,15 @@ if mode == "xmr":
         WHERE src_name='wide' AND tgt_name='slice_o'
           AND src_lo=0 AND src_hi=3""") == 1,
           "a part-select of a downward reference keeps its bits")
+    # A select spelled through the genvar: the stored path carries each
+    # iteration's constant, so the two iterations are two keys.
+    for path in ("u_arr[1].x", "u_arr[2].x"):
+        check(one("""
+            SELECT count(*) FROM hier_ref
+            WHERE path = ? AND access = 'read'""", path) == 1,
+              f"the genvar select resolves to {path}")
+    check(one("SELECT count(*) FROM hier_ref WHERE path LIKE '%k+1%'") == 0,
+          "and no path keeps the unexpanded spelling")
     # A control dependency whose target is outward.
     check(one("""
         SELECT count(*) FROM v_net_dep

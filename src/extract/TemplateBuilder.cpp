@@ -309,12 +309,12 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
         text = normalizedText(r.origin, sourceManager);
     // The symbol knows its own name, and that is always a usable path.
     //
-    // Both spellings above can fail. canonicalPath has no case for a
-    // HierarchicalValue, so every cross-module reference falls to
-    // normalizedText -- which recovers text by slicing a source buffer and
-    // returns nothing when the reference's ends sit in different buffers, i.e.
-    // when any part of the name came from a macro. `q <= `TOP.glob` was
-    // therefore dropped where `q <= tb_top.glob` was recorded.
+    // Both spellings above can fail. canonicalPath declines an upward
+    // reference, which then falls to normalizedText -- and that recovers
+    // text by slicing a source buffer, returning nothing when the
+    // reference's ends sit in different buffers, i.e. when any part of the
+    // name came from a macro. `q <= `TOP.glob` was therefore dropped where
+    // `q <= tb_top.glob` was recorded.
     if (text.empty() && r.sym)
         text = r.sym->getHierarchicalPath();
     // Empty is the only reason left to drop one. There used to be a second --
@@ -564,10 +564,9 @@ bool TemplateBuilder::segsFromAncestry(const InstanceBodySymbol* stopBody,
                                   SymbolKind::GenerateBlockArray) {
                     auto& arr =
                         parent->asSymbol().as<GenerateBlockArraySymbol>();
-                    std::string base(arr.name);
-                    if (base.empty())
-                        base = arr.getExternalName();
-                    level = base + level;
+                    level = escapedSegment(arr.name.empty()
+                                               ? arr.getExternalName()
+                                               : arr.name) + level;
                     up = arr.getParentScope();
                 }
                 else {

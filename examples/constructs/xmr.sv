@@ -130,6 +130,16 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     // rides the LOAD side of the arc -- the branch a design with ties in only
     // one direction never reaches.
     sink u_sink2 (.p(8'h00), .seen(u.split));
+
+    // A select spelled through the genvar: one spelling in the source, a
+    // different element each iteration. The stored path carries the constant
+    // each iteration resolved to, or two references share one key and a
+    // consumer keying on (path, stmt) folds them.
+    leaf u_arr [0:2] ();
+    logic [1:0] arr_q;
+    for (genvar k = 0; k < 2; k = k + 1) begin : ga
+        assign arr_q[k] = u_arr[k+1].x;
+    end
 endmodule
 
 module xmr_top(input logic clk, input logic a, input logic [7:0] d,
