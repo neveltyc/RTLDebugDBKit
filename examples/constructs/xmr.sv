@@ -22,6 +22,16 @@ module sink(input logic [7:0] p, output logic [7:0] seen);
     assign seen = p;
 endmodule
 
+// A body instantiated twice, holding a path that climbs out and comes back
+// into ITSELF. The symbol it lands on belongs to the analysed body, so a
+// locality test that asks only about the symbol calls it a local read -- and
+// then each occurrence reads its OWN net, which is the one thing the path
+// does not say. Both occurrences must answer with the reference.
+module twice(output logic [7:0] mine, output logic [7:0] named);
+    assign mine = 8'hA5;
+    assign named = xmr_top.u_tw1.mine;
+endmodule
+
 module xmr(input logic clk, input logic a, input logic [7:0] d,
            input logic g1, input logic g2, input logic sens_only,
            input logic quiet_gate,
@@ -120,4 +130,20 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     // rides the LOAD side of the arc -- the branch a design with ties in only
     // one direction never reaches.
     sink u_sink2 (.p(8'h00), .seen(u.split));
+endmodule
+
+module xmr_top(input logic clk, input logic a, input logic [7:0] d,
+               input logic g1, input logic g2, input logic sens_only,
+               input logic quiet_gate,
+               output logic q, output logic [3:0] slice_o, output logic tick,
+               output logic [3:0] sp_hi, output logic [3:0] sp_lo,
+               output logic seen, output logic far_o,
+               output logic [7:0] m1_named, output logic [7:0] m2_named);
+    xmr u_xmr (.clk(clk), .a(a), .d(d), .g1(g1), .g2(g2),
+               .sens_only(sens_only), .quiet_gate(quiet_gate), .q(q),
+               .slice_o(slice_o), .tick(tick), .sp_hi(sp_hi), .sp_lo(sp_lo),
+               .seen(seen), .far_o(far_o));
+    logic [7:0] mine1, mine2;
+    twice u_tw1 (.mine(mine1), .named(m1_named));
+    twice u_tw2 (.mine(mine2), .named(m2_named));
 endmodule
