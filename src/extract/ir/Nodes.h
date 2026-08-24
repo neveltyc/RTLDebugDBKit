@@ -89,10 +89,12 @@ struct AssignmentNode {
 struct BindNode {
     const slang::ast::FormalArgumentSymbol* formal = nullptr;
     const slang::ast::Expression* actualOrigin = nullptr;
-    Ref actual;
+    /// The actual's bits paired with the formal's, as an assignment's
+    /// operands are paired with its target: `t({hi, lo})` fills two windows
+    /// of one formal, and each element reaches only its own.
+    PairedSrc pair;
     bool reads = false;
     bool writes = false;
-    bool oneToOne = false;
     bool bindable = true;
     slang::SourceRange where;
 };
