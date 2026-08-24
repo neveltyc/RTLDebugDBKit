@@ -226,8 +226,13 @@ statement's rows.
 **`net`** — every object that can be driven, read or wired: nets and
 variables, of the instance body and its generate scopes, and — because a
 dependency end is an id and an id must exist — subroutine formals, locals
-and block variables, named by their scope-relative dotted path (`bump.v`,
-`g[0].sig`). Parameters, type parameters and specparams are *not* here:
+and block variables. `name` is the dotted path relative to `inst_id`,
+generate and subroutine segments included (`g[0].sig`, `bump.v`): a net's
+full path is its **instance's** tree path plus `name`. `scope_node_id` is
+the instance or generate node that declares it — the filter for "signals
+of this scope", never the name's anchor: prefixing the scope node's path
+onto `name` counts every generate segment twice (`top.g[0].g[0].sig`).
+Parameters, type parameters and specparams are *not* here:
 they are not connectivity. `decl_kind` is
 the net type's own word (`wire`, `wand`, `trireg`, a user-defined nettype's
 name) or `variable`. `is_implicit=1` marks a net slang created for an
@@ -235,7 +240,6 @@ undeclared identifier under the active `` `default_nettype ``; its location
 is the first use. `width` is the flattened bit width, NULL when the type is
 not integral — bit *offsets* still index the flattened space slang computes
 for unpacked objects, so ranges on a NULL-width net remain meaningful.
-`scope_node_id` is the instance or generate node that declares it.
 
 **`term`** — one terminal per port, in port-list order (`ordinal`). The
 root's terminals are the design's top-level ports; a child's are the pins
@@ -544,7 +548,9 @@ have no location.
 param_signature, scope_node_id, net_name, decl_kind, data_type,
 width, is_implicit, file_path, src_path, src_line, src_col`.
 No direction column — direction belongs to terminals, and a net's port-ness
-is one `v_term_map` join away.
+is one `v_term_map` join away. A net's full path is its `inst_id`'s tree
+path plus `net_name` — never `scope_node_id`'s, which repeats the generate
+segments `net_name` already carries (see `net`).
 
 **`v_term`** — one row per terminal: `term_id, inst_id,
 module_id, module_name, term_name, term_kind, direction, data_type,
