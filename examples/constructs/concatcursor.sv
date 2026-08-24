@@ -77,4 +77,13 @@ module concatcursor(input logic clk, input logic [31:0] d, input logic [7:0] e,
     always_ff @(posedge clk) {arr[2], rode} <= {e, f};
     always_ff @(posedge clk) {arr[idx], arr[3]} <= {f, e};
     assign rode_o = rode;
+
+    // A RANGE select over an unpacked array. slang's own bounds for it come
+    // back the width of one element however many the select names, so a
+    // range recorded from them says the elements past the first are
+    // untouched -- an under-claim wearing exact=1, which is the reading that
+    // must never be wrong. Recorded as an unknown part of the array instead.
+    logic [7:0] slice_src [0:3];
+    logic [7:0] slice_dst [0:1];
+    assign slice_dst = slice_src[1:2];
 endmodule
