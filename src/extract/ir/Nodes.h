@@ -96,6 +96,9 @@ struct BindNode {
     bool reads = false;
     bool writes = false;
     bool bindable = true;
+    /// The actual is a constant, so `pair` names no source: the formal
+    /// is tied off rather than fed by a net.
+    bool constantActual = false;
     slang::SourceRange where;
 };
 

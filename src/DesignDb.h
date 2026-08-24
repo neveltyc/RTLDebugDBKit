@@ -492,6 +492,14 @@ namespace designdb {
 /// `disable` gains a kind for a different reason -- it names a block, not
 /// a net -- but the same one underneath: the condition gating it was a
 /// read with no statement to belong to, and vanished with the statement.
+///
+/// A constant bound to a subroutine argument now ties the formal off.
+/// `t(8'h5A, y)` left the formal with no driver at all while the identical
+/// tie written as a port connection recorded `conn_kind='constant'`, so
+/// the same fact answered differently depending on how it was spelled. It
+/// is a source-less `data` arc, which is what `constant` means, anchored
+/// by a target row on the calling statement -- the discipline every other
+/// source-less arc already follows.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
