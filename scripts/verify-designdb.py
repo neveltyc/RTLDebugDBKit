@@ -73,7 +73,7 @@ DOMAINS = (
       "final"), False),
     ("stmt", "stmt_kind",
      ("assignment", "assertion", "wait", "call", "system_task", "event_control",
-      "alias", "release"), False),
+      "alias", "release", "trigger", "disable"), False),
     ("stmt", "assign_kind", ("continuous", "blocking", "nonblocking"), True),
     ("expr_ref", "role",
      ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
@@ -91,7 +91,7 @@ VIEW_DOMAINS = (
     ("v_driver", "driver_kind",
      ("data", "control", "primitive", "procedure", "connection",
       "connection_expression", "constant", "terminal", "system_task", "alias",
-      "external")),
+      "external", "trigger")),
     ("v_load", "load_kind",
      ("dataflow", "connection", "sensitivity", "wait", "statement", "terminal",
       "alias")),
@@ -764,7 +764,7 @@ check(one("""
 check(one("""
     SELECT count(*) FROM stmt_target a
     JOIN stmt s ON s.id = a.stmt_id
-    WHERE s.stmt_kind != 'release'
+    WHERE s.stmt_kind NOT IN ('release', 'trigger')
       AND NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.stmt_target_id = a.id)
       AND NOT EXISTS (SELECT 1 FROM hier_ref h
                       WHERE h.stmt_id = a.stmt_id AND h.access = 'read')""") == 0,
@@ -1241,13 +1241,14 @@ for col, tbl in (("term_map_id", "term_map"), ("conn_id", "net_conn"),
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_net_id IS NOT NULL
-      AND driver_kind IN ('constant','terminal','system_task','external')""") == 0,
-      "constant/terminal/system_task/external never name a driver net")
+      AND driver_kind IN ('constant','terminal','system_task','external',
+                          'trigger')""") == 0,
+      "constant/terminal/system_task/external/trigger never name a driver net")
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_net_id IS NULL
       AND driver_kind NOT IN ('constant','terminal','system_task','external',
-                              'primitive','procedure')""") == 0,
+                              'primitive','procedure','trigger')""") == 0,
       "only kinds that can lack a driver net do")
 # An external driver is real but nameless HERE: no net row, so no name --
 # yet unlike a constant it keeps its window, because the referenced
@@ -1382,7 +1383,7 @@ check(one("""
     WHERE driver_kind NOT IN ('data','control','primitive','procedure',
                               'connection','connection_expression','constant',
                               'terminal','system_task','alias',
-                              'external')""") == 0,
+                              'external','trigger')""") == 0,
       "driver_kind stays in its vocabulary")
 check(one("""
     SELECT count(*) FROM v_load
@@ -1927,6 +1928,32 @@ if mode == "params":
 
 
 if mode == "procedural":
+    # `-> fired` is what makes an event happen. Without the row the event
+    # had waiters and no cause; `constant` would have been worse, saying it
+    # is tied off.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'fired' AND driver_kind = 'trigger'
+          AND driver_net_id IS NULL""") == 1,
+          "a triggered event is driven by its trigger, not by a constant")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name = 'fired' AND load_kind = 'sensitivity'""") == 1,
+          "and the procedure waiting on it is still its load")
+    # Both statements exist so their gating has somewhere to land: the
+    # condition reaching them is a read, and it had nowhere else to go.
+    for kind in ("trigger", "disable"):
+        check(one("""
+            SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
+            JOIN net n ON n.id = e.net_id
+            WHERE s.stmt_kind = ? AND e.role = 'control' AND n.name = 'en'""",
+                  kind) == 1,
+              f"a gated {kind} records the condition it was reached under")
+    check(one("""
+        SELECT count(*) FROM stmt WHERE stmt_kind = 'disable'
+          AND NOT EXISTS (SELECT 1 FROM stmt_target t WHERE t.stmt_id = stmt.id)
+        """) == 1,
+          "and a disable names no net, having written none")
     # ---- LRM 11.4.1: an assignment operator reads its target
     # LRM 11.4.1 -- an assignment operator reads its target. slang builds
     # `a += b` as BinaryExpression(LValueReference, b), and an

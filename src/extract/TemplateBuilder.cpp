@@ -922,6 +922,9 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                                             RefRole::Assertion}
                             : n.kind == ReadNode::Kind::Wait
                                 ? std::pair{StmtKind::Wait, RefRole::Wait}
+                            : n.kind == ReadNode::Kind::Disable
+                                ? std::pair{StmtKind::Disable,
+                                            RefRole::CallArgument}
                                 : std::pair{StmtKind::Call,
                                             RefRole::CallArgument};
                         fileReadLike(n.reads, gates.refs(n.gate), {}, kind,
@@ -932,6 +935,12 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                         fileReadLike(n.reads, gates.refs(n.gate), n.writes,
                                      StmtKind::SystemTask, RefRole::SystemTask,
                                      /*writesAreReleased=*/false, n.construct,
+                                     n.seq, n.dropped, n.where);
+                    }
+                    else if constexpr (std::is_same_v<T, TriggerNode>) {
+                        fileReadLike({}, gates.refs(n.gate), n.events,
+                                     StmtKind::Trigger, RefRole::CallArgument,
+                                     /*writesAreReleased=*/false, "trigger",
                                      n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReleaseNode>) {

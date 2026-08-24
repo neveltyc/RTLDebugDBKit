@@ -111,7 +111,7 @@ struct EventNode {
 /// condition, a user call's own arguments. `dropped` counts the operands
 /// filtered as compile-time constants.
 struct ReadNode {
-    enum class Kind { Assertion, Wait, Call };
+    enum class Kind { Assertion, Wait, Call, Disable };
     std::vector<Ref> reads;
     Kind kind = Kind::Call;
     std::string construct;
@@ -133,6 +133,17 @@ struct SystemTaskNode {
     slang::SourceRange where;
 };
 
+/// `-> ev`: names the event it triggers. The cause is control reaching
+/// the statement, which is no net, so the arc has no source -- the shape
+/// a system task's write already has.
+struct TriggerNode {
+    std::vector<Ref> events;
+    GateId gate = 0;
+    int64_t seq = 0;
+    int64_t dropped = 0;
+    slang::SourceRange where;
+};
+
 /// `release` / `deassign`: names its lvalues and drives nothing.
 struct ReleaseNode {
     std::vector<Ref> lvalues;
@@ -144,6 +155,6 @@ struct ReleaseNode {
 };
 
 using Node = std::variant<AssignmentNode, BindNode, EventNode, ReadNode,
-                          SystemTaskNode, ReleaseNode>;
+                          SystemTaskNode, TriggerNode, ReleaseNode>;
 
 } // namespace designdb::detail

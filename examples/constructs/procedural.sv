@@ -116,10 +116,26 @@ endmodule
 
 // A level-sensitive procedure and an edge-agnostic event, neither of which
 // has a posedge/negedge spelling to be mistaken for.
-module evkinds (input logic en, input logic ev, input logic [7:0] d,
-                output logic [7:0] latched, output logic [7:0] both_q);
+//
+// And the two statements that used to produce nothing at all. `-> fired`
+// is what makes an event variable happen: with no row it had waiters and
+// no cause, so a trace back from it said the design never touches it, and
+// the condition gating the trigger vanished with the statement. `disable`
+// names a block rather than a net, so it contributes only its own gating
+// -- which is the whole point, since that read had nowhere else to go.
+module evkinds (input logic clk, input logic en, input logic ev,
+                input logic [7:0] d,
+                output logic [7:0] latched, output logic [7:0] both_q,
+                output logic [7:0] waited);
+    event fired;
     always_latch if (en) latched <= d;
     always @(edge ev) both_q <= d;
+    always @(posedge clk) if (en) -> fired;
+    always @(fired) waited <= d;
+    always @(posedge clk) begin : stopper
+        if (en) disable stopper;
+        waited <= d;
+    end
 endmodule
 
 `define DRIVE(D, S) assign D = (S)
@@ -158,7 +174,7 @@ module procedural (input logic clk, input logic [7:0] x, k,
                    output logic [7:0] shift_self, masked,
                    output logic [7:0] assign_style, ret_style,
                    output logic [7:0] matched, looped, sum, output logic held,
-                   output logic [7:0] latched, both_q,
+                   output logic [7:0] latched, both_q, waited,
                    output logic [7:0] via_macro, direct, out_arg,
                    output logic [3:0] narrow_arg);
     compound u_cmp (.clk(clk), .x(x), .explicit_self(explicit_self),
@@ -167,8 +183,8 @@ module procedural (input logic clk, input logic [7:0] x, k,
     stmtgaps u_stg (.clk(clk), .x(x), .k(k), .sel(sel), .b(b), .g(g),
                     .assign_style(assign_style), .ret_style(ret_style),
                     .matched(matched), .looped(looped), .sum(sum), .held(held));
-    evkinds  u_ev  (.en(en), .ev(ev), .d(x), .latched(latched),
-                    .both_q(both_q));
+    evkinds  u_ev  (.clk(clk), .en(en), .ev(ev), .d(x), .latched(latched),
+                    .both_q(both_q), .waited(waited));
     macroloc u_mac (.a(x), .via_macro(via_macro), .direct(direct),
                     .out_arg(out_arg), .narrow_arg(narrow_arg));
 endmodule
