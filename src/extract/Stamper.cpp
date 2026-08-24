@@ -82,7 +82,7 @@ private:
     };
 
     /// A template-local index as a database id: base + index + 1, with the
-    /// null index (-1) as SQL's 0-means-NULL. The spelling existed 18 times.
+    /// null index (-1) as SQL's 0-means-NULL.
     static int64_t stampId(int64_t base, int64_t idx) {
         return idx < 0 ? 0 : base + idx + 1;
     }
