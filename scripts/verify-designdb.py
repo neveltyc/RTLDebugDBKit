@@ -1921,6 +1921,15 @@ if mode == "procedural":
 
 
 if mode == "structural":
+    # A terminal whose type has no packed width is still placed: the two
+    # sides of one whole-to-whole binding must not disagree about it.
+    check(one("""SELECT count(*) FROM v_term_map
+                 WHERE term_name='arr' AND term_exact=1 AND map_exact=1""") >= 1,
+          "an unpacked-array terminal maps whole and exact inside")
+    check(one("""SELECT count(*) FROM v_net_conn
+                 WHERE term_name='arr' AND term_exact=0""") == 0,
+          "and its connection agrees from the outside")
+
     # Two occurrences of one parameterisation: one signature, two row sets.
     check(one("""
         SELECT count(*) FROM inst i JOIN module m ON m.id=i.module_id

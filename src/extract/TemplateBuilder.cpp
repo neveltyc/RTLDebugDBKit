@@ -151,9 +151,7 @@ void TemplateBuilder::collectTermSlots(const InstanceBodySymbol& body,
     for (auto* portSym : body.getPortList()) {
         if (!portSym)
             continue;
-        auto width = [](const Type& ty) {
-            return ty.isIntegral() ? int64_t(ty.getBitWidth()) : int64_t(-1);
-        };
+        auto width = [](const Type& ty) { return int64_t(flattenedWidth(ty)); };
         switch (portSym->kind) {
             case SymbolKind::Port:
                 out.emplace(portSym,
@@ -678,7 +676,7 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
                 if (netIdx < 0)
                     continue;
                 TplRange termR;
-                const uint64_t fw = inner.type ? inner.type->getBitWidth() : 0;
+                const uint64_t fw = inner.type ? flattenedWidth(*inner.type) : 0;
                 if (cn.windowExact && fw &&
                     !(cn.winLo == 0 && cn.winHi + 1 >= fw))
                     termR.bits = std::make_pair(cn.winLo, cn.winHi);

@@ -59,8 +59,20 @@ program watcher(input logic clk, input logic [7:0] dout);
     initial $display("dout=%0h", dout);
 endprogram
 
+// A port whose type is an unpacked array. It has no PACKED width, only the
+// flattened one the schema's bit offsets index, so a width taken from the
+// packed one makes the terminal's two sides disagree: the inside maps it
+// whole and exactly, the outside cannot place it at all.
+module aggport(input logic [7:0] arr [0:1], output logic [7:0] o);
+    assign o = arr[0];
+endmodule
+
 module structural(input logic clk, input logic [7:0] din,
-                  output logic [7:0] dout, inout wire pad);
+                  output logic [7:0] dout, inout wire pad,
+                  output logic [7:0] agg_o);
     hierarchy u_h (.clk(clk), .din(din), .dout(dout), .pad(pad));
     watcher   u_w (.clk(clk), .dout(dout));
+
+    logic [7:0] mem [0:1];
+    aggport   u_ag (.arr(mem), .o(agg_o));
 endmodule
