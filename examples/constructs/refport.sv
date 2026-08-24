@@ -18,9 +18,20 @@ module refsink(ref logic [7:0] shared, input logic clk, input logic [7:0] step);
     always_ff @(posedge clk) shared <= shared + step;
 endmodule
 
+// A `const ref` ARGUMENT is the same binding read-only: the reference is
+// passed to avoid copying an aggregate, and `const` is what stops the body
+// assigning through it. It is the one `ref` that drives nothing, so a rule
+// keyed on the direction alone gives its actual a driver no call can make.
 module refport(input logic clk, input logic [7:0] step,
-               output logic [7:0] o);
+               output logic [7:0] o, output logic [7:0] scanned);
     logic [7:0] shared;
+    logic [7:0] table_ro;
     refsink u_rs (.shared(shared), .clk(clk), .step(step));
     assign o = shared;
+
+    function automatic logic [7:0] scan(const ref logic [7:0] big,
+                                        input logic [7:0] sel);
+        return big ^ sel;
+    endfunction
+    always_comb scanned = scan(table_ro, step);
 endmodule

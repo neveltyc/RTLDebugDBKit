@@ -627,13 +627,16 @@ check(one("""
                        OR d.expr_ref_id IS NOT NULL
                        OR d.tgt_hier_ref_id IS NOT NULL
                        OR d.map_exact IS NOT NULL
-                  -- Every other procedure row names a source, and the
-                  -- write-back direction (formal -> actual) is told apart by
-                  -- the formal being it -- so no target row. The reading side
-                  -- names where the actual came from, exactly as the doc
-                  -- promises: an argument reference or a resolved outward
-                  -- one, never both.
-                  ELSE d.stmt_target_id IS NOT NULL
+                  -- Every other procedure row names a source, and its
+                  -- direction decides what may hang off it: the reading side
+                  -- (actual -> formal) names where the actual came from and
+                  -- writes nothing, the write-back side (formal -> actual)
+                  -- carries the statement's target row. One row is one
+                  -- direction, so it is never both -- and the reading side
+                  -- names an argument reference or a resolved outward one,
+                  -- never both of those either.
+                  ELSE (d.expr_ref_id IS NOT NULL
+                        AND d.stmt_target_id IS NOT NULL)
                        OR (d.expr_ref_id IS NOT NULL
                            AND d.src_hier_ref_id IS NOT NULL)
                 END
@@ -2077,6 +2080,15 @@ if mode == "udp":
           "and no two siblings share a name")
 
 if mode == "refport":
+    # A `const ref` actual is read and never written: the direction alone
+    # would make it a driver, and no call can produce that write.
+    check(one("""SELECT count(*) FROM v_driver
+                 WHERE signal_name='table_ro'""") == 0,
+          "a const ref actual has no driver")
+    check(one("""SELECT count(*) FROM v_load
+                 WHERE signal_name='table_ro' AND load_kind='dataflow'""") >= 1,
+          "and is read by the call")
+
     # LRM 23.2.2.4 -- the fourth port direction. A `ref` binds the actual
     # VARIABLE rather than a net both sides drive, and like `inout` it arcs
     # both ways: the terminal is a driver of the outer net and a load of it.
@@ -2727,6 +2739,16 @@ if mode == "callsite":
         JOIN call_site cs ON cs.id = d.call_site_id
         WHERE cs.subroutine_name='pick' AND d.stmt_id IS NOT NULL""") > 0,
           "while the body it walked is")
+    # An output actual is written by the calling statement: the driver and
+    # the statement-target row are two halves of one fact, and a reader that
+    # asks either view must get the same answer.
+    check(one("""SELECT count(*) FROM v_driver
+                 WHERE signal_name='w' AND driver_kind='procedure'""") == 1,
+          "an output actual has a procedure driver")
+    check(one("""SELECT count(*) FROM v_stmt_target t JOIN net n ON n.id=t.net_id
+                 WHERE n.name='w' AND t.target_kind='written_by'""") == 1,
+          "and the calling statement records it as a target")
+
     # Each call's argument binds to the shared formal under its OWN site.
     check(one("""
         SELECT count(DISTINCT call_site_id) FROM v_net_dep
