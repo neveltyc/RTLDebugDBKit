@@ -321,7 +321,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
             continue;
         }
         const uint64_t formalWidth =
-            (!inArray && connExpr->type) ? connExpr->type->getBitWidth() : 0;
+            (!inArray && connExpr->type) ? flattenedWidth(*connExpr->type) : 0;
         // The connection expression's type is not always the formal's: an
         // output port narrower than the net it drives arrives as a plain
         // assignment with no conversion node to degrade through, so the
