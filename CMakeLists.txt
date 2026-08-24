@@ -38,9 +38,12 @@ if(NOT EXISTS ${CPM_DOWNLOAD_LOCATION})
 endif()
 include(${CPM_DOWNLOAD_LOCATION})
 
-# slang is pinned to an exact revision, not a range. The exporter reads private
-# analysis structure (driver bit ranges, canonical instance bodies), so an
-# upgrade is a deliberate, differential-tested step rather than a float.
+# slang is pinned to an exact revision, not a range. The exporter is built on
+# API that slang does not hold stable across releases -- ValuePath and its
+# longest-static-prefix bounds, AnalysisManager's analyzed scopes and
+# procedures, HierarchicalReference's resolved path, and canonical instance
+# bodies -- and v10 to v11 broke several of them outright. An upgrade is a
+# deliberate, differential-tested step rather than a float.
 # Mind the tag spelling: slang tags a release `vN.M`, with no patch component --
 # `v11.0`, never `v11.0.0`. A three-part tag does not exist upstream, and CPM
 # reports the miss as a failed fetch rather than as a pin that names nothing.
