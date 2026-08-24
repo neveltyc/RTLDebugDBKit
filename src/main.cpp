@@ -656,6 +656,10 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     writer.setMeta("recursion_count", std::to_string(stats.recursiveInstances));
     writer.setMeta("truncated_call_count", std::to_string(stats.truncatedCalls));
     writer.setMeta("unanalysed_inst_count", std::to_string(stats.unanalysedInsts));
+    // Not a cause of `partial`: a checker is a construct this tool does
+    // not model, not a walk that fell short. It is published so its
+    // absence can be read rather than guessed at.
+    writer.setMeta("checker_inst_count", std::to_string(stats.checkerInsts));
     writer.setMeta("tool_version", RTLDESIGNDB_VERSION);
     writer.setMeta("slang_version", RTLDESIGNDB_SLANG_TAG);
     // Which build produced this, at commit granularity. `tool_version`

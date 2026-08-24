@@ -273,6 +273,10 @@ struct Template {
     std::vector<TplNet> nets;
     std::vector<TplTerm> terms;
     std::vector<TplTermMap> termMaps;
+    /// Checker instantiations in this body. Not modelled -- counted, so
+    /// the seal can say how many are missing rather than leaving their
+    /// absence indistinguishable from a design that has none.
+    int64_t checkerInsts = 0;
     std::vector<TplProcedure> procedures;
     std::vector<TplStmt> stmts;
     std::vector<TplCallSite> callSites;

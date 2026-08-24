@@ -60,6 +60,8 @@ SELECT
                   THEN value END) AS INTEGER) AS recursion_count,
     CAST(MAX(CASE WHEN key = 'truncated_call_count'
                   THEN value END) AS INTEGER) AS truncated_call_count,
+    CAST(MAX(CASE WHEN key = 'checker_inst_count'
+                  THEN value END) AS INTEGER) AS checker_inst_count,
     CAST(MAX(CASE WHEN key = 'unanalysed_inst_count'
                   THEN value END) AS INTEGER) AS unanalysed_inst_count,
     MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest

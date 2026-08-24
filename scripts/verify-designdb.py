@@ -885,7 +885,7 @@ check(meta["schema_version"] == SCHEMA_VERSION,
       f"schema_version is {SCHEMA_VERSION}", f"got {meta['schema_version']}")
 COUNTS = ("error_count", "unresolved_count", "empty_procedure_count",
           "duplicate_path_count", "recursion_count", "truncated_call_count",
-          "unanalysed_inst_count")
+          "checker_inst_count", "unanalysed_inst_count")
 nonnumeric = [k for k in COUNTS if not meta[k].isdigit()]
 if nonnumeric:
     fatal(f"meta count(s) not a number: {', '.join(nonnumeric)}")
@@ -928,7 +928,8 @@ VIEW_COLUMNS = {
         "producer_revision",
         "top", "analysis_status", "error_count", "unresolved_count",
         "empty_procedure_count", "duplicate_path_count", "recursion_count",
-        "truncated_call_count", "unanalysed_inst_count", "config_digest"],
+        "truncated_call_count", "checker_inst_count", "unanalysed_inst_count",
+        "config_digest"],
     "v_tree_node": [
         "node_id", "parent_node_id", "node_name", "node_kind", "ordinal",
         "inst_id", "parent_inst_id", "module_id", "module_name", "def_kind",
@@ -1836,6 +1837,17 @@ if mode == "interfaces":
           "no reference path carries a space or a comment")
 
 if mode == "assertions":
+    # A checker produces no rows at all -- not an instance, not a node, not
+    # its assertion. The count is what keeps that readable, and it does not
+    # make the export `partial`: a construct this tool declines is not a
+    # walk that fell short.
+    check(one("SELECT checker_inst_count FROM v_db_info") == 1,
+          "a checker instance is counted though it is not modelled")
+    check(one("""
+        SELECT count(*) FROM v_tree_node WHERE node_name = 'u_chk'""") == 0,
+          "and contributes no node")
+    check(one("SELECT analysis_status FROM v_db_info") == "complete",
+          "while the status stays complete")
     check(one("""
         SELECT count(*) FROM stmt WHERE stmt_kind='assertion'""") >= 3,
           "assertion statements")
