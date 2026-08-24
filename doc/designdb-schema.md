@@ -995,6 +995,16 @@ statements their ordinary rows. What differs is the boundary:
   `net_dep` whose far end is that interface's net. Two modules on one
   interface meet at those nets, which is where a trace crosses.
 
+* A subroutine DECLARED in the interface and called through a port
+  (`bus.stamp(d)`) is walked, like every subroutine, at the call site — so
+  its statements are the caller's rows, and the interface variables its
+  body names resolve through the same terminal a member reference takes.
+  The arcs land on the interface instance's nets, cross-instance, gated by
+  whatever gated the call. Its FORMALS are not nets of the interface —
+  nothing walks that body's own subroutines — so what an argument
+  contributes stays an unresolved reference, `driver_kind='external'`,
+  exactly as a package subroutine's formal does (see *Packages*).
+
 So "what drives `axi_if.master`'s `vld`" is `v_driver` on the interface
 instance's own net.
 

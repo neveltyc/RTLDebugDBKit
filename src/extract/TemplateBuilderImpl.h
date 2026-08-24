@@ -85,6 +85,31 @@ inline const InstanceBodySymbol& canonicalBodyOf(const InstanceSymbol& inst) {
     return inst.getCanonicalBody() ? *inst.getCanonicalBody() : inst.body;
 }
 
+/// The instance body that DECLARES `sym` as one of its nets, or null.
+///
+/// Only the eagerly collected set counts -- a member of the body or of one
+/// of its generate scopes -- because those are exactly the symbols another
+/// body's template can count on finding a net row for. A subroutine formal
+/// or local gets a row only if some procedure of its own body walks it, so
+/// a reference from elsewhere cannot assume one: resolving to an instance
+/// while naming no net would be a resolution that answers half.
+inline const InstanceBodySymbol* declaringInstanceBody(const Symbol& sym) {
+    for (const Scope* s = sym.getParentScope(); s;) {
+        auto& owner = s->asSymbol();
+        switch (owner.kind) {
+            case SymbolKind::InstanceBody:
+                return &owner.as<InstanceBodySymbol>();
+            case SymbolKind::GenerateBlock:
+            case SymbolKind::GenerateBlockArray:
+                break;
+            default:
+                return nullptr;
+        }
+        s = owner.getParentScope();
+    }
+    return nullptr;
+}
+
 /// The local net a reference names, or -1 when it names something else.
 ///
 /// A hierarchical path names ONE occurrence. It is never the occurrence's
