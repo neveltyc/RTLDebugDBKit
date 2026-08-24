@@ -164,6 +164,21 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                        }),
                         reads.end());
         }
+        // A bound argument is read by its binding, which names the formal it
+        // feeds. Leaving it here too made one read two rows, against the
+        // rule that a read lands in exactly one of assign_operand, expr_ref
+        // and proc_event. Matched by the reference's own expression, as
+        // collectGating matches: `t(y, y)` is two occurrences and two
+        // bindings, not one read to drop twice.
+        std::set<const Expression*> bound;
+        collectBoundArgumentRefs(call, bound);
+        if (!bound.empty()) {
+            reads.erase(std::remove_if(reads.begin(), reads.end(),
+                                       [&](const Ref& r) {
+                                           return bound.count(r.origin) > 0;
+                                       }),
+                        reads.end());
+        }
         // A system task that writes an argument -- $readmemh into a memory,
         // $sscanf into a variable, $cast into its destination -- really does
         // drive it, and slang models the write as an assignment inside the
@@ -209,6 +224,27 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         };
         Finder f(*this, out, refs);
         expr.visit(f);
+    }
+
+    /// The expressions bindArguments will bind, so a statement-level call
+    /// does not record their reads a second time. A system call has no
+    /// formals and binds nothing.
+    void collectBoundArgumentRefs(const CallExpression& call,
+                                  std::set<const Expression*>& out) {
+        auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
+        if (!sub || !*sub)
+            return;
+        auto args = call.arguments();
+        auto formals = (*sub)->getArguments();
+        const size_t n = std::min(args.size(), formals.size());
+        for (size_t i = 0; i < n; i++) {
+            if (!args[i] || !formals[i])
+                continue;
+            std::vector<Ref> refs;
+            collectRefs(*args[i], eval, refs);
+            for (auto& r : refs)
+                out.insert(r.origin);
+        }
     }
 
     static std::string callWord(const CallExpression& call) {
@@ -551,21 +587,37 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             if (actualExpr->kind == ExpressionKind::Assignment &&
                 actualExpr->as<AssignmentExpression>().isLValueArg())
                 actualExpr = &actualExpr->as<AssignmentExpression>().left();
-            std::vector<Ref> actuals;
-            collectRefs(*args[i], eval, actuals, /*skipSelectors=*/writes);
-            for (auto& a : actuals) {
-                if (!a.sym)
+
+            // The formal is the assignment's other side: the actual's
+            // elements are positioned in its bit space and paired against
+            // it, so a concatenated actual reaches its own window instead
+            // of claiming the whole formal, exactly as `{hi, lo} = x` does.
+            Ref formalRef;
+            formalRef.sym = formals[i];
+            formalRef.cover = BitInterval::whole();
+            formalRef.exact = true;
+            const uint64_t fw = bitWidthOf(*formals[i]);
+            const Slot formalSlot =
+                fw ? Slot::at(formalRef, BitRange(0, fw - 1), true)
+                   : Slot::unpositioned(formalRef);
+
+            // Positioned from the unwrapped actual: an output actual is
+            // args[i] wrapped in bindLValue's assignment, and a walk over
+            // the wrapper positions nothing and claims no correspondence
+            // even where the actual fills the formal exactly.
+            std::vector<Slot> actualSlots;
+            collectSlots(*actualExpr, eval, 0, actualSlots, /*skipSelectors=*/writes);
+            for (auto& as : actualSlots) {
+                if (!as.ref.sym)
                     continue;
-                // Whole-to-whole only when the actual IS a reference filling
-                // the formal -- the same leaf rule every positional claim
-                // answers to.
-                const uint64_t fw = bitWidthOf(*formals[i]);
-                const bool oneToOne =
-                    actuals.size() == 1 && isPlainReference(*actualExpr) &&
-                    coverFillsWidth(actuals[0].cover, actuals[0].exact, fw,
-                                    bitWidthOf(*actuals[0].sym));
-                emit(BindNode{formals[i], args[i], a, reads, writes, oneToOne,
-                              bindable, expr.sourceRange});
+                std::optional<BitRange> span;
+                if (!slotsOverlap(formalSlot, as, span))
+                    continue;
+                PairedSrc pair{narrowed(as, span), narrowed(formalSlot, span),
+                               formalSlot.positional && as.positional,
+                               as.ref};
+                emit(BindNode{formals[i], args[i], std::move(pair), reads,
+                              writes, bindable, expr.sourceRange});
             }
         }
     }
