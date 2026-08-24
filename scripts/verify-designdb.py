@@ -2330,6 +2330,32 @@ if mode == "concatcursor":
             WHERE src_name=? AND tgt_name='whole' AND tgt_lo=? AND tgt_hi=?
               AND tgt_exact=1""", name, lo, hi) == 1,
               f"and reading it back puts {name} at bits {hi}:{lo} of whole")
+    # A streaming operand's window survives as an UPPER BOUND, never exact:
+    # the stream permutes bits, so which of a[5:0] reach either half is
+    # unknown, and exact would claim bits that never arrive.
+    for tgt in ("sh", "sl"):
+        check(one("""
+            SELECT count(*) FROM v_net_dep
+            WHERE src_name='a' AND tgt_name=? AND src_lo=0 AND src_hi=5
+              AND src_exact=0""", tgt) == 1,
+              f"a streamed read reaches {tgt} as an upper bound")
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name IN ('a','b') AND tgt_name IN ('sh','sl')
+          AND src_exact=1""") == 0,
+          "and no streamed pairing claims exact source bits")
+    # The mirror, a streaming TARGET: the written windows are the unknown.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name='a' AND tgt_name='sm0' AND tgt_exact=0""") == 1,
+          "a streamed write reaches its target as an upper bound")
+    # A named pattern positions per member exactly as the simple one does.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name='a' AND tgt_name='packed_o' AND tgt_lo=4 AND tgt_hi=7
+          AND map_exact=1""") == 1,
+          "a named pattern member lands on its own window")
+
     # A zero-width operand takes no position and does not stop the walk:
     # the two operands beside it land where they would with the pad absent.
     for name, lo, hi in (("a", 8, 15), ("b", 0, 7)):
