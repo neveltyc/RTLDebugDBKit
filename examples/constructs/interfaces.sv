@@ -70,6 +70,16 @@ module arrayed(simple_bus bus_arr[2]);
     assign bus_arr[1].data = 8'hA5;
 endmodule
 
+// The same port with two dimensions. The elements of the outer array are
+// arrays themselves, so a walk that takes them for instances binds nothing:
+// the segments must be the LEAVES, in declaration order, on both the
+// connection side and the reference side or the two disagree about which
+// segment is which.
+module arrayed2(simple_bus grid[2][2]);
+    assign grid[0][1].vld  = 1'b1;
+    assign grid[1][0].data = 8'h3C;
+endmodule
+
 // Calls the interface's own task. The body's write to `data` and its read of
 // `vld` belong to the interface instance this occurrence is bound to, not to
 // this module, and must arrive as cross-instance dataflow.
@@ -130,4 +140,7 @@ module interfaces;
 
     simple_bus barr[2](clk);
     arrayed    u_arr(.bus_arr(barr));
+
+    simple_bus bgrid[2][2](clk);
+    arrayed2   u_grid(.grid(bgrid));
 endmodule

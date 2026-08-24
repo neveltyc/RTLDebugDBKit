@@ -518,6 +518,8 @@ namespace designdb {
 /// carries the segment it meant, decided by whose subtree the target sits
 /// in rather than by the written index, since `bus_arr[k]` in a generate
 /// loop spells one thing and lands on a different element each iteration.
+/// A multi-dimensional port binds its LEAVES, since an element of the
+/// outer array is another array and not an instance.
 ///
 /// A built-in method's effect on its receiver stays unmodelled, and the
 /// doc says so where the other testbench constructs are declined.

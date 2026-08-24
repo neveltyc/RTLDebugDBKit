@@ -1713,6 +1713,23 @@ if mode == "interfaces":
         SELECT count(*) FROM v_driver v JOIN tree_node t ON t.id = v.signal_inst_id
         WHERE t.name = 'barr[1]' AND v.signal_name = 'data'""") == 1,
           "so the interface net behind it is driven, not silent")
+    # Two dimensions: the segments are the LEAVES in declaration order. An
+    # element of the outer array is an array, not an instance, so a walk one
+    # level deep binds none of them.
+    for ordinal, inst in ((0, "bgrid[0][0]"), (1, "bgrid[0][1]"),
+                          (2, "bgrid[1][0]"), (3, "bgrid[1][1]")):
+        check(one("""
+            SELECT count(*) FROM net_conn c JOIN term tm ON tm.id = c.term_id
+            JOIN tree_node t ON t.id = c.outer_intf_inst_id
+            WHERE tm.name = 'grid' AND c.ordinal = ? AND t.name = ?""",
+                  ordinal, inst) == 1,
+              f"the two-dimensional port's segment {ordinal} binds {inst}")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path = 'grid[1][0].data' AND t.name = 'bgrid[1][0]'
+          AND n.name = 'data'""") == 1,
+          "and a reference through it agrees with the connection side")
 
     # A task declared in the interface, called through a port: its body is
     # walked in the CALLER's template, so its bare names belong to a body

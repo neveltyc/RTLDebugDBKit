@@ -111,6 +111,23 @@ inline const InstanceBodySymbol* declaringInstanceBody(const Symbol& sym) {
     return nullptr;
 }
 
+/// The instances an interface port's binding stands for, flattened in
+/// declaration order: a scalar yields itself, an array its elements, a
+/// multi-dimensional array its leaves. One connection segment per entry,
+/// and both the segment writer and the reference resolver walk it the same
+/// way -- they have to agree on which segment is which.
+inline void flattenIfaceBinding(const Symbol& sym,
+                                std::vector<const Symbol*>& out) {
+    if (sym.kind == SymbolKind::InstanceArray) {
+        for (auto* elem : sym.as<InstanceArraySymbol>().elements) {
+            if (elem)
+                flattenIfaceBinding(*elem, out);
+        }
+        return;
+    }
+    out.push_back(&sym);
+}
+
 /// The local net a reference names, or -1 when it names something else.
 ///
 /// A hierarchical path names ONE occurrence. It is never the occurrence's
