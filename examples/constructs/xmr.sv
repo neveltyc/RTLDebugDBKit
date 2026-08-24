@@ -108,6 +108,31 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     logic [7:0] loaded_mem [0:3];
     initial $readmemh("nonexistent.hex", loaded_mem);
 
+    // The same write from a CONDITION. The call belongs to no statement of
+    // its own, and v_driver tells a system write from a tie-off by the
+    // statement it came from -- so without a row for the call, `seeded` was
+    // written by a task and reported as driven by nothing at all.
+    logic [7:0] seeded;
+    logic       seeded_ok;
+    initial begin
+        seeded_ok = 1'b0;
+        if ($value$plusargs("SEED=%d", seeded))
+            seeded_ok = 1'b1;
+    end
+
+    // A system call NESTED in another, in a condition. The outer call's
+    // collection reaches through the inner one, so a row per call recorded
+    // the inner write twice -- one row per OUTERMOST call carries both,
+    // which is the shape a statement-level call already has.
+    logic [7:0] outer_v, inner_v;
+    logic       nested_ok;
+    initial begin
+        nested_ok = 1'b0;
+        if ($cast(outer_v, $value$plusargs("N=%d", inner_v)))
+            nested_ok = 1'b1;
+    end
+
+
     // The same write, but the memory lives in another instance -- and a
     // constant driving an outward target. Both have a source of a kind the
     // schema cannot name AND a target it can only reach by reference, so

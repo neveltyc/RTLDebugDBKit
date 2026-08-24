@@ -68,8 +68,9 @@ private:
 
     /// Everything one stamped occurrence needs to remember.
     struct Bases {
-        int64_t net = 0, term = 0, proc = 0, stmt = 0, target = 0, operand = 0,
-                exprRef = 0, procEvent = 0, dep = 0, hierRef = 0, callSite = 0;
+        int64_t net = 0, term = 0, termMap = 0, proc = 0, stmt = 0, target = 0,
+                operand = 0, exprRef = 0, procEvent = 0, dep = 0, hierRef = 0,
+                callSite = 0;
     };
 
     struct ReplayJob {
@@ -78,7 +79,10 @@ private:
         const Template* t = nullptr;
         size_t refIdx = 0;
         Bases base;
-        std::vector<int64_t> ifaceBind; // term index -> bound iface inst id
+        // term index -> the instances bound to it, one per segment: an
+        // interface array port binds an element per segment, a scalar
+        // one and only one.
+        std::vector<std::vector<int64_t>> ifaceBind;
     };
 
     /// A template-local index as a database id: base + index + 1, with the
@@ -99,7 +103,7 @@ private:
                          const std::string& name, int64_t nodeId,
                          int64_t parentNode, int64_t parentInst,
                          int64_t ordinal, const TplLoc& instLoc,
-                         std::vector<int64_t> ifaceBind) {
+                         std::vector<std::vector<int64_t>> ifaceBind) {
         (void)instSym;
         Template& t = templates[key];
 
@@ -132,8 +136,9 @@ private:
     /// Every module occurrence passes through here -- a top from run(), a
     /// child from stampChildModule -- which is why the unanalysed count is
     /// taken here and not beside either caller.
-    void stampBody(Template& t, int64_t instId, std::vector<int64_t> ifaceBind) {
+    void stampBody(Template& t, int64_t instId, std::vector<std::vector<int64_t>> ifaceBind) {
         stats.stampedBodies++;
+        stats.checkerInsts += t.checkerInsts;
         if (!t.analysedBody)
             stats.unanalysedInsts++;
         // Scope nodes: index 0 is the instance itself; the rest are
@@ -158,6 +163,8 @@ private:
         Bases base;
         base.net = netCounter;         netCounter += int64_t(t.nets.size());
         base.term = termCounter;       termCounter += int64_t(t.terms.size());
+        base.termMap = termMapCounter;
+        termMapCounter += int64_t(t.termMaps.size());
         base.proc = procCounter;       procCounter += int64_t(t.procedures.size());
         base.stmt = stmtCounter;       stmtCounter += int64_t(t.stmts.size());
         base.target = targetCounter;   targetCounter += int64_t(t.targets.size());
@@ -230,7 +237,6 @@ private:
             row.dataTypeId = tm.dataTypeId;
             row.width = tm.width;
             row.ordinal = int64_t(i);
-            row.isConst = tm.isConst;
             row.modport = tm.modport;
             row.fileId = tm.loc.fileId;
             row.line = tm.loc.line;
@@ -239,8 +245,10 @@ private:
         }
         stats.terms += int64_t(t.terms.size());
 
-        for (auto& m : t.termMaps) {
+        for (size_t i = 0; i < t.termMaps.size(); i++) {
+            auto& m = t.termMaps[i];
             TermMapRow row;
+            row.id = base.termMap + int64_t(i) + 1;
             row.termId = base.term + m.term + 1;
             row.ordinal = m.ordinal;
             row.netId = base.net + m.net + 1;
@@ -258,7 +266,6 @@ private:
             row.id = base.proc + int64_t(i) + 1;
             row.instId = instId;
             row.scopeNodeId = scopeNode[size_t(p.scope)];
-            row.name = p.name;
             row.procedureKind = word(p.kind);
             row.ordinal = int64_t(i);
             row.fileId = p.loc.fileId;
@@ -433,28 +440,40 @@ private:
         // Each child's incoming interface bindings -- and, per connection,
         // the bound instance id its row carries. Computed here in the parent
         // where the connections are written.
-        std::vector<std::vector<int64_t>> childIfaceBind(t.children.size());
+        std::vector<std::vector<std::vector<int64_t>>> childIfaceBind(
+            t.children.size());
         std::vector<std::vector<int64_t>> connIfaceId(t.children.size());
         for (size_t i = 0; i < t.children.size(); i++) {
             auto& c = t.children[i];
             if (c.kind != TplChild::Module)
                 continue;
             auto& ct = templates[c.groupKey];
-            childIfaceBind[i].assign(ct.terms.size(), 0);
+            childIfaceBind[i].assign(ct.terms.size(), {});
             connIfaceId[i].assign(c.conns.size(), 0);
             for (size_t k = 0; k < c.conns.size(); k++) {
                 auto& conn = c.conns[k];
                 if (conn.kind != ConnKind::Interface || conn.childTerm < 0)
                     continue;
                 int64_t bound = 0;
-                if (conn.ifaceChild >= 0)
+                if (conn.ifaceChild >= 0) {
                     bound = childNode[size_t(conn.ifaceChild)];
+                }
                 else if (conn.ifaceOwnTerm >= 0 &&
-                         size_t(conn.ifaceOwnTerm) < ifaceBind.size())
-                    bound = ifaceBind[size_t(conn.ifaceOwnTerm)];
+                         size_t(conn.ifaceOwnTerm) < ifaceBind.size()) {
+                    // A port passed straight through keeps the segment it
+                    // came in on: this template's own terminal binds the
+                    // same elements in the same order.
+                    auto& own = ifaceBind[size_t(conn.ifaceOwnTerm)];
+                    if (size_t(conn.ordinal) < own.size())
+                        bound = own[size_t(conn.ordinal)];
+                }
                 connIfaceId[i][k] = bound;
-                if (size_t(conn.childTerm) < childIfaceBind[i].size())
-                    childIfaceBind[i][size_t(conn.childTerm)] = bound;
+                if (size_t(conn.childTerm) < childIfaceBind[i].size()) {
+                    auto& slot = childIfaceBind[i][size_t(conn.childTerm)];
+                    if (size_t(conn.ordinal) >= slot.size())
+                        slot.resize(size_t(conn.ordinal) + 1, 0);
+                    slot[size_t(conn.ordinal)] = bound;
+                }
             }
         }
 
@@ -479,7 +498,7 @@ private:
 
     void stampChildModule(const TplChild& c, int64_t nodeId, int64_t parentNode,
                           int64_t parentInst, int64_t ordinal,
-                          std::vector<int64_t> ifaceBind) {
+                          std::vector<std::vector<int64_t>> ifaceBind) {
         Template& ct = templates[c.groupKey];
         TreeNodeRow node;
         node.id = nodeId;
@@ -731,10 +750,13 @@ private:
                     break;
                 case TplHierRef::ViaIfaceTerm:
                     if (ref.ifaceTerm >= 0 &&
-                        size_t(ref.ifaceTerm) < job.ifaceBind.size() &&
-                        job.ifaceBind[size_t(ref.ifaceTerm)] != 0)
-                        node = descend(job.ifaceBind[size_t(ref.ifaceTerm)],
-                                       ref.segs);
+                        size_t(ref.ifaceTerm) < job.ifaceBind.size()) {
+                        auto& bound = job.ifaceBind[size_t(ref.ifaceTerm)];
+                        if (size_t(ref.ifaceElem) < bound.size() &&
+                            bound[size_t(ref.ifaceElem)] != 0)
+                            node = descend(bound[size_t(ref.ifaceElem)],
+                                           ref.segs);
+                    }
                     break;
                 case TplHierRef::Package: {
                     // Not a tree descent -- a package is not under a normal
@@ -863,6 +885,7 @@ private:
     int64_t nodeCounter = 0;
     int64_t netCounter = 0;
     int64_t termCounter = 0;
+    int64_t termMapCounter = 0;
     int64_t procCounter = 0;
     int64_t stmtCounter = 0;
     int64_t targetCounter = 0;

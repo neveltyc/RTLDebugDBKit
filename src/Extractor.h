@@ -132,6 +132,10 @@ struct Stats {
     /// a warning reading "131 of 132" against a denominator with rows the
     /// numerator cannot reach is a fraction of the wrong thing.
     int64_t stampedBodies = 0;
+    /// Checker instances, which are not modelled at all. Counted so
+    /// their absence is a fact a consumer can read rather than one
+    /// indistinguishable from a design that instantiates none.
+    int64_t checkerInsts = 0;
 };
 
 /// Extracts `compilation` into `writer`. `analysis` must already have run.

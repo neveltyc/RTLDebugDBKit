@@ -208,7 +208,6 @@ CREATE TABLE term(
     data_type_id  INTEGER REFERENCES data_type(id),
     width         INTEGER,
     ordinal       INTEGER NOT NULL,
-    is_const      INTEGER CHECK(is_const IN (0,1)),
     modport       TEXT,
     file_id       INTEGER REFERENCES file(id),
     line          INTEGER,
@@ -222,6 +221,7 @@ CREATE TABLE term(
 -- keeping the two relations apart is what v9's one-table version kept
 -- getting wrong.
 CREATE TABLE term_map(
+    id            INTEGER PRIMARY KEY,
     term_id       INTEGER NOT NULL REFERENCES term(id),
     ordinal       INTEGER NOT NULL,
     inner_net_id  INTEGER NOT NULL REFERENCES net(id),
@@ -232,7 +232,7 @@ CREATE TABLE term_map(
     inner_hi      INTEGER,
     inner_exact   INTEGER NOT NULL CHECK(inner_exact IN (0,1)),
     map_exact     INTEGER NOT NULL CHECK(map_exact IN (0,1)),
-    PRIMARY KEY(term_id, ordinal));
+    UNIQUE(term_id, ordinal));
 
 -- The OUTSIDE of a terminal: what the parent connected to it, one row per
 -- atomic segment -- each concatenation element and each replication copy is
@@ -288,7 +288,6 @@ CREATE TABLE proc(
     id             INTEGER PRIMARY KEY,
     inst_id        INTEGER NOT NULL REFERENCES inst(id),
     scope_node_id  INTEGER NOT NULL REFERENCES tree_node(id),
-    name           TEXT,
     proc_kind      TEXT NOT NULL
         /*!*/CHECK(proc_kind IN ('always','always_ff','always_comb','always_latch',
                                  'initial','final'))/*!*/,
@@ -349,7 +348,7 @@ CREATE TABLE stmt(
     stmt_kind             TEXT NOT NULL
         /*!*/CHECK(stmt_kind IN ('assignment','assertion','wait','call',
                                  'system_task','event_control','alias',
-                                 'release'))/*!*/,
+                                 'release','trigger','disable'))/*!*/,
     construct             TEXT,
     assign_kind           TEXT
         /*!*/CHECK(assign_kind IN ('continuous','blocking','nonblocking'))/*!*/,

@@ -424,7 +424,115 @@ namespace designdb {
 /// same reason and one more: the doc has said since v2 that task and function
 /// bodies get no procedure row, their statements belonging to the calling
 /// procedure, so the constraint contradicted the contract beside it.
-inline constexpr int SchemaVersion = 17;
+///
+/// v18 drops two columns nothing can fill and widens one NULL rule.
+///
+/// `term.is_const` marked a `const ref` port. There is no such thing:
+/// `const` is rejected on a port declaration, so the column could only ever
+/// hold 0 or NULL and never the fact it existed to carry. `proc.name` held
+/// a task or function name, and v17 removed the rows that had one. Both are
+/// gone rather than kept as columns a consumer must ask about and never
+/// learn from.
+///
+/// `net.width` and `term.width` were NULL for every non-integral type,
+/// which left an unpacked object's ranges unmeasurable: bit offsets index
+/// the FLATTENED space, so `[4:11]` of a four-element byte array is a
+/// window into 32 bits that the row would not name. Both now carry the
+/// flattened width -- the space the offsets are in -- and are NULL only for
+/// a type with no bits at all.
+///
+/// v18 also gives `term_map` a surrogate `id`, as every other child table
+/// has, and points `v_net_attachment`'s two wiring kinds at the row they
+/// describe: `terminal_inside` at `term_map_id`, `actual_outside` at
+/// `conn_id`, in place of the `term_id` both carried. A terminal is not
+/// the attachment -- `.q({2{r}})` gives one pin two connection segments,
+/// and both rows said `term_id=48` with nothing to tell them apart, though
+/// the view's contract is that its typed id names the relation's own row.
+/// `v_term_map` publishes the new id so the join stays inside the view set.
+///
+/// Three columns join the view surface. `v_driver` and `v_load` gain
+/// `signal_ref` beside the `driver_ref`/`load_ref` they already had: either
+/// end of an arc can be the hierarchically named one -- `assign q = u.x`
+/// names the driver, `always_comb u.x = a` names the signal -- and with
+/// only one spelling published the second was reachable in three joins from
+/// the side that asks who drives `x`. `v_tree_node` gains `def_kind`, so an
+/// interface instance and a module instance, both `node_kind='instance'`,
+/// are told apart without joining a table the view set does not cover.
+/// `v_db_info` gains `tool`, which was a required meta key with no column;
+/// the required set is now exactly the view's columns less `top`.
+///
+/// Two views join the set. `v_node_path` publishes the path assembly the
+/// tree deliberately does not store: a segment per node is the right
+/// storage, but every consumer re-derived the join and three plausible
+/// spellings of it are wrong -- anchoring on a null parent sweeps in
+/// packages, and prefixing a net's scope path counts generate levels
+/// twice. `v_proc_event` publishes the events themselves, so "which flops
+/// does this net clock, on which edge" stops needing the base tables:
+/// edge_kind and the procedure's kind arrive on one row.
+///
+/// `v_net_attachment`'s `event` kind moves from `proc_id` to
+/// `proc_event_id` with them, for the reason the two wiring kinds moved:
+/// one procedure takes several events on one net, and the procedure is not
+/// the row.
+///
+/// One spelling for one thing, last: a view whose row has a single bit
+/// range spells it bare, as its base table does. `v_stmt_target`'s
+/// `tgt_*`, `v_stmt_operand`'s `operand_*`, `v_hier_ref`'s `ref_*` and
+/// `v_net_attachment`'s `exact` were four spellings of one concept, none
+/// of them the base tables'. All four are now `lo`/`hi`/`is_exact`; the
+/// prefixed form stays where a row really has two ends, as `v_net_dep`
+/// does.
+///
+/// Two statements that produced no rows at all now do. `-> ev` is what
+/// makes an event happen, and without it an event variable had waiters and
+/// no cause -- a trace back said nothing in the design touches it.
+/// `stmt_kind` gains `trigger`, the target names the event, and the arc is
+/// source-less like a system task's, surfacing as `driver_kind='trigger'`:
+/// nothing FEEDS an event, so `constant` would have said it is tied off.
+/// `disable` gains a kind for a different reason -- it names a block, not
+/// a net -- but the same one underneath: the condition gating it was a
+/// read with no statement to belong to, and vanished with the statement.
+///
+/// A constant bound to a subroutine argument now ties the formal off.
+/// `t(8'h5A, y)` left the formal with no driver at all while the identical
+/// tie written as a port connection recorded `conn_kind='constant'`, so
+/// the same fact answered differently depending on how it was spelled. It
+/// is a source-less `data` arc, which is what `constant` means, anchored
+/// by a target row on the calling statement -- the discipline every other
+/// source-less arc already follows.
+///
+/// A system task called inside a CONDITION writes its argument like any
+/// other, and recorded nothing: v_driver tells a system write from a
+/// tie-off by the statement it came from, and a call in a condition
+/// belongs to none, so the write had no attribution to be given. It now
+/// gets a `stmt` row of its own -- what the procedure-header
+/// `event_control` row already is for reads with nowhere to belong. Only
+/// the write travels with it; what the condition reads is gating already.
+///
+/// An interface ARRAY as a module's own port binds one element per segment
+/// of its terminal, where it used to be a single `net_conn` row naming no
+/// instance -- so every member reference through it stayed text-only and
+/// the interface nets behind it read as undriven. It is the shape a
+/// concatenated actual already has on an ordinary port: one terminal, a
+/// row per piece, in declaration order. A reference through such a port
+/// carries the segment it meant, decided by whose subtree the target sits
+/// in rather than by the written index, since `bus_arr[k]` in a generate
+/// loop spells one thing and lands on a different element each iteration.
+/// A multi-dimensional port binds its LEAVES, since an element of the
+/// outer array is another array and not an instance.
+///
+/// A built-in method's effect on its receiver stays unmodelled, and the
+/// doc says so where the other testbench constructs are declined.
+///
+/// `meta.checker_inst_count` joins the required set, and `v_db_info` the
+/// column for it. A checker instantiation produces no rows at all -- its
+/// symbol is not an InstanceSymbol, so the walk never reaches its ports,
+/// assertions or scope -- and nothing said so, leaving a design that has
+/// checkers indistinguishable from one that has none. It does not make
+/// the export `partial`: a construct this tool declines is not a walk that
+/// fell short, which is the same reason an unresolved instantiation does
+/// not.
+inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -467,8 +575,7 @@ struct TreeNodeRow {
     int64_t id = 0;
     int64_t parentNodeId = 0;     // 0 = root (stored NULL)
     std::string name;             // one path segment, never more
-    std::string nodeKind;         // root | instance | generate | primitive |
-                                  // unresolved | package
+    std::string nodeKind;         // NodeKind's word
     int64_t ordinal = 0;          // order among siblings
 };
 
@@ -516,7 +623,8 @@ struct NetRow {
                                   // subroutine segments included (`g[0].sig`, `bump.v`)
     std::string declarationKind;  // wire | tri | ... | variable
     int64_t dataTypeId = 0;
-    int64_t width = -1;           // flattened bits; -1 = not integral, stored NULL
+    int64_t width = -1;           // flattened bits, the space offsets index;
+                                  // -1 = a type with no bits, stored NULL
     bool isImplicit = false;
     int64_t fileId = 0;
     uint32_t line = 0;
@@ -535,7 +643,6 @@ struct TermRow {
     int64_t dataTypeId = 0;
     int64_t width = -1;           // -1 = NULL
     int64_t ordinal = 0;          // position in the port list
-    int isConst = -1;             // const ref; -1 = does not apply, stored NULL
     std::string modport;          // "" = NULL
     int64_t fileId = 0;
     uint32_t line = 0;
@@ -544,6 +651,7 @@ struct TermRow {
 
 /// One segment of a terminal's mapping onto nets inside its own instance.
 struct TermMapRow {
+    int64_t id = 0;
     int64_t termId = 0;
     int64_t ordinal = 0;
     int64_t netId = 0;
@@ -579,8 +687,6 @@ struct ProcedureRow {
     int64_t id = 0;
     int64_t instId = 0;
     int64_t scopeNodeId = 0;
-    std::string name;             // "" = NULL; nothing sets it since v17 removed
-                                  // task/function rows, the only named procedures
     std::string procedureKind;    // ProcKind's word
     int64_t ordinal = 0;
     int64_t fileId = 0;

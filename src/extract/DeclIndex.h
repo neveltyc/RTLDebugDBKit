@@ -30,6 +30,7 @@
 #include "slang/ast/types/Type.h"
 
 #include "DesignDb.h"
+#include "extract/Ref.h"
 #include "extract/SourceLocator.h"
 #include "extract/SymbolText.h"
 #include "extract/Template.h"
@@ -85,8 +86,8 @@ public:
         net.name = std::move(rel);
         net.declKind = declarationKindOf(sym);
         net.dataTypeId = writer.internDataType(typeOf(sym));
-        if (sym.getType().isIntegral())
-            net.width = static_cast<int64_t>(sym.getType().getBitWidth());
+        if (const uint64_t w = bitWidthOf(sym))
+            net.width = static_cast<int64_t>(w);
         if (sym.kind == SymbolKind::Net)
             net.isImplicit = sym.as<NetSymbol>().isImplicit;
         net.loc = locator.locate(sym.location);
