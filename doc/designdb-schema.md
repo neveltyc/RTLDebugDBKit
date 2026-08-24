@@ -664,7 +664,11 @@ rest of the reference is `v_hier_ref`. `driver_kind`:
   drives the internal net at range granularity.
 * `constant` — a tie-off or constant right-hand side: `driver_net_id` NULL
   and every driver column NULL with it; `stmt_id` or `conn_id` names its
-  origin.
+  origin. A constant bound to a subroutine argument is one of these, as
+  `.p(8'h5A)` is on a pin: the formal is tied off, and the call statement
+  names it as a target — a source-less dependency is anchored by a target
+  row here as everywhere. A call written inside a CONDITION has no
+  statement row to anchor to and records neither.
 * `external` — the source is a reference this export has no net row for:
   an upward name from a shared body, an interface-array binding.
   `driver_net_id` is NULL and `driver_ref` carries the reference as

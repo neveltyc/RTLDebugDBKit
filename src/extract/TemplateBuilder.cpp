@@ -1337,10 +1337,38 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
     const bool reads = n.reads;
     const bool writes = n.writes;
     const int mapExact = n.pair.mapExact ? 1 : 0;
-    if (!n.formal || !actual.sym)
+    if (!n.formal || (!actual.sym && !n.constantActual))
         return;
     const int32_t stmt = n.bindable ? b.curStmt : -1;
     const int32_t formalNet = b.decl->netFor(*n.formal);
+    if (n.constantActual) {
+        // `data` with no source is what `constant` means, and it is what the
+        // same tie-off written as a port connection already records -- not
+        // `procedure`, which says a call reached a formal this body cannot
+        // name. A source-less dependency is anchored by a target row, here
+        // as everywhere: the call is the statement that writes the formal.
+        // A call inside a CONDITION has no statement row to anchor to and
+        // records nothing, as its write-back does not either.
+        if (formalNet < 0 || stmt < 0)
+            return;
+        TplStmtRef tr;
+        tr.stmt = stmt;
+        tr.ordinal = b.targetOrdinal++;
+        tr.net = formalNet;
+        tr.r = rangeOf(n.pair.tgt);
+        const int32_t targetIdx = int32_t(b.t->targets.size());
+        b.t->targets.push_back(std::move(tr));
+        TplDep d;
+        d.src.net = -1;
+        d.tgt.net = formalNet;
+        d.stmt = stmt;
+        d.targetRef = targetIdx;
+        d.kind = DepKind::Data;
+        d.tgtR = rangeOf(n.pair.tgt);
+        d.callSite = b.curCallSite;
+        b.t->deps.push_back(std::move(d));
+        return;
+    }
     if (formalNet < 0) {
         // The formal is not a net of THIS body, which is what a subroutine
         // declared in a package, an interface or $unit looks like from here.

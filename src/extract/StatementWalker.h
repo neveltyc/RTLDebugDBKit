@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <set>
 #include <string>
@@ -643,6 +644,18 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // even where the actual fills the formal exactly.
             std::vector<Slot> actualSlots;
             collectSlots(*actualExpr, eval, 0, actualSlots, /*skipSelectors=*/writes);
+            // A constant actual leaves no slot to pair, and the formal
+            // then had no driver at all -- while the same tie-off
+            // written as a port connection records one. The formal is
+            // tied off; say so.
+            if (reads &&
+                std::none_of(actualSlots.begin(), actualSlots.end(),
+                             [](const Slot& s) { return s.ref.sym != nullptr; })) {
+                emit(BindNode{formals[i], args[i], PairedSrc{{}, formalSlot.ref,
+                                                            false, {}},
+                              reads, writes, bindable,
+                              /*constantActual=*/true, expr.sourceRange});
+            }
             for (auto& as : actualSlots) {
                 if (!as.ref.sym)
                     continue;
@@ -653,7 +666,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                formalSlot.positional && as.positional,
                                as.ref};
                 emit(BindNode{formals[i], args[i], std::move(pair), reads,
-                              writes, bindable, expr.sourceRange});
+                              writes, bindable, /*constantActual=*/false,
+                              expr.sourceRange});
             }
         }
     }

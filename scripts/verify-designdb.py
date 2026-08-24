@@ -3017,6 +3017,22 @@ if mode == "external":
           "and no upward source is misreported as a constant")
 
 if mode == "callsite":
+    # A constant actual ties the formal off, the same fact `.p(8'h5A)`
+    # records on a pin. Without it the formal came back with the two
+    # net-fed calls as its only drivers and this one invisible.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'tie.v' AND driver_kind = 'constant'
+          AND driver_net_id IS NULL AND stmt_id IS NOT NULL""") == 1,
+          "a constant actual drives its formal as a tie-off")
+    # A source-less dependency is anchored by a target row here as
+    # everywhere, so the two views agree on what the call writes.
+    check(one("""
+        SELECT count(*) FROM v_stmt_target t JOIN v_driver d
+          ON d.stmt_id = t.stmt_id AND d.signal_net_id = t.net_id
+        WHERE t.net_name = 'tie.v' AND d.driver_kind = 'constant'
+          AND t.target_kind = 'written_by'""") == 1,
+          "and the statement that ties it names it as a target")
     # Two calls to one task, from two sites -- both bump, both outermost.
     check(one("""SELECT count(*) FROM v_call_site
                  WHERE subroutine_name='bump' AND depth=1""") == 2,
