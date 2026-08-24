@@ -1,8 +1,8 @@
 // Copyright (c) 2026 neveltyc
 // released under the BSD 3-Clause License (see LICENSE)
 //
-// check-rtl: expect-fail icarus -- no output arguments on a function, and
-// no queue methods
+// check-rtl: expect-fail icarus -- no output arguments on a function, no
+// queue methods, and no `randomize`
 //
 // References that leave the instance and have no dotted path to be stored
 // under. A reference with no hier_ref row leaves a net_dep with a null source
@@ -80,6 +80,13 @@ module outward_leaf (input logic clk, output logic [7:0] q, gated, taken,
     int log_q[$];
     always_ff @(posedge clk)
         log_q.push_back(int'(q));
+
+    // A system subroutine with NO `$`, which writes its argument from
+    // outside anything the model names exactly as a `$` task does. Telling
+    // the two apart by the prefix alone dropped the write, because only the
+    // system-task branch carries one; the written argument decides it too.
+    logic [7:0] drawn;
+    initial randomize(drawn);
 endmodule
 
 module outward_tb;

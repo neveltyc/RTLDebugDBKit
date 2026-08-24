@@ -60,6 +60,26 @@ endmodule
 module sink(input logic s);
 endmodule
 
+// An interface ARRAY as the module's OWN port. One terminal binds an element
+// per segment -- the shape a concatenated actual has on an ordinary port --
+// and recorded as a single row it named no instance at all, so every member
+// reference through it stayed text-only and the interface nets behind it
+// read as undriven.
+module arrayed(simple_bus bus_arr[2]);
+    assign bus_arr[0].vld  = 1'b1;
+    assign bus_arr[1].data = 8'hA5;
+endmodule
+
+// The same port with two dimensions. The elements of the outer array are
+// arrays themselves, so a walk that takes them for instances binds nothing:
+// the segments must be the LEAVES, in declaration order, on both the
+// connection side and the reference side or the two disagree about which
+// segment is which.
+module arrayed2(simple_bus grid[2][2]);
+    assign grid[0][1].vld  = 1'b1;
+    assign grid[1][0].data = 8'h3C;
+endmodule
+
 // Calls the interface's own task. The body's write to `data` and its read of
 // `vld` belong to the interface instance this occurrence is bound to, not to
 // this module, and must arrive as cross-instance dataflow.
@@ -117,4 +137,10 @@ module interfaces;
     simple_bus bus5(clk);
     stamp_pair u_pair_same (.bus(bus4), .alt(bus4), .din(stamp_in));
     stamp_pair u_pair_apart(.bus(bus4), .alt(bus5), .din(stamp_in));
+
+    simple_bus barr[2](clk);
+    arrayed    u_arr(.bus_arr(barr));
+
+    simple_bus bgrid[2][2](clk);
+    arrayed2   u_grid(.grid(bgrid));
 endmodule

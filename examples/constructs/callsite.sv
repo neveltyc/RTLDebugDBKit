@@ -7,9 +7,10 @@
 // each hop through the subroutine, only the rows of one call and keep each
 // call's real combination: {g1, a} and {g2, b}, never {g1, b}.
 //
-// It also carries the argument form whose row set is decided by the binding
-// rather than by the body: an `output` actual, which the calling statement
-// writes as it writes any other target.
+// It also carries the two argument forms whose row set is decided by the
+// binding rather than by the body: an `output` actual, which the calling
+// statement writes as it writes any other target, and a CONSTANT actual,
+// which ties the formal off exactly as `.p(8'h5A)` ties off a pin.
 
 module callsite_top(input logic g1, input logic g2,
                     input logic [7:0] a, input logic [7:0] b,
@@ -31,6 +32,12 @@ module callsite_top(input logic g1, input logic g2,
     task automatic store(input logic [7:0] v, output logic [7:0] o);
         o = v;
     endtask
+    // A CONSTANT actual. There is no net to name as the source, so the
+    // formal is tied off -- the same fact `.p(8'h5A)` records on a pin,
+    // which the call side did not record at all.
+    task automatic tie(input logic [7:0] v);
+        s = s | v;
+    endtask
     always_comb begin
         r = 8'h00;
         s = 8'h00;
@@ -38,5 +45,6 @@ module callsite_top(input logic g1, input logic g2,
         if (g2) bump(b);       // call site 2: gated by g2, argument b
         if (pick(c)) s = c;    // call site 3: call in a control expression
         store(a, w);           // an output actual: w is written by the call
+        tie(8'h5A);            // a constant actual: the formal is tied off
     end
 endmodule

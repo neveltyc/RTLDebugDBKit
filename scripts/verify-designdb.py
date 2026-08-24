@@ -73,7 +73,7 @@ DOMAINS = (
       "final"), False),
     ("stmt", "stmt_kind",
      ("assignment", "assertion", "wait", "call", "system_task", "event_control",
-      "alias", "release"), False),
+      "alias", "release", "trigger", "disable"), False),
     ("stmt", "assign_kind", ("continuous", "blocking", "nonblocking"), True),
     ("expr_ref", "role",
      ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
@@ -91,7 +91,7 @@ VIEW_DOMAINS = (
     ("v_driver", "driver_kind",
      ("data", "control", "primitive", "procedure", "connection",
       "connection_expression", "constant", "terminal", "system_task", "alias",
-      "external")),
+      "external", "trigger")),
     ("v_load", "load_kind",
      ("dataflow", "connection", "sensitivity", "wait", "statement", "terminal",
       "alias")),
@@ -159,7 +159,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "17"
+SCHEMA_VERSION = "18"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
@@ -271,7 +271,6 @@ for tbl, col, values, nullable in DOMAINS:
 
 for tbl, cols in (
     ("net", ("is_implicit",)),
-    ("term", ("is_const",)),
     ("term_map", ("term_exact", "inner_exact", "map_exact")),
     ("net_conn", ("outer_exact", "term_exact", "map_exact")),
     ("stmt_target", ("is_exact",)),
@@ -869,13 +868,12 @@ check(one("""
       "connection columns match conn_kind")
 
 # ------------------------------------------------------------------ meta
-# The doc states the required set as a rule -- the v_db_info columns plus
-# `tool`, minus `top` -- so it is derived here rather than hand-copied:
-# a column added to the view then demands its meta key without this list
-# needing to know.
+# The doc states the required set as a rule -- the v_db_info columns minus
+# `top` -- so it is derived here rather than hand-copied: a column added to
+# the view then demands its meta key without this list needing to know.
 required = [r[1] for r in con.execute("PRAGMA table_info(v_db_info)")
-            if r[1] != "top"] + ["tool"]
-if required == ["tool"]:
+            if r[1] != "top"]
+if not required:
     fatal("v_db_info is missing")
 meta = dict(con.execute("SELECT key, value FROM meta"))
 # Fatal rather than collected: every check below indexes these keys.
@@ -886,7 +884,7 @@ check(meta["schema_version"] == SCHEMA_VERSION,
       f"schema_version is {SCHEMA_VERSION}", f"got {meta['schema_version']}")
 COUNTS = ("error_count", "unresolved_count", "empty_procedure_count",
           "duplicate_path_count", "recursion_count", "truncated_call_count",
-          "unanalysed_inst_count")
+          "checker_inst_count", "unanalysed_inst_count")
 nonnumeric = [k for k in COUNTS if not meta[k].isdigit()]
 if nonnumeric:
     fatal(f"meta count(s) not a number: {', '.join(nonnumeric)}")
@@ -925,13 +923,15 @@ for k in COUNTS:
 # absent from this list.
 VIEW_COLUMNS = {
     "v_db_info": [
-        "schema_version", "tool_version", "slang_version", "producer_revision",
+        "schema_version", "tool", "tool_version", "slang_version",
+        "producer_revision",
         "top", "analysis_status", "error_count", "unresolved_count",
         "empty_procedure_count", "duplicate_path_count", "recursion_count",
-        "truncated_call_count", "unanalysed_inst_count", "config_digest"],
+        "truncated_call_count", "checker_inst_count", "unanalysed_inst_count",
+        "config_digest"],
     "v_tree_node": [
         "node_id", "parent_node_id", "node_name", "node_kind", "ordinal",
-        "inst_id", "parent_inst_id", "module_id", "module_name",
+        "inst_id", "parent_inst_id", "module_id", "module_name", "def_kind",
         "param_signature", "def_name", "file_path", "src_path",
         "src_line", "src_col"],
     "v_net": [
@@ -942,10 +942,10 @@ VIEW_COLUMNS = {
     "v_term": [
         "term_id", "inst_id", "module_id", "module_name",
         "term_name", "term_kind", "direction", "data_type", "width",
-        "ordinal", "is_const", "modport", "file_path", "src_path",
+        "ordinal", "modport", "file_path", "src_path",
         "src_line", "src_col"],
     "v_term_map": [
-        "term_id", "term_inst_id", "term_name",
+        "term_map_id", "term_id", "term_inst_id", "term_name",
         "map_ordinal", "inner_net_id", "inner_net_name",
         "term_lo", "term_hi", "term_exact", "inner_lo", "inner_hi",
         "inner_exact", "map_exact"],
@@ -966,15 +966,17 @@ VIEW_COLUMNS = {
         "dep_kind", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
     "v_driver": [
-        "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
-        "signal_hi", "signal_exact", "driver_net_id", "driver_inst_id",
+        "signal_net_id", "signal_inst_id", "signal_name", "signal_ref",
+        "signal_lo", "signal_hi", "signal_exact",
+        "driver_net_id", "driver_inst_id",
         "driver_name", "driver_ref", "driver_lo", "driver_hi", "driver_exact",
         "driver_kind", "dep_id", "conn_id", "stmt_id",
         "prim_id", "term_id", "map_exact", "call_site_id", "file_path",
         "src_path", "src_line", "src_col"],
     "v_load": [
-        "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
-        "signal_hi", "signal_exact", "load_net_id", "load_inst_id",
+        "signal_net_id", "signal_inst_id", "signal_name", "signal_ref",
+        "signal_lo", "signal_hi", "signal_exact",
+        "load_net_id", "load_inst_id",
         "load_name", "load_ref", "load_lo", "load_hi", "load_exact",
         "load_kind", "dep_id", "conn_id", "stmt_id", "proc_id",
         "term_id", "map_exact", "call_site_id", "file_path", "src_path",
@@ -987,22 +989,27 @@ VIEW_COLUMNS = {
         "file_path", "src_path", "src_line", "src_col"],
     "v_stmt_target": [
         "target_id", "stmt_id", "ordinal", "net_id", "net_name",
-        "target_kind", "tgt_lo", "tgt_hi", "tgt_exact", "call_site_id"],
+        "target_kind", "lo", "hi", "is_exact", "call_site_id"],
     "v_stmt_operand": [
         "operand_id", "stmt_id", "ordinal", "net_id", "net_name",
-        "operand_lo", "operand_hi", "operand_exact", "call_site_id"],
+        "lo", "hi", "is_exact", "call_site_id"],
     "v_net_attachment": [
         "net_id", "inst_id", "net_name", "attachment_kind",
-        "lo", "hi", "exact", "stmt_id",
-        "term_id", "stmt_target_id", "assign_operand_id", "expr_ref_id",
-        "proc_id", "dep_id", "hier_ref_id"],
+        "lo", "hi", "is_exact", "stmt_id",
+        "term_map_id", "conn_id", "stmt_target_id", "assign_operand_id",
+        "expr_ref_id", "proc_event_id", "dep_id", "hier_ref_id"],
+    "v_node_path": ["node_id", "node_path"],
+    "v_proc_event": [
+        "proc_event_id", "proc_id", "inst_id", "proc_kind", "stmt_id",
+        "net_id", "net_name", "event_kind", "edge_kind",
+        "file_path", "src_path", "src_line", "src_col"],
     "v_call_site": [
         "call_site_id", "inst_id", "module_id", "module_name",
         "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
     "v_hier_ref": [
         "hier_ref_id", "inst_id", "module_id", "module_name", "stmt_id",
         "ref_path", "access", "resolved_inst_id", "resolved_net_id",
-        "resolved_net_name", "ref_lo", "ref_hi", "ref_exact",
+        "resolved_net_name", "lo", "hi", "is_exact",
         "file_path", "src_path", "src_line", "src_col"],
 }
 for view, want in VIEW_COLUMNS.items():
@@ -1025,6 +1032,8 @@ for view, base in (
     ("v_stmt_operand", "assign_operand"),
     ("v_call_site", "call_site"),
     ("v_hier_ref", "hier_ref"),
+    ("v_proc_event", "proc_event"),
+    ("v_node_path", "tree_node"),
 ):
     nv = one(f'SELECT count(*) FROM "{view}"')
     nb = one(f'SELECT count(*) FROM "{base}"')
@@ -1187,31 +1196,34 @@ for view in ("v_driver", "v_load", "v_net_dep"):
 # an id into a slot its kind does not own.
 check(one("""
     SELECT count(*) FROM v_net_attachment
-    WHERE (term_id IS NOT NULL) + (stmt_target_id IS NOT NULL)
+    WHERE (term_map_id IS NOT NULL) + (conn_id IS NOT NULL)
+        + (stmt_target_id IS NOT NULL)
         + (assign_operand_id IS NOT NULL) + (expr_ref_id IS NOT NULL)
-        + (proc_id IS NOT NULL) + (dep_id IS NOT NULL)
+        + (proc_event_id IS NOT NULL) + (dep_id IS NOT NULL)
         + (hier_ref_id IS NOT NULL) != 1""") == 0,
       "every attachment names exactly one typed id")
 check(one("""
     SELECT count(*) FROM v_net_attachment WHERE CASE attachment_kind
-        WHEN 'terminal_inside'    THEN term_id IS NULL
-        WHEN 'actual_outside'     THEN term_id IS NULL
+        WHEN 'terminal_inside'    THEN term_map_id IS NULL
+        WHEN 'actual_outside'     THEN conn_id IS NULL
         WHEN 'written_by'         THEN stmt_target_id IS NULL
         WHEN 'release_target'     THEN stmt_target_id IS NULL
         WHEN 'alias_binding'      THEN stmt_target_id IS NULL
         WHEN 'read_by'            THEN assign_operand_id IS NULL
         WHEN 'condition'          THEN expr_ref_id IS NULL
         WHEN 'statement_read'     THEN expr_ref_id IS NULL
-        WHEN 'event'              THEN proc_id IS NULL
+        WHEN 'event'              THEN proc_event_id IS NULL
         WHEN 'dep_in'             THEN dep_id IS NULL
         WHEN 'dep_out'            THEN dep_id IS NULL
         WHEN 'named_from_outside' THEN hier_ref_id IS NULL
         ELSE 1 END""") == 0,
       "and it is the typed id its attachment_kind implies")
 # Each typed id resolves in its own table -- the join a consumer would make.
-for col, tbl in (("term_id", "term"), ("stmt_target_id", "stmt_target"),
+for col, tbl in (("term_map_id", "term_map"), ("conn_id", "net_conn"),
+                 ("stmt_target_id", "stmt_target"),
                  ("assign_operand_id", "assign_operand"),
-                 ("expr_ref_id", "expr_ref"), ("proc_id", "proc"),
+                 ("expr_ref_id", "expr_ref"),
+                 ("proc_event_id", "proc_event"),
                  ("dep_id", "net_dep"), ("hier_ref_id", "hier_ref")):
     check(one(f"""SELECT count(*) FROM v_net_attachment a
         WHERE a.{col} IS NOT NULL
@@ -1229,13 +1241,14 @@ for col, tbl in (("term_id", "term"), ("stmt_target_id", "stmt_target"),
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_net_id IS NOT NULL
-      AND driver_kind IN ('constant','terminal','system_task','external')""") == 0,
-      "constant/terminal/system_task/external never name a driver net")
+      AND driver_kind IN ('constant','terminal','system_task','external',
+                          'trigger')""") == 0,
+      "constant/terminal/system_task/external/trigger never name a driver net")
 check(one("""
     SELECT count(*) FROM v_driver
     WHERE driver_net_id IS NULL
       AND driver_kind NOT IN ('constant','terminal','system_task','external',
-                              'primitive','procedure')""") == 0,
+                              'primitive','procedure','trigger')""") == 0,
       "only kinds that can lack a driver net do")
 # An external driver is real but nameless HERE: no net row, so no name --
 # yet unlike a constant it keeps its window, because the referenced
@@ -1322,7 +1335,7 @@ check(one("""
     WHERE (resolved_net_name IS NOT NULL) != (resolved_net_id IS NOT NULL)""") == 0,
       "v_hier_ref names a resolved net exactly when there is one")
 # The rest is projection, and projection is where a pair of columns quietly
-# swaps. Nothing else in this file reads ref_lo/ref_hi/ref_exact or
+# swaps. Nothing else in this file reads the view's own range columns or
 # resolved_inst_id, so without this they are pinned by name and position and
 # by nothing about their value.
 check(one("""
@@ -1331,8 +1344,8 @@ check(one("""
        OR v.ref_path IS NOT h.path OR v.access IS NOT h.access
        OR v.resolved_inst_id IS NOT h.resolved_inst_id
        OR v.resolved_net_id IS NOT h.resolved_net_id
-       OR v.ref_lo IS NOT h.lo OR v.ref_hi IS NOT h.hi
-       OR v.ref_exact IS NOT h.is_exact
+       OR v.lo IS NOT h.lo OR v.hi IS NOT h.hi
+       OR v.is_exact IS NOT h.is_exact
        OR v.src_line IS NOT h.line OR v.src_col IS NOT h.col""") == 0,
       "and every other v_hier_ref column is its base row's, unswapped")
 check(one("""
@@ -1370,7 +1383,7 @@ check(one("""
     WHERE driver_kind NOT IN ('data','control','primitive','procedure',
                               'connection','connection_expression','constant',
                               'terminal','system_task','alias',
-                              'external')""") == 0,
+                              'external','trigger')""") == 0,
       "driver_kind stays in its vocabulary")
 check(one("""
     SELECT count(*) FROM v_load
@@ -1396,6 +1409,7 @@ for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
                   ("v_net_conn", "outer_net_id"),
                   ("v_net_attachment", "net_id"),
                   ("v_hier_ref", "resolved_net_id"),
+                  ("v_proc_event", "net_id"),
                   ("v_net_dep", "call_site_id"),
                   ("v_stmt", "call_site_id"),
                   ("v_stmt_target", "call_site_id"),
@@ -1423,6 +1437,32 @@ if mode:
 
 
 if mode == "constructs":
+    # One procedure takes several events on one net -- two waits on clk
+    # here -- so the attachment names the event, not the procedure.
+    check(one("""
+        SELECT count(DISTINCT a.proc_event_id) FROM v_net_attachment a
+        JOIN v_net n ON n.net_id = a.net_id
+        WHERE a.attachment_kind = 'event' AND n.net_name = 'clk'""")
+          == one("""
+        SELECT count(*) FROM proc_event e JOIN net n ON n.id = e.net_id
+        WHERE n.name = 'clk'"""),
+          "each event on one net is its own attachment row")
+    # The clock question in one row: which edge, in what kind of procedure.
+    check(one("""
+        SELECT count(*) FROM v_proc_event
+        WHERE net_name = 'clk' AND edge_kind = 'posedge'
+          AND proc_kind = 'always_ff' AND event_kind = 'sensitivity'""") >= 1,
+          "v_proc_event answers edge and procedure kind together")
+
+    # One pin takes several connection segments -- `.q({2{rep_r}})` tiles it
+    # twice -- so the wiring attachment names the segment. A terminal id
+    # cannot tell the two copies apart; the two rows must differ.
+    check(one("""
+        SELECT count(DISTINCT a.conn_id) FROM v_net_attachment a
+        JOIN net_conn c ON c.id = a.conn_id
+        JOIN v_net n ON n.net_id = a.net_id
+        WHERE a.attachment_kind = 'actual_outside' AND n.net_name = 'rep_r'""") == 2,
+          "each copy of a replicated actual is its own attachment row")
     # A system task's written argument is not a read of it, wherever the
     # call sits. From inside a condition the gating used to pick it up, so
     # the signal a plusarg fills gated whatever the branch wrote.
@@ -1652,6 +1692,44 @@ if mode == "interfaces":
     check(one("""
         SELECT count(*) FROM term WHERE term_kind='interface'""") >= 3,
           "interface terminals")
+    # An interface array as the module's own port binds an element per
+    # segment of one terminal, and the member references through it resolve
+    # per element -- both were a single row naming no instance.
+    for ordinal, inst in ((0, "barr[0]"), (1, "barr[1]")):
+        check(one("""
+            SELECT count(*) FROM net_conn c JOIN term tm ON tm.id = c.term_id
+            JOIN tree_node t ON t.id = c.outer_intf_inst_id
+            WHERE tm.name = 'bus_arr' AND c.ordinal = ? AND t.name = ?""",
+                  ordinal, inst) == 1,
+              f"the array port's segment {ordinal} binds {inst}")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path = 'bus_arr[0].vld' AND t.name = 'barr[0]'
+          AND n.name = 'vld'""") == 1,
+          "and a member reference through it lands on that element")
+    check(one("""
+        SELECT count(*) FROM v_driver v JOIN tree_node t ON t.id = v.signal_inst_id
+        WHERE t.name = 'barr[1]' AND v.signal_name = 'data'""") == 1,
+          "so the interface net behind it is driven, not silent")
+    # Two dimensions: the segments are the LEAVES in declaration order. An
+    # element of the outer array is an array, not an instance, so a walk one
+    # level deep binds none of them.
+    for ordinal, inst in ((0, "bgrid[0][0]"), (1, "bgrid[0][1]"),
+                          (2, "bgrid[1][0]"), (3, "bgrid[1][1]")):
+        check(one("""
+            SELECT count(*) FROM net_conn c JOIN term tm ON tm.id = c.term_id
+            JOIN tree_node t ON t.id = c.outer_intf_inst_id
+            WHERE tm.name = 'grid' AND c.ordinal = ? AND t.name = ?""",
+                  ordinal, inst) == 1,
+              f"the two-dimensional port's segment {ordinal} binds {inst}")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path = 'grid[1][0].data' AND t.name = 'bgrid[1][0]'
+          AND n.name = 'data'""") == 1,
+          "and a reference through it agrees with the connection side")
+
     # A task declared in the interface, called through a port: its body is
     # walked in the CALLER's template, so its bare names belong to a body
     # the caller cannot place. They resolve through the bound terminal, and
@@ -1775,6 +1853,17 @@ if mode == "interfaces":
           "no reference path carries a space or a comment")
 
 if mode == "assertions":
+    # A checker produces no rows at all -- not an instance, not a node, not
+    # its assertion. The count is what keeps that readable, and it does not
+    # make the export `partial`: a construct this tool declines is not a
+    # walk that fell short.
+    check(one("SELECT checker_inst_count FROM v_db_info") == 1,
+          "a checker instance is counted though it is not modelled")
+    check(one("""
+        SELECT count(*) FROM v_tree_node WHERE node_name = 'u_chk'""") == 0,
+          "and contributes no node")
+    check(one("SELECT analysis_status FROM v_db_info") == "complete",
+          "while the status stays complete")
     check(one("""
         SELECT count(*) FROM stmt WHERE stmt_kind='assertion'""") >= 3,
           "assertion statements")
@@ -1888,6 +1977,32 @@ if mode == "params":
 
 
 if mode == "procedural":
+    # `-> fired` is what makes an event happen. Without the row the event
+    # had waiters and no cause; `constant` would have been worse, saying it
+    # is tied off.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'fired' AND driver_kind = 'trigger'
+          AND driver_net_id IS NULL""") == 1,
+          "a triggered event is driven by its trigger, not by a constant")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name = 'fired' AND load_kind = 'sensitivity'""") == 1,
+          "and the procedure waiting on it is still its load")
+    # Both statements exist so their gating has somewhere to land: the
+    # condition reaching them is a read, and it had nowhere else to go.
+    for kind in ("trigger", "disable"):
+        check(one("""
+            SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
+            JOIN net n ON n.id = e.net_id
+            WHERE s.stmt_kind = ? AND e.role = 'control' AND n.name = 'en'""",
+                  kind) == 1,
+              f"a gated {kind} records the condition it was reached under")
+    check(one("""
+        SELECT count(*) FROM stmt WHERE stmt_kind = 'disable'
+          AND NOT EXISTS (SELECT 1 FROM stmt_target t WHERE t.stmt_id = stmt.id)
+        """) == 1,
+          "and a disable names no net, having written none")
     # ---- LRM 11.4.1: an assignment operator reads its target
     # LRM 11.4.1 -- an assignment operator reads its target. slang builds
     # `a += b` as BinaryExpression(LValueReference, b), and an
@@ -2273,6 +2388,14 @@ if mode == "outward":
         SELECT count(*) FROM stmt
         WHERE stmt_kind = 'call' AND construct = 'push_back'""") == 1,
           "a built-in method is a call, not a system task")
+    # And a system subroutine with no `$` that DOES write: the prefix alone
+    # sent it down the branch with no writeRefs, so its argument came back
+    # with no driver at all.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'drawn' AND driver_kind = 'system_task'
+          AND driver_net_id IS NULL""") == 1,
+          "a written argument makes a prefixless system call a system task")
     # A call whose formal is no net of this instance still drives its output
     # actual, and says so in both places: the target row that names the
     # statement, and a dependency with no source -- there is no formal here to
@@ -2335,6 +2458,19 @@ if mode == "outward":
           "and it reads nothing at all, so nothing else stands in for it")
 
 if mode == "naming":
+    # The assembled path keeps every segment as the tree spells it: an
+    # escaped identifier with its backslash, its terminator and the `.`
+    # inside it, and a generate level exactly once.
+    for path in ("naming.\\u.1 ", "naming.\\gn.1 ", "naming.g[0]"):
+        check(one("SELECT count(*) FROM v_node_path WHERE node_path = ?",
+                  path) == 1,
+              f"v_node_path spells {path!r} as the tree does")
+    # A net's full path is its INSTANCE's path plus the name -- the scope
+    # node's path would repeat the generate segment the name already has.
+    check(one("""
+        SELECT count(*) FROM v_net n JOIN v_node_path p ON p.node_id = n.inst_id
+        WHERE p.node_path || '.' || n.net_name = 'naming.g[0].w'""") == 1,
+          "and a net path assembles from its instance, not its scope")
     # Every leaf comes through leafSegment, so an escaped name keeps slang's
     # own `\name ` spelling and an array element carries its SOURCE index --
     # for a gate exactly as for a module instantiation, since the two are one
@@ -2377,6 +2513,38 @@ if mode == "naming":
           "and never a respelling of it")
 
 if mode == "concatcursor":
+    # A pattern whose element order is not most significant first takes the
+    # whole target at range granularity. Walking it anyway reported the
+    # OPPOSITE window and called it exact, which is the one failure mode a
+    # position must not have.
+    for tgt in ("up_arr", "keyed", "up_keyed"):
+        check(one("SELECT count(*) FROM v_net_dep WHERE tgt_name = ? "
+                  "AND tgt_lo IS NULL AND map_exact = 0", tgt) == 2,
+              f"the inverted-order pattern {tgt} claims no per-element window")
+        check(one("SELECT count(*) FROM v_net_dep WHERE tgt_name = ? "
+                  "AND tgt_lo IS NOT NULL", tgt) == 0,
+              f"and never a window for {tgt}")
+
+    # The two flattening directions, which a consumer cannot guess from one
+    # example: a packed member declared first takes the HIGH offsets, an
+    # unpacked element declared first takes the LOW ones.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name = 'a' AND tgt_name = 'packed_o'
+          AND tgt_lo = 4 AND tgt_hi = 7""") == 1,
+          "a packed pattern's first member takes the high offsets")
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name = 'a' AND tgt_name = 'arr' AND tgt_lo = 0
+          AND tgt_hi = 7""") == 1,
+          "while an unpacked array's first element takes the low ones")
+
+    # An unpacked object's width is the flattened space its offsets index,
+    # not its packed width -- without it a range like [8:15] on a byte array
+    # names a window into a size the row does not state.
+    for name, w in (("arr", 32), ("slice_src", 32), ("slice_dst", 16)):
+        check(one("SELECT width FROM v_net WHERE net_name = ?", name) == w,
+              f"the unpacked net {name} reports its flattened width")
     # An unpacked-array range select: slang's bounds cover one element
     # however many the select names, so no range is claimed at all rather
     # than one that says the rest is untouched.
@@ -2529,6 +2697,42 @@ if mode == "rootref":
           "while the local path beside it follows the occurrence")
 
 if mode == "xmr":
+    # A system task called in a CONDITION still writes its argument. The
+    # call belongs to no statement of its own, and v_driver tells a system
+    # write from a tie-off by the statement it came from -- so the call
+    # gets a row, as the procedure header does for reads with no statement.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'seeded' AND driver_kind = 'system_task'
+          AND driver_net_id IS NULL""") == 1,
+          "a system write inside a condition is attributed, not lost")
+    check(one("""
+        SELECT count(*) FROM v_stmt
+        WHERE stmt_kind = 'system_task' AND construct = '$value$plusargs'""") == 1,
+          "and the call it came from is the statement that carries it")
+    # Nested calls in one condition: the outer collection reaches through
+    # the inner one, so a row per call recorded the inner write twice. One
+    # row per outermost call carries both writes, once each.
+    for net in ("outer_v", "inner_v"):
+        check(one("SELECT count(*) FROM v_driver WHERE signal_name = ? "
+                  "AND driver_kind = 'system_task'", net) == 1,
+              f"a nested system call records {net} exactly once")
+    check(one("""
+        SELECT count(*) FROM v_stmt
+        WHERE stmt_kind = 'system_task' AND construct = '$cast'""") == 1,
+          "and the nesting is one statement, not one per call")
+
+    # A hierarchical WRITE names its target, and the driver view says so on
+    # the row itself: `always_comb u.x = a` is one lookup from the far net,
+    # not a walk out to net_dep and back through hier_ref.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='x' AND driver_name='a' AND signal_ref='u.x'""") == 1,
+          "a hierarchically written signal carries its spelling on the arc")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='a' AND load_name='x' AND load_ref='u.x'""") == 1,
+          "and the load view mirrors it")
     # A path that climbs out of a twice-instantiated body and back into it
     # lands on a symbol of that body, and is still not the occurrence's own
     # net: both occurrences answer with the reference, neither with itself.
@@ -2717,7 +2921,8 @@ if mode == "xmr":
     check(one("""
         SELECT count(*) FROM v_net_attachment a
         JOIN v_net n ON n.net_id = a.net_id
-        JOIN v_term t ON t.term_id = a.term_id
+        JOIN v_net_conn c ON c.conn_id = a.conn_id
+        JOIN v_term t ON t.term_id = c.term_id
         JOIN v_tree_node tn ON tn.node_id = t.inst_id
         WHERE n.net_name='g' AND a.attachment_kind='actual_outside'
           AND t.term_name='p' AND tn.node_name='u_sink'""") == 1,
@@ -2900,7 +3105,7 @@ if mode == "external":
         JOIN v_hier_ref h ON h.hier_ref_id = d.src_hier_ref_id
         WHERE v.driver_kind='external' AND v.signal_name='nib'
           AND h.access='read' AND h.resolved_net_id IS NULL
-          AND h.ref_lo=0 AND h.ref_hi=3""") >= 1,
+          AND h.lo=0 AND h.hi=3""") >= 1,
           "and v_hier_ref holds the reference that row named")
     check(one("""
         SELECT count(*) FROM net_dep
@@ -2920,6 +3125,22 @@ if mode == "external":
           "and no upward source is misreported as a constant")
 
 if mode == "callsite":
+    # A constant actual ties the formal off, the same fact `.p(8'h5A)`
+    # records on a pin. Without it the formal came back with the two
+    # net-fed calls as its only drivers and this one invisible.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'tie.v' AND driver_kind = 'constant'
+          AND driver_net_id IS NULL AND stmt_id IS NOT NULL""") == 1,
+          "a constant actual drives its formal as a tie-off")
+    # A source-less dependency is anchored by a target row here as
+    # everywhere, so the two views agree on what the call writes.
+    check(one("""
+        SELECT count(*) FROM v_stmt_target t JOIN v_driver d
+          ON d.stmt_id = t.stmt_id AND d.signal_net_id = t.net_id
+        WHERE t.net_name = 'tie.v' AND d.driver_kind = 'constant'
+          AND t.target_kind = 'written_by'""") == 1,
+          "and the statement that ties it names it as a target")
     # Two calls to one task, from two sites -- both bump, both outermost.
     check(one("""SELECT count(*) FROM v_call_site
                  WHERE subroutine_name='bump' AND depth=1""") == 2,
@@ -3043,6 +3264,20 @@ if mode == "callsite":
           "and call site 2's", f"got {sorted(v2)}")
 
 if mode == "package":
+    # A package is parentless without being a root, so it anchors its own
+    # path and contributes nothing to any instance path.
+    check(one("""
+        SELECT count(*) FROM v_node_path p JOIN v_tree_node t
+          ON t.node_id = p.node_id
+        WHERE t.node_kind = 'package' AND p.node_path = t.node_name""") == 1,
+          "a package path is its own name and no more")
+    check(one("""
+        SELECT count(*) FROM v_node_path p JOIN v_tree_node t
+          ON t.node_id = p.node_id
+        WHERE t.node_kind != 'package'
+          AND p.node_path LIKE (SELECT node_name FROM v_tree_node
+                                WHERE node_kind = 'package') || '.%'""") == 0,
+          "and no elaborated path runs through one")
     # A package is a pseudo-occurrence now: node_kind='package', a matching
     # inst with parent_inst_id NULL and a def_kind='package' module.
     check(one("""

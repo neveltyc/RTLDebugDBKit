@@ -209,16 +209,8 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
                 term.kind = TermKind::Signal;
                 term.direction = directionOf(p.direction);
                 term.dataTypeId = writer.internDataType(p.getType().toString());
-                if (p.getType().isIntegral())
-                    term.width = static_cast<int64_t>(p.getType().getBitWidth());
-                term.isConst = 0;
-                if (p.direction == ArgumentDirection::Ref && p.internalSymbol &&
-                    ValueSymbol::isKind(p.internalSymbol->kind)) {
-                    auto& vs = p.internalSymbol->as<ValueSymbol>();
-                    if (vs.kind == SymbolKind::Variable &&
-                        vs.as<VariableSymbol>().flags.has(VariableFlags::Const))
-                        term.isConst = 1;
-                }
+                if (const uint64_t w = flattenedWidth(p.getType()))
+                    term.width = static_cast<int64_t>(w);
                 break;
             }
             case SymbolKind::MultiPort: {
@@ -226,9 +218,8 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
                 term.kind = TermKind::Signal;
                 term.direction = directionOf(mp.direction);
                 term.dataTypeId = writer.internDataType(mp.getType().toString());
-                if (mp.getType().isIntegral())
-                    term.width = static_cast<int64_t>(mp.getType().getBitWidth());
-                term.isConst = 0;
+                if (const uint64_t w = flattenedWidth(mp.getType()))
+                    term.width = static_cast<int64_t>(w);
                 break;
             }
             case SymbolKind::InterfacePort: {
@@ -466,9 +457,16 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
         // port -- replayed onto the net would claim bits the reference
         // does not touch.
         if (!inner) {
+            // A plain name resolves; a constant does not. `modport m(input
+            // .k(K))` renames a parameter, which has no net row, and taking
+            // it as the target resolved the instance while leaving the net
+            // NULL -- a half-answer the resolved pair does not allow.
             if (auto* conn = mp.getConnectionExpr();
-                conn && conn->kind == ExpressionKind::NamedValue)
-                inner = &conn->as<NamedValueExpression>().symbol;
+                conn && conn->kind == ExpressionKind::NamedValue) {
+                auto& sym = conn->as<NamedValueExpression>().symbol;
+                if (!isConstantSymbol(sym))
+                    inner = &sym;
+            }
         }
         if (!inner) {
             row.resolve = TplHierRef::Failed;
@@ -486,6 +484,26 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
             if (it != b.termOf->end()) {
                 auto& ip = first->as<InterfacePortSymbol>();
                 auto [iface, modport] = ip.getConnection();
+                // An interface ARRAY port: the terminal binds an element per
+                // segment, so the route needs the element as well. Which one
+                // is decided by whose subtree the target sits in, not by the
+                // written index -- `bus_arr[k]` in a generate loop spells one
+                // thing and lands on a different element each iteration.
+                if (iface && iface->kind == SymbolKind::InstanceArray) {
+                    std::vector<const Symbol*> elems;
+                    flattenIfaceBinding(*iface, elems);
+                    for (size_t e = 0; e < elems.size(); e++) {
+                        std::string rel;
+                        if (!splitBelow(full, elems[e]->getHierarchicalPath(), rel))
+                            continue;
+                        row.resolve = TplHierRef::ViaIfaceTerm;
+                        row.ifaceTerm = it->second.term;
+                        row.ifaceElem = int32_t(e);
+                        if (!segsFromAncestry(nullptr, elems[e], *target, row))
+                            row.resolve = TplHierRef::Failed;
+                        return;
+                    }
+                }
                 if (iface) {
                     std::string ifacePrefix = iface->getHierarchicalPath();
                     std::string rel;
@@ -650,6 +668,13 @@ void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body)
     // The index first: its constructor establishes scope 0, and nothing
     // below can name a net or a scope until it exists.
     DeclIndex decl(t, body, body.getHierarchicalPath(), locator, writer);
+
+    // Checkers are not modelled. A CheckerInstanceSymbol is not an
+    // InstanceSymbol, so the walk never reaches one and its whole
+    // subtree -- ports, assertions, everything -- is absent. Counting
+    // them is what keeps that absence readable.
+    forEachOfKind<SymbolKind::CheckerInstance, CheckerInstanceSymbol>(
+        body, [&](const CheckerInstanceSymbol&) { t.checkerInsts++; });
 
     Build b;
     b.t = &t;
@@ -931,6 +956,9 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                                             RefRole::Assertion}
                             : n.kind == ReadNode::Kind::Wait
                                 ? std::pair{StmtKind::Wait, RefRole::Wait}
+                            : n.kind == ReadNode::Kind::Disable
+                                ? std::pair{StmtKind::Disable,
+                                            RefRole::CallArgument}
                                 : std::pair{StmtKind::Call,
                                             RefRole::CallArgument};
                         fileReadLike(n.reads, gates.refs(n.gate), {}, kind,
@@ -941,6 +969,12 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                         fileReadLike(n.reads, gates.refs(n.gate), n.writes,
                                      StmtKind::SystemTask, RefRole::SystemTask,
                                      /*writesAreReleased=*/false, n.construct,
+                                     n.seq, n.dropped, n.where);
+                    }
+                    else if constexpr (std::is_same_v<T, TriggerNode>) {
+                        fileReadLike({}, gates.refs(n.gate), n.events,
+                                     StmtKind::Trigger, RefRole::CallArgument,
+                                     /*writesAreReleased=*/false, "trigger",
                                      n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReleaseNode>) {
@@ -1337,10 +1371,38 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
     const bool reads = n.reads;
     const bool writes = n.writes;
     const int mapExact = n.pair.mapExact ? 1 : 0;
-    if (!n.formal || !actual.sym)
+    if (!n.formal || (!actual.sym && !n.constantActual))
         return;
     const int32_t stmt = n.bindable ? b.curStmt : -1;
     const int32_t formalNet = b.decl->netFor(*n.formal);
+    if (n.constantActual) {
+        // `data` with no source is what `constant` means, and it is what the
+        // same tie-off written as a port connection already records -- not
+        // `procedure`, which says a call reached a formal this body cannot
+        // name. A source-less dependency is anchored by a target row, here
+        // as everywhere: the call is the statement that writes the formal.
+        // A call inside a CONDITION has no statement row to anchor to and
+        // records nothing, as its write-back does not either.
+        if (formalNet < 0 || stmt < 0)
+            return;
+        TplStmtRef tr;
+        tr.stmt = stmt;
+        tr.ordinal = b.targetOrdinal++;
+        tr.net = formalNet;
+        tr.r = rangeOf(n.pair.tgt);
+        const int32_t targetIdx = int32_t(b.t->targets.size());
+        b.t->targets.push_back(std::move(tr));
+        TplDep d;
+        d.src.net = -1;
+        d.tgt.net = formalNet;
+        d.stmt = stmt;
+        d.targetRef = targetIdx;
+        d.kind = DepKind::Data;
+        d.tgtR = rangeOf(n.pair.tgt);
+        d.callSite = b.curCallSite;
+        b.t->deps.push_back(std::move(d));
+        return;
+    }
     if (formalNet < 0) {
         // The formal is not a net of THIS body, which is what a subroutine
         // declared in a package, an interface or $unit looks like from here.

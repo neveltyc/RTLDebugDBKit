@@ -42,6 +42,7 @@ CREATE VIEW v_db_info AS
 SELECT
     CAST(MAX(CASE WHEN key = 'schema_version'
                   THEN value END) AS INTEGER) AS schema_version,
+    MAX(CASE WHEN key = 'tool'                  THEN value END) AS tool,
     MAX(CASE WHEN key = 'tool_version'          THEN value END) AS tool_version,
     MAX(CASE WHEN key = 'slang_version'         THEN value END) AS slang_version,
     MAX(CASE WHEN key = 'producer_revision'     THEN value END) AS producer_revision,
@@ -59,6 +60,8 @@ SELECT
                   THEN value END) AS INTEGER) AS recursion_count,
     CAST(MAX(CASE WHEN key = 'truncated_call_count'
                   THEN value END) AS INTEGER) AS truncated_call_count,
+    CAST(MAX(CASE WHEN key = 'checker_inst_count'
+                  THEN value END) AS INTEGER) AS checker_inst_count,
     CAST(MAX(CASE WHEN key = 'unanalysed_inst_count'
                   THEN value END) AS INTEGER) AS unanalysed_inst_count,
     MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest
@@ -82,6 +85,7 @@ SELECT
     COALESCE(i.parent_inst_id, p.inst_id)  AS parent_inst_id,
     i.module_id                            AS module_id,
     m.name                                 AS module_name,
+    m.def_kind                             AS def_kind,
     i.param_signature                      AS param_signature,
     COALESCE(p.def_name, i.unresolved_def) AS def_name,
     f.path                                 AS file_path,
@@ -94,6 +98,31 @@ LEFT JOIN prim p    ON p.id = n.id
 LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN file f         ON f.id = COALESCE(i.file_id, p.file_id)
 LEFT JOIN src_file sf ON sf.id = f.src_file_id;
+
+-- One row per tree node: the dotted path from its root down to it. The
+-- tree stores one segment per node and no path strings, so this is the
+-- assembly rule published once rather than rewritten per consumer -- three
+-- of whose spellings are wrong. It anchors on the node's OWN root, so a
+-- package (parentless, like a root, but not one) contributes its own name
+-- and nothing else; the elaborated-tree paths are the rows whose node is
+-- not a package.
+--
+-- Two properties a consumer has to plan around. The walk is the whole tree
+-- however few paths are wanted -- no value pushes into a recursive CTE --
+-- so this is a scan to take once and keep, never a per-row lookup. And the
+-- result does not round-trip: an escaped identifier may hold a `.`
+-- (`\g.1 `), so a path is assembled here and matched whole, never split
+-- back into segments.
+CREATE VIEW v_node_path AS
+WITH RECURSIVE up(node_id, cur, path) AS (
+    SELECT id, parent_node_id, name FROM tree_node
+  UNION ALL
+    SELECT u.node_id, p.parent_node_id, p.name || '.' || u.path
+    FROM up u JOIN tree_node p ON p.id = u.cur)
+SELECT
+    node_id AS node_id,
+    path    AS node_path
+FROM up WHERE cur IS NULL;
 
 -- One row per net: a connectable object of one concrete instance. No
 -- direction column -- direction belongs to terminals, and a net's port-ness
@@ -139,7 +168,6 @@ SELECT
     dt.text     AS data_type,
     t.width     AS width,
     t.ordinal   AS ordinal,
-    t.is_const  AS is_const,
     t.modport   AS modport,
     f.path      AS file_path,
     sf.path     AS src_path,
@@ -155,6 +183,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- One row per term_map segment: the inside of a terminal.
 CREATE VIEW v_term_map AS
 SELECT
+    mp.id           AS term_map_id,
     mp.term_id      AS term_id,
     t.inst_id       AS term_inst_id,
     t.name          AS term_name,
@@ -478,6 +507,7 @@ SELECT
     d.tgt_net_id             AS signal_net_id,
     tn.inst_id               AS signal_inst_id,
     tn.name                  AS signal_name,
+    th.path                  AS signal_ref,
     d.tgt_lo                 AS signal_lo,
     d.tgt_hi                 AS signal_hi,
     d.tgt_exact              AS signal_exact,
@@ -499,6 +529,11 @@ SELECT
     CASE WHEN d.src_net_id IS NOT NULL THEN d.dep_kind
          WHEN d.src_hier_ref_id IS NOT NULL THEN 'external'
          WHEN s.stmt_kind = 'system_task' THEN 'system_task'
+         -- `-> ev` names what it triggers and nothing that feeds it:
+         -- the cause is control reaching the statement, which is no
+         -- net. Calling that a tie-off would say the event is held at
+         -- a constant, the opposite of what a trigger does.
+         WHEN s.stmt_kind = 'trigger' THEN 'trigger'
          WHEN d.dep_kind != 'data' THEN d.dep_kind
          ELSE 'constant' END AS driver_kind,
     d.id                     AS dep_id,
@@ -516,13 +551,14 @@ FROM net_dep d
 JOIN net tn              ON tn.id = d.tgt_net_id
 LEFT JOIN net sn         ON sn.id = d.src_net_id
 LEFT JOIN hier_ref sh    ON sh.id = d.src_hier_ref_id
+LEFT JOIN hier_ref th    ON th.id = d.tgt_hier_ref_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
 LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
-    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
     a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
@@ -541,7 +577,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
 UNION ALL
 SELECT
-    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
     a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
@@ -558,7 +594,7 @@ WHERE a.direction IN ('output', 'inout', 'ref')
   AND a.conn_kind IN ('signal', 'external_reference')
 UNION ALL
 SELECT
-    m.inner_net_id, n.inst_id, n.name,
+    m.inner_net_id, n.inst_id, n.name, NULL,
     m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
@@ -623,6 +659,7 @@ SELECT
     d.src_net_id             AS signal_net_id,
     sn.inst_id               AS signal_inst_id,
     sn.name                  AS signal_name,
+    sh.path                  AS signal_ref,
     d.src_lo                 AS signal_lo,
     d.src_hi                 AS signal_hi,
     d.src_exact              AS signal_exact,
@@ -650,13 +687,14 @@ FROM net_dep d
 JOIN net sn              ON sn.id = d.src_net_id
 JOIN net tn              ON tn.id = d.tgt_net_id
 LEFT JOIN hier_ref th    ON th.id = d.tgt_hier_ref_id
+LEFT JOIN hier_ref sh    ON sh.id = d.src_hier_ref_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
 LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
-    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
     a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
@@ -672,7 +710,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
 UNION ALL
 SELECT
-    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
     a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
@@ -689,7 +727,7 @@ WHERE a.direction IN ('output', 'inout', 'ref')
   AND a.conn_kind IN ('signal', 'external_reference')
 UNION ALL
 SELECT
-    pe.net_id, n.inst_id, n.name,
+    pe.net_id, n.inst_id, n.name, NULL,
     NULL, NULL, 1,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
@@ -702,7 +740,7 @@ LEFT JOIN file f         ON f.id = pe.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
-    e.net_id, n.inst_id, n.name,
+    e.net_id, n.inst_id, n.name, NULL,
     e.lo, e.hi, e.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     CASE e.role WHEN 'wait' THEN 'wait'
@@ -719,7 +757,7 @@ WHERE e.role IN ('assertion', 'wait', 'event', 'system_task')
    OR NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.expr_ref_id = e.id)
 UNION ALL
 SELECT
-    o.net_id, n.inst_id, n.name,
+    o.net_id, n.inst_id, n.name, NULL,
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
@@ -733,7 +771,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_operand_id = o.id)
 UNION ALL
 SELECT
-    m.inner_net_id, n.inst_id, n.name,
+    m.inner_net_id, n.inst_id, n.name, NULL,
     m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
@@ -818,9 +856,9 @@ SELECT
     CASE WHEN s.stmt_kind = 'release' THEN 'release_target'
          WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
          ELSE 'written_by' END AS target_kind,
-    a.lo       AS tgt_lo,
-    a.hi       AS tgt_hi,
-    a.is_exact AS tgt_exact,
+    a.lo       AS lo,
+    a.hi       AS hi,
+    a.is_exact AS is_exact,
     s.call_site_id AS call_site_id
 FROM stmt_target a
 JOIN net n ON n.id = a.net_id
@@ -838,13 +876,41 @@ SELECT
     o.ordinal  AS ordinal,
     o.net_id   AS net_id,
     n.name     AS net_name,
-    o.lo       AS operand_lo,
-    o.hi       AS operand_hi,
-    o.is_exact AS operand_exact,
+    o.lo       AS lo,
+    o.hi       AS hi,
+    o.is_exact AS is_exact,
     s.call_site_id AS call_site_id
 FROM assign_operand o
 JOIN net n ON n.id = o.net_id
 JOIN stmt s ON s.id = o.stmt_id;
+
+-- One row per edge event a procedure triggers on or waits on: the
+-- sensitivity list entries of its header (stmt_id NULL) and the waits its
+-- statements make. The procedure's kind travels with it because the two
+-- questions arrive together -- "which flops does this net clock" is
+-- edge_kind beside proc_kind, and the statement views carry neither.
+-- edge_kind is NULL for a level-sensitive event written explicitly;
+-- net_id is NULL when the event expression is not a plain net.
+CREATE VIEW v_proc_event AS
+SELECT
+    e.id          AS proc_event_id,
+    e.proc_id     AS proc_id,
+    p.inst_id     AS inst_id,
+    p.proc_kind   AS proc_kind,
+    e.stmt_id     AS stmt_id,
+    e.net_id      AS net_id,
+    n.name        AS net_name,
+    e.event_kind  AS event_kind,
+    e.edge_kind   AS edge_kind,
+    f.path        AS file_path,
+    sf.path       AS src_path,
+    e.line        AS src_line,
+    e.col         AS src_col
+FROM proc_event e
+JOIN proc p              ON p.id = e.proc_id
+LEFT JOIN net n          ON n.id = e.net_id
+LEFT JOIN file f         ON f.id = e.file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- Everything touching one net, one row per attachment: the structural
 -- adjacency that v_driver/v_load answer directionally, answered flatly --
@@ -854,12 +920,16 @@ JOIN stmt s ON s.id = o.stmt_id;
 -- polymorphic id whose meaning a consumer had to reconstruct from the
 -- kind. The typed column each kind fills:
 --
---   terminal_inside     term_id      term_map: the net stands behind a
+--   terminal_inside     term_map_id  term_map: the net stands behind a
 --                                    terminal of its own instance.
---   actual_outside      term_id      net_conn: the net is wired to a
+--   actual_outside      conn_id      net_conn: the net is wired to a
 --                                    child's terminal, named directly
 --                                    (outer_net_id) or through a resolved
---                                    external tie (`.p(u.g[7:4])`).
+--                                    external tie (`.p(u.g[7:4])`). One
+--                                    terminal takes several segments --
+--                                    `.q({2{r}})` tiles it twice -- so the
+--                                    terminal is not the row, the
+--                                    connection is.
 --   written_by          stmt_target_id   stmt_target of an assignment, a
 --                                    system-task write, or a call writing
 --                                    its output actual.
@@ -871,8 +941,10 @@ JOIN stmt s ON s.id = o.stmt_id;
 --   read_by             assign_operand_id
 --   condition           expr_ref_id  expr_ref with role='control'.
 --   statement_read      expr_ref_id  every other expr_ref role.
---   event               proc_id      proc_event: a procedure triggers or
---                                    waits on it. proc_id is the procedure.
+--   event               proc_event_id  proc_event: a procedure triggers
+--                                    or waits on it. One procedure takes
+--                                    several events on one net, so the
+--                                    procedure is not the row either.
 --   dep_in / dep_out    dep_id       net_dep, by end.
 --   named_from_outside  hier_ref_id  a resolved hier_ref lands on it.
 --
@@ -884,16 +956,17 @@ JOIN stmt s ON s.id = o.stmt_id;
 CREATE VIEW v_net_attachment AS
 SELECT m.inner_net_id AS net_id, n.inst_id AS inst_id, n.name AS net_name,
        'terminal_inside' AS attachment_kind,
-       m.inner_lo AS lo, m.inner_hi AS hi, m.inner_exact AS exact,
+       m.inner_lo AS lo, m.inner_hi AS hi, m.inner_exact AS is_exact,
        NULL AS stmt_id,
-       m.term_id AS term_id, NULL AS stmt_target_id, NULL AS assign_operand_id,
-       NULL AS expr_ref_id, NULL AS proc_id, NULL AS dep_id,
+       m.id AS term_map_id, NULL AS conn_id, NULL AS stmt_target_id,
+       NULL AS assign_operand_id,
+       NULL AS expr_ref_id, NULL AS proc_event_id, NULL AS dep_id,
        NULL AS hier_ref_id
 FROM term_map m JOIN net n ON n.id = m.inner_net_id
 UNION ALL
 SELECT c.outer_net_id, n.inst_id, n.name, 'actual_outside',
        c.outer_lo, c.outer_hi, c.outer_exact, NULL,
-       c.term_id, NULL, NULL, NULL, NULL, NULL, NULL
+       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL
 FROM net_conn c JOIN net n ON n.id = c.outer_net_id
 WHERE c.outer_net_id IS NOT NULL
 UNION ALL
@@ -904,7 +977,7 @@ UNION ALL
 -- this net feed" answered nothing for exactly the ties v12 taught to arc.
 SELECT h.resolved_net_id, n.inst_id, n.name, 'actual_outside',
        h.lo, h.hi, h.is_exact, NULL,
-       c.term_id, NULL, NULL, NULL, NULL, NULL, NULL
+       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL
 FROM net_conn c
 JOIN hier_ref h ON h.id = c.outer_hier_ref_id
 JOIN net n ON n.id = h.resolved_net_id
@@ -922,42 +995,42 @@ SELECT a.net_id, n.inst_id, n.name,
             WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
             ELSE 'written_by' END,
        a.lo, a.hi, a.is_exact, a.stmt_id,
-       NULL, a.id, NULL, NULL, NULL, NULL, NULL
+       NULL, NULL, a.id, NULL, NULL, NULL, NULL, NULL
 FROM stmt_target a JOIN net n ON n.id = a.net_id
 JOIN stmt s ON s.id = a.stmt_id
 UNION ALL
 SELECT o.net_id, n.inst_id, n.name, 'read_by',
        o.lo, o.hi, o.is_exact, o.stmt_id,
-       NULL, NULL, o.id, NULL, NULL, NULL, NULL
+       NULL, NULL, NULL, o.id, NULL, NULL, NULL, NULL
 FROM assign_operand o JOIN net n ON n.id = o.net_id
 UNION ALL
 SELECT e.net_id, n.inst_id, n.name,
        CASE WHEN e.role = 'control' THEN 'condition'
             ELSE 'statement_read' END,
        e.lo, e.hi, e.is_exact, e.stmt_id,
-       NULL, NULL, NULL, e.id, NULL, NULL, NULL
+       NULL, NULL, NULL, NULL, e.id, NULL, NULL, NULL
 FROM expr_ref e JOIN net n ON n.id = e.net_id
 UNION ALL
 SELECT pe.net_id, n.inst_id, n.name, 'event',
        NULL, NULL, 1, pe.stmt_id,
-       NULL, NULL, NULL, NULL, pe.proc_id, NULL, NULL
+       NULL, NULL, NULL, NULL, NULL, pe.id, NULL, NULL
 FROM proc_event pe JOIN net n ON n.id = pe.net_id
 WHERE pe.net_id IS NOT NULL
 UNION ALL
 SELECT d.tgt_net_id, n.inst_id, n.name, 'dep_in',
        d.tgt_lo, d.tgt_hi, d.tgt_exact, d.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, d.id, NULL
+       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL
 FROM net_dep d JOIN net n ON n.id = d.tgt_net_id
 UNION ALL
 SELECT d.src_net_id, n.inst_id, n.name, 'dep_out',
        d.src_lo, d.src_hi, d.src_exact, d.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, d.id, NULL
+       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL
 FROM net_dep d JOIN net n ON n.id = d.src_net_id
 WHERE d.src_net_id IS NOT NULL
 UNION ALL
 SELECT h.resolved_net_id, n.inst_id, n.name, 'named_from_outside',
        h.lo, h.hi, h.is_exact, h.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, NULL, h.id
+       NULL, NULL, NULL, NULL, NULL, NULL, NULL, h.id
 FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
 WHERE h.resolved_net_id IS NOT NULL;
 
@@ -1014,9 +1087,9 @@ SELECT
     h.resolved_inst_id  AS resolved_inst_id,
     h.resolved_net_id   AS resolved_net_id,
     rn.name             AS resolved_net_name,
-    h.lo                AS ref_lo,
-    h.hi                AS ref_hi,
-    h.is_exact          AS ref_exact,
+    h.lo                AS lo,
+    h.hi                AS hi,
+    h.is_exact          AS is_exact,
     f.path              AS file_path,
     sf.path             AS src_path,
     h.line              AS src_line,

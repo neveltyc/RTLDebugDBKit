@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <set>
 #include <string>
@@ -189,9 +190,13 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         //
         // A built-in METHOD (`q.push_back(x)`, `q.delete()`) registers as a
         // system call in slang but is not a system task: nothing leaves the
-        // language, and stmt_kind has `call` for exactly this. The `$`
-        // prefix is what separates the two vocabularies.
-        if (call.isSystemCall() && call.getSubroutineName().starts_with('$')) {
+        // language, and stmt_kind has `call` for exactly this. What separates
+        // the two is the `$` prefix OR a written argument -- `randomize(a)`
+        // carries no `$` and still drives a from outside anything the model
+        // names, and classifying it by the prefix alone dropped its write
+        // entirely, since only this branch carries writeRefs.
+        if (call.isSystemCall() &&
+            (call.getSubroutineName().starts_with('$') || !writeRefs.empty())) {
             emit(SystemTaskNode{std::move(reads), std::move(writeRefs),
                                 callWord(call), gateId(), seq++,
                                 filteredConstants, stmt.sourceRange});
@@ -341,6 +346,43 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                        refs.end());
         }
         gating.insert(gating.end(), refs.begin(), refs.end());
+        emitSystemWritesIn(expr);
+    }
+
+    /// A system task called in a CONDITION still writes its argument, and
+    /// the write has nowhere to go: the call belongs to no statement, so
+    /// v_driver cannot tell it from a tie-off the way it does for a
+    /// statement-level one. It gets a row of its own -- the same answer the
+    /// procedure-header `event_control` row is to reads with no statement.
+    /// Only the write travels; what the condition reads is gating already.
+    ///
+    /// One row per OUTERMOST call, carrying everything it writes, which is
+    /// the shape a statement-level call has. Emitting per nested call
+    /// instead recorded an inner write twice: once for the inner call and
+    /// again for the outer, whose collection reaches through it.
+    void emitSystemWritesIn(const Expression& expr) {
+        struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
+            StatementWalker& self;
+            explicit Finder(StatementWalker& self) : self(self) {}
+            void handle(const CallExpression& call) {
+                if (!call.isSystemCall()) {
+                    visitDefault(call);
+                    return;
+                }
+                std::set<const ValueSymbol*> syms;
+                std::vector<Ref> writes;
+                self.collectWrittenTargets(call, syms, &writes);
+                if (writes.empty()) {
+                    visitDefault(call);
+                    return;
+                }
+                self.emit(SystemTaskNode{{}, std::move(writes),
+                                         callWord(call), self.gateId(),
+                                         self.seq++, 0, call.sourceRange});
+            }
+        };
+        Finder f(*this);
+        expr.visit(f);
     }
 
     /// The expressions a call inside `expr` writes without reading: the
@@ -518,6 +560,25 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         visitDefault(expr);
     }
 
+    /// `-> ev`. Without a row the event had loads and no cause at all,
+    /// and the condition gating the trigger had no statement to hang on.
+    void handle(const EventTriggerStatement& stmt) {
+        std::vector<Ref> events;
+        filteredConstants = 0;
+        collectRefs(stmt.target, eval, events, /*skipSelectors=*/true);
+        emit(TriggerNode{std::move(events), gateId(), seq++,
+                         filteredConstants, stmt.sourceRange});
+        visitDefault(stmt);
+    }
+
+    /// `disable blk`. It names a block, not a net, so the row exists for
+    /// its gating: the condition reaching it is a read of that signal.
+    void handle(const DisableStatement& stmt) {
+        emit(ReadNode{{}, ReadNode::Kind::Disable, "disable", gateId(),
+                      seq++, 0, stmt.sourceRange});
+        visitDefault(stmt);
+    }
+
     void handle(const CallExpression& expr) {
         visitDefault(expr);
         auto sub = std::get_if<const SubroutineSymbol*>(&expr.subroutine);
@@ -624,6 +685,23 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // even where the actual fills the formal exactly.
             std::vector<Slot> actualSlots;
             collectSlots(*actualExpr, eval, 0, actualSlots, /*skipSelectors=*/writes);
+            // A constant actual leaves no slot to pair, and the formal
+            // then had no driver at all -- while the same tie-off
+            // written as a port connection records one. The formal is
+            // tied off; say so.
+            //
+            // Constant, not merely nameless: `t($urandom())` also yields no
+            // slot, and it holds the formal at no value at all. Calling
+            // that a tie-off states the one thing `constant` means and the
+            // one thing it is not.
+            if (reads && actualExpr->eval(eval) &&
+                std::none_of(actualSlots.begin(), actualSlots.end(),
+                             [](const Slot& s) { return s.ref.sym != nullptr; })) {
+                emit(BindNode{formals[i], args[i], PairedSrc{{}, formalSlot.ref,
+                                                            false, {}},
+                              reads, writes, bindable,
+                              /*constantActual=*/true, expr.sourceRange});
+            }
             for (auto& as : actualSlots) {
                 if (!as.ref.sym)
                     continue;
@@ -634,7 +712,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                formalSlot.positional && as.positional,
                                as.ref};
                 emit(BindNode{formals[i], args[i], std::move(pair), reads,
-                              writes, bindable, expr.sourceRange});
+                              writes, bindable, /*constantActual=*/false,
+                              expr.sourceRange});
             }
         }
     }

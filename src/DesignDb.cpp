@@ -209,22 +209,22 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNet]);
         prepare("INSERT INTO term(id, inst_id, name, term_kind, direction,"
-                " data_type_id, width, ordinal, is_const, modport, file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " data_type_id, width, ordinal, modport, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsTerm]);
-        prepare("INSERT INTO term_map(term_id, ordinal, inner_net_id,"
+        prepare("INSERT INTO term_map(id, term_id, ordinal, inner_net_id,"
                 " term_lo, term_hi, term_exact, inner_lo, inner_hi, inner_exact,"
                 " map_exact)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsTermMap]);
         prepare("INSERT INTO net_conn(id, outer_net_id, term_id, ordinal, conn_kind,"
                 " outer_lo, outer_hi, outer_exact, term_lo, term_hi, term_exact,"
                 " map_exact, outer_intf_inst_id, outer_hier_ref_id, file_id, line, col)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetConn]);
-        prepare("INSERT INTO proc(id, inst_id, scope_node_id, name, proc_kind,"
+        prepare("INSERT INTO proc(id, inst_id, scope_node_id, proc_kind,"
                 " ordinal, file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?,?)",
                 &ins[InsProcedure]);
         prepare("INSERT INTO call_site(id, inst_id, caller_stmt_id,"
                 " parent_call_site_id, subroutine_name, depth)"
@@ -511,9 +511,8 @@ void Writer::addTerm(const TermRow& r) {
     bindOptId(s, 6, r.dataTypeId);
     bindOptWidth(s, 7, r.width);
     sqlite3_bind_int64(s, 8, r.ordinal);
-    bindTri(s, 9, r.isConst);
-    bindOptText(s, 10, r.modport);
-    bindLoc(s, 11, r.fileId, r.line, r.column);
+    bindOptText(s, 9, r.modport);
+    bindLoc(s, 10, r.fileId, r.line, r.column);
     step(s);
     bumped();
 }
@@ -521,12 +520,13 @@ void Writer::addTerm(const TermRow& r) {
 void Writer::addTermMap(const TermMapRow& r) {
     auto* s = ins[InsTermMap];
     sqlite3_reset(s);
-    sqlite3_bind_int64(s, 1, r.termId);
-    sqlite3_bind_int64(s, 2, r.ordinal);
-    sqlite3_bind_int64(s, 3, r.netId);
-    bindRange(s, 4, r.termBits, r.termExact);
-    bindRange(s, 7, r.netBits, r.netExact);
-    sqlite3_bind_int(s, 10, r.mappingExact ? 1 : 0);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.termId);
+    sqlite3_bind_int64(s, 3, r.ordinal);
+    sqlite3_bind_int64(s, 4, r.netId);
+    bindRange(s, 5, r.termBits, r.termExact);
+    bindRange(s, 8, r.netBits, r.netExact);
+    sqlite3_bind_int(s, 11, r.mappingExact ? 1 : 0);
     step(s);
     bumped();
 }
@@ -573,11 +573,10 @@ void Writer::addProcedure(const ProcedureRow& r) {
     sqlite3_bind_int64(s, 1, r.id);
     sqlite3_bind_int64(s, 2, r.instId);
     sqlite3_bind_int64(s, 3, r.scopeNodeId);
-    bindOptText(s, 4, r.name);
-    sqlite3_bind_text(s, 5, r.procedureKind.c_str(), static_cast<int>(r.procedureKind.size()),
+    sqlite3_bind_text(s, 4, r.procedureKind.c_str(), static_cast<int>(r.procedureKind.size()),
                       SQLITE_STATIC);
-    sqlite3_bind_int64(s, 6, r.ordinal);
-    bindLoc(s, 7, r.fileId, r.line, r.column);
+    sqlite3_bind_int64(s, 5, r.ordinal);
+    bindLoc(s, 6, r.fileId, r.line, r.column);
     step(s);
     bumped();
 }
