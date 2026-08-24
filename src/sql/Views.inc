@@ -97,6 +97,31 @@ LEFT JOIN module m       ON m.id = i.module_id
 LEFT JOIN file f         ON f.id = COALESCE(i.file_id, p.file_id)
 LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
+-- One row per tree node: the dotted path from its root down to it. The
+-- tree stores one segment per node and no path strings, so this is the
+-- assembly rule published once rather than rewritten per consumer -- three
+-- of whose spellings are wrong. It anchors on the node's OWN root, so a
+-- package (parentless, like a root, but not one) contributes its own name
+-- and nothing else; the elaborated-tree paths are the rows whose node is
+-- not a package.
+--
+-- Two properties a consumer has to plan around. The walk is the whole tree
+-- however few paths are wanted -- no value pushes into a recursive CTE --
+-- so this is a scan to take once and keep, never a per-row lookup. And the
+-- result does not round-trip: an escaped identifier may hold a `.`
+-- (`\g.1 `), so a path is assembled here and matched whole, never split
+-- back into segments.
+CREATE VIEW v_node_path AS
+WITH RECURSIVE up(node_id, cur, path) AS (
+    SELECT id, parent_node_id, name FROM tree_node
+  UNION ALL
+    SELECT u.node_id, p.parent_node_id, p.name || '.' || u.path
+    FROM up u JOIN tree_node p ON p.id = u.cur)
+SELECT
+    node_id AS node_id,
+    path    AS node_path
+FROM up WHERE cur IS NULL;
+
 -- One row per net: a connectable object of one concrete instance. No
 -- direction column -- direction belongs to terminals, and a net's port-ness
 -- is one v_term_map join away. file_path is the spelling as written in
@@ -852,6 +877,34 @@ FROM assign_operand o
 JOIN net n ON n.id = o.net_id
 JOIN stmt s ON s.id = o.stmt_id;
 
+-- One row per edge event a procedure triggers on or waits on: the
+-- sensitivity list entries of its header (stmt_id NULL) and the waits its
+-- statements make. The procedure's kind travels with it because the two
+-- questions arrive together -- "which flops does this net clock" is
+-- edge_kind beside proc_kind, and the statement views carry neither.
+-- edge_kind is NULL for a level-sensitive event written explicitly;
+-- net_id is NULL when the event expression is not a plain net.
+CREATE VIEW v_proc_event AS
+SELECT
+    e.id          AS proc_event_id,
+    e.proc_id     AS proc_id,
+    p.inst_id     AS inst_id,
+    p.proc_kind   AS proc_kind,
+    e.stmt_id     AS stmt_id,
+    e.net_id      AS net_id,
+    n.name        AS net_name,
+    e.event_kind  AS event_kind,
+    e.edge_kind   AS edge_kind,
+    f.path        AS file_path,
+    sf.path       AS src_path,
+    e.line        AS src_line,
+    e.col         AS src_col
+FROM proc_event e
+JOIN proc p              ON p.id = e.proc_id
+LEFT JOIN net n          ON n.id = e.net_id
+LEFT JOIN file f         ON f.id = e.file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
+
 -- Everything touching one net, one row per attachment: the structural
 -- adjacency that v_driver/v_load answer directionally, answered flatly --
 -- "what hangs off this net". attachment_kind names the relation, and
@@ -881,8 +934,10 @@ JOIN stmt s ON s.id = o.stmt_id;
 --   read_by             assign_operand_id
 --   condition           expr_ref_id  expr_ref with role='control'.
 --   statement_read      expr_ref_id  every other expr_ref role.
---   event               proc_id      proc_event: a procedure triggers or
---                                    waits on it. proc_id is the procedure.
+--   event               proc_event_id  proc_event: a procedure triggers
+--                                    or waits on it. One procedure takes
+--                                    several events on one net, so the
+--                                    procedure is not the row either.
 --   dep_in / dep_out    dep_id       net_dep, by end.
 --   named_from_outside  hier_ref_id  a resolved hier_ref lands on it.
 --
@@ -898,7 +953,7 @@ SELECT m.inner_net_id AS net_id, n.inst_id AS inst_id, n.name AS net_name,
        NULL AS stmt_id,
        m.id AS term_map_id, NULL AS conn_id, NULL AS stmt_target_id,
        NULL AS assign_operand_id,
-       NULL AS expr_ref_id, NULL AS proc_id, NULL AS dep_id,
+       NULL AS expr_ref_id, NULL AS proc_event_id, NULL AS dep_id,
        NULL AS hier_ref_id
 FROM term_map m JOIN net n ON n.id = m.inner_net_id
 UNION ALL
@@ -951,7 +1006,7 @@ FROM expr_ref e JOIN net n ON n.id = e.net_id
 UNION ALL
 SELECT pe.net_id, n.inst_id, n.name, 'event',
        NULL, NULL, 1, pe.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, pe.proc_id, NULL, NULL
+       NULL, NULL, NULL, NULL, NULL, pe.id, NULL, NULL
 FROM proc_event pe JOIN net n ON n.id = pe.net_id
 WHERE pe.net_id IS NOT NULL
 UNION ALL

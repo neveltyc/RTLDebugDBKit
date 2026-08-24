@@ -495,25 +495,27 @@ flag marks the hop where bit precision is lost.
 
 ## The stable query interface
 
-Fifteen views. Their existence, column sets and order, column semantics,
+Seventeen views. Their existence, column sets and order, column semantics,
 NULL rules and row granularity are the contract; `verify-designdb.py`
 asserts all of it on every export. Ground rules:
 
-* A FACT view's row is one base-table row — `v_tree_node`, `v_net`,
+* A FACT view's row is one base-table row — `v_tree_node`, `v_node_path`,
+  `v_net`,
   `v_term`, `v_term_map`, `v_net_conn`, `v_net_dep`,
-  `v_stmt`, `v_stmt_target`, `v_stmt_operand`, `v_call_site`,
+  `v_stmt`, `v_stmt_target`, `v_stmt_operand`, `v_proc_event`,
+  `v_call_site`,
   `v_hier_ref` — and
   count(view) == count(base) is checked. Every internal join is against a
   primary key; nothing fans out.
 * Not every id the contract publishes has a view to follow it into.
-  `expr_ref`, `proc` and `prim` are named by `v_net_attachment`,
+  `expr_ref` and `prim` are named by `v_net_attachment`,
   `v_net_dep`, `v_driver` and `v_load` and have none — a consumer that needs
   the row behind one of those ids reads the base table this document
   describes. For `prim` that is only `prim_kind`: the node's name, def_name
   and location are already in `v_tree_node` (`node_kind='primitive'`).
   `inst_param` and `module` likewise have no views — parameter and
-  definition queries read the base tables. The fifteen views are the stable
-  surface, not the whole answerable surface. `hier_ref` was in that set
+  definition queries read the base tables. The published views are the
+  stable surface, not the whole answerable surface. `hier_ref` was in that set
   and is no longer: four views point
   at it (`v_net_dep`'s two `*_hier_ref_id`, `v_net_conn`'s
   `outer_hier_ref_id`, `v_net_attachment`'s `hier_ref_id`) and it is the one
@@ -563,6 +565,21 @@ has `inst_id` NULL, `parent_inst_id` its owning instance and
 `def_name` the gate/UDP name; `unresolved` has `module_id` NULL and
 `def_name` the unresolvable spelling; the root and generate levels
 have no location.
+
+**`v_node_path`** — one row per node: `node_id, node_path`. The dotted
+path from the node's own root, assembled the one right way: the tree stores
+a segment per node and no path strings, and the obvious hand-written
+assemblies get it wrong — anchoring on `parent_node_id IS NULL` sweeps in
+packages, which are parentless without being roots, and prefixing a net's
+`scope_node_id` path counts every generate level twice. A package
+contributes its own name and nothing else; the elaborated-tree paths are
+the rows whose node is not a `package`.
+
+Two properties to plan around. The walk covers the whole tree however few
+paths are wanted — no value pushes down into a recursive CTE — so this is a
+scan to take once and keep, not a per-row lookup. And a path does not
+round-trip: an escaped identifier may hold a `.`, so match a path whole and
+never split it back into segments.
 
 **`v_net`** — one row per net: `net_id, inst_id, module_id, module_name,
 param_signature, scope_node_id, net_name, decl_kind, data_type,
@@ -740,7 +757,7 @@ id columns pointing at that relation's own row (the exclusive-arc shape
 `term_map_id`; `actual_outside` → `conn_id`; `written_by` /
 `release_target` / `alias_binding` →
 `stmt_target_id`; `read_by` → `assign_operand_id`; `condition` /
-`statement_read` → `expr_ref_id`; `event` → `proc_id`; `dep_in` /
+`statement_read` → `expr_ref_id`; `event` → `proc_event_id`; `dep_in` /
 `dep_out` → `dep_id`; `named_from_outside` → `hier_ref_id`. The two
 wiring kinds name the segment, not the terminal: one pin takes several —
 `.q({2{r}})` tiles it twice — and a terminal id cannot tell those rows
@@ -756,9 +773,20 @@ through the id the kind implies: the statement kinds (`written_by`,
 `read_by`, `condition`, `statement_read`, `release_target`,
 `alias_binding`) through `stmt_id` against `v_stmt`; `terminal_inside` through
 `term_map_id` against `v_term_map` and `actual_outside` through `conn_id`
-against `v_net_conn`; `event` through the `proc_event` base row;
+against `v_net_conn`; `event` through `proc_event_id` against
+`v_proc_event`;
 `dep_in`/`dep_out` through `dep_id` against `v_net_dep`;
 `named_from_outside` through `hier_ref_id` against `v_hier_ref`.
+
+**`v_proc_event`** — one row per edge event: `proc_event_id, proc_id,
+inst_id, proc_kind, stmt_id, net_id, net_name, event_kind, edge_kind,
+file_path, src_path, src_line, src_col`. The sensitivity entries of a
+procedure's header (`stmt_id` NULL) and the waits its statements make.
+`proc_kind` travels with the event because the two arrive together: "which
+flops does this net clock, on which edge" is `edge_kind` beside
+`proc_kind`, and no statement view carries either. `edge_kind` is NULL for
+a level-sensitive event written explicitly; `net_id` is NULL when the event
+expression is not a plain net. A point query by `net_id` seeks.
 
 **`v_call_site`** — one row per subroutine-body expansion: `call_site_id,
 inst_id, module_id, module_name, caller_stmt_id, parent_call_site_id,
