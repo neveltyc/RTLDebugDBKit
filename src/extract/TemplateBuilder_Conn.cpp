@@ -362,7 +362,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 c.conns.push_back(std::move(tc));
                 continue;
             }
-            const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
+            const int32_t netIdx = netOfRef(*b.decl, cn.ref);
             if (netIdx < 0) {
                 // Tied to something with no name here. The row exists
                 // either way; what it is tied to is in hier_ref.
@@ -483,7 +483,7 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
                 tc.childTerm = termSlot;
                 tc.ordinal = seqOrdinal++;
                 tc.loc = at;
-                const int32_t netIdx = b.decl->netFor(*r.sym);
+                const int32_t netIdx = netOfRef(*b.decl, r);
                 if (netIdx < 0) {
                     const int32_t saved = b.curStmt;
                     b.curStmt = -1;
@@ -531,7 +531,7 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
                 c.conns.push_back(std::move(tc));
                 continue;
             }
-            const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
+            const int32_t netIdx = netOfRef(*b.decl, cn.ref);
             if (netIdx < 0) {
                 const int32_t saved = b.curStmt;
                 b.curStmt = -1;

@@ -204,6 +204,35 @@ inline bool isPlainReference(const Expression& e) {
     }
 }
 
+/// The hierarchical value a reference is rooted at, or null when the
+/// reference names something in scope. Selects, member accesses and
+/// conversions are transparent: `u.mem[3]` is a hierarchical reference to
+/// `mem`, spelled through a select.
+inline const HierarchicalValueExpression* hierarchicalRoot(const Expression* e) {
+    for (;;) {
+        if (!e)
+            return nullptr;
+        switch (e->kind) {
+            case ExpressionKind::HierarchicalValue:
+                return &e->as<HierarchicalValueExpression>();
+            case ExpressionKind::ElementSelect:
+                e = &e->as<ElementSelectExpression>().value();
+                break;
+            case ExpressionKind::RangeSelect:
+                e = &e->as<RangeSelectExpression>().value();
+                break;
+            case ExpressionKind::MemberAccess:
+                e = &e->as<MemberAccessExpression>().value();
+                break;
+            case ExpressionKind::Conversion:
+                e = &e->as<ConversionExpression>().operand();
+                break;
+            default:
+                return nullptr;
+        }
+    }
+}
+
 /// Every reference in `expr`, tagged with the bits of the assignment it
 /// occupies. Concatenations and simple assignment patterns are positioned
 /// element by element, MSB first; conversions are transparent when width-
