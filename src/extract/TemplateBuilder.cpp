@@ -483,11 +483,11 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
                 // written index -- `bus_arr[k]` in a generate loop spells one
                 // thing and lands on a different element each iteration.
                 if (iface && iface->kind == SymbolKind::InstanceArray) {
-                    auto elems = iface->as<InstanceArraySymbol>().elements;
+                    std::vector<const Symbol*> elems;
+                    flattenIfaceBinding(*iface, elems);
                     for (size_t e = 0; e < elems.size(); e++) {
                         std::string rel;
-                        if (!elems[e] ||
-                            !splitBelow(full, elems[e]->getHierarchicalPath(), rel))
+                        if (!splitBelow(full, elems[e]->getHierarchicalPath(), rel))
                             continue;
                         row.resolve = TplHierRef::ViaIfaceTerm;
                         row.ifaceTerm = it->second.term;

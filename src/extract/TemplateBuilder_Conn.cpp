@@ -276,7 +276,9 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
             // reference through the port stayed text-only while the same
             // element written in the parent (`.b(arr[k])`) resolved.
             if (ifaceSym && ifaceSym->kind == SymbolKind::InstanceArray) {
-                for (auto* elem : ifaceSym->as<InstanceArraySymbol>().elements) {
+                std::vector<const Symbol*> elems;
+                flattenIfaceBinding(*ifaceSym, elems);
+                for (auto* elem : elems) {
                     TplConn tc;
                     tc.kind = ConnKind::Interface;
                     tc.childTerm = termIdx;
