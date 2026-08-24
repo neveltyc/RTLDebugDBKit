@@ -31,7 +31,7 @@ TemplateSet TemplateBuilder::run() {
     // body has no AnalyzedScope yields a template with no procedure in it;
     // see designdb::Stats for why that happens and why no row moves.
     for (auto& [key, group] : groups) {
-        if (!analysis.getAnalyzedScope(*group.body))
+        if (!wasAnalysed(analysis, *group.body))
             stats.unanalysedBodies++;
     }
 
@@ -62,9 +62,9 @@ TemplateSet TemplateBuilder::run() {
     /// The body to extract a group's dataflow from: one the analysis manager
     /// actually analysed, else the first seen.
 void TemplateBuilder::offer(Group& g, const InstanceBodySymbol& body) {
-    if (g.body && analysis.getAnalyzedScope(*g.body))
+    if (g.body && wasAnalysed(analysis, *g.body))
         return;
-    if (!g.body || analysis.getAnalyzedScope(body))
+    if (!g.body || wasAnalysed(analysis, body))
         g.body = &body;
 }
 
@@ -114,7 +114,7 @@ std::string TemplateBuilder::groupKey(const InstanceBodySymbol& body) const {
     /// one parent is two separate branches and must be collected on both,
     /// and only a repeat *on the way down* is the impossible one.
 void TemplateBuilder::collect(const InstanceSymbol& inst) {
-    auto& body = inst.getCanonicalBody() ? *inst.getCanonicalBody() : inst.body;
+    auto& body = canonicalBodyOf(inst);
     auto key = groupKey(body);
     auto& g = groups[key];
     if (g.name.empty()) {

@@ -357,6 +357,32 @@ inline void collectStatementRefs(const NodeT& node, std::vector<Ref>& out) {
               out.end());
 }
 
+/// Whether `sym` is declared inside `sub` -- a subroutine's own argument,
+/// local or block variable, as opposed to something its body samples from
+/// the enclosing design.
+///
+/// By walking the scope chain, not by comparing hierarchical-path strings.
+/// The string test asked whether the symbol's path started with the
+/// subroutine's path plus a dot, which is two path constructions per symbol
+/// per call site and is only as reliable as the paths are injective: a
+/// subroutine named `f` and a sibling scope named `f_aux` share a prefix
+/// until the dot saves them, and an escaped identifier holding a dot has no
+/// such guarantee at all. The chain is exact and stops at the first hit.
+inline bool declaredInside(const Symbol& sym, const SubroutineSymbol& sub) {
+    for (auto* scope = sym.getParentScope(); scope;
+         scope = scope->asSymbol().getParentScope()) {
+        auto& owner = scope->asSymbol();
+        if (&owner == &sub)
+            return true;
+        // Statement blocks nest inside the body; anything at or above the
+        // enclosing instance is not the subroutine's own.
+        if (owner.kind == SymbolKind::InstanceBody ||
+            owner.kind == SymbolKind::CompilationUnit)
+            return false;
+    }
+    return false;
+}
+
 /// A called subroutine's free reads -- what it samples beyond its arguments.
 inline void collectCallReadsInto(const Expression& expr,
                                  std::set<const SubroutineSymbol*>& active,
@@ -375,13 +401,8 @@ inline void collectCallReadsInto(const Expression& expr,
                 return;
             std::vector<Ref> inner;
             collectStatementRefs((*sub)->getBody(), inner);
-            const std::string scope = (*sub)->getHierarchicalPath();
             for (auto& r : inner) {
-                std::string path = r.sym->getHierarchicalPath();
-                const bool isLocal = path.size() > scope.size() &&
-                                     path.compare(0, scope.size(), scope) == 0 &&
-                                     path[scope.size()] == '.';
-                if (!isLocal)
+                if (!declaredInside(*r.sym, **sub))
                     out.push_back(r);
             }
             active.erase(*sub);
@@ -417,13 +438,8 @@ struct ReadCollector : public ASTVisitor<ReadCollector, VisitFlags::AllGood> {
         std::vector<const ValueSymbol*> inner;
         ReadCollector c(inner, active);
         (*sub)->getBody().visit(c);
-        const std::string scope = (*sub)->getHierarchicalPath();
         for (auto* sym : inner) {
-            std::string path = sym->getHierarchicalPath();
-            const bool isLocal = path.size() > scope.size() &&
-                                 path.compare(0, scope.size(), scope) == 0 &&
-                                 path[scope.size()] == '.';
-            if (!isLocal)
+            if (!declaredInside(*sym, **sub))
                 out.push_back(sym);
         }
         active.erase(*sub);

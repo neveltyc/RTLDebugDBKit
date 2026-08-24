@@ -33,7 +33,6 @@
 #include <vector>
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/analysis/AnalyzedProcedure.h"
-#include "slang/analysis/ValueDriver.h"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
@@ -72,6 +71,7 @@
 #include "extract/Ref.h"
 #include "extract/SymbolText.h"
 #include "extract/ir/Nodes.h"
+#include "extract/ir/SlangFacts.h"
 
 using namespace slang;
 using namespace slang::ast;
