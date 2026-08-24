@@ -997,7 +997,12 @@ VIEW_COLUMNS = {
         "net_id", "inst_id", "net_name", "attachment_kind",
         "lo", "hi", "exact", "stmt_id",
         "term_map_id", "conn_id", "stmt_target_id", "assign_operand_id",
-        "expr_ref_id", "proc_id", "dep_id", "hier_ref_id"],
+        "expr_ref_id", "proc_event_id", "dep_id", "hier_ref_id"],
+    "v_node_path": ["node_id", "node_path"],
+    "v_proc_event": [
+        "proc_event_id", "proc_id", "inst_id", "proc_kind", "stmt_id",
+        "net_id", "net_name", "event_kind", "edge_kind",
+        "file_path", "src_path", "src_line", "src_col"],
     "v_call_site": [
         "call_site_id", "inst_id", "module_id", "module_name",
         "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
@@ -1027,6 +1032,8 @@ for view, base in (
     ("v_stmt_operand", "assign_operand"),
     ("v_call_site", "call_site"),
     ("v_hier_ref", "hier_ref"),
+    ("v_proc_event", "proc_event"),
+    ("v_node_path", "tree_node"),
 ):
     nv = one(f'SELECT count(*) FROM "{view}"')
     nb = one(f'SELECT count(*) FROM "{base}"')
@@ -1192,7 +1199,7 @@ check(one("""
     WHERE (term_map_id IS NOT NULL) + (conn_id IS NOT NULL)
         + (stmt_target_id IS NOT NULL)
         + (assign_operand_id IS NOT NULL) + (expr_ref_id IS NOT NULL)
-        + (proc_id IS NOT NULL) + (dep_id IS NOT NULL)
+        + (proc_event_id IS NOT NULL) + (dep_id IS NOT NULL)
         + (hier_ref_id IS NOT NULL) != 1""") == 0,
       "every attachment names exactly one typed id")
 check(one("""
@@ -1205,7 +1212,7 @@ check(one("""
         WHEN 'read_by'            THEN assign_operand_id IS NULL
         WHEN 'condition'          THEN expr_ref_id IS NULL
         WHEN 'statement_read'     THEN expr_ref_id IS NULL
-        WHEN 'event'              THEN proc_id IS NULL
+        WHEN 'event'              THEN proc_event_id IS NULL
         WHEN 'dep_in'             THEN dep_id IS NULL
         WHEN 'dep_out'            THEN dep_id IS NULL
         WHEN 'named_from_outside' THEN hier_ref_id IS NULL
@@ -1215,7 +1222,8 @@ check(one("""
 for col, tbl in (("term_map_id", "term_map"), ("conn_id", "net_conn"),
                  ("stmt_target_id", "stmt_target"),
                  ("assign_operand_id", "assign_operand"),
-                 ("expr_ref_id", "expr_ref"), ("proc_id", "proc"),
+                 ("expr_ref_id", "expr_ref"),
+                 ("proc_event_id", "proc_event"),
                  ("dep_id", "net_dep"), ("hier_ref_id", "hier_ref")):
     check(one(f"""SELECT count(*) FROM v_net_attachment a
         WHERE a.{col} IS NOT NULL
@@ -1400,6 +1408,7 @@ for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
                   ("v_net_conn", "outer_net_id"),
                   ("v_net_attachment", "net_id"),
                   ("v_hier_ref", "resolved_net_id"),
+                  ("v_proc_event", "net_id"),
                   ("v_net_dep", "call_site_id"),
                   ("v_stmt", "call_site_id"),
                   ("v_stmt_target", "call_site_id"),
@@ -1427,6 +1436,23 @@ if mode:
 
 
 if mode == "constructs":
+    # One procedure takes several events on one net -- two waits on clk
+    # here -- so the attachment names the event, not the procedure.
+    check(one("""
+        SELECT count(DISTINCT a.proc_event_id) FROM v_net_attachment a
+        JOIN v_net n ON n.net_id = a.net_id
+        WHERE a.attachment_kind = 'event' AND n.net_name = 'clk'""")
+          == one("""
+        SELECT count(*) FROM proc_event e JOIN net n ON n.id = e.net_id
+        WHERE n.name = 'clk'"""),
+          "each event on one net is its own attachment row")
+    # The clock question in one row: which edge, in what kind of procedure.
+    check(one("""
+        SELECT count(*) FROM v_proc_event
+        WHERE net_name = 'clk' AND edge_kind = 'posedge'
+          AND proc_kind = 'always_ff' AND event_kind = 'sensitivity'""") >= 1,
+          "v_proc_event answers edge and procedure kind together")
+
     # One pin takes several connection segments -- `.q({2{rep_r}})` tiles it
     # twice -- so the wiring attachment names the segment. A terminal id
     # cannot tell the two copies apart; the two rows must differ.
@@ -2348,6 +2374,19 @@ if mode == "outward":
           "and it reads nothing at all, so nothing else stands in for it")
 
 if mode == "naming":
+    # The assembled path keeps every segment as the tree spells it: an
+    # escaped identifier with its backslash, its terminator and the `.`
+    # inside it, and a generate level exactly once.
+    for path in ("naming.\\u.1 ", "naming.\\gn.1 ", "naming.g[0]"):
+        check(one("SELECT count(*) FROM v_node_path WHERE node_path = ?",
+                  path) == 1,
+              f"v_node_path spells {path!r} as the tree does")
+    # A net's full path is its INSTANCE's path plus the name -- the scope
+    # node's path would repeat the generate segment the name already has.
+    check(one("""
+        SELECT count(*) FROM v_net n JOIN v_node_path p ON p.node_id = n.inst_id
+        WHERE p.node_path || '.' || n.net_name = 'naming.g[0].w'""") == 1,
+          "and a net path assembles from its instance, not its scope")
     # Every leaf comes through leafSegment, so an escaped name keeps slang's
     # own `\name ` spelling and an array element carries its SOURCE index --
     # for a gate exactly as for a module instantiation, since the two are one
@@ -3074,6 +3113,20 @@ if mode == "callsite":
           "and call site 2's", f"got {sorted(v2)}")
 
 if mode == "package":
+    # A package is parentless without being a root, so it anchors its own
+    # path and contributes nothing to any instance path.
+    check(one("""
+        SELECT count(*) FROM v_node_path p JOIN v_tree_node t
+          ON t.node_id = p.node_id
+        WHERE t.node_kind = 'package' AND p.node_path = t.node_name""") == 1,
+          "a package path is its own name and no more")
+    check(one("""
+        SELECT count(*) FROM v_node_path p JOIN v_tree_node t
+          ON t.node_id = p.node_id
+        WHERE t.node_kind != 'package'
+          AND p.node_path LIKE (SELECT node_name FROM v_tree_node
+                                WHERE node_kind = 'package') || '.%'""") == 0,
+          "and no elaborated path runs through one")
     # A package is a pseudo-occurrence now: node_kind='package', a matching
     # inst with parent_inst_id NULL and a def_kind='package' module.
     check(one("""

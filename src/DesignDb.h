@@ -460,6 +460,20 @@ namespace designdb {
 /// are told apart without joining a table the view set does not cover.
 /// `v_db_info` gains `tool`, which was a required meta key with no column;
 /// the required set is now exactly the view's columns less `top`.
+///
+/// Two views join the set. `v_node_path` publishes the path assembly the
+/// tree deliberately does not store: a segment per node is the right
+/// storage, but every consumer re-derived the join and three plausible
+/// spellings of it are wrong -- anchoring on a null parent sweeps in
+/// packages, and prefixing a net's scope path counts generate levels
+/// twice. `v_proc_event` publishes the events themselves, so "which flops
+/// does this net clock, on which edge" stops needing the base tables:
+/// edge_kind and the procedure's kind arrive on one row.
+///
+/// `v_net_attachment`'s `event` kind moves from `proc_id` to
+/// `proc_event_id` with them, for the reason the two wiring kinds moved:
+/// one procedure takes several events on one net, and the procedure is not
+/// the row.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
