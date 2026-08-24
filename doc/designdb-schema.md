@@ -471,6 +471,22 @@ into the flattened object, NOT declared indices: `logic [15:8] off` has bit
 offsets straight onto declared indices mislabels every signal not declared
 `[N-1:0]`; the declared shape is recoverable from the type text.
 
+An aggregate is flattened into that same space, and the two kinds run in
+opposite directions — the one thing a consumer cannot guess from a single
+example:
+
+* **Packed**, most significant first. In `struct packed { logic [7:0] hi;
+  logic [7:0] lo; }` the member declared FIRST takes the HIGH offsets:
+  `hi` is 8–15, `lo` is 0–7. It is one integral value, and the first
+  member is its top bits.
+* **Unpacked**, first element lowest. In `logic [7:0] arr [0:1]` the
+  element declared first takes the LOW offsets: `arr[0]` is 0–7, `arr[1]`
+  is 8–15. There is no integral value here at all — the space is the
+  selectable one slang computes — and it counts up from the first element.
+
+`width` is that flattened width for both, so a range is always measurable
+against the whole (see `net`).
+
 * NULL bits with `exact=1` — the whole object.
 * NULL bits with `exact=0` — somewhere inside it, unknown where.
 * present bits with `exact=1` — exactly those bits.
