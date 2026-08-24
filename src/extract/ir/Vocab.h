@@ -121,6 +121,21 @@ inline const char* word(DefKind k) {
     SLANG_UNREACHABLE;
 }
 
+enum class NodeKind : uint8_t {
+    Root, Instance, Generate, Primitive, Unresolved, Package
+};
+inline const char* word(NodeKind k) {
+    switch (k) {
+        case NodeKind::Root:       return "root";
+        case NodeKind::Instance:   return "instance";
+        case NodeKind::Generate:   return "generate";
+        case NodeKind::Primitive:  return "primitive";
+        case NodeKind::Unresolved: return "unresolved";
+        case NodeKind::Package:    return "package";
+    }
+    SLANG_UNREACHABLE;
+}
+
 enum class ProcKind : uint8_t {
     Always, AlwaysFF, AlwaysComb, AlwaysLatch, Initial, Final
 };

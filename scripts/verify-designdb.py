@@ -464,6 +464,38 @@ check(one("""
     WHERE (n.id IS NOT NULL AND n.inst_id != p.inst_id)
        OR (s.id IS NOT NULL AND COALESCE(s.proc_id, 0) != e.proc_id)""") == 0,
       "proc_event stays inside its procedure")
+# The ids are computed as base + index per instance, so the one error the
+# REFERENCES clauses cannot see is a wrong base: an id that lands on a
+# perfectly valid row of ANOTHER instance. These two joins are where that
+# error becomes visible for the two per-instance references the block
+# above does not already cover.
+check(one("""
+    SELECT count(*) FROM stmt s JOIN proc p ON p.id = s.proc_id
+    WHERE p.inst_id != s.inst_id""") == 0,
+      "a statement's procedure belongs to its own instance")
+check(one("""
+    SELECT count(*) FROM hier_ref h JOIN stmt s ON s.id = h.stmt_id
+    WHERE s.inst_id != h.inst_id""") == 0,
+      "a hier_ref's statement belongs to its own instance")
+
+# ------------------------------------------------------------- ordinals
+# Dense 0..n-1 per parent. The UNIQUE constraints stop duplicates on the
+# statement children; nothing stops a list that starts past 0 or skips --
+# which is what a producer indexing the wrong list looks like -- and the
+# tables without a UNIQUE get their duplicate check here too.
+ORDINALS = (("tree_node", "parent_node_id"), ("inst_param", "inst_id"),
+            ("term", "inst_id"), ("term_map", "term_id"),
+            ("net_conn", "term_id"), ("proc", "inst_id"),
+            ("stmt", "inst_id"), ("stmt_target", "stmt_id"),
+            ("assign_operand", "stmt_id"), ("expr_ref", "stmt_id"))
+for tbl, parent in ORDINALS:
+    check(one(f"""
+        SELECT count(*) FROM (
+          SELECT 1 FROM "{tbl}" GROUP BY "{parent}"
+          HAVING min(ordinal) != 0
+              OR max(ordinal) != count(*) - 1
+              OR count(DISTINCT ordinal) != count(*))""") == 0,
+          f"{tbl}.ordinal is dense per {parent}")
 check(one("""
     SELECT count(*) FROM proc_event
     WHERE (event_kind = 'sensitivity') != (stmt_id IS NULL)""") == 0,
@@ -829,11 +861,14 @@ check(one("""
       "connection columns match conn_kind")
 
 # ------------------------------------------------------------------ meta
-required = ["schema_version", "analysis_status", "error_count",
-            "unresolved_count", "empty_procedure_count", "duplicate_path_count",
-            "recursion_count", "truncated_call_count", "unanalysed_inst_count",
-            "tool", "tool_version", "slang_version", "producer_revision",
-            "config_digest"]
+# The doc states the required set as a rule -- the v_db_info columns plus
+# `tool`, minus `top` -- so it is derived here rather than hand-copied:
+# a column added to the view then demands its meta key without this list
+# needing to know.
+required = [r[1] for r in con.execute("PRAGMA table_info(v_db_info)")
+            if r[1] != "top"] + ["tool"]
+if required == ["tool"]:
+    fatal("v_db_info is missing")
 meta = dict(con.execute("SELECT key, value FROM meta"))
 # Fatal rather than collected: every check below indexes these keys.
 missing = [k for k in required if k not in meta or meta[k] is None]
