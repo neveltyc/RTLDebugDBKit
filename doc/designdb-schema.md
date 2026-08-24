@@ -888,20 +888,6 @@ ordinal, sequence, signature, width).
   round-trip.
 * `ordinal` is position in a declaration or extraction list; `sequence` is
   execution order inside a procedure. Neither is an identity.
-
-For a reader arriving with netlist instincts, the objects are the ones the
-EDA standards already name:
-
-| here | elsewhere |
-|---|---|
-| `net` | OpenAccess oaNet, VPI vpiNet |
-| `term` on the root | OpenAccess oaTerm — the block-boundary port |
-| `term` on a child | OpenAccess oaInstTerm — the instance pin |
-| `net_conn` | VPI vpiHighConn — the pin's outside |
-| `term_map` | VPI vpiLowConn — the pin's inside |
-| `net_dep` | one hop of a fanin/fanout traversal |
-| `hier_ref` | an XMR |
-
 * Every id is issued by the exporter in one pass; 0 is never an id. The
   REFERENCES clauses are enforced by the verifier's `foreign_key_check`,
   not per-insert — and the enum CHECK clauses are, by default, not in the
@@ -910,6 +896,80 @@ EDA standards already name:
   `--check-constraints`, and the verifier re-derives every domain from the
   finished file either way. The value domains are contract and are listed
   in this document; their CHECK spelling in the file is not.
+
+## Against the standard object model
+
+The vocabulary is the SystemVerilog object model's wherever one exists, because a reader arriving with VPI or netlist instincts
+should not have to learn new words for old objects. Where this schema
+departs from it, the departure is listed here rather than left to be
+inferred — the same courtesy `vpi_user.h` gets from any tool that extends
+it.
+
+**The same object, the same name.** These carry the standard's meaning:
+
+| here | standard |
+|---|---|
+| `module` | `vpiModule`, `vpiInterface`, `vpiProgram`, `vpiPackage` — the definition, per `def_kind` |
+| `inst` | `vpiInstance` |
+| `inst_param` | `vpiParameter` |
+| `prim` | `vpiPrimitive` — `vpiGate`, `vpiSwitch`, `vpiUdp`, per `prim_kind` |
+| `term` on the root | `vpiPort`; OpenAccess oaTerm, the block-boundary port |
+| `term` on a child | `vpiPort` of the instance; OpenAccess oaInstTerm, the pin |
+| `net` | `vpiNet`; OpenAccess oaNet |
+| `proc` | `vpiProcess` — `vpiAlways`, `vpiInitial`, `vpiFinal` |
+| `proc_event` | `vpiEventControl` on a process, `vpiEventStmt` for a wait |
+| `net_conn` | `vpiHighConn` — the pin's outside |
+| `term_map` | `vpiLowConn` — the pin's inside |
+| `v_driver`, `v_load` | `vpiDriver`, `vpiLoad` — asked there as relations of a net |
+
+**The same object, a different shape.** The name is the standard's; what the
+row holds is not:
+
+* `net` also carries what the standard files under `vpiVariables`. Dataflow
+  does not distinguish them and a dependency end is one id, so they are one
+  relation; `decl_kind` says which it was (`wire`, `trireg`, a nettype's own
+  name, or `variable`).
+* `net_conn` and `term_map` are row SETS. `vpiHighConn` and `vpiLowConn` are
+  each one handle; here a connection is one row per atomic segment, each
+  with its window of the formal, because `.q({2{r}})` is two segments of one
+  pin and one handle cannot say so.
+* `tree_node` is one relation for every kind of hierarchy level —
+  instance, `vpiGenScope`, primitive, package, and an unresolved
+  instantiation — under one id space, so `a.b[0].c` resolves by one indexed
+  lookup per segment without knowing what each level is.
+* A bit range is an LSB-relative offset into the flattened object, never
+  `vpiLeftRange`/`vpiRightRange`'s declared indices. See *Bit ranges*.
+* `stmt` is one relation where the standard has a class hierarchy of
+  statements. `stmt_kind` discriminates, and a statement-level construct
+  the model does not otherwise name gets a row on the same terms — the
+  procedure header's `event_control`, an `alias`, a `release`.
+* `data_type` is interned TEXT, not a `vpiTypespec` graph. The type's
+  spelling is enough to recover the declared shape; its structure is not
+  modelled.
+
+**No counterpart in the standard.** These are this schema's own, and a
+consumer should not go looking for them in `vpi_user.h`:
+
+* `net_dep` — the standard offers `vpiDriver` and `vpiLoad` as relations a
+  simulator computes on demand. Here every arc is a stored row with its
+  statement, its operand or target row, its bit windows and its call site,
+  so a trace is a query rather than a callback.
+* `hier_ref` — a reference that leaves its instance. The standard has
+  `vpiFullName` as a string property; there is no object for the reference
+  itself, and no place to put its resolution, its access direction or its
+  window.
+* `call_site` — one subroutine-body expansion. Needed because a body is
+  walked once per call, which the standard's model does not represent.
+* `stmt_target`, `assign_operand`, `expr_ref` — positioned, classified
+  references. The standard keeps expression trees; these are the flattened
+  reference rows the trees are reduced to (see *What is not here*).
+* `meta`, `src_file`, `file` — the seal and the provenance. Nothing in the
+  object model answers "which files did this come from, and have they
+  changed since".
+* `stmt.stmt_kind`'s vocabulary is this schema's own words, not the
+  standard's class names, though most name the same construct
+  (`vpiAssignment`, `vpiContAssign`, `vpiTaskCall`, `vpiEventStmt`,
+  `vpiDisable`).
 
 ## Provenance
 
