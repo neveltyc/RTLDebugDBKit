@@ -43,7 +43,7 @@ MODES = {
     "patterncase": "patterncase",
     "callsite": "callsite_top",
     "package": "package_top",
-    "xmr": "xmr",
+    "xmr": "xmr_top",
     "external": "tb_top",
     "outward": "outward_tb",
     "rootref": "rootref",
@@ -2350,6 +2350,17 @@ if mode == "rootref":
           "while the local path beside it follows the occurrence")
 
 if mode == "xmr":
+    # A path that climbs out of a twice-instantiated body and back into it
+    # lands on a symbol of that body, and is still not the occurrence's own
+    # net: both occurrences answer with the reference, neither with itself.
+    check(one("""SELECT count(*) FROM v_driver d JOIN net n ON n.id=d.signal_net_id
+                 WHERE n.name='named' AND d.driver_kind='external'""") == 2,
+          "a path back into the analysed body stays a reference")
+    check(one("""SELECT count(*) FROM v_driver d JOIN net n ON n.id=d.signal_net_id
+                 JOIN net s ON s.id=d.driver_net_id
+                 WHERE n.name='named' AND s.name='mine'""") == 0,
+          "and never resolves to the occurrence's own net")
+
     # A downward read is a real dependency naming the reference it went
     # through -- not a hier_ref row beside a fabricated constant driver.
     check(one("""
