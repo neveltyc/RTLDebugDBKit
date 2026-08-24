@@ -275,7 +275,7 @@ which outer column is set — the kind first, then its pointer:
 | `constant` | — | a tie-off; the term window is kept so the formal's bits tile without a gap |
 | `unconnected` | — | recorded, not omitted: absence would also mean "the exporter did not get this far". Claimed only for a pin the parent left empty — a connection whose shape this schema cannot spell (a sequence expression against a black box) records the nets it reaches as `expression_operand` instead |
 | `expression_operand` | `outer_net_id` or `outer_hier_ref_id` | the actual is an expression; this row is one net it reads. `.en(state == RUN)` samples `state` but does not alias it to `en`; `map_exact` is 0 by construction |
-| `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. NULL when the binding has no per-occurrence object (an interface array element). No dataflow arc pretends to cross an interface binding |
+| `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. An interface ARRAY port binds one element per segment, in declaration order, as a concatenated actual does on an ordinary port. NULL only where the binding has no per-occurrence object at all. No dataflow arc pretends to cross an interface binding |
 | `external_reference` | `outer_hier_ref_id` | tied to something with no name in the parent (`.p(u.g[7:4])`); the reference says what, with `access='connect'`. It crosses like any other connection once the reference resolves — with a `map_exact` of its own, so the arc is traceable bit by bit — while an upward tie (`.a(tb.glob)`) stays a recorded connection with no arc |
 
 Width degradation: when the connection expression's width and the declared
@@ -452,10 +452,12 @@ when the export can replay the reference —
   bound to;
 * package items (`pkg::mask`): resolved to the package's net (see
   *Packages*), the same for a bare name imported from the package;
-* upward references, and members reached through an interface array that
-  is the module's own port: NULL. The one analysed body speaks for
-  occurrences whose surroundings may differ, so the target is not resolved
-  per occurrence.
+* through an interface ARRAY port of the instance's own
+  (`bus_arr[0].vld`): resolved to the element that occurrence's terminal
+  binds in that segment;
+* upward references: NULL. The one analysed body speaks for occurrences
+  whose surroundings may differ, so the target is not resolved per
+  occurrence.
 
 NULL `resolved_*` means not resolved here. A dependency whose source went
 through an unresolved reference is still written and surfaces in `v_driver`
@@ -670,7 +672,7 @@ rest of the reference is `v_hier_ref`. `driver_kind`:
   row here as everywhere. A call written inside a CONDITION has no
   statement row to anchor to and records neither.
 * `external` — the source is a reference this export has no net row for:
-  an upward name from a shared body, an interface-array binding.
+  an upward name from a shared body, a `$unit` item.
   `driver_net_id` is NULL and `driver_ref` carries the reference as
   written, so the row still answers what it reads; `src_hier_ref_id` on the
   dependency points at the rest of it (`v_hier_ref`: location, resolution
@@ -997,11 +999,14 @@ no dataflow, not that the hierarchy stops early.
   the far object has no row: a trace ends at the reference text. `$unit`
   compilation-unit items are the same. (Package variables do resolve — see
   *Packages*.)
-* An interface array as a module's OWN port (`simple_bus bus_arr[2]`)
-  binds as a single `net_conn` row with `outer_intf_inst_id` NULL, and
-  member references through it stay text-only. An element binding written
-  in the parent (`.b(arr[k])`) resolves per occurrence like any other
-  interface port.
+
+* A built-in method's effect on the object it is called on is not
+  modelled. `q.push_back(x)` records the call (`stmt_kind='call'`,
+  `construct='push_back'`) and its argument as a read, and nothing that
+  says `q` was rewritten — so a queue has loads and no driver. Queues,
+  dynamic and associative arrays are testbench constructs; the
+  synthesizable subset does not meet them, and the mutation has no honest
+  arc to record for the methods that take no value argument.
 * Clocking blocks are not modelled: a clocking block declares no nets and
   gets no rows, and a `cb.sig` reference has no special handling. Virtual
   interfaces likewise — a `virtual interface` handle is a run-time value,

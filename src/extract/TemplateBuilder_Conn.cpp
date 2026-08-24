@@ -269,6 +269,27 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
 
         if (conn->port.kind == SymbolKind::InterfacePort) {
             auto [ifaceSym, modport] = conn->getIfaceConn();
+            // An interface ARRAY port binds one element per segment, the
+            // shape a concatenated actual already has on an ordinary port:
+            // one terminal, a row per piece, in declaration order. Recorded
+            // as a single row it named no instance at all, so every member
+            // reference through the port stayed text-only while the same
+            // element written in the parent (`.b(arr[k])`) resolved.
+            if (ifaceSym && ifaceSym->kind == SymbolKind::InstanceArray) {
+                for (auto* elem : ifaceSym->as<InstanceArraySymbol>().elements) {
+                    TplConn tc;
+                    tc.kind = ConnKind::Interface;
+                    tc.childTerm = termIdx;
+                    tc.ordinal = nextOrdinal();
+                    tc.loc = at;
+                    if (auto it = childOf.find(elem); it != childOf.end())
+                        tc.ifaceChild = it->second;
+                    else
+                        stats.external++;
+                    c.conns.push_back(std::move(tc));
+                }
+                continue;
+            }
             TplConn tc;
             tc.kind = ConnKind::Interface;
             tc.childTerm = termIdx;
@@ -285,8 +306,8 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                         tc.ifaceOwnTerm = ownIt->second.term;
                 }
                 else {
-                    // An interface array element or another synthesized
-                    // shape: no per-occurrence object to point at.
+                    // A synthesized shape with no per-occurrence object to
+                    // point at.
                     stats.external++;
                 }
             }
