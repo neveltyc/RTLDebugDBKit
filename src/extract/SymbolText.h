@@ -36,6 +36,8 @@
 #include "slang/syntax/SyntaxNode.h"
 #include "slang/text/SourceManager.h"
 
+#include "extract/ir/Vocab.h"
+
 namespace designdb::detail {
 
 using namespace slang;
@@ -280,10 +282,26 @@ inline std::string procedureWord(const Symbol& sym) {
     }
 }
 
+/// The same classification as a ProcKind, for proc.proc_kind. A continuous
+/// assign has no procedure row at all, so it needs no case here.
+inline ProcKind procKindOf(const Symbol& sym) {
+    if (sym.kind != SymbolKind::ProceduralBlock)
+        return ProcKind::Always;
+    switch (sym.as<ProceduralBlockSymbol>().procedureKind) {
+        case ProceduralBlockKind::AlwaysComb:  return ProcKind::AlwaysComb;
+        case ProceduralBlockKind::AlwaysLatch: return ProcKind::AlwaysLatch;
+        case ProceduralBlockKind::AlwaysFF:    return ProcKind::AlwaysFF;
+        case ProceduralBlockKind::Always:      return ProcKind::Always;
+        case ProceduralBlockKind::Initial:     return ProcKind::Initial;
+        case ProceduralBlockKind::Final:       return ProcKind::Final;
+        default:                               return ProcKind::Always;
+    }
+}
+
 /// Every edge-triggered event in a timing control, in the order written --
 /// all of them, since an event list has no ordering semantics.
 inline void collectEdgeEvents(const TimingControl* t,
-                              std::vector<std::pair<const Expression*, std::string>>& out,
+                              std::vector<std::pair<const Expression*, Edge>>& out,
                               std::vector<const Expression*>* iffs = nullptr) {
     if (!t)
         return;
@@ -299,10 +317,10 @@ inline void collectEdgeEvents(const TimingControl* t,
             // dataflow rows already carry, and duplicating it would list
             // every combinational read twice.
             out.emplace_back(&se.expr,
-                             se.edge == EdgeKind::PosEdge   ? "posedge"
-                             : se.edge == EdgeKind::NegEdge ? "negedge"
-                             : se.edge == EdgeKind::BothEdges ? "both"
-                                                              : "");
+                             se.edge == EdgeKind::PosEdge     ? Edge::Posedge
+                             : se.edge == EdgeKind::NegEdge   ? Edge::Negedge
+                             : se.edge == EdgeKind::BothEdges ? Edge::Both
+                                                              : Edge::None);
             // `@(posedge clk iff en)` samples `en` too; it qualifies the
             // event rather than being one.
             if (iffs && se.iffCondition)
@@ -528,12 +546,12 @@ inline std::string declarationKindOf(const Symbol& sym) {
     }
 }
 
-inline std::string directionWord(ArgumentDirection d) {
+inline Direction directionOf(ArgumentDirection d) {
     switch (d) {
-        case ArgumentDirection::In:    return "input";
-        case ArgumentDirection::Out:   return "output";
-        case ArgumentDirection::InOut: return "inout";
-        default:                       return "ref";
+        case ArgumentDirection::In:    return Direction::Input;
+        case ArgumentDirection::Out:   return Direction::Output;
+        case ArgumentDirection::InOut: return Direction::Inout;
+        default:                       return Direction::Ref;
     }
 }
 

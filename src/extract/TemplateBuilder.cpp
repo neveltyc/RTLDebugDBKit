@@ -208,8 +208,8 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
         switch (portSym->kind) {
             case SymbolKind::Port: {
                 auto& p = portSym->as<PortSymbol>();
-                term.kind = "signal";
-                term.direction = directionWord(p.direction);
+                term.kind = TermKind::Signal;
+                term.direction = directionOf(p.direction);
                 term.dataTypeId = writer.internDataType(p.getType().toString());
                 if (p.getType().isIntegral())
                     term.width = static_cast<int64_t>(p.getType().getBitWidth());
@@ -225,8 +225,8 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
             }
             case SymbolKind::MultiPort: {
                 auto& mp = portSym->as<MultiPortSymbol>();
-                term.kind = "signal";
-                term.direction = directionWord(mp.direction);
+                term.kind = TermKind::Signal;
+                term.direction = directionOf(mp.direction);
                 term.dataTypeId = writer.internDataType(mp.getType().toString());
                 if (mp.getType().isIntegral())
                     term.width = static_cast<int64_t>(mp.getType().getBitWidth());
@@ -235,7 +235,7 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
             }
             case SymbolKind::InterfacePort: {
                 auto& ip = portSym->as<InterfacePortSymbol>();
-                term.kind = "interface";
+                term.kind = TermKind::Interface;
                 std::string text = ip.interfaceDef
                                        ? std::string(ip.interfaceDef->name)
                                        : std::string("interface");
@@ -254,16 +254,16 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
     collectTermSlots(body, termSlots[&t]);
 }
 
-int32_t TemplateBuilder::newStmt(Build& b, std::string kind, std::string construct,
-                                 std::string assignKind, int64_t seq, std::string delay,
+int32_t TemplateBuilder::newStmt(Build& b, StmtKind kind, std::string construct,
+                                 AssignKind assignKind, int64_t seq, std::string delay,
                                  int64_t dropped, const TplLoc& loc) {
     TplStmt s;
     s.scope = b.curScope;
     s.proc = b.curProc;
     s.sequence = b.curProc < 0 ? -1 : seq;
-    s.kind = std::move(kind);
+    s.kind = kind;
     s.construct = std::move(construct);
-    s.assignKind = std::move(assignKind);
+    s.assignKind = assignKind;
     s.delay = std::move(delay);
     s.dropped = dropped;
     s.callSite = b.curCallSite;
@@ -277,13 +277,13 @@ int32_t TemplateBuilder::newStmt(Build& b, std::string kind, std::string constru
     return idx;
 }
 
-int32_t TemplateBuilder::addExprRef(Build& b, int32_t stmt, const Ref& r, std::string role,
+int32_t TemplateBuilder::addExprRef(Build& b, int32_t stmt, const Ref& r, RefRole role,
                                     int32_t netIdx) {
     TplExprRef e;
     e.stmt = stmt;
     e.ordinal = b.exprOrdinal++;
     e.net = netIdx;
-    e.role = std::move(role);
+    e.role = role;
     e.r = rangeOf(r);
     const int32_t idx = int32_t(b.t->exprRefs.size());
     b.t->exprRefs.push_back(std::move(e));
@@ -301,7 +301,7 @@ int32_t TemplateBuilder::addExprRef(Build& b, int32_t stmt, const Ref& r, std::s
     /// they describe a particular dependency rather than the reference.
 int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
                                     const TplLoc& at, EvalContext& eval,
-                                    const char* access,
+                                    std::optional<Access> access,
                                     const Ref* asWritten) {
     auto key = std::make_tuple(r.origin, isWrite, b.curStmt);
     if (auto it = b.hierSeen.find(key); it != b.hierSeen.end())
@@ -336,7 +336,7 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
     TplHierRef row;
     row.stmt = b.curStmt;
     row.path = std::move(text);
-    row.access = access ? access : (isWrite ? "write" : "read");
+    row.access = access.value_or(isWrite ? Access::Write : Access::Read);
     row.r = rangeOf(asWritten ? *asWritten : r);
     row.loc = at;
     fillResolution(b, row, r);
@@ -443,7 +443,8 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
                     if (splitBelow(full, ifacePrefix, rel)) {
                         row.resolve = TplHierRef::ViaIfaceTerm;
                         row.ifaceTerm = it->second.term;
-                        splitSegsAndNet(rel, *target, row);
+                        if (!segsFromAncestry(nullptr, iface, *target, row))
+                            row.resolve = TplHierRef::Failed;
                         return;
                     }
                 }
@@ -461,7 +462,8 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     std::string rel;
     if (!fromRoot && splitBelow(full, b.decl->bodyPrefix(), rel)) {
         row.resolve = TplHierRef::Downward;
-        splitSegsAndNet(rel, *target, row);
+        if (!segsFromAncestry(b.body, nullptr, *target, row))
+            row.resolve = TplHierRef::Failed;
         return;
     }
     // getHierarchicalPath() stops at Root (Symbol.cpp:117 walks up only
@@ -469,7 +471,8 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // already root-relative and its first segment is a top instance name --
     // which is what Stamper's descend(0, segs) consumes.
     row.resolve = TplHierRef::Absolute;
-    splitSegsAndNet(full, *target, row);
+    if (!segsFromAncestry(nullptr, nullptr, *target, row))
+        row.resolve = TplHierRef::Failed;
 }
 
 bool TemplateBuilder::splitBelow(const std::string& full, const std::string& prefix,
@@ -483,12 +486,30 @@ bool TemplateBuilder::splitBelow(const std::string& full, const std::string& pre
     return true;
 }
 
-    /// Splits `rel` into the tree segments that lead to the target's
-    /// instance and the scope-relative net name inside it. The instance
-    /// chain is recovered from the target symbol's own ancestry: every
-    /// enclosing InstanceSymbol contributes its path segments.
-void TemplateBuilder::splitSegsAndNet(const std::string& rel, const Symbol& target,
-                                      TplHierRef& row) {
+    /// Fills the replay route to `target`: the tree segments from the stop
+    /// level down to the target's instance, and the scope-relative net name
+    /// inside it. Stops at `stopBody` (the analysed body: a Downward route),
+    /// at `stopInst` (the instance an interface terminal is bound to), or at
+    /// the design root when both are null (an Absolute route).
+    ///
+    /// The segments come from the target's own ancestry through the same
+    /// producers that named the tree -- leafSegment per instance level,
+    /// generateSegment per generate level, an array element fused with its
+    /// array's name exactly as DeclIndex spells its scope. They used to be
+    /// recovered by splitting slang's hierarchical-path string on '.', which
+    /// agreed with the tree only where slang's spelling and ours happened to
+    /// coincide: an escaped identifier with a dot in it split apart, and an
+    /// unnamed instance -- whose level slang's path omits entirely -- left a
+    /// gap no lookup could cross. The net name stays the slang-path suffix
+    /// below the owner, because net rows are named from that same suffix
+    /// (relativePath), and one producer per channel is the point.
+    ///
+    /// False means no route: the ancestry never met the stop level, or a
+    /// level on the way has no name of its own (a nameless instantiation's
+    /// tree segment is synthesised per scope and cannot be respelled here).
+bool TemplateBuilder::segsFromAncestry(const InstanceBodySymbol* stopBody,
+                                       const Symbol* stopInst,
+                                       const Symbol& target, TplHierRef& row) {
     // The nearest enclosing instance of the target decides where the
     // tree walk ends and the net name begins.
     const Scope* s = target.getParentScope();
@@ -501,48 +522,82 @@ void TemplateBuilder::splitSegsAndNet(const std::string& rel, const Symbol& targ
         }
         s = sym.getParentScope();
     }
-    if (!owner) {
-        row.resolve = TplHierRef::Failed;
-        return;
-    }
-    std::string ownerPath = owner->getHierarchicalPath();
+    if (!owner)
+        return false;
     std::string netRel;
-    std::string treePath;
-    std::string targetFull = target.getHierarchicalPath();
-    if (!splitBelow(targetFull, ownerPath, netRel)) {
-        row.resolve = TplHierRef::Failed;
-        return;
+    if (!splitBelow(target.getHierarchicalPath(), owner->getHierarchicalPath(),
+                    netRel))
+        return false;
+
+    std::vector<std::string> segs;   // collected leaf to root, then reversed
+    const InstanceBodySymbol* body = owner;
+    bool reachedRoot = false;
+    while (!reachedRoot) {
+        if (stopBody && body == stopBody)
+            break;
+        const InstanceSymbol* inst = body->parentInstance;
+        if (!inst) {
+            // A body with no instance above it. An Absolute route ends
+            // here; any other stop level was never met.
+            if (stopBody || stopInst)
+                return false;
+            break;
+        }
+        if (stopInst && static_cast<const Symbol*>(inst) == stopInst)
+            break;
+        std::string seg = leafSegment(*inst);
+        if (seg.empty())
+            return false;
+        segs.push_back(std::move(seg));
+        // The generate levels holding this instance inside its parent body,
+        // innermost first. An array element and its array are one tree
+        // level, spelled base[k], exactly as DeclIndex names the scope.
+        const Scope* up = inst->getParentScope();
+        for (;;) {
+            if (!up)
+                return false;
+            auto& sym = up->asSymbol();
+            if (sym.kind == SymbolKind::InstanceBody) {
+                body = &sym.as<InstanceBodySymbol>();
+                break;
+            }
+            // Above a top instance sits the design root, not a body. That
+            // is where an Absolute route finishes -- descend(0, segs)
+            // starts at a top instance name -- and where any other stop
+            // level has been missed.
+            if (sym.kind == SymbolKind::Root ||
+                sym.kind == SymbolKind::CompilationUnit) {
+                if (stopBody || stopInst)
+                    return false;
+                reachedRoot = true;
+                break;
+            }
+            if (sym.kind == SymbolKind::GenerateBlock) {
+                auto& block = sym.as<GenerateBlockSymbol>();
+                std::string level = generateSegment(block);
+                const Scope* parent = block.getParentScope();
+                if (parent && parent->asSymbol().kind ==
+                                  SymbolKind::GenerateBlockArray) {
+                    auto& arr =
+                        parent->asSymbol().as<GenerateBlockArraySymbol>();
+                    std::string base(arr.name);
+                    if (base.empty())
+                        base = arr.getExternalName();
+                    level = base + level;
+                    up = arr.getParentScope();
+                }
+                else {
+                    up = block.getParentScope();
+                }
+                segs.push_back(std::move(level));
+                continue;
+            }
+            up = sym.getParentScope();
+        }
     }
-    // The tree part is what remains of `rel` once the net part (and its
-    // dot) is dropped from the end.
-    if (netRel.size() + 1 <= rel.size() &&
-        rel.compare(rel.size() - netRel.size(), netRel.size(), netRel) == 0 &&
-        (rel.size() == netRel.size() ||
-         rel[rel.size() - netRel.size() - 1] == '.')) {
-        treePath = rel.size() == netRel.size()
-                       ? std::string()
-                       : rel.substr(0, rel.size() - netRel.size() - 1);
-    }
-    else if (rel == netRel) {
-        treePath.clear();
-    }
-    else {
-        row.resolve = TplHierRef::Failed;
-        return;
-    }
-    row.netName = netRel;
-    row.segs.clear();
-    // Split the tree path into per-node segments. Generate levels are
-    // one node per segment exactly as instance levels are; an array
-    // index `[k]` belongs to the segment before it in the stamped names.
-    size_t start = 0;
-    while (start < treePath.size()) {
-        size_t dot = treePath.find('.', start);
-        if (dot == std::string::npos)
-            dot = treePath.size();
-        row.segs.push_back(treePath.substr(start, dot - start));
-        start = dot + 1;
-    }
+    row.netName = std::move(netRel);
+    row.segs.assign(segs.rbegin(), segs.rend());
+    return true;
 }
 
 void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body) {
@@ -696,7 +751,11 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
     if (!isContinuous) {
         TplProcedure p;
         p.scope = b.decl->scopeForSymbol(sym);
-        p.kind = construct == "assign" ? "always" : construct;
+        // A continuous assign gets no procedure row, so the word that
+        // distinguishes it never reaches here; every other procedure is
+        // classified from the symbol rather than re-read out of the
+        // construct word it also produced.
+        p.kind = procKindOf(sym);
         p.loc = procAt;
         procIdx = int32_t(b.t->procedures.size());
         b.t->procedures.push_back(std::move(p));
@@ -713,24 +772,24 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
     int32_t sensStmt = -1;
     auto sensReadStmt = [&]() {
         if (sensStmt < 0) {
-            sensStmt = newStmt(b, "event_control", "sensitivity",
-                               std::string(), -1, std::string(), 0, procAt);
+            sensStmt = newStmt(b, StmtKind::EventControl, "sensitivity",
+                               AssignKind::None, -1, std::string(), 0, procAt);
         }
         return sensStmt;
     };
     if (procIdx >= 0) {
-        std::vector<std::pair<const Expression*, std::string>> raw;
+        std::vector<std::pair<const Expression*, Edge>> raw;
         std::vector<const Expression*> iffs;
         collectEdgeEvents(sens.timingControl, raw, &iffs);
         for (auto& [expr, edge] : raw)
-            addProcEvent(b, procIdx, -1, expr, edge, "sensitivity", procAt,
+            addProcEvent(b, procIdx, -1, expr, edge, EventKind::Sensitivity, procAt,
                          evalCtx, sensReadStmt);
         for (auto* cond : iffs) {
             std::vector<Ref> reads;
             collectRefs(*cond, evalCtx, reads);
             const int32_t s = sensReadStmt();
             for (auto& r : reads)
-                recordRead(b, s, r, "event", procAt, evalCtx);
+                recordRead(b, s, r, RefRole::Event, procAt, evalCtx);
         }
     }
 
@@ -747,32 +806,26 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
 
     // ---- a statement-level event control (a wait)
     auto onEvent =
-        [&](const Expression* e, const std::string& edge, int64_t seq,
-            SourceRange where) {
+        [&](const Expression* e, Edge edge, int64_t seq, SourceRange where) {
             if (procIdx < 0)
                 return;
             const TplLoc at = locator.locate(where.start(), procAt);
-            const int32_t s = newStmt(b, "event_control", "wait",
-                                      std::string(), seq, std::string(), 0,
+            const int32_t s = newStmt(b, StmtKind::EventControl, "wait",
+                                      AssignKind::None, seq, std::string(), 0,
                                       at);
-            addProcEvent(b, procIdx, s, e, edge, "wait", at, evalCtx,
+            addProcEvent(b, procIdx, s, e, edge, EventKind::Wait, at, evalCtx,
                          [&]() { return s; });
         };
     // ---- a statement that reads without writing anything nameable
     auto fileReadLike =
         [&](const std::vector<Ref>& reads, const std::vector<Ref>& gating,
-            const std::vector<Ref>& writes, const std::string& stmtKind,
-            const std::string& construct2, int64_t seq, int64_t dropped,
-            SourceRange where) {
+            const std::vector<Ref>& writes, StmtKind stmtKind, RefRole role,
+            bool writesAreReleased, const std::string& construct2,
+            int64_t seq, int64_t dropped, SourceRange where) {
             const TplLoc at = locator.locate(where.start(), procAt);
             const int32_t s = newStmt(b, stmtKind, construct2,
-                                      std::string(), seq, std::string(),
+                                      AssignKind::None, seq, std::string(),
                                       dropped, at);
-            const std::string role = stmtKind == "assertion" ? "assertion"
-                                     : stmtKind == "wait"    ? "wait"
-                                     : stmtKind == "system_task"
-                                         ? "system_task"
-                                         : "call_argument";
             for (auto& r : reads)
                 recordRead(b, s, r, role, at, evalCtx);
             // The conditions that gate it. No dependency can exist --
@@ -780,7 +833,7 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
             // the condition IS read, and dropping it lost the signal
             // from every load query.
             for (auto& g : gating)
-                recordRead(b, s, g, "control", at, evalCtx);
+                recordRead(b, s, g, RefRole::Control, at, evalCtx);
             // What the task writes. The source is genuinely unknowable
             // -- a file, a plusarg, a format string -- so the row has
             // no source, and v_driver tells it apart from a constant
@@ -793,7 +846,7 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                 // lvalue and drives nothing, so it gets a target row
                 // and deliberately no dependency.
                 reached = true;
-                if (stmtKind == "release")
+                if (writesAreReleased)
                     recordReleaseTarget(b, s, w, at, evalCtx);
                 else
                     recordSystemWrite(b, s, w, at, evalCtx);
@@ -826,21 +879,31 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                         onEvent(n.expr, n.edge, n.seq, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReadNode>) {
-                        const char* kind =
-                            n.kind == ReadNode::Kind::Assertion ? "assertion"
-                            : n.kind == ReadNode::Kind::Wait    ? "wait"
-                                                                : "call";
+                        // The node kind IS the statement kind and the read
+                        // role; the receiver used to recover both from a
+                        // string it had just been handed.
+                        const auto [kind, role] =
+                            n.kind == ReadNode::Kind::Assertion
+                                ? std::pair{StmtKind::Assertion,
+                                            RefRole::Assertion}
+                            : n.kind == ReadNode::Kind::Wait
+                                ? std::pair{StmtKind::Wait, RefRole::Wait}
+                                : std::pair{StmtKind::Call,
+                                            RefRole::CallArgument};
                         fileReadLike(n.reads, gates.refs(n.gate), {}, kind,
+                                     role, /*writesAreReleased=*/false,
                                      n.construct, n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, SystemTaskNode>) {
                         fileReadLike(n.reads, gates.refs(n.gate), n.writes,
-                                     "system_task", n.construct, n.seq,
-                                     n.dropped, n.where);
+                                     StmtKind::SystemTask, RefRole::SystemTask,
+                                     /*writesAreReleased=*/false, n.construct,
+                                     n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReleaseNode>) {
                         fileReadLike({}, gates.refs(n.gate), n.lvalues,
-                                     "release",
+                                     StmtKind::Release, RefRole::CallArgument,
+                                     /*writesAreReleased=*/true,
                                      n.isRelease ? "release" : "deassign",
                                      n.seq, n.dropped, n.where);
                     }
@@ -927,7 +990,7 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
         if (href < 0)
             return;
         TplDep d;
-        d.kind = "data";
+        d.kind = DepKind::Data;
         d.sourceless = true;
         d.stmt = stmt;
         d.tgt.href = href;
@@ -951,7 +1014,7 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
     d.tgt.net = netIdx;
     d.stmt = stmt;
     d.targetRef = targetIdx;
-    d.kind = "data";
+    d.kind = DepKind::Data;
     d.tgtR = rangeOf(r);
     d.callSite = b.curCallSite;
     b.t->deps.push_back(std::move(d));
@@ -959,7 +1022,7 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
 
     /// One read of a statement, wherever it lands: an expr_ref for a net of
     /// this instance, a hier_ref for anything outside it.
-void TemplateBuilder::recordRead(Build& b, int32_t stmt, const Ref& r, const std::string& role,
+void TemplateBuilder::recordRead(Build& b, int32_t stmt, const Ref& r, RefRole role,
                                  const TplLoc& at, EvalContext& evalCtx) {
     if (!r.sym)
         return;
@@ -975,8 +1038,8 @@ void TemplateBuilder::recordRead(Build& b, int32_t stmt, const Ref& r, const std
 }
 
 void TemplateBuilder::addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
-                                   const Expression* expr, const std::string& edge,
-                                   const std::string& eventKind, const TplLoc& at,
+                                   const Expression* expr, Edge edge,
+                                   EventKind eventKind, const TplLoc& at,
                                    EvalContext& evalCtx,
                                    const std::function<int32_t()>& readStmt) {
     int32_t netIdx = -1;
@@ -1004,7 +1067,8 @@ void TemplateBuilder::addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
         std::vector<Ref> reads;
         collectRefs(*expr, evalCtx, reads);
         const int32_t s = readStmt();
-        const std::string role = eventKind == "wait" ? "wait" : "event";
+        const RefRole role =
+            eventKind == EventKind::Wait ? RefRole::Wait : RefRole::Event;
         for (auto& r : reads)
             recordRead(b, s, r, role, at, evalCtx);
     }
@@ -1029,9 +1093,10 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
     if (targets.empty())
         return;
     const bool continuous = isContinuous && !inSubroutine;
-    const int32_t stmt = newStmt(b, "assignment", construct,
-                                 continuous ? "continuous"
-                                            : (blocking ? "blocking" : "nonblocking"),
+    const int32_t stmt = newStmt(b, StmtKind::Assignment, construct,
+                                 continuous  ? AssignKind::Continuous
+                                 : blocking  ? AssignKind::Blocking
+                                             : AssignKind::Nonblocking,
                                  seq, delay, dropped, at);
     // The control reads gate every target of the statement; recorded once,
     // reused by each target's control dependencies. An outward condition is
@@ -1054,7 +1119,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
         if (netIdx < 0)
             c.href = addHierRef(b, false, g, at, evalCtx);
         else
-            c.exprRef = addExprRef(b, stmt, g, "control", netIdx);
+            c.exprRef = addExprRef(b, stmt, g, RefRole::Control, netIdx);
         controls.push_back(std::move(c));
     }
 
@@ -1103,7 +1168,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
         }
         else {
             srcHref = addHierRef(b, false, p.src, at, evalCtx,
-                                 nullptr, &p.srcAsWritten);
+                                 std::nullopt, &p.srcAsWritten);
         }
         if (!haveTarget)
             continue;
@@ -1115,7 +1180,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             d.stmt = stmt;
             d.operandRef = operandIdx;
             d.targetRef = targetIdx;
-            d.kind = "data";
+            d.kind = DepKind::Data;
             d.srcR = rangeOf(p.src);
             // The bits of the target THIS operand reaches, not the
             // whole target: the `stmt_target` row above still spans
@@ -1127,7 +1192,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
         }
         else if (srcNet >= 0 || srcHref >= 0) {
             TplDep d;
-            d.kind = "data";
+            d.kind = DepKind::Data;
             d.stmt = stmt;
             d.src.net = srcNet;
             d.src.href = srcHref;
@@ -1154,7 +1219,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             d.tgt.net = dstNet;
             d.stmt = stmt;
             d.targetRef = targetIdx;
-            d.kind = "data";
+            d.kind = DepKind::Data;
             d.tgtR = rangeOf(dst);
             d.callSite = b.curCallSite;
             b.t->deps.push_back(std::move(d));
@@ -1165,7 +1230,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             // outward constant write with no driver whatsoever, so a
             // trace back from the far net said nothing wrote it.
             TplDep d;
-            d.kind = "data";
+            d.kind = DepKind::Data;
             d.sourceless = true;
             d.stmt = stmt;
             d.tgt.href = tgtHref;
@@ -1192,7 +1257,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
                 d.stmt = stmt;
                 d.exprRef = c.exprRef;
                 d.targetRef = targetIdx;
-                d.kind = "control";
+                d.kind = DepKind::Control;
                 d.srcR = rangeOf(src);
                 d.tgtR = rangeOf(dst);
                 d.mappingExact = 0;
@@ -1201,7 +1266,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             }
             else {
                 TplDep d;
-                d.kind = "control";
+                d.kind = DepKind::Control;
                 d.stmt = stmt;
                 d.src.net = c.exprRef >= 0 ? b.decl->netFor(*src.sym) : -1;
                 d.src.href = c.href;
@@ -1250,7 +1315,7 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         if (actualIdx < 0)
             return;
         if (reads && stmt >= 0)
-            addExprRef(b, stmt, actual, "call_argument", actualIdx);
+            addExprRef(b, stmt, actual, RefRole::CallArgument, actualIdx);
         if (writes) {
             // The target row AND a source-less `procedure` dependency, which
             // is the shape v_driver has documented since v14: "`procedure`
@@ -1290,7 +1355,7 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
             d.tgt.net = actualIdx;
             d.stmt = stmt;
             d.targetRef = targetIdx;
-            d.kind = "procedure";
+            d.kind = DepKind::Procedure;
             d.tgtR = rangeOf(actual);
             // mappingExact stays NULL: there is no source end to correspond
             // with, and a correspondence beside a driver that does not exist
@@ -1312,7 +1377,7 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
             return;
         if (reads) {
             TplDep d;
-            d.kind = "procedure";
+            d.kind = DepKind::Procedure;
             d.stmt = stmt;
             d.src.href = href;
             d.tgt.net = formalNet;
@@ -1323,7 +1388,7 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         }
         if (writes) {
             TplDep d;
-            d.kind = "procedure";
+            d.kind = DepKind::Procedure;
             d.stmt = stmt;
             d.src.net = formalNet;
             d.tgt.href = href;
@@ -1337,13 +1402,13 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
     if (reads) {
         int32_t exprIdx = -1;
         if (stmt >= 0)
-            exprIdx = addExprRef(b, stmt, actual, "call_argument", actualNet);
+            exprIdx = addExprRef(b, stmt, actual, RefRole::CallArgument, actualNet);
         TplDep d;
         d.src.net = actualNet;
         d.tgt.net = formalNet;
         d.stmt = stmt;
         d.exprRef = exprIdx;
-        d.kind = "procedure";
+        d.kind = DepKind::Procedure;
         d.srcR = rangeOf(actual);
         d.mappingExact = oneToOne ? 1 : 0;
         d.callSite = b.curCallSite;
@@ -1354,7 +1419,7 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         d.src.net = formalNet;
         d.tgt.net = actualNet;
         d.stmt = stmt;
-        d.kind = "procedure";
+        d.kind = DepKind::Procedure;
         d.tgtR = rangeOf(actual);
         d.mappingExact = oneToOne ? 1 : 0;
         d.callSite = b.curCallSite;
@@ -1446,8 +1511,9 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
             return;
         const TplLoc at = locator.locate(al.location);
         b.curScope = b.decl->scopeForSymbol(al);
-        const int32_t stmt = newStmt(b, "alias", "alias", std::string(),
-                                     /*seq=*/-1, std::string(), 0, at);
+        const int32_t stmt = newStmt(b, StmtKind::Alias, "alias",
+                                     AssignKind::None, /*seq=*/-1,
+                                     std::string(), 0, at);
         if (stmt < 0)
             return;
 
@@ -1521,7 +1587,7 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
                 d.stmt = stmt;
                 d.operandRef = sides[i].operand;
                 d.targetRef = sides[j].target;
-                d.kind = "alias";
+                d.kind = DepKind::Alias;
                 d.srcR = rangeOf(sides[i].ref);
                 d.tgtR = rangeOf(sides[j].ref);
                 // An alias is bit for bit by definition; it is only
@@ -1593,8 +1659,9 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
             "nmos", "pmos", "rnmos", "rpmos", "cmos", "rcmos",
             "tran", "rtran", "tranif0", "tranif1", "rtranif0", "rtranif1"};
         p.primKind = def.primitiveKind == PrimitiveSymbol::UserDefined
-                         ? "udp"
-                         : kSwitches.count(def.name) ? "switch" : "gate";
+                         ? PrimKind::Udp
+                         : kSwitches.count(def.name) ? PrimKind::Switch
+                                                     : PrimKind::Gate;
         p.defName = std::string(def.name);
         p.loc = locator.locate(prim.location);
         const int32_t primIdx = int32_t(b.t->prims.size());
@@ -1679,7 +1746,7 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
                 d.src.net = srcNet;
                 d.tgt.net = dstNet;
                 d.prim = primIdx;
-                d.kind = "primitive";
+                d.kind = DepKind::Primitive;
                 d.srcR = rangeOf(src);
                 d.tgtR = rangeOf(dst);
                 const bool oneBit =
@@ -1700,7 +1767,7 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
                 d.src.net = -1;
                 d.tgt.net = dstNet;
                 d.prim = primIdx;
-                d.kind = "primitive";
+                d.kind = DepKind::Primitive;
                 d.tgtR = rangeOf(dst);
                 d.callSite = b.curCallSite;
                 b.t->deps.push_back(std::move(d));
@@ -1722,9 +1789,15 @@ void TemplateBuilder::internModuleRow(const DefinitionSymbol& def) {
     row.id = int64_t(moduleIds.size()) + 1;
     row.name = std::string(def.name);
     switch (def.definitionKind) {
-        case DefinitionKind::Interface: row.definitionKind = "interface"; break;
-        case DefinitionKind::Program:   row.definitionKind = "program";   break;
-        default:                        row.definitionKind = "module";    break;
+        case DefinitionKind::Interface:
+            row.definitionKind = word(DefKind::Interface);
+            break;
+        case DefinitionKind::Program:
+            row.definitionKind = word(DefKind::Program);
+            break;
+        default:
+            row.definitionKind = word(DefKind::Module);
+            break;
     }
     const TplLoc at = locator.locate(def.location);
     row.fileId = at.fileId;
