@@ -30,12 +30,17 @@
 // exact=0 is an upper bound rather than the bits actually touched.
 //
 // The REFERENCES clauses document the joins; they are not enforced at runtime,
-// since `PRAGMA foreign_keys` is left at its default of off. The verifier runs
-// `foreign_key_check` on every export -- the ids are all issued by one process
-// in one pass, and paying a lookup per inserted row to re-verify them is the
-// wrong side of that trade.
+// since `PRAGMA foreign_keys` is left at its default of off. Turning it on
+// would not merely cost a lookup per inserted row -- it would fail the export:
+// `net_conn.outer_hier_ref_id` and `call_site.caller_stmt_id` are written
+// before the rows they reference, and no clause here is DEFERRABLE. The
+// verifier's `foreign_key_check` on the finished file reaches the same
+// conclusion the per-row check would, after the forward references have
+// landed.
 R"SQL(
-CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+-- value NOT NULL so v_db_info's MAX(CASE...) pivot keeps one meaning for
+-- NULL: the key is missing, never "present but empty".
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE src_file(
     id      INTEGER PRIMARY KEY,

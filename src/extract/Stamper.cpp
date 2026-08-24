@@ -107,7 +107,7 @@ private:
         node.id = nodeId;
         node.parentNodeId = parentNode;
         node.name = name;
-        node.nodeKind = parentNode == 0 ? "root" : "instance";
+        node.nodeKind = word(parentNode == 0 ? NodeKind::Root : NodeKind::Instance);
         node.ordinal = ordinal;
         writer.addTreeNode(node);
 
@@ -148,7 +148,7 @@ private:
             node.id = id;
             node.parentNodeId = parentId;
             node.name = t.scopes[i].name;
-            node.nodeKind = "generate";
+            node.nodeKind = word(NodeKind::Generate);
             node.ordinal = siblingOrdinal[size_t(parent < 0 ? 0 : parent)]++;
             writer.addTreeNode(node);
             noteChild(parentId, node.name, id);
@@ -185,7 +185,7 @@ private:
             node.id = id;
             node.parentNodeId = parentId;
             node.name = t.prims[i].name;
-            node.nodeKind = "primitive";
+            node.nodeKind = word(NodeKind::Primitive);
             node.ordinal = siblingOrdinal[size_t(t.prims[i].scope)]++;
             writer.addTreeNode(node);
             noteChild(parentId, node.name, id);
@@ -485,7 +485,7 @@ private:
         node.id = nodeId;
         node.parentNodeId = parentNode;
         node.name = c.name;
-        node.nodeKind = "instance";
+        node.nodeKind = word(NodeKind::Instance);
         node.ordinal = ordinal;
         writer.addTreeNode(node);
 
@@ -553,7 +553,7 @@ private:
         node.id = nodeId;
         node.parentNodeId = parentNode;
         node.name = c.name;
-        node.nodeKind = "unresolved";
+        node.nodeKind = word(NodeKind::Unresolved);
         node.ordinal = ordinal;
         writer.addTreeNode(node);
 
@@ -653,7 +653,7 @@ private:
             node.id = nodeId;
             node.parentNodeId = 0;   // a pseudo-occurrence above the roots
             node.name = std::string(pkg->name);
-            node.nodeKind = "package";
+            node.nodeKind = word(NodeKind::Package);
             node.ordinal = rootOrdinal++;
             writer.addTreeNode(node);
 

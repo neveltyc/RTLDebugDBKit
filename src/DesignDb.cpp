@@ -330,7 +330,7 @@ void Writer::bumped() {
 
 void Writer::setMeta(std::string_view key, std::string_view value) {
     sqlite3_stmt* s = nullptr;
-    prepare("INSERT OR REPLACE INTO meta VALUES(?,?)", &s);
+    prepare("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", &s);
     sqlite3_bind_text(s, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT);
     int rc = sqlite3_step(s);
