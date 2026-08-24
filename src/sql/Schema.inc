@@ -221,6 +221,7 @@ CREATE TABLE term(
 -- keeping the two relations apart is what v9's one-table version kept
 -- getting wrong.
 CREATE TABLE term_map(
+    id            INTEGER PRIMARY KEY,
     term_id       INTEGER NOT NULL REFERENCES term(id),
     ordinal       INTEGER NOT NULL,
     inner_net_id  INTEGER NOT NULL REFERENCES net(id),
@@ -231,7 +232,7 @@ CREATE TABLE term_map(
     inner_hi      INTEGER,
     inner_exact   INTEGER NOT NULL CHECK(inner_exact IN (0,1)),
     map_exact     INTEGER NOT NULL CHECK(map_exact IN (0,1)),
-    PRIMARY KEY(term_id, ordinal));
+    UNIQUE(term_id, ordinal));
 
 -- The OUTSIDE of a terminal: what the parent connected to it, one row per
 -- atomic segment -- each concatenation element and each replication copy is

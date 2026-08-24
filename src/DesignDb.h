@@ -440,6 +440,15 @@ namespace designdb {
 /// window into 32 bits that the row would not name. Both now carry the
 /// flattened width -- the space the offsets are in -- and are NULL only for
 /// a type with no bits at all.
+///
+/// v18 also gives `term_map` a surrogate `id`, as every other child table
+/// has, and points `v_net_attachment`'s two wiring kinds at the row they
+/// describe: `terminal_inside` at `term_map_id`, `actual_outside` at
+/// `conn_id`, in place of the `term_id` both carried. A terminal is not
+/// the attachment -- `.q({2{r}})` gives one pin two connection segments,
+/// and both rows said `term_id=48` with nothing to tell them apart, though
+/// the view's contract is that its typed id names the relation's own row.
+/// `v_term_map` publishes the new id so the join stays inside the view set.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
@@ -560,6 +569,7 @@ struct TermRow {
 
 /// One segment of a terminal's mapping onto nets inside its own instance.
 struct TermMapRow {
+    int64_t id = 0;
     int64_t termId = 0;
     int64_t ordinal = 0;
     int64_t netId = 0;

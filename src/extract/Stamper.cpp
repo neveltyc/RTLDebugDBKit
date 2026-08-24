@@ -68,8 +68,9 @@ private:
 
     /// Everything one stamped occurrence needs to remember.
     struct Bases {
-        int64_t net = 0, term = 0, proc = 0, stmt = 0, target = 0, operand = 0,
-                exprRef = 0, procEvent = 0, dep = 0, hierRef = 0, callSite = 0;
+        int64_t net = 0, term = 0, termMap = 0, proc = 0, stmt = 0, target = 0,
+                operand = 0, exprRef = 0, procEvent = 0, dep = 0, hierRef = 0,
+                callSite = 0;
     };
 
     struct ReplayJob {
@@ -158,6 +159,8 @@ private:
         Bases base;
         base.net = netCounter;         netCounter += int64_t(t.nets.size());
         base.term = termCounter;       termCounter += int64_t(t.terms.size());
+        base.termMap = termMapCounter;
+        termMapCounter += int64_t(t.termMaps.size());
         base.proc = procCounter;       procCounter += int64_t(t.procedures.size());
         base.stmt = stmtCounter;       stmtCounter += int64_t(t.stmts.size());
         base.target = targetCounter;   targetCounter += int64_t(t.targets.size());
@@ -238,8 +241,10 @@ private:
         }
         stats.terms += int64_t(t.terms.size());
 
-        for (auto& m : t.termMaps) {
+        for (size_t i = 0; i < t.termMaps.size(); i++) {
+            auto& m = t.termMaps[i];
             TermMapRow row;
+            row.id = base.termMap + int64_t(i) + 1;
             row.termId = base.term + m.term + 1;
             row.ordinal = m.ordinal;
             row.netId = base.net + m.net + 1;
@@ -861,6 +866,7 @@ private:
     int64_t nodeCounter = 0;
     int64_t netCounter = 0;
     int64_t termCounter = 0;
+    int64_t termMapCounter = 0;
     int64_t procCounter = 0;
     int64_t stmtCounter = 0;
     int64_t targetCounter = 0;

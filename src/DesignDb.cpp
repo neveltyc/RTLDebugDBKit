@@ -212,10 +212,10 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " data_type_id, width, ordinal, modport, file_id, line, col)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsTerm]);
-        prepare("INSERT INTO term_map(term_id, ordinal, inner_net_id,"
+        prepare("INSERT INTO term_map(id, term_id, ordinal, inner_net_id,"
                 " term_lo, term_hi, term_exact, inner_lo, inner_hi, inner_exact,"
                 " map_exact)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsTermMap]);
         prepare("INSERT INTO net_conn(id, outer_net_id, term_id, ordinal, conn_kind,"
                 " outer_lo, outer_hi, outer_exact, term_lo, term_hi, term_exact,"
@@ -520,12 +520,13 @@ void Writer::addTerm(const TermRow& r) {
 void Writer::addTermMap(const TermMapRow& r) {
     auto* s = ins[InsTermMap];
     sqlite3_reset(s);
-    sqlite3_bind_int64(s, 1, r.termId);
-    sqlite3_bind_int64(s, 2, r.ordinal);
-    sqlite3_bind_int64(s, 3, r.netId);
-    bindRange(s, 4, r.termBits, r.termExact);
-    bindRange(s, 7, r.netBits, r.netExact);
-    sqlite3_bind_int(s, 10, r.mappingExact ? 1 : 0);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.termId);
+    sqlite3_bind_int64(s, 3, r.ordinal);
+    sqlite3_bind_int64(s, 4, r.netId);
+    bindRange(s, 5, r.termBits, r.termExact);
+    bindRange(s, 8, r.netBits, r.netExact);
+    sqlite3_bind_int(s, 11, r.mappingExact ? 1 : 0);
     step(s);
     bumped();
 }

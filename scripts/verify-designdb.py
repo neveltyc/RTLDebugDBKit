@@ -944,7 +944,7 @@ VIEW_COLUMNS = {
         "ordinal", "modport", "file_path", "src_path",
         "src_line", "src_col"],
     "v_term_map": [
-        "term_id", "term_inst_id", "term_name",
+        "term_map_id", "term_id", "term_inst_id", "term_name",
         "map_ordinal", "inner_net_id", "inner_net_name",
         "term_lo", "term_hi", "term_exact", "inner_lo", "inner_hi",
         "inner_exact", "map_exact"],
@@ -993,8 +993,8 @@ VIEW_COLUMNS = {
     "v_net_attachment": [
         "net_id", "inst_id", "net_name", "attachment_kind",
         "lo", "hi", "exact", "stmt_id",
-        "term_id", "stmt_target_id", "assign_operand_id", "expr_ref_id",
-        "proc_id", "dep_id", "hier_ref_id"],
+        "term_map_id", "conn_id", "stmt_target_id", "assign_operand_id",
+        "expr_ref_id", "proc_id", "dep_id", "hier_ref_id"],
     "v_call_site": [
         "call_site_id", "inst_id", "module_id", "module_name",
         "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
@@ -1186,15 +1186,16 @@ for view in ("v_driver", "v_load", "v_net_dep"):
 # an id into a slot its kind does not own.
 check(one("""
     SELECT count(*) FROM v_net_attachment
-    WHERE (term_id IS NOT NULL) + (stmt_target_id IS NOT NULL)
+    WHERE (term_map_id IS NOT NULL) + (conn_id IS NOT NULL)
+        + (stmt_target_id IS NOT NULL)
         + (assign_operand_id IS NOT NULL) + (expr_ref_id IS NOT NULL)
         + (proc_id IS NOT NULL) + (dep_id IS NOT NULL)
         + (hier_ref_id IS NOT NULL) != 1""") == 0,
       "every attachment names exactly one typed id")
 check(one("""
     SELECT count(*) FROM v_net_attachment WHERE CASE attachment_kind
-        WHEN 'terminal_inside'    THEN term_id IS NULL
-        WHEN 'actual_outside'     THEN term_id IS NULL
+        WHEN 'terminal_inside'    THEN term_map_id IS NULL
+        WHEN 'actual_outside'     THEN conn_id IS NULL
         WHEN 'written_by'         THEN stmt_target_id IS NULL
         WHEN 'release_target'     THEN stmt_target_id IS NULL
         WHEN 'alias_binding'      THEN stmt_target_id IS NULL
@@ -1208,7 +1209,8 @@ check(one("""
         ELSE 1 END""") == 0,
       "and it is the typed id its attachment_kind implies")
 # Each typed id resolves in its own table -- the join a consumer would make.
-for col, tbl in (("term_id", "term"), ("stmt_target_id", "stmt_target"),
+for col, tbl in (("term_map_id", "term_map"), ("conn_id", "net_conn"),
+                 ("stmt_target_id", "stmt_target"),
                  ("assign_operand_id", "assign_operand"),
                  ("expr_ref_id", "expr_ref"), ("proc_id", "proc"),
                  ("dep_id", "net_dep"), ("hier_ref_id", "hier_ref")):
@@ -1422,6 +1424,15 @@ if mode:
 
 
 if mode == "constructs":
+    # One pin takes several connection segments -- `.q({2{rep_r}})` tiles it
+    # twice -- so the wiring attachment names the segment. A terminal id
+    # cannot tell the two copies apart; the two rows must differ.
+    check(one("""
+        SELECT count(DISTINCT a.conn_id) FROM v_net_attachment a
+        JOIN net_conn c ON c.id = a.conn_id
+        JOIN v_net n ON n.net_id = a.net_id
+        WHERE a.attachment_kind = 'actual_outside' AND n.net_name = 'rep_r'""") == 2,
+          "each copy of a replicated actual is its own attachment row")
     # A system task's written argument is not a read of it, wherever the
     # call sits. From inside a condition the gating used to pick it up, so
     # the signal a plusarg fills gated whatever the branch wrote.
@@ -2722,7 +2733,8 @@ if mode == "xmr":
     check(one("""
         SELECT count(*) FROM v_net_attachment a
         JOIN v_net n ON n.net_id = a.net_id
-        JOIN v_term t ON t.term_id = a.term_id
+        JOIN v_net_conn c ON c.conn_id = a.conn_id
+        JOIN v_term t ON t.term_id = c.term_id
         JOIN v_tree_node tn ON tn.node_id = t.inst_id
         WHERE n.net_name='g' AND a.attachment_kind='actual_outside'
           AND t.term_name='p' AND tn.node_name='u_sink'""") == 1,

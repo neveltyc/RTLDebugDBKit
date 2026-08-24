@@ -154,6 +154,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- One row per term_map segment: the inside of a terminal.
 CREATE VIEW v_term_map AS
 SELECT
+    mp.id           AS term_map_id,
     mp.term_id      AS term_id,
     t.inst_id       AS term_inst_id,
     t.name          AS term_name,
@@ -853,12 +854,16 @@ JOIN stmt s ON s.id = o.stmt_id;
 -- polymorphic id whose meaning a consumer had to reconstruct from the
 -- kind. The typed column each kind fills:
 --
---   terminal_inside     term_id      term_map: the net stands behind a
+--   terminal_inside     term_map_id  term_map: the net stands behind a
 --                                    terminal of its own instance.
---   actual_outside      term_id      net_conn: the net is wired to a
+--   actual_outside      conn_id      net_conn: the net is wired to a
 --                                    child's terminal, named directly
 --                                    (outer_net_id) or through a resolved
---                                    external tie (`.p(u.g[7:4])`).
+--                                    external tie (`.p(u.g[7:4])`). One
+--                                    terminal takes several segments --
+--                                    `.q({2{r}})` tiles it twice -- so the
+--                                    terminal is not the row, the
+--                                    connection is.
 --   written_by          stmt_target_id   stmt_target of an assignment, a
 --                                    system-task write, or a call writing
 --                                    its output actual.
@@ -885,14 +890,15 @@ SELECT m.inner_net_id AS net_id, n.inst_id AS inst_id, n.name AS net_name,
        'terminal_inside' AS attachment_kind,
        m.inner_lo AS lo, m.inner_hi AS hi, m.inner_exact AS exact,
        NULL AS stmt_id,
-       m.term_id AS term_id, NULL AS stmt_target_id, NULL AS assign_operand_id,
+       m.id AS term_map_id, NULL AS conn_id, NULL AS stmt_target_id,
+       NULL AS assign_operand_id,
        NULL AS expr_ref_id, NULL AS proc_id, NULL AS dep_id,
        NULL AS hier_ref_id
 FROM term_map m JOIN net n ON n.id = m.inner_net_id
 UNION ALL
 SELECT c.outer_net_id, n.inst_id, n.name, 'actual_outside',
        c.outer_lo, c.outer_hi, c.outer_exact, NULL,
-       c.term_id, NULL, NULL, NULL, NULL, NULL, NULL
+       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL
 FROM net_conn c JOIN net n ON n.id = c.outer_net_id
 WHERE c.outer_net_id IS NOT NULL
 UNION ALL
@@ -903,7 +909,7 @@ UNION ALL
 -- this net feed" answered nothing for exactly the ties v12 taught to arc.
 SELECT h.resolved_net_id, n.inst_id, n.name, 'actual_outside',
        h.lo, h.hi, h.is_exact, NULL,
-       c.term_id, NULL, NULL, NULL, NULL, NULL, NULL
+       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL
 FROM net_conn c
 JOIN hier_ref h ON h.id = c.outer_hier_ref_id
 JOIN net n ON n.id = h.resolved_net_id
@@ -921,42 +927,42 @@ SELECT a.net_id, n.inst_id, n.name,
             WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
             ELSE 'written_by' END,
        a.lo, a.hi, a.is_exact, a.stmt_id,
-       NULL, a.id, NULL, NULL, NULL, NULL, NULL
+       NULL, NULL, a.id, NULL, NULL, NULL, NULL, NULL
 FROM stmt_target a JOIN net n ON n.id = a.net_id
 JOIN stmt s ON s.id = a.stmt_id
 UNION ALL
 SELECT o.net_id, n.inst_id, n.name, 'read_by',
        o.lo, o.hi, o.is_exact, o.stmt_id,
-       NULL, NULL, o.id, NULL, NULL, NULL, NULL
+       NULL, NULL, NULL, o.id, NULL, NULL, NULL, NULL
 FROM assign_operand o JOIN net n ON n.id = o.net_id
 UNION ALL
 SELECT e.net_id, n.inst_id, n.name,
        CASE WHEN e.role = 'control' THEN 'condition'
             ELSE 'statement_read' END,
        e.lo, e.hi, e.is_exact, e.stmt_id,
-       NULL, NULL, NULL, e.id, NULL, NULL, NULL
+       NULL, NULL, NULL, NULL, e.id, NULL, NULL, NULL
 FROM expr_ref e JOIN net n ON n.id = e.net_id
 UNION ALL
 SELECT pe.net_id, n.inst_id, n.name, 'event',
        NULL, NULL, 1, pe.stmt_id,
-       NULL, NULL, NULL, NULL, pe.proc_id, NULL, NULL
+       NULL, NULL, NULL, NULL, NULL, pe.proc_id, NULL, NULL
 FROM proc_event pe JOIN net n ON n.id = pe.net_id
 WHERE pe.net_id IS NOT NULL
 UNION ALL
 SELECT d.tgt_net_id, n.inst_id, n.name, 'dep_in',
        d.tgt_lo, d.tgt_hi, d.tgt_exact, d.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, d.id, NULL
+       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL
 FROM net_dep d JOIN net n ON n.id = d.tgt_net_id
 UNION ALL
 SELECT d.src_net_id, n.inst_id, n.name, 'dep_out',
        d.src_lo, d.src_hi, d.src_exact, d.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, d.id, NULL
+       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL
 FROM net_dep d JOIN net n ON n.id = d.src_net_id
 WHERE d.src_net_id IS NOT NULL
 UNION ALL
 SELECT h.resolved_net_id, n.inst_id, n.name, 'named_from_outside',
        h.lo, h.hi, h.is_exact, h.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, NULL, h.id
+       NULL, NULL, NULL, NULL, NULL, NULL, NULL, h.id
 FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
 WHERE h.resolved_net_id IS NOT NULL;
 
