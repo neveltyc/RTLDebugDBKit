@@ -528,9 +528,15 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             if (!args[i] || !formals[i])
                 continue;
             const auto dir = formals[i]->direction;
+            // A `const ref` is passed by reference to avoid copying and
+            // cannot be assigned through, so it drives nothing. slang
+            // decides `hasOutputArgs` by this same pair of tests.
+            const bool constRef =
+                dir == ArgumentDirection::Ref &&
+                formals[i]->flags.has(VariableFlags::Const);
             const bool writes = dir == ArgumentDirection::Out ||
                                 dir == ArgumentDirection::InOut ||
-                                dir == ArgumentDirection::Ref;
+                                (dir == ArgumentDirection::Ref && !constRef);
             const bool reads = dir == ArgumentDirection::In ||
                                dir == ArgumentDirection::InOut ||
                                dir == ArgumentDirection::Ref;
