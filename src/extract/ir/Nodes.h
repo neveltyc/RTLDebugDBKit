@@ -110,7 +110,7 @@ struct BindNode {
 /// A statement-level event control -- a wait, not sensitivity.
 struct EventNode {
     const slang::ast::Expression* expr = nullptr;
-    std::string edge;
+    Edge edge = Edge::None;
     int64_t seq = 0;
     slang::SourceRange where;
 };
