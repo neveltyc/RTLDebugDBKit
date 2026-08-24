@@ -1284,10 +1284,11 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
     /// walked once per call site so each carries its caller's gating.
 void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
                                   EvalContext& evalCtx) {
-    const Ref& actual = n.actual;
+    const Ref& actual = n.pair.src;      // the actual, narrowed to this window
+    const Ref& formalWindow = n.pair.tgt; // the formal's bits it reaches
     const bool reads = n.reads;
     const bool writes = n.writes;
-    const bool oneToOne = n.oneToOne;
+    const int mapExact = n.pair.mapExact ? 1 : 0;
     if (!n.formal || !actual.sym)
         return;
     const int32_t stmt = n.bindable ? b.curStmt : -1;
@@ -1305,8 +1306,17 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         // the two halves apart precisely so nobody resolves the formal
         // against the actual's spelling again.
         const int32_t actualIdx = b.decl->netFor(*actual.sym);
-        if (actualIdx < 0)
+        if (actualIdx < 0) {
+            // Neither end is a net of this instance -- a package task fed a
+            // $unit item. No dependency can be made, but the reference is
+            // still what the statement names, and dropping it leaves the
+            // statement naming nothing at all.
+            const int32_t saved = b.curStmt;
+            b.curStmt = stmt;
+            addHierRef(b, writes, actual, at, evalCtx);
+            b.curStmt = saved;
             return;
+        }
         if (reads && stmt >= 0)
             addExprRef(b, stmt, actual, RefRole::CallArgument, actualIdx);
         if (writes) {
@@ -1375,7 +1385,8 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
             d.src.href = href;
             d.tgt.net = formalNet;
             d.srcR = rangeOf(actual);
-            d.mappingExact = oneToOne ? 1 : 0;
+            d.tgtR = rangeOf(formalWindow);
+            d.mappingExact = mapExact;
             d.callSite = b.curCallSite;
             b.t->deps.push_back(std::move(d));
         }
@@ -1384,9 +1395,10 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
             d.kind = DepKind::Procedure;
             d.stmt = stmt;
             d.src.net = formalNet;
+            d.srcR = rangeOf(formalWindow);
             d.tgt.href = href;
             d.tgtR = rangeOf(actual);
-            d.mappingExact = oneToOne ? 1 : 0;
+            d.mappingExact = mapExact;
             d.callSite = b.curCallSite;
             b.t->deps.push_back(std::move(d));
         }
@@ -1403,7 +1415,8 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         d.exprRef = exprIdx;
         d.kind = DepKind::Procedure;
         d.srcR = rangeOf(actual);
-        d.mappingExact = oneToOne ? 1 : 0;
+        d.tgtR = rangeOf(formalWindow);
+        d.mappingExact = mapExact;
         d.callSite = b.curCallSite;
         b.t->deps.push_back(std::move(d));
     }
@@ -1423,12 +1436,13 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         }
         TplDep d;
         d.src.net = formalNet;
+        d.srcR = rangeOf(formalWindow);
         d.tgt.net = actualNet;
         d.stmt = stmt;
         d.targetRef = targetIdx;
         d.kind = DepKind::Procedure;
         d.tgtR = rangeOf(actual);
-        d.mappingExact = oneToOne ? 1 : 0;
+        d.mappingExact = mapExact;
         d.callSite = b.curCallSite;
         b.t->deps.push_back(std::move(d));
     }
