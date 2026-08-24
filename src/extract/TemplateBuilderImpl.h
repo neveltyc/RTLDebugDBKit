@@ -85,6 +85,19 @@ inline const InstanceBodySymbol& canonicalBodyOf(const InstanceSymbol& inst) {
     return inst.getCanonicalBody() ? *inst.getCanonicalBody() : inst.body;
 }
 
+/// The local net a reference names, or -1 when it names something else.
+///
+/// A hierarchical path names ONE occurrence. It is never the occurrence's
+/// own net, even where the symbol it resolves to belongs to the analysed
+/// body -- which is what a shared canonical body makes of `top.m1.loc` read
+/// from m1. Replaying that as a local read hands every other occurrence its
+/// own net instead, a wrong (net, instance) pair with nothing marking it.
+inline int32_t netOfRef(DeclIndex& decl, const Ref& r) {
+    if (!r.sym || hierarchicalRoot(r.origin))
+        return -1;
+    return decl.netFor(*r.sym);
+}
+
 /// A Ref's coverage in the template row encoding: bits only when a specific
 /// run is known, exactness as claimed.
 inline TplRange rangeOf(const Ref& r) {

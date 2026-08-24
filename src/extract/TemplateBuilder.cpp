@@ -356,19 +356,8 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
 void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // The reference expression may be wrapped in selects and
     // conversions; the resolved reference lives on the base value node.
-    const Expression* e = r.origin;
-    while (e) {
-        if (e->kind == ExpressionKind::ElementSelect)
-            e = &e->as<ElementSelectExpression>().value();
-        else if (e->kind == ExpressionKind::RangeSelect)
-            e = &e->as<RangeSelectExpression>().value();
-        else if (e->kind == ExpressionKind::MemberAccess)
-            e = &e->as<MemberAccessExpression>().value();
-        else if (e->kind == ExpressionKind::Conversion)
-            e = &e->as<ConversionExpression>().operand();
-        else
-            break;
-    }
+    const HierarchicalValueExpression* hv = hierarchicalRoot(r.origin);
+
     // A package item -- `pkg::mask`, or a bare `mask` imported from one.
     // slang resolves the `::` at compile time, so this is a NamedValue,
     // not a HierarchicalValue: it is caught here on the symbol's own
@@ -389,10 +378,9 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
             }
         }
     }
-    if (!e || e->kind != ExpressionKind::HierarchicalValue)
-        return;
-    auto& hv = e->as<HierarchicalValueExpression>();
-    const Symbol* target = hv.ref.target;
+    if (!hv)
+        return;   // nothing hierarchical to walk; NotHierarchical stands
+    const Symbol* target = hv->ref.target;
     if (!target || !r.sym) {
         row.resolve = TplHierRef::Failed;
         return;
@@ -406,9 +394,9 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // from every occurrence, which is exactly what TplHierRef::Absolute is
     // for. Asking isUpward() alone dropped `$root.a.b.c` with the upward
     // ones and left Absolute unreachable.
-    const bool fromRoot = !hv.ref.path.empty() && hv.ref.path.front().symbol &&
-                          hv.ref.path.front().symbol->kind == SymbolKind::Root;
-    if (!fromRoot && hv.ref.isUpward()) {
+    const bool fromRoot = !hv->ref.path.empty() && hv->ref.path.front().symbol &&
+                          hv->ref.path.front().symbol->kind == SymbolKind::Root;
+    if (!fromRoot && hv->ref.isUpward()) {
         row.resolve = TplHierRef::Upward;
         return;
     }
@@ -428,8 +416,8 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     std::string full = target->getHierarchicalPath();
     // The interface-port case: the reference entered through one of this
     // template's own interface terminals.
-    if (hv.ref.isViaIfacePort() && !hv.ref.path.empty()) {
-        const Symbol* first = hv.ref.path.front().symbol;
+    if (hv->ref.isViaIfacePort() && !hv->ref.path.empty()) {
+        const Symbol* first = hv->ref.path.front().symbol;
         if (first && first->kind == SymbolKind::InterfacePort) {
             auto it = b.termOf->find(first);
             if (it != b.termOf->end()) {
@@ -672,7 +660,7 @@ void TemplateBuilder::buildTermMaps(Build& b, const InstanceBodySymbol& body) {
             for (auto& cn : segs) {
                 if (!cn.ref.sym)
                     continue;
-                const int32_t netIdx = b.decl->netFor(*cn.ref.sym);
+                const int32_t netIdx = netOfRef(*b.decl, cn.ref);
                 if (netIdx < 0)
                     continue;
                 TplRange termR;
@@ -945,7 +933,7 @@ void TemplateBuilder::recordReleaseTarget(Build& b, int32_t stmt, const Ref& r,
                                           const TplLoc& at, EvalContext& evalCtx) {
     if (!r.sym)
         return;
-    const int32_t netIdx = b.decl->netFor(*r.sym);
+    const int32_t netIdx = netOfRef(*b.decl, r);
     if (netIdx < 0) {
         const int32_t saved = b.curStmt;
         b.curStmt = stmt;
@@ -970,7 +958,7 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
                                         const TplLoc& at, EvalContext& evalCtx) {
     if (!r.sym)
         return;
-    const int32_t netIdx = b.decl->netFor(*r.sym);
+    const int32_t netIdx = netOfRef(*b.decl, r);
     if (netIdx < 0) {
         // `$readmemh("f.hex", u.mem)` -- the task drives a memory in
         // another instance. Recording only the reference left that
@@ -1019,7 +1007,7 @@ void TemplateBuilder::recordRead(Build& b, int32_t stmt, const Ref& r, RefRole r
                                  const TplLoc& at, EvalContext& evalCtx) {
     if (!r.sym)
         return;
-    const int32_t netIdx = b.decl->netFor(*r.sym);
+    const int32_t netIdx = netOfRef(*b.decl, r);
     if (netIdx < 0) {
         const int32_t saved = b.curStmt;
         b.curStmt = stmt;
@@ -1106,7 +1094,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             continue;
         ControlRec c;
         c.src = g;
-        const int32_t netIdx = b.decl->netFor(*g.sym);
+        const int32_t netIdx = netOfRef(*b.decl, g);
         if (netIdx < 0)
             c.href = addHierRef(b, false, g, at, evalCtx);
         else
@@ -1121,7 +1109,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
     // The target row, or the outward write.
     int32_t targetIdx = -1;
     int32_t tgtHref = -1;
-    int32_t dstNet = b.decl->netFor(*dst.sym);
+    int32_t dstNet = netOfRef(*b.decl, dst);
     if (dstNet < 0) {
         tgtHref = addHierRef(b, true, dst, at, evalCtx);
     }
@@ -1145,7 +1133,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
     for (auto& p : pairs) {
         if (!p.src.sym)
             continue;
-        const int32_t srcNet = b.decl->netFor(*p.src.sym);
+        const int32_t srcNet = netOfRef(*b.decl, p.src);
         int32_t operandIdx = -1;
         int32_t srcHref = -1;
         if (srcNet >= 0) {
@@ -1239,7 +1227,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
             if (c.exprRef < 0 && c.href < 0)
                 continue;
             if (c.exprRef >= 0 && targetIdx >= 0) {
-                const int32_t srcNet = b.decl->netFor(*src.sym);
+                const int32_t srcNet = netOfRef(*b.decl, src);
                 if (srcNet < 0)
                     continue;
                 TplDep d;
@@ -1259,7 +1247,7 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
                 TplDep d;
                 d.kind = DepKind::Control;
                 d.stmt = stmt;
-                d.src.net = c.exprRef >= 0 ? b.decl->netFor(*src.sym) : -1;
+                d.src.net = c.exprRef >= 0 ? netOfRef(*b.decl, src) : -1;
                 d.src.href = c.href;
                 d.tgt.net = dstNet;
                 d.tgt.href = tgtHref;
@@ -1303,7 +1291,7 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         // is no reference text to file a hier_ref under -- the node carries
         // the two halves apart precisely so nobody resolves the formal
         // against the actual's spelling again.
-        const int32_t actualIdx = b.decl->netFor(*actual.sym);
+        const int32_t actualIdx = netOfRef(*b.decl, actual);
         if (actualIdx < 0) {
             // Neither end is a net of this instance -- a package task fed a
             // $unit item. No dependency can be made, but the reference is
@@ -1366,7 +1354,7 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         }
         return;
     }
-    const int32_t actualNet = b.decl->netFor(*actual.sym);
+    const int32_t actualNet = netOfRef(*b.decl, actual);
     if (actualNet < 0) {
         // An outward actual still binds: the dependency pairs here and
         // materialises when the reference resolves.
@@ -1567,7 +1555,7 @@ void TemplateBuilder::buildNetAliases(Build& b, const InstanceBodySymbol& body) 
             Side sd;
             sd.group = thisGroup;
             sd.ref = one;
-            sd.net = b.decl->netFor(*sd.ref.sym);
+            sd.net = netOfRef(*b.decl, sd.ref);
             if (sd.net < 0) {
                 // Nothing in this instance to bind; the reference is
                 // the record, as everywhere else.
@@ -1737,7 +1725,7 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
 
         for (auto& dstTerm : writes) {
             const Ref& dst = dstTerm.ref;
-            const int32_t dstNet = dst.sym ? b.decl->netFor(*dst.sym) : -1;
+            const int32_t dstNet = dst.sym ? netOfRef(*b.decl, dst) : -1;
             if (dstNet < 0) {
                 if (dst.sym)
                     addHierRef(b, true, dst, b.t->prims.back().loc, evalCtx);
@@ -1755,7 +1743,7 @@ void TemplateBuilder::buildPrimitives(Build& b, const InstanceBodySymbol& body) 
                 if (srcTerm.terminal == dstTerm.terminal)
                     continue;
                 const Ref& src = srcTerm.ref;
-                const int32_t srcNet = src.sym ? b.decl->netFor(*src.sym) : -1;
+                const int32_t srcNet = src.sym ? netOfRef(*b.decl, src) : -1;
                 if (srcNet < 0) {
                     if (src.sym)
                         addHierRefIfOutward(b, src, evalCtx);
