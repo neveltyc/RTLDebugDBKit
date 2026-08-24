@@ -474,6 +474,14 @@ namespace designdb {
 /// `proc_event_id` with them, for the reason the two wiring kinds moved:
 /// one procedure takes several events on one net, and the procedure is not
 /// the row.
+///
+/// One spelling for one thing, last: a view whose row has a single bit
+/// range spells it bare, as its base table does. `v_stmt_target`'s
+/// `tgt_*`, `v_stmt_operand`'s `operand_*`, `v_hier_ref`'s `ref_*` and
+/// `v_net_attachment`'s `exact` were four spellings of one concept, none
+/// of them the base tables'. All four are now `lo`/`hi`/`is_exact`; the
+/// prefixed form stays where a row really has two ends, as `v_net_dep`
+/// does.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.

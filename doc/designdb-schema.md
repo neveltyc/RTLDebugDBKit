@@ -723,7 +723,7 @@ stmt_kind, construct, assign_kind, delay, dropped_operand_count,
 call_site_id, file_path, src_path, src_line, src_col`.
 
 **`v_stmt_target`** — one row per target reference: `target_id, stmt_id,
-ordinal, net_id, net_name, target_kind, tgt_lo, tgt_hi, tgt_exact,
+ordinal, net_id, net_name, target_kind, lo, hi, is_exact,
 call_site_id`. An lvalue is not the same thing as a write, and
 `target_kind` says which, in `v_net_attachment`'s vocabulary and computed
 by the same expression: `written_by` (an assignment, a system task, or a
@@ -735,8 +735,8 @@ it is also the only place it can be mistaken for a driver) and
 two views equal per target row.
 
 **`v_stmt_operand`** — one row per operand reference: `operand_id,
-stmt_id, ordinal, net_id, net_name, operand_lo, operand_hi,
-operand_exact, call_site_id` (no classic abbreviation for *operand*, so
+stmt_id, ordinal, net_id, net_name, lo, hi,
+is_exact, call_site_id` (no classic abbreviation for *operand*, so
 the word stays whole). No `target_kind` counterpart: a read is a read
 whatever statement makes it.
 
@@ -761,7 +761,7 @@ id columns pointing at that relation's own row (the exclusive-arc shape
 `dep_out` → `dep_id`; `named_from_outside` → `hier_ref_id`. The two
 wiring kinds name the segment, not the terminal: one pin takes several —
 `.q({2{r}})` tiles it twice — and a terminal id cannot tell those rows
-apart. `lo/hi/exact`
+apart. `lo/hi/is_exact`
 are this net's window in the attachment. Each branch is one base
 selection, count-reconciled; a point query by `net_id` seeks on every
 branch; and the verifier holds that exactly one typed id is non-null per
@@ -797,8 +797,8 @@ string. See *Tracing across calls*.
 
 **`v_hier_ref`** — one row per reference that leaves its instance:
 `hier_ref_id, inst_id, module_id, module_name, stmt_id, ref_path, access,
-resolved_inst_id, resolved_net_id, resolved_net_name, ref_lo, ref_hi,
-ref_exact, file_path, src_path, src_line, src_col`. The target of the four
+resolved_inst_id, resolved_net_id, resolved_net_name, lo, hi,
+is_exact, file_path, src_path, src_line, src_col`. The target of the four
 `hier_ref` ids the other views publish — `v_net_dep`'s
 `src_hier_ref_id`/`tgt_hier_ref_id`, `v_net_conn`'s `outer_hier_ref_id`,
 `v_net_attachment`'s `hier_ref_id`. `ref_path` rather than `path` because
@@ -843,8 +843,9 @@ ordinal, sequence, signature, width).
 * Tables are `singular_snake_case`. `_id` appears exactly where a column
   holds another table's primary key, and nowhere else.
 * A bit range is prefixed with the end it describes (`src_lo`,
-  `term_exact`); a single-range table spells its own bare (`lo`/`hi`/
-  `is_exact`).
+  `term_exact`); where a row has only one, it spells it bare (`lo`/`hi`/
+  `is_exact`). Views follow the same rule as tables: `v_net_dep` has two
+  ends and prefixes both, `v_stmt_target` has one and does not.
 * The two sides of a terminal are `outer_*` (what the parent wired — the
   actual; VPI's highConn) and `inner_*` (what the pin stands for inside;
   vpiLowConn). Direction words never name structure: an `inout` pin's

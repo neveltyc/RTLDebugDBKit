@@ -989,13 +989,13 @@ VIEW_COLUMNS = {
         "file_path", "src_path", "src_line", "src_col"],
     "v_stmt_target": [
         "target_id", "stmt_id", "ordinal", "net_id", "net_name",
-        "target_kind", "tgt_lo", "tgt_hi", "tgt_exact", "call_site_id"],
+        "target_kind", "lo", "hi", "is_exact", "call_site_id"],
     "v_stmt_operand": [
         "operand_id", "stmt_id", "ordinal", "net_id", "net_name",
-        "operand_lo", "operand_hi", "operand_exact", "call_site_id"],
+        "lo", "hi", "is_exact", "call_site_id"],
     "v_net_attachment": [
         "net_id", "inst_id", "net_name", "attachment_kind",
-        "lo", "hi", "exact", "stmt_id",
+        "lo", "hi", "is_exact", "stmt_id",
         "term_map_id", "conn_id", "stmt_target_id", "assign_operand_id",
         "expr_ref_id", "proc_event_id", "dep_id", "hier_ref_id"],
     "v_node_path": ["node_id", "node_path"],
@@ -1009,7 +1009,7 @@ VIEW_COLUMNS = {
     "v_hier_ref": [
         "hier_ref_id", "inst_id", "module_id", "module_name", "stmt_id",
         "ref_path", "access", "resolved_inst_id", "resolved_net_id",
-        "resolved_net_name", "ref_lo", "ref_hi", "ref_exact",
+        "resolved_net_name", "lo", "hi", "is_exact",
         "file_path", "src_path", "src_line", "src_col"],
 }
 for view, want in VIEW_COLUMNS.items():
@@ -1334,7 +1334,7 @@ check(one("""
     WHERE (resolved_net_name IS NOT NULL) != (resolved_net_id IS NOT NULL)""") == 0,
       "v_hier_ref names a resolved net exactly when there is one")
 # The rest is projection, and projection is where a pair of columns quietly
-# swaps. Nothing else in this file reads ref_lo/ref_hi/ref_exact or
+# swaps. Nothing else in this file reads the view's own range columns or
 # resolved_inst_id, so without this they are pinned by name and position and
 # by nothing about their value.
 check(one("""
@@ -1343,8 +1343,8 @@ check(one("""
        OR v.ref_path IS NOT h.path OR v.access IS NOT h.access
        OR v.resolved_inst_id IS NOT h.resolved_inst_id
        OR v.resolved_net_id IS NOT h.resolved_net_id
-       OR v.ref_lo IS NOT h.lo OR v.ref_hi IS NOT h.hi
-       OR v.ref_exact IS NOT h.is_exact
+       OR v.lo IS NOT h.lo OR v.hi IS NOT h.hi
+       OR v.is_exact IS NOT h.is_exact
        OR v.src_line IS NOT h.line OR v.src_col IS NOT h.col""") == 0,
       "and every other v_hier_ref column is its base row's, unswapped")
 check(one("""
@@ -2970,7 +2970,7 @@ if mode == "external":
         JOIN v_hier_ref h ON h.hier_ref_id = d.src_hier_ref_id
         WHERE v.driver_kind='external' AND v.signal_name='nib'
           AND h.access='read' AND h.resolved_net_id IS NULL
-          AND h.ref_lo=0 AND h.ref_hi=3""") >= 1,
+          AND h.lo=0 AND h.hi=3""") >= 1,
           "and v_hier_ref holds the reference that row named")
     check(one("""
         SELECT count(*) FROM net_dep
