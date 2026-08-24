@@ -42,6 +42,7 @@ CREATE VIEW v_db_info AS
 SELECT
     CAST(MAX(CASE WHEN key = 'schema_version'
                   THEN value END) AS INTEGER) AS schema_version,
+    MAX(CASE WHEN key = 'tool'                  THEN value END) AS tool,
     MAX(CASE WHEN key = 'tool_version'          THEN value END) AS tool_version,
     MAX(CASE WHEN key = 'slang_version'         THEN value END) AS slang_version,
     MAX(CASE WHEN key = 'producer_revision'     THEN value END) AS producer_revision,
@@ -82,6 +83,7 @@ SELECT
     COALESCE(i.parent_inst_id, p.inst_id)  AS parent_inst_id,
     i.module_id                            AS module_id,
     m.name                                 AS module_name,
+    m.def_kind                             AS def_kind,
     i.param_signature                      AS param_signature,
     COALESCE(p.def_name, i.unresolved_def) AS def_name,
     f.path                                 AS file_path,
@@ -478,6 +480,7 @@ SELECT
     d.tgt_net_id             AS signal_net_id,
     tn.inst_id               AS signal_inst_id,
     tn.name                  AS signal_name,
+    th.path                  AS signal_ref,
     d.tgt_lo                 AS signal_lo,
     d.tgt_hi                 AS signal_hi,
     d.tgt_exact              AS signal_exact,
@@ -516,13 +519,14 @@ FROM net_dep d
 JOIN net tn              ON tn.id = d.tgt_net_id
 LEFT JOIN net sn         ON sn.id = d.src_net_id
 LEFT JOIN hier_ref sh    ON sh.id = d.src_hier_ref_id
+LEFT JOIN hier_ref th    ON th.id = d.tgt_hier_ref_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
 LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
-    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
     a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
@@ -541,7 +545,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
 UNION ALL
 SELECT
-    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
     a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
@@ -558,7 +562,7 @@ WHERE a.direction IN ('output', 'inout', 'ref')
   AND a.conn_kind IN ('signal', 'external_reference')
 UNION ALL
 SELECT
-    m.inner_net_id, n.inst_id, n.name,
+    m.inner_net_id, n.inst_id, n.name, NULL,
     m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
@@ -623,6 +627,7 @@ SELECT
     d.src_net_id             AS signal_net_id,
     sn.inst_id               AS signal_inst_id,
     sn.name                  AS signal_name,
+    sh.path                  AS signal_ref,
     d.src_lo                 AS signal_lo,
     d.src_hi                 AS signal_hi,
     d.src_exact              AS signal_exact,
@@ -650,13 +655,14 @@ FROM net_dep d
 JOIN net sn              ON sn.id = d.src_net_id
 JOIN net tn              ON tn.id = d.tgt_net_id
 LEFT JOIN hier_ref th    ON th.id = d.tgt_hier_ref_id
+LEFT JOIN hier_ref sh    ON sh.id = d.src_hier_ref_id
 LEFT JOIN stmt s         ON s.id = d.stmt_id
 LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
-    a.outer_net_id, outnet.inst_id, outnet.name,
+    a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
     a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
@@ -672,7 +678,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
 UNION ALL
 SELECT
-    a.inner_net_id, innet.inst_id, innet.name,
+    a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
     a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
@@ -689,7 +695,7 @@ WHERE a.direction IN ('output', 'inout', 'ref')
   AND a.conn_kind IN ('signal', 'external_reference')
 UNION ALL
 SELECT
-    pe.net_id, n.inst_id, n.name,
+    pe.net_id, n.inst_id, n.name, NULL,
     NULL, NULL, 1,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
@@ -702,7 +708,7 @@ LEFT JOIN file f         ON f.id = pe.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 UNION ALL
 SELECT
-    e.net_id, n.inst_id, n.name,
+    e.net_id, n.inst_id, n.name, NULL,
     e.lo, e.hi, e.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     CASE e.role WHEN 'wait' THEN 'wait'
@@ -719,7 +725,7 @@ WHERE e.role IN ('assertion', 'wait', 'event', 'system_task')
    OR NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.expr_ref_id = e.id)
 UNION ALL
 SELECT
-    o.net_id, n.inst_id, n.name,
+    o.net_id, n.inst_id, n.name, NULL,
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
@@ -733,7 +739,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.assign_operand_id = o.id)
 UNION ALL
 SELECT
-    m.inner_net_id, n.inst_id, n.name,
+    m.inner_net_id, n.inst_id, n.name, NULL,
     m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',

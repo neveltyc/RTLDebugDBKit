@@ -548,15 +548,17 @@ asserts all of it on every export. Ground rules:
   fan-in cone is the consumer's recursive query, one step per row here.
 
 **`v_db_info`** — the meta seal as one row, counts CAST to INTEGER:
-`schema_version, tool_version, slang_version, producer_revision, top,
+`schema_version, tool, tool_version, slang_version, producer_revision, top,
 analysis_status, error_count, unresolved_count, empty_procedure_count,
 duplicate_path_count, recursion_count, truncated_call_count,
 unanalysed_inst_count, config_digest`.
 
 **`v_tree_node`** — one row per node: `node_id, parent_node_id, node_name,
 node_kind, ordinal, inst_id, parent_inst_id, module_id, module_name,
-param_signature, def_name, file_path, src_path, src_line,
-src_col`. NULL by kind: `generate` has no subtype columns; `primitive`
+def_kind, param_signature, def_name, file_path, src_path, src_line,
+src_col`. `def_kind` is the definition's, so an interface instance and a
+module instance — both `node_kind='instance'` — are told apart here rather
+than through a join to `module`. NULL by kind: `generate` has no subtype columns; `primitive`
 has `inst_id` NULL, `parent_inst_id` its owning instance and
 `def_name` the gate/UDP name; `unresolved` has `module_id` NULL and
 `def_name` the unresolvable spelling; the root and generate levels
@@ -602,14 +604,21 @@ the row was produced walking a subroutine body (NULL at module level).
 Not deduplicated.
 
 **`v_driver`** — every direct driving arc of `signal_net`, one row each:
-`signal_net_id, signal_inst_id, signal_name, signal_lo, signal_hi,
+`signal_net_id, signal_inst_id, signal_name, signal_ref, signal_lo,
+signal_hi,
 signal_exact, driver_net_id, driver_inst_id, driver_name, driver_ref,
 driver_lo, driver_hi, driver_exact, driver_kind, dep_id, conn_id,
 stmt_id, prim_id, term_id, map_exact, call_site_id, file_path,
 src_path, src_line, src_col`.
 
-`driver_ref` is how the driving end was **spelled** when it was reached by a
-hierarchical name, and NULL when it was not — one meaning in two
+`signal_ref` and `driver_ref` are how each end was **spelled** when it was
+reached by a hierarchical name, NULL when it was not. Both ends carry one
+because either can be the named one: `assign q = u.x` names the driver,
+`always_comb u.x = a` names the signal, and a view with only the driver's
+spelling left the second invisible from the side that asks who drives `x`.
+`v_load` mirrors them as `signal_ref`/`load_ref`.
+
+`driver_ref` in detail — one meaning in two
 situations. On an `external` row it is the only name there is. On a
 crossing whose tie resolved (`.p(u.g[7:4])`) the driver net is named as
 well, and `driver_ref` says what the parent wrote: where the bits live and
@@ -663,7 +672,8 @@ rest of the reference is `v_hier_ref`. `driver_kind`:
 An unconnected terminal contributes no row.
 
 **`v_load`** — every recorded read of `signal_net`, one row each:
-`signal_net_id, signal_inst_id, signal_name, signal_lo, signal_hi,
+`signal_net_id, signal_inst_id, signal_name, signal_ref, signal_lo,
+signal_hi,
 signal_exact, load_net_id, load_inst_id, load_name, load_ref, load_lo,
 load_hi, load_exact, load_kind, dep_id, conn_id, stmt_id,
 proc_id, term_id, map_exact, call_site_id, file_path, src_path,
@@ -856,9 +866,9 @@ slang hands the buffers back in is the order a thread pool finished reading
 them.
 `file` holds the spellings rows carry — as written in the filelist —
 joined to their src_file. `meta` is the seal; its required keys are the
-`v_db_info` columns plus `tool`, except `top` — the space-separated names
-of the elaborated top instances — which is absent when the design
-elaborates none.
+`v_db_info` columns except `top` — the space-separated names of the
+elaborated top instances — which is absent when the design elaborates
+none.
 `analysis_status` is `complete | partial | hierarchy_only` and agrees with
 the counts beside it, each of which is published: `error_count`,
 `empty_procedure_count` (skipped procedures), `duplicate_path_count` (two
