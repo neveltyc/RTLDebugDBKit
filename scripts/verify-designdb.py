@@ -1712,6 +1712,32 @@ if mode == "interfaces":
         SELECT count(*) FROM v_driver v JOIN tree_node t ON t.id = v.signal_inst_id
         WHERE t.name = 'barr[1]' AND v.signal_name = 'data'""") == 1,
           "so the interface net behind it is driven, not silent")
+    # Forwarded through an intermediate module's own array port, and fed by
+    # a slice of it: segment 0 of the child reads segment 2 of the parent, so
+    # a connection that assumed the two ordinals agree bound the wrong
+    # element -- and before that, nothing at all.
+    for ordinal, inst in ((0, "bwide[2]"), (1, "bwide[3]")):
+        check(one("""
+            SELECT count(*) FROM net_conn c JOIN term tm ON tm.id = c.term_id
+            JOIN tree_node t ON t.id = c.outer_intf_inst_id
+            JOIN v_node_path p ON p.node_id = tm.inst_id
+            WHERE tm.name = 'bus_arr' AND c.ordinal = ? AND t.name = ?
+              AND p.node_path = 'interfaces.u_relay_arr.u_far'""",
+                  ordinal, inst) == 1,
+              f"a forwarded array's segment {ordinal} reads {inst}")
+    check(one("""
+        SELECT count(*) FROM v_driver v JOIN tree_node t ON t.id = v.signal_inst_id
+        WHERE t.name = 'bwide[2]' AND v.signal_name = 'vld'""") == 1,
+          "so the interface net behind the forwarded port is driven")
+    # The same template, two occurrences, two arrays: the route is the
+    # terminal and its segment, replayed per occurrence, never a stored id.
+    check(one("""
+        SELECT count(DISTINCT t.name) FROM net_conn c
+        JOIN term tm ON tm.id = c.term_id
+        JOIN tree_node t ON t.id = c.outer_intf_inst_id
+        WHERE tm.name = 'bus_arr'""") == 4,
+          "and the shared template resolves to four distinct elements")
+
     # Two dimensions: the segments are the LEAVES in declaration order. An
     # element of the outer array is an array, not an instance, so a walk one
     # level deep binds none of them.

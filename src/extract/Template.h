@@ -250,6 +250,10 @@ struct TplConn {
     int mappingExact = -1;
     int32_t ifaceChild = -1; // interface binding to a sibling child
     int32_t ifaceOwnTerm = -1; // interface pass-through of the parent's port
+    /// Which SEGMENT of that terminal, for an interface array forwarded
+    /// through it. The child's segment ordinal is not it: a port may be
+    /// fed by a slice of a wider array, so the two orders differ.
+    int32_t ifaceOwnSeg = 0;
     int32_t hierRef = -1;    // external tie: index into parent's hierRefs
     TplLoc loc;
 };

@@ -275,7 +275,7 @@ which outer column is set — the kind first, then its pointer:
 | `constant` | — | a tie-off; the term window is kept so the formal's bits tile without a gap |
 | `unconnected` | — | recorded, not omitted: absence would also mean "the exporter did not get this far". Claimed only for a pin the parent left empty — a connection whose shape this schema cannot spell (a sequence expression against a black box) records the nets it reaches as `expression_operand` instead |
 | `expression_operand` | `outer_net_id` or `outer_hier_ref_id` | the actual is an expression; this row is one net it reads. `.en(state == RUN)` samples `state` but does not alias it to `en`; `map_exact` is 0 by construction |
-| `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. An interface ARRAY port binds one element per segment, in declaration order — the leaves, for a multi-dimensional one — as a concatenated actual does on an ordinary port. NULL where the segment has no per-occurrence object, and for an array FORWARDED from the instance's own port: a scalar interface resolves through such a chain, an array does not. No dataflow arc pretends to cross an interface binding |
+| `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. An interface ARRAY port binds one element per segment, in declaration order — the leaves, for a multi-dimensional one — as a concatenated actual does on an ordinary port. It resolves through a pass-through chain like a scalar, including where the port is fed by a slice of a wider array, in which case the segment a row reads is not the one it occupies. NULL where the segment has no per-occurrence object at all. No dataflow arc pretends to cross an interface binding |
 | `external_reference` | `outer_hier_ref_id` | tied to something with no name in the parent (`.p(u.g[7:4])`); the reference says what, with `access='connect'`. It crosses like any other connection once the reference resolves — with a `map_exact` of its own, so the arc is traceable bit by bit — while an upward tie (`.a(tb.glob)`) stays a recorded connection with no arc |
 
 Width degradation: when the connection expression's width and the declared
@@ -454,8 +454,8 @@ when the export can replay the reference —
   *Packages*), the same for a bare name imported from the package;
 * through an interface ARRAY port of the instance's own
   (`bus_arr[0].vld`): resolved to the element that occurrence's terminal
-  binds in that segment — unless the array reached this instance by being
-  forwarded from a parent's own array port, which is not resolved;
+  binds in that segment, however many levels the array was forwarded
+  through;
 * upward references: NULL. The one analysed body speaks for occurrences
   whose surroundings may differ, so the target is not resolved per
   occurrence.
