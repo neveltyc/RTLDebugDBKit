@@ -693,6 +693,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
         std::vector<Ref> targets;
         collectRefs(expr.left(), eval, targets, /*skipSelectors=*/true);
+        // Path analysis found nothing to write. No RTL is known to reach
+        // here, and nothing in the fixture corpus or the three real designs
+        // does; it stands because losing a driver outright is the one
+        // outcome that must not happen. The root is resolved by walking the
+        // lvalue rather than through getSymbolReference, which hands back a
+        // FIELD symbol for a member access on an unpacked struct.
         if (targets.empty()) {
             const Expression* root = &expr.left();
             for (;;) {
@@ -710,11 +716,10 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 Ref r;
                 r.sym = &root->as<ValueExpressionBase>().symbol;
                 r.origin = root;
-                // Reached only when the slot walk and this recovery
-                // disagree on how many targets there are, so no narrower
-                // claim than the whole object is available.
-                r.cover = BitInterval::whole();
-                r.exact = true;
+                // The default cover: path analysis computed no bounds, so
+                // the object is written somewhere and this records that
+                // much. Claiming the whole of it exactly would state the
+                // one thing this branch does not know.
                 targets.push_back(r);
             }
             else {
