@@ -2235,6 +2235,17 @@ if mode == "naming":
           "and no node answers to the bare name of an array")
 
 if mode == "concatcursor":
+    # An unpacked-array range select: slang's bounds cover one element
+    # however many the select names, so no range is claimed at all rather
+    # than one that says the rest is untouched.
+    check(one("""SELECT count(*) FROM v_net_dep
+                 WHERE src_name='slice_src'
+                   AND src_lo IS NULL AND src_exact=0""") >= 1,
+          "an unpacked-array slice claims no bits it did not verify")
+    check(one("""SELECT count(*) FROM v_net_dep
+                 WHERE src_name='slice_src' AND src_exact=1""") == 0,
+          "and never calls the narrow span exact")
+
     # The cursor walk, in both directions. Every operand of the exact split
     # takes its own eighth of the source, MSB first; a wrapped cursor would
     # put one of them at an offset near 2^64 instead, so pinning all four is
