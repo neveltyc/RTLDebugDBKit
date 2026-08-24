@@ -281,10 +281,31 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
         return;
     }
 
+    // A streaming concatenation redistributes bits: which of an operand's
+    // bits land in which window of the result is a per-bit permutation this
+    // model does not compute. Each reference keeps its own window as an
+    // UPPER BOUND -- exact stays claimed nowhere, since carrying the
+    // operand's exact bits into every pairing said `{<<{a[5:0], b[1:0]}}`
+    // feeds a target from bits that never reach it.
+    if (expr.kind == ExpressionKind::Streaming) {
+        std::vector<Ref> refs;
+        collectRefs(expr, ctx, refs, skipSelectors);
+        for (auto& r : refs) {
+            r.exact = false;
+            out.push_back(width
+                              ? Slot::at(r, BitRange(base, base + width - 1), false)
+                              : Slot::unpositioned(r));
+        }
+        return;
+    }
+
     if (expr.kind == ExpressionKind::Conversion) {
         auto& conv = expr.as<ConversionExpression>();
         const uint64_t iw = exprWidthOf(conv.operand());
-        if (width && iw >= width) {
+        // A streaming operand types as void, so the width test cannot admit
+        // it -- descend anyway; the branch above owns its claims.
+        if (conv.operand().kind == ExpressionKind::Streaming ||
+            (width && iw >= width)) {
             collectSlots(conv.operand(), ctx, base, out, skipSelectors);
             return;
         }

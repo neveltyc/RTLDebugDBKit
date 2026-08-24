@@ -63,6 +63,17 @@ module concatcursor(input logic clk, input logic [31:0] d, input logic [7:0] e,
     // operand widths of the concatenation it sits in.
     assign streamed = {>>{a, b}};
 
+    // A bit-reversing stream into a SPLIT target: which operand bits land in
+    // which half is a permutation this model does not compute, so each
+    // pairing keeps its operand window as an upper bound -- exact would
+    // claim a[5:2] feeds a half it never reaches. The mirror below streams
+    // the TARGET, where the unknown side is which target bits each source
+    // reaches.
+    logic [3:0] sh, sl;
+    assign {sh, sl} = {<<{a[5:0], b[1:0]}};
+    logic [7:0] sm0, sm1;
+    assign {>>{sm0, sm1}} = {a, b};
+
     // Unpacked targets on the left of one concatenation.
     logic [7:0] arr [0:3];
     always_comb {arr[0], arr[1]} = {a, b};
