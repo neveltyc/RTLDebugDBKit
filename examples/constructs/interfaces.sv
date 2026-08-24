@@ -70,6 +70,16 @@ module arrayed(simple_bus bus_arr[2]);
     assign bus_arr[1].data = 8'hA5;
 endmodule
 
+// An interface array FORWARDED through an intermediate module's own array
+// port, and fed by a SLICE of it. The child's segment ordinal is not the
+// parent's here -- segment 0 of `bus_arr` reads segment 2 of `ra` -- so the
+// connection has to name which segment of its own terminal it reads rather
+// than assuming the two agree. `arrayed` is instantiated twice against
+// different arrays, so the shared template must resolve per occurrence.
+module relay_arr(simple_bus ra[4]);
+    arrayed u_far(.bus_arr(ra[2:3]));
+endmodule
+
 // The same port with two dimensions. The elements of the outer array are
 // arrays themselves, so a walk that takes them for instances binds nothing:
 // the segments must be the LEAVES, in declaration order, on both the
@@ -143,4 +153,7 @@ module interfaces;
 
     simple_bus bgrid[2][2](clk);
     arrayed2   u_grid(.grid(bgrid));
+
+    simple_bus bwide[4](clk);
+    relay_arr  u_relay_arr(.ra(bwide));
 endmodule

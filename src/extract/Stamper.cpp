@@ -460,12 +460,13 @@ private:
                 }
                 else if (conn.ifaceOwnTerm >= 0 &&
                          size_t(conn.ifaceOwnTerm) < ifaceBind.size()) {
-                    // A port passed straight through keeps the segment it
-                    // came in on: this template's own terminal binds the
-                    // same elements in the same order.
+                    // The segment of OUR terminal the connection named,
+                    // which is not the child's ordinal: a port fed by a
+                    // slice of a wider array binds the same instance at two
+                    // different positions.
                     auto& own = ifaceBind[size_t(conn.ifaceOwnTerm)];
-                    if (size_t(conn.ordinal) < own.size())
-                        bound = own[size_t(conn.ordinal)];
+                    if (size_t(conn.ifaceOwnSeg) < own.size())
+                        bound = own[size_t(conn.ifaceOwnSeg)];
                 }
                 connIfaceId[i][k] = bound;
                 if (size_t(conn.childTerm) < childIfaceBind[i].size()) {
