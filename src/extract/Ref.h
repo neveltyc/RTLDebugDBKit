@@ -109,6 +109,19 @@ inline std::optional<Ref> refOf(const ValuePath& path) {
     r.origin = path.fullExpr;
     if (!path.lsp)
         return r;
+    // The bounds must span what the reference names. slang computes them by
+    // walking the select path, and where that arithmetic and the prefix's
+    // own type disagree the bounds describe something other than this
+    // reference -- an unpacked-array RANGE select comes back the width of
+    // ONE element. Shipping the narrow span as exact says the bits outside
+    // it are untouched, which is the one reading that must never be wrong;
+    // an unknown cover says what is true, that the reference is somewhere
+    // inside the object.
+    const uint64_t named =
+        path.lsp->type ? flattenedWidth(*path.lsp->type) : 0;
+    const uint64_t spanned = path.lspBounds.second - path.lspBounds.first + 1;
+    if (named && named != spanned)
+        return r;
     r.exact = path.isFullyStatic();
     r.cover = BitInterval::forBounds(path.lspBounds.first, path.lspBounds.second,
                                      bitWidthOf(*sym));
