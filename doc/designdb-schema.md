@@ -275,7 +275,7 @@ which outer column is set — the kind first, then its pointer:
 | `constant` | — | a tie-off; the term window is kept so the formal's bits tile without a gap |
 | `unconnected` | — | recorded, not omitted: absence would also mean "the exporter did not get this far". Claimed only for a pin the parent left empty — a connection whose shape this schema cannot spell (a sequence expression against a black box) records the nets it reaches as `expression_operand` instead |
 | `expression_operand` | `outer_net_id` or `outer_hier_ref_id` | the actual is an expression; this row is one net it reads. `.en(state == RUN)` samples `state` but does not alias it to `en`; `map_exact` is 0 by construction |
-| `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. An interface ARRAY port binds one element per segment, in declaration order — the leaves, for a multi-dimensional one — as a concatenated actual does on an ordinary port. NULL only where the binding has no per-occurrence object at all. No dataflow arc pretends to cross an interface binding |
+| `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. An interface ARRAY port binds one element per segment, in declaration order — the leaves, for a multi-dimensional one — as a concatenated actual does on an ordinary port. NULL where the segment has no per-occurrence object, and for an array FORWARDED from the instance's own port: a scalar interface resolves through such a chain, an array does not. No dataflow arc pretends to cross an interface binding |
 | `external_reference` | `outer_hier_ref_id` | tied to something with no name in the parent (`.p(u.g[7:4])`); the reference says what, with `access='connect'`. It crosses like any other connection once the reference resolves — with a `map_exact` of its own, so the arc is traceable bit by bit — while an upward tie (`.a(tb.glob)`) stays a recorded connection with no arc |
 
 Width degradation: when the connection expression's width and the declared
@@ -454,7 +454,8 @@ when the export can replay the reference —
   *Packages*), the same for a bare name imported from the package;
 * through an interface ARRAY port of the instance's own
   (`bus_arr[0].vld`): resolved to the element that occurrence's terminal
-  binds in that segment;
+  binds in that segment — unless the array reached this instance by being
+  forwarded from a parent's own array port, which is not resolved;
 * upward references: NULL. The one analysed body speaks for occurrences
   whose surroundings may differ, so the target is not resolved per
   occurrence.
@@ -773,9 +774,9 @@ fallback when a dependency did not survive — needs the row itself to say
 which expansion it belongs to.
 
 **`v_net_attachment`** — everything touching one net, one row per
-attachment: `net_id, inst_id, net_name, attachment_kind, lo, hi, exact,
+attachment: `net_id, inst_id, net_name, attachment_kind, lo, hi, is_exact,
 stmt_id, term_map_id, conn_id, stmt_target_id, assign_operand_id,
-expr_ref_id, proc_id, dep_id, hier_ref_id`. The structural adjacency the
+expr_ref_id, proc_event_id, dep_id, hier_ref_id`. The structural adjacency the
 directional views cannot ask flatly — "what hangs off this net" — with
 `attachment_kind` naming the relation and exactly ONE of the eight typed
 id columns pointing at that relation's own row (the exclusive-arc shape
@@ -974,6 +975,14 @@ no dataflow, not that the hierarchy stops early.
   gating and no dependencies at all.
 * No source text. The file, line and column are here; the text is in the
   file.
+* An assignment pattern is positioned per element only where its element
+  order runs most significant first: a concatenation always, and a pattern
+  against a PACKED aggregate. Against an unpacked one — and for a
+  `'{index: value}` pattern against an array of either kind — the order is
+  the opposite, so those record one dependency per operand against the
+  whole target at `map_exact=0` rather than a window each. `'{default: e}`
+  and `'{N{e}}` do the same for a different reason: one written expression
+  stands for several members, and the row count follows what was written.
 * No expression trees, no temporaries. `assign y = (a & b) | c` is three
   operands, three dependencies onto `y`, `map_exact=0`, and no
   fabricated `tmp` net. A consumer that needs the expression's shape reads

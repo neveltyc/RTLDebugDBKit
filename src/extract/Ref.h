@@ -89,8 +89,16 @@ inline uint64_t flattenedWidth(const Type& type) {
     // selectable element -- a count, not a width, and positioning against
     // it puts a void replication operand or an unelaborated port on a bit
     // it does not have.
-    if (ct.isUnpackedArray() || ct.isUnpackedStruct() || ct.isUnpackedUnion())
+    if (ct.isUnpackedArray() || ct.isUnpackedStruct() || ct.isUnpackedUnion()) {
+        // A queue, a dynamic array and an associative array have no element
+        // count until run time, and getSelectableWidth answers 1 for all
+        // three -- the same count-not-a-width trap one level up. Reporting
+        // it is worse than reporting nothing: 1 is a measurement, and it is
+        // false.
+        if (ct.isDynamicallySizedArray() || ct.isAssociativeArray())
+            return 0;
         return ct.getSelectableWidth();
+    }
     return ct.getBitWidth();
 }
 
@@ -290,11 +298,10 @@ inline void collectSlots(const Expression& expr, EvalContext& ctx, uint64_t base
     if (expr.kind == ExpressionKind::Streaming) {
         std::vector<Ref> refs;
         collectRefs(expr, ctx, refs, skipSelectors);
+        // A stream types as void, so there is no window to sit in either.
         for (auto& r : refs) {
             r.exact = false;
-            out.push_back(width
-                              ? Slot::at(r, BitRange(base, base + width - 1), false)
-                              : Slot::unpositioned(r));
+            out.push_back(Slot::unpositioned(r));
         }
         return;
     }

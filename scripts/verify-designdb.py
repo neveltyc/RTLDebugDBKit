@@ -764,7 +764,7 @@ check(one("""
 check(one("""
     SELECT count(*) FROM stmt_target a
     JOIN stmt s ON s.id = a.stmt_id
-    WHERE s.stmt_kind NOT IN ('release', 'trigger')
+    WHERE s.stmt_kind != 'release'
       AND NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.stmt_target_id = a.id)
       AND NOT EXISTS (SELECT 1 FROM hier_ref h
                       WHERE h.stmt_id = a.stmt_id AND h.access = 'read')""") == 0,
@@ -868,13 +868,12 @@ check(one("""
       "connection columns match conn_kind")
 
 # ------------------------------------------------------------------ meta
-# The doc states the required set as a rule -- the v_db_info columns plus
-# `tool`, minus `top` -- so it is derived here rather than hand-copied:
-# a column added to the view then demands its meta key without this list
-# needing to know.
+# The doc states the required set as a rule -- the v_db_info columns minus
+# `top` -- so it is derived here rather than hand-copied: a column added to
+# the view then demands its meta key without this list needing to know.
 required = [r[1] for r in con.execute("PRAGMA table_info(v_db_info)")
             if r[1] != "top"]
-if required == ["tool"]:
+if not required:
     fatal("v_db_info is missing")
 meta = dict(con.execute("SELECT key, value FROM meta"))
 # Fatal rather than collected: every check below indexes these keys.
@@ -2389,6 +2388,14 @@ if mode == "outward":
         SELECT count(*) FROM stmt
         WHERE stmt_kind = 'call' AND construct = 'push_back'""") == 1,
           "a built-in method is a call, not a system task")
+    # And a system subroutine with no `$` that DOES write: the prefix alone
+    # sent it down the branch with no writeRefs, so its argument came back
+    # with no driver at all.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'drawn' AND driver_kind = 'system_task'
+          AND driver_net_id IS NULL""") == 1,
+          "a written argument makes a prefixless system call a system task")
     # A call whose formal is no net of this instance still drives its output
     # actual, and says so in both places: the target row that names the
     # statement, and a dependency with no source -- there is no formal here to
@@ -2506,6 +2513,18 @@ if mode == "naming":
           "and never a respelling of it")
 
 if mode == "concatcursor":
+    # A pattern whose element order is not most significant first takes the
+    # whole target at range granularity. Walking it anyway reported the
+    # OPPOSITE window and called it exact, which is the one failure mode a
+    # position must not have.
+    for tgt in ("up_arr", "keyed", "up_keyed"):
+        check(one("SELECT count(*) FROM v_net_dep WHERE tgt_name = ? "
+                  "AND tgt_lo IS NULL AND map_exact = 0", tgt) == 2,
+              f"the inverted-order pattern {tgt} claims no per-element window")
+        check(one("SELECT count(*) FROM v_net_dep WHERE tgt_name = ? "
+                  "AND tgt_lo IS NOT NULL", tgt) == 0,
+              f"and never a window for {tgt}")
+
     # The two flattening directions, which a consumer cannot guess from one
     # example: a packed member declared first takes the HIGH offsets, an
     # unpacked element declared first takes the LOW ones.
@@ -2691,6 +2710,17 @@ if mode == "xmr":
         SELECT count(*) FROM v_stmt
         WHERE stmt_kind = 'system_task' AND construct = '$value$plusargs'""") == 1,
           "and the call it came from is the statement that carries it")
+    # Nested calls in one condition: the outer collection reaches through
+    # the inner one, so a row per call recorded the inner write twice. One
+    # row per outermost call carries both writes, once each.
+    for net in ("outer_v", "inner_v"):
+        check(one("SELECT count(*) FROM v_driver WHERE signal_name = ? "
+                  "AND driver_kind = 'system_task'", net) == 1,
+              f"a nested system call records {net} exactly once")
+    check(one("""
+        SELECT count(*) FROM v_stmt
+        WHERE stmt_kind = 'system_task' AND construct = '$cast'""") == 1,
+          "and the nesting is one statement, not one per call")
 
     # A hierarchical WRITE names its target, and the driver view says so on
     # the row itself: `always_comb u.x = a` is one lookup from the far net,

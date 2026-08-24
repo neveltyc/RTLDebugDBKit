@@ -575,8 +575,7 @@ struct TreeNodeRow {
     int64_t id = 0;
     int64_t parentNodeId = 0;     // 0 = root (stored NULL)
     std::string name;             // one path segment, never more
-    std::string nodeKind;         // root | instance | generate | primitive |
-                                  // unresolved | package
+    std::string nodeKind;         // NodeKind's word
     int64_t ordinal = 0;          // order among siblings
 };
 

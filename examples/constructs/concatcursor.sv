@@ -26,7 +26,8 @@ module concatcursor(input logic clk, input logic [31:0] d, input logic [7:0] e,
                     output logic [15:0] streamed, output logic [3:0] narrow,
                     output logic [95:0] mixed, output logic [7:0] arr_a,
                     output logic [7:0] arr_b, output logic [7:0] rode_o,
-                    output logic [15:0] padded);
+                    output logic [15:0] padded, output logic [15:0] keyed_o,
+                    output logic [7:0] up0, output logic [7:0] uk1);
     logic [7:0] a, b, c, f;
     localparam int PAD = 0;
 
@@ -43,6 +44,20 @@ module concatcursor(input logic clk, input logic [31:0] d, input logic [7:0] e,
     // A widening one, which does not descend -- the operand cannot cover the
     // context, so the reference degrades to the whole range.
     assign narrow = 4'({a, b, c});
+
+    // The patterns whose element order is NOT most significant first, which
+    // is the order the walk assumes. A pattern against an unpacked
+    // aggregate lists element zero first and element zero sits at the LOW
+    // offsets; a `'{index: value}` pattern against an array of either kind
+    // is ordered by ascending index, which is the same inversion. Walking
+    // them anyway does not lose a position, it reports the opposite one and
+    // calls it exact -- so they take the whole target at range granularity.
+    logic [7:0] up_arr [0:1];
+    always_comb up_arr = '{a, b};
+    logic [1:0][7:0] keyed;
+    assign keyed = '{1: a, 0: b};
+    logic [7:0] up_keyed [0:1];
+    always_comb up_keyed = '{0: a, 1: b};
 
     // A packed assignment pattern: the same walk, element by element.
     assign packed_o = '{hi: a[3:0], lo: b[3:0]};
@@ -94,6 +109,10 @@ module concatcursor(input logic clk, input logic [31:0] d, input logic [7:0] e,
     // range recorded from them says the elements past the first are
     // untouched -- an under-claim wearing exact=1, which is the reading that
     // must never be wrong. Recorded as an unknown part of the array instead.
+    assign keyed_o = keyed;
+    assign up0 = up_arr[0];
+    assign uk1 = up_keyed[1];
+
     logic [7:0] slice_src [0:3];
     logic [7:0] slice_dst [0:1];
     assign slice_dst = slice_src[1:2];

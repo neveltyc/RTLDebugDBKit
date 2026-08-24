@@ -752,8 +752,7 @@ private:
                     if (ref.ifaceTerm >= 0 &&
                         size_t(ref.ifaceTerm) < job.ifaceBind.size()) {
                         auto& bound = job.ifaceBind[size_t(ref.ifaceTerm)];
-                        if (ref.ifaceElem >= 0 &&
-                            size_t(ref.ifaceElem) < bound.size() &&
+                        if (size_t(ref.ifaceElem) < bound.size() &&
                             bound[size_t(ref.ifaceElem)] != 0)
                             node = descend(bound[size_t(ref.ifaceElem)],
                                            ref.segs);
