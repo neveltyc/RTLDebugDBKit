@@ -159,8 +159,7 @@ void TemplateBuilder::registerChildren(Build& b, const Scope& scope, int32_t sco
         switch (member.kind) {
             case SymbolKind::Instance: {
                 auto& inst = member.as<InstanceSymbol>();
-                auto& cbody = inst.getCanonicalBody() ? *inst.getCanonicalBody()
-                                                      : inst.body;
+                auto& cbody = canonicalBodyOf(inst);
                 TplChild c;
                 c.scope = scopeIdx;
                 c.name = leafSegment(inst);
@@ -235,8 +234,7 @@ void TemplateBuilder::registerChildren(Build& b, const Scope& scope, int32_t sco
     /// terminals, as written here in the parent.
 void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, TplChild& c,
                                          const std::unordered_map<const Symbol*, int32_t>& childOf) {
-    auto& childBody = child.getCanonicalBody() ? *child.getCanonicalBody()
-                                               : child.body;
+    auto& childBody = canonicalBodyOf(child);
     Template& childT = templates[groupKey(childBody)];
     // The child's OWN body, not the canonical one the template was built from:
     // getPortConnections() hands back port symbols belonging to this instance,
