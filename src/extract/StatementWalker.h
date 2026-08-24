@@ -186,7 +186,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // so only the system case needs targets of its own; without them the
         // argument read as undriven and its procedure as one that wrote
         // nothing at all.
-        if (call.isSystemCall()) {
+        //
+        // A built-in METHOD (`q.push_back(x)`, `q.delete()`) registers as a
+        // system call in slang but is not a system task: nothing leaves the
+        // language, and stmt_kind has `call` for exactly this. The `$`
+        // prefix is what separates the two vocabularies.
+        if (call.isSystemCall() && call.getSubroutineName().starts_with('$')) {
             emit(SystemTaskNode{std::move(reads), std::move(writeRefs),
                                 callWord(call), gateId(), seq++,
                                 filteredConstants, stmt.sourceRange});

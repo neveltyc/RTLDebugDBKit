@@ -2195,6 +2195,12 @@ if mode == "patterncase":
 
 
 if mode == "outward":
+    # A built-in method registers as a system call in slang, but nothing
+    # leaves the language: the row says `call`, with the method's own word.
+    check(one("""
+        SELECT count(*) FROM stmt
+        WHERE stmt_kind = 'call' AND construct = 'push_back'""") == 1,
+          "a built-in method is a call, not a system task")
     # A call whose formal is no net of this instance still drives its output
     # actual, and says so in both places: the target row that names the
     # statement, and a dependency with no source -- there is no formal here to

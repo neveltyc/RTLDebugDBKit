@@ -9,8 +9,8 @@
 // enum; the word appears where a row becomes SQL.
 //
 // Domains the schema publishes as OPEN stay strings and are absent here:
-// stmt.construct takes a system task's own name, net.decl_kind a
-// user-defined nettype's.
+// stmt.construct takes a system task's or built-in method's own name,
+// net.decl_kind a user-defined nettype's.
 //
 // slang/util/Util.h is the only dependency, for SLANG_UNREACHABLE; this
 // header stays clear of the AST vocabulary so Template.h can hold rows

@@ -332,8 +332,10 @@ alias | release`;
 `construct` the construct's own word: on an assignment it is the enclosing
 procedure's (`always_ff` for a clocked assignment, `assign` for a
 continuous one), except `force`/`proc_assign` on the assignment a `force`
-or procedural `assign` makes; `assert`, `$display`, `call`, `sensitivity`,
-`wait` on their statement kinds; `release`/`deassign` on a release row. `assign_kind` (`continuous |
+or procedural `assign` makes; `assert`, `$display`, `sensitivity`,
+`wait` on their statement kinds; on a `call` row it is `call` for a user
+subroutine and the method's own word (`push_back`) for a built-in method;
+`release`/`deassign` on a release row. `assign_kind` (`continuous |
 blocking | nonblocking`) is set exactly on assignments; `sequence` is
 execution order within the procedure (NULL outside one, and on the
 procedure-header `event_control` row that holds a non-plain sensitivity's
