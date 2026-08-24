@@ -339,9 +339,11 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     }
 
     /// The expressions a call inside `expr` writes without reading: the
-    /// actuals bound to an `output` formal. `inout` and `ref` are read as
-    /// well, so what they give a condition is a real read and stays. The
-    /// selectors stay too -- `chk(a, m[i])` reads i to decide where to write.
+    /// actuals bound to an `output` formal, and the arguments a system task
+    /// writes -- `if ($value$plusargs("SEED=%d", seed))` writes seed and
+    /// reads nothing of it. `inout` and `ref` are read as well, so what they
+    /// give a condition is a real read and stays. The selectors stay too --
+    /// `chk(a, m[i])` reads i to decide where to write.
     void collectCallOutputs(const Expression& expr,
                             std::set<const Expression*>& out) {
         struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
@@ -351,6 +353,16 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 self(self), out(out) {}
             void handle(const CallExpression& call) {
                 visitDefault(call);
+                if (call.isSystemCall()) {
+                    // slang models the written argument as an assignment
+                    // inside the call, the same shape an output actual has.
+                    std::set<const ValueSymbol*> syms;
+                    std::vector<Ref> writes;
+                    self.collectWrittenTargets(call, syms, &writes);
+                    for (auto& w : writes)
+                        out.insert(w.origin);
+                    return;
+                }
                 auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
                 if (!sub || !*sub)
                     return;
