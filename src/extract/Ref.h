@@ -67,20 +67,14 @@ inline bool isConstantSymbol(const ValueSymbol& sym) {
 
 struct Ref {
     const ValueSymbol* sym = nullptr;
-    /// Which bits of the object this reference covers. Defaults to the
-    /// honest answer for a reference nobody has bounded yet; the old
-    /// encoding defaulted to "all of it, exactly", which is how a dropped
-    /// fill read as a fact.
+    /// Which bits of the object this reference covers. Unknown until
+    /// something computes bounds: a reference nobody has bounded must not
+    /// read as one that covers everything.
     BitInterval cover = BitInterval::unknown();
     bool exact = false;
     /// The expression the reference was written as; consulted when the symbol
     /// lives outside the instance (hier_ref text) and for resolution replay.
     const Expression* origin = nullptr;
-
-    /// True when no specific run of bits is stored -- the whole object, or
-    /// an unknown part of it. Every reader that keys "emit NULL bits" off
-    /// the old `whole` flag means exactly this.
-    bool whole() const { return !cover.isRange(); }
 };
 
 inline uint64_t bitWidthOf(const ValueSymbol& sym) {
@@ -130,8 +124,7 @@ inline void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Re
 struct Slot {
     Ref ref;
     /// The window of the enclosing assignment this reference sits in, or
-    /// nullopt when the walk could not place it. The old encoding spelled
-    /// "unplaced" as a hand-written {0, ~uint64_t{0}} pair at eight sites.
+    /// nullopt when the walk could not place it.
     std::optional<BitRange> pos;
     /// True when the reference's own bits map one-to-one onto `pos`.
     bool positional = false;
@@ -277,9 +270,9 @@ inline Ref narrowed(const Slot& s, const std::optional<BitRange>& span) {
         return r;
     if (span->lo <= s.pos->lo && span->hi >= s.pos->hi)
         return r;
-    // A positional slot's reference is exact (that is what positional
-    // asserts), so its cover is Whole or Range, never Unknown; an offset of
-    // zero reproduces the old whole-object arithmetic.
+    // A positional slot's reference is exact -- that is what positional
+    // asserts -- so its cover is Whole or Range, never Unknown, and a whole
+    // cover starts at bit zero.
     const uint64_t offset = r.cover.isRange() ? r.cover.lo() : 0;
     r.cover = BitInterval::forBounds(offset + (span->lo - s.pos->lo),
                                      offset + (span->hi - s.pos->lo),
@@ -333,9 +326,8 @@ struct StatementRefCollector : ASTVisitor<StatementRefCollector, VisitFlags::All
         Ref r;
         r.sym = &e.symbol;
         r.origin = &e;
-        // No bounds computed here -- and now the type says so: unknown() is
-        // the collector's honest answer, where the old encoding borrowed
-        // whole=true and relied on exact=false to keep the two apart.
+        // No bounds computed here; unknown() is the default and the honest
+        // answer.
         out.push_back(r);
     }
 };

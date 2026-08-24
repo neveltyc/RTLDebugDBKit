@@ -8,8 +8,8 @@
 // template-local index -- an int32_t position in one of these vectors, never a
 // database id. Stamping turns each into (index + that occurrence's base).
 //
-// Plain data: no slang types, no AST vocabulary -- the claim used to be a
-// comment and is now an include list.
+// Plain data: no slang types and no AST vocabulary, so a row cannot reach
+// back into the compilation it was read from.
 
 #pragma once
 
@@ -179,7 +179,6 @@ struct TplEnd {
     int32_t net = -1;
     int32_t href = -1;
 
-    bool local() const { return net >= 0; }
     bool outward() const { return href >= 0; }
 };
 
@@ -187,9 +186,7 @@ struct TplEnd {
 /// element, target element), never by joining afterwards. A row whose ends
 /// are all local stamps inline with its occurrence's reserved id block; a
 /// row with an outward end is deferred until the final pass, when the
-/// occurrence's references have resolved. The old model kept those two
-/// lifecycles as two structs sharing eleven fields; the endpoint type makes
-/// the split a predicate instead.
+/// occurrence's references have resolved. `deferred()` is that split.
 struct TplDep {
     TplEnd src, tgt;
     /// True when the dependency has no source BY DESIGN -- a system task
@@ -219,10 +216,9 @@ struct TplHierRef {
     TplRange r;
     TplLoc loc;
     /// How the reference resolves per occurrence -- or why it does not.
-    /// The first three all stamp NULL resolved ids; they are spelled apart
+    /// The first three all stamp NULL resolved ids, and are spelled apart
     /// because "nothing to resolve", "tried and could not" and "must not
-    /// guess" are different facts, and one name for all three left the
-    /// resolver's five bare returns indistinguishable.
+    /// guess" are different facts about the same NULL.
     enum ResolveKind {
         NotHierarchical,     // a bare or package-free name; nothing to walk
         Failed,              // a target existed and no replay could be built

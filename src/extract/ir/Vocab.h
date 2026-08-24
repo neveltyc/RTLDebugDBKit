@@ -1,24 +1,26 @@
 // Copyright (c) 2026 neveltyc
 // released under the BSD 3-Clause License (see LICENSE)
 //
-// The closed vocabularies, as enums, with their published spellings in one
-// place. Every value here is interface: it appears in a schema CHECK clause,
-// in doc/designdb-schema.md, and in verify-designdb.py's DOMAINS table --
-// which is the authoritative statement of the contract and which
-// --domain-coverage holds the fixture corpus to. Before this header the
-// spellings were string literals scattered across four files, and the only
-// thing catching a typo was the CHECK clause at insert time (when enabled);
-// a value the extractor could never produce, like the v16 'checker', was
-// invisible until the corpus-coverage gate existed.
+// The closed vocabularies, as enums with their published spellings.
 //
-// Template rows store the enum; the word appears exactly once, where the
-// stamper turns a row into SQL. Domains the schema publishes as OPEN --
-// stmt.construct (a system task's own name), net.decl_kind (a user-defined
-// nettype's own name) -- stay strings on purpose.
+// Every value here is interface: it appears in a schema CHECK clause, in
+// doc/designdb-schema.md, and in verify-designdb.py's DOMAINS table, which
+// --domain-coverage holds the fixture corpus to. Template rows store the
+// enum; the word appears where a row becomes SQL.
+//
+// Domains the schema publishes as OPEN stay strings and are absent here:
+// stmt.construct takes a system task's own name, net.decl_kind a
+// user-defined nettype's.
+//
+// slang/util/Util.h is the only dependency, for SLANG_UNREACHABLE; this
+// header stays clear of the AST vocabulary so Template.h can hold rows
+// without reaching the compilation.
 
 #pragma once
 
 #include <cstdint>
+
+#include "slang/util/Util.h"
 
 namespace designdb::detail {
 
@@ -31,7 +33,7 @@ inline const char* word(DepKind k) {
         case DepKind::Procedure: return "procedure";
         case DepKind::Alias:     return "alias";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class Access : uint8_t { Read, Write, Connect };
@@ -41,7 +43,7 @@ inline const char* word(Access a) {
         case Access::Write:   return "write";
         case Access::Connect: return "connect";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class RefRole : uint8_t {
@@ -56,7 +58,7 @@ inline const char* word(RefRole r) {
         case RefRole::CallArgument: return "call_argument";
         case RefRole::SystemTask:   return "system_task";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class EventKind : uint8_t { Sensitivity, Wait };
@@ -65,8 +67,8 @@ inline const char* word(EventKind k) {
 }
 
 /// None spells the NULL of a level-sensitive event written explicitly.
-/// Named Edge, not EdgeKind: slang has an ast::EdgeKind of its own and
-/// these headers use its namespace unqualified.
+/// Named Edge because slang has an ast::EdgeKind these headers see
+/// unqualified.
 enum class Edge : uint8_t { None, Posedge, Negedge, Both };
 inline const char* word(Edge e) {
     switch (e) {
@@ -75,7 +77,7 @@ inline const char* word(Edge e) {
         case Edge::Negedge: return "negedge";
         case Edge::Both:    return "both";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class StmtKind : uint8_t {
@@ -92,7 +94,7 @@ inline const char* word(StmtKind k) {
         case StmtKind::Alias:        return "alias";
         case StmtKind::Release:      return "release";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 /// None spells the NULL of a statement that is not an assignment.
@@ -104,12 +106,10 @@ inline const char* word(AssignKind k) {
         case AssignKind::Blocking:    return "blocking";
         case AssignKind::Nonblocking: return "nonblocking";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
-/// module.def_kind. There is no Checker: the schema's CHECK clause listed
-/// one at v16 and nothing could ever write it -- which is the kind of dead
-/// interface value a closed enum makes visible.
+/// module.def_kind. No Checker: nothing in the extractor can produce one.
 enum class DefKind : uint8_t { Module, Interface, Program, Package };
 inline const char* word(DefKind k) {
     switch (k) {
@@ -118,7 +118,7 @@ inline const char* word(DefKind k) {
         case DefKind::Program:   return "program";
         case DefKind::Package:   return "package";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class ProcKind : uint8_t {
@@ -133,7 +133,7 @@ inline const char* word(ProcKind k) {
         case ProcKind::Initial:     return "initial";
         case ProcKind::Final:       return "final";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class TermKind : uint8_t { Signal, Interface };
@@ -152,7 +152,7 @@ inline const char* word(Direction d) {
         case Direction::Inout:  return "inout";
         case Direction::Ref:    return "ref";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class PrimKind : uint8_t { Gate, Switch, Udp };
@@ -162,7 +162,7 @@ inline const char* word(PrimKind k) {
         case PrimKind::Switch: return "switch";
         case PrimKind::Udp:    return "udp";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 enum class ConnKind : uint8_t {
@@ -178,7 +178,7 @@ inline const char* word(ConnKind k) {
         case ConnKind::Interface:         return "interface";
         case ConnKind::ExternalReference: return "external_reference";
     }
-    return "";
+    SLANG_UNREACHABLE;
 }
 
 } // namespace designdb::detail

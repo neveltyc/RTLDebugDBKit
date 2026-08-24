@@ -2,23 +2,17 @@
 // released under the BSD 3-Clause License (see LICENSE)
 //
 // The statement-walk node stream: what one procedure's walk hands to whoever
-// is filing it, as six self-contained node kinds instead of four callbacks
-// with eleven positional parameters and a shared mutable gating stack.
+// files it.
 //
-// Each node owns everything about its statement. An assignment owns its
-// TARGETS -- the old interface sent one callback per target with a
-// `firstTarget` flag, and the receiver reconstructed statement identity from
-// the flag; skipping a first target attached the second target of `{a,b} =
-// ...` to the previous statement. A system task carries its reads and the
-// targets it writes as two named fields -- the old interface overloaded one
-// `writes` vector with "driven from outside the model" under one statement
-// kind and "released, drives nothing" under another, disambiguated by
-// string. The gate is an id into the walk's interned table rather than a
-// vector re-sent with every target of every statement.
+// Each node owns everything about its statement -- an assignment owns its
+// targets, so statement identity is the node rather than a flag on the first
+// of several calls; a system task names its reads and its writes apart. The
+// gate is an id into the walk's interned table, so a branch context is stored
+// once however many statements it gates.
 //
-// Nodes still carry slang pointers (Ref does too); the adapter that walls
-// slang types off is a later phase's, and until then this header sits in
-// ir/ for its shape, not its purity.
+// Nodes carry slang pointers, as Ref does: a hier_ref's text is recovered
+// from the expression it was written as, so the AST has to stay reachable
+// from a filed node.
 
 #pragma once
 
@@ -43,10 +37,8 @@ inline bool sameRef(const Ref& a, const Ref& b) {
            a.cover == b.cover;
 }
 
-/// The interned gating contexts of one procedure walk. A branch context is
-/// pushed once and referenced by id however many statements it gates; the
-/// old interface copied the stack into every emission. Interning is a linear
-/// scan over content -- gate stacks are a handful of refs and one procedure
+/// The interned gating contexts of one procedure walk. Interning is a linear
+/// scan over content: gate stacks hold a handful of refs and one procedure
 /// interns a handful of contexts, so an index would cost more than it saves.
 class GateTable {
 public:
@@ -75,8 +67,8 @@ struct TargetRecord {
     std::vector<PairedSrc> pairs;
 };
 
-/// One assignment statement, owning its targets. `{a, b} = {x, y}` is one
-/// node with two TargetRecords; `x++` is one node with one.
+/// One assignment statement and every target it writes: `{a, b} = {x, y}` is
+/// one node with two TargetRecords.
 struct AssignmentNode {
     std::vector<TargetRecord> targets;
     GateId gate = 0;
@@ -91,13 +83,11 @@ struct AssignmentNode {
     const char* constructWord = nullptr;
 };
 
-/// One actual bound to one formal at a call site. The formal is the symbol
-/// and the actual is the reference -- the old interface folded both into one
-/// Ref whose `sym` was the formal and whose `origin` was the actual's
-/// expression, which two receiver-side comments document as a trap.
+/// One actual bound to one formal at a call site. The formal is a symbol and
+/// the actual a reference: at a call site the formal has no expression of its
+/// own, so it has no reference text and must never be resolved as if it did.
 struct BindNode {
     const slang::ast::FormalArgumentSymbol* formal = nullptr;
-    /// The actual as written; what the old folded Ref carried as `origin`.
     const slang::ast::Expression* actualOrigin = nullptr;
     Ref actual;
     bool reads = false;
@@ -117,10 +107,7 @@ struct EventNode {
 
 /// A statement whose whole effect is to read: an assertion, a wait
 /// condition, a user call's own arguments. `dropped` counts the operands
-/// filtered as compile-time constants -- the assignment path always counted
-/// its own, while the read path reset the counter and never looked, so a
-/// read-only statement's dropped operands were reported as zero however
-/// many there were.
+/// filtered as compile-time constants.
 struct ReadNode {
     enum class Kind { Assertion, Wait, Call };
     std::vector<Ref> reads;

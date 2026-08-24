@@ -31,7 +31,7 @@ TemplateSet TemplateBuilder::run() {
     // body has no AnalyzedScope yields a template with no procedure in it;
     // see designdb::Stats for why that happens and why no row moves.
     for (auto& [key, group] : groups) {
-        if (!wasAnalysed(analysis, *group.body))
+        if (!analysis.getAnalyzedScope(*group.body))
             stats.unanalysedBodies++;
     }
 
@@ -62,9 +62,9 @@ TemplateSet TemplateBuilder::run() {
     /// The body to extract a group's dataflow from: one the analysis manager
     /// actually analysed, else the first seen.
 void TemplateBuilder::offer(Group& g, const InstanceBodySymbol& body) {
-    if (g.body && wasAnalysed(analysis, *g.body))
+    if (g.body && analysis.getAnalyzedScope(*g.body))
         return;
-    if (!g.body || wasAnalysed(analysis, body))
+    if (!g.body || analysis.getAnalyzedScope(body))
         g.body = &body;
 }
 
@@ -495,14 +495,12 @@ bool TemplateBuilder::splitBelow(const std::string& full, const std::string& pre
     /// The segments come from the target's own ancestry through the same
     /// producers that named the tree -- leafSegment per instance level,
     /// generateSegment per generate level, an array element fused with its
-    /// array's name exactly as DeclIndex spells its scope. They used to be
-    /// recovered by splitting slang's hierarchical-path string on '.', which
-    /// agreed with the tree only where slang's spelling and ours happened to
-    /// coincide: an escaped identifier with a dot in it split apart, and an
-    /// unnamed instance -- whose level slang's path omits entirely -- left a
-    /// gap no lookup could cross. The net name stays the slang-path suffix
-    /// below the owner, because net rows are named from that same suffix
-    /// (relativePath), and one producer per channel is the point.
+    /// array's name as DeclIndex spells its scope -- because a segment the
+    /// stamper cannot find by name is a route to nowhere. Splitting slang's
+    /// hierarchical path instead agrees with the tree only where the two
+    /// spellings coincide, which an escaped identifier holding a dot and an
+    /// unnamed instance both break. The net name IS the slang-path suffix
+    /// below the owner, matching how net rows are named (relativePath).
     ///
     /// False means no route: the ancestry never met the stop level, or a
     /// level on the way has no name of its own (a nameless instantiation's
@@ -879,9 +877,6 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                         onEvent(n.expr, n.edge, n.seq, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReadNode>) {
-                        // The node kind IS the statement kind and the read
-                        // role; the receiver used to recover both from a
-                        // string it had just been handed.
                         const auto [kind, role] =
                             n.kind == ReadNode::Kind::Assertion
                                 ? std::pair{StmtKind::Assertion,
@@ -1051,8 +1046,6 @@ void TemplateBuilder::addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
             Ref r;
             r.sym = &vs;
             r.origin = expr;
-            // Parity with the pre-BitInterval default: an event reference
-            // that leaves the instance claimed the whole object exactly.
             r.cover = BitInterval::whole();
             r.exact = true;
             const int32_t saved = b.curStmt;
