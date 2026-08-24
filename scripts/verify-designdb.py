@@ -1692,6 +1692,27 @@ if mode == "interfaces":
     check(one("""
         SELECT count(*) FROM term WHERE term_kind='interface'""") >= 3,
           "interface terminals")
+    # An interface array as the module's own port binds an element per
+    # segment of one terminal, and the member references through it resolve
+    # per element -- both were a single row naming no instance.
+    for ordinal, inst in ((0, "barr[0]"), (1, "barr[1]")):
+        check(one("""
+            SELECT count(*) FROM net_conn c JOIN term tm ON tm.id = c.term_id
+            JOIN tree_node t ON t.id = c.outer_intf_inst_id
+            WHERE tm.name = 'bus_arr' AND c.ordinal = ? AND t.name = ?""",
+                  ordinal, inst) == 1,
+              f"the array port's segment {ordinal} binds {inst}")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path = 'bus_arr[0].vld' AND t.name = 'barr[0]'
+          AND n.name = 'vld'""") == 1,
+          "and a member reference through it lands on that element")
+    check(one("""
+        SELECT count(*) FROM v_driver v JOIN tree_node t ON t.id = v.signal_inst_id
+        WHERE t.name = 'barr[1]' AND v.signal_name = 'data'""") == 1,
+          "so the interface net behind it is driven, not silent")
+
     # A task declared in the interface, called through a port: its body is
     # walked in the CALLER's template, so its bare names belong to a body
     # the caller cannot place. They resolve through the bound terminal, and

@@ -228,6 +228,10 @@ struct TplHierRef {
         Package              // segs[0] names a package; netName its member
     } resolve = NotHierarchical;
     int32_t ifaceTerm = -1;  // ViaIfaceTerm: which of this template's terms
+    /// ViaIfaceTerm: which segment of that terminal, for an interface
+    /// ARRAY port. One terminal binds one element per segment, so the
+    /// terminal alone does not say which instance the reference meant.
+    int32_t ifaceElem = 0;
     std::vector<std::string> segs;   // tree segments to descend
     std::string netName;     // scope-relative net name at the target instance
 

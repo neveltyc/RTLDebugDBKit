@@ -508,6 +508,19 @@ namespace designdb {
 /// gets a `stmt` row of its own -- what the procedure-header
 /// `event_control` row already is for reads with nowhere to belong. Only
 /// the write travels with it; what the condition reads is gating already.
+///
+/// An interface ARRAY as a module's own port binds one element per segment
+/// of its terminal, where it used to be a single `net_conn` row naming no
+/// instance -- so every member reference through it stayed text-only and
+/// the interface nets behind it read as undriven. It is the shape a
+/// concatenated actual already has on an ordinary port: one terminal, a
+/// row per piece, in declaration order. A reference through such a port
+/// carries the segment it meant, decided by whose subtree the target sits
+/// in rather than by the written index, since `bus_arr[k]` in a generate
+/// loop spells one thing and lands on a different element each iteration.
+///
+/// A built-in method's effect on its receiver stays unmodelled, and the
+/// doc says so where the other testbench constructs are declined.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.

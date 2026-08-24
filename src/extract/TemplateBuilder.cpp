@@ -477,6 +477,26 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
             if (it != b.termOf->end()) {
                 auto& ip = first->as<InterfacePortSymbol>();
                 auto [iface, modport] = ip.getConnection();
+                // An interface ARRAY port: the terminal binds an element per
+                // segment, so the route needs the element as well. Which one
+                // is decided by whose subtree the target sits in, not by the
+                // written index -- `bus_arr[k]` in a generate loop spells one
+                // thing and lands on a different element each iteration.
+                if (iface && iface->kind == SymbolKind::InstanceArray) {
+                    auto elems = iface->as<InstanceArraySymbol>().elements;
+                    for (size_t e = 0; e < elems.size(); e++) {
+                        std::string rel;
+                        if (!elems[e] ||
+                            !splitBelow(full, elems[e]->getHierarchicalPath(), rel))
+                            continue;
+                        row.resolve = TplHierRef::ViaIfaceTerm;
+                        row.ifaceTerm = it->second.term;
+                        row.ifaceElem = int32_t(e);
+                        if (!segsFromAncestry(nullptr, elems[e], *target, row))
+                            row.resolve = TplHierRef::Failed;
+                        return;
+                    }
+                }
                 if (iface) {
                     std::string ifacePrefix = iface->getHierarchicalPath();
                     std::string rel;
