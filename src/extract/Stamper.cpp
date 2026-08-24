@@ -230,7 +230,6 @@ private:
             row.dataTypeId = tm.dataTypeId;
             row.width = tm.width;
             row.ordinal = int64_t(i);
-            row.isConst = tm.isConst;
             row.modport = tm.modport;
             row.fileId = tm.loc.fileId;
             row.line = tm.loc.line;
@@ -258,7 +257,6 @@ private:
             row.id = base.proc + int64_t(i) + 1;
             row.instId = instId;
             row.scopeNodeId = scopeNode[size_t(p.scope)];
-            row.name = p.name;
             row.procedureKind = word(p.kind);
             row.ordinal = int64_t(i);
             row.fileId = p.loc.fileId;

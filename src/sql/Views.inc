@@ -139,7 +139,6 @@ SELECT
     dt.text     AS data_type,
     t.width     AS width,
     t.ordinal   AS ordinal,
-    t.is_const  AS is_const,
     t.modport   AS modport,
     f.path      AS file_path,
     sf.path     AS src_path,
