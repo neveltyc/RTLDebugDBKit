@@ -12,11 +12,26 @@
 // interface terminals (term.term_kind='interface'), and interface member
 // references from inside the connected modules -- which leave their module and
 // land in hier_ref.
+//
+// Also here: a task DECLARED IN THE INTERFACE and called through a port. Its
+// body is walked in the caller's template, so its names -- the interface's
+// own variables -- arrive there as bare identifiers of a body the caller
+// cannot place. They resolve through the terminal the interface is bound to,
+// the same route `bus.vld` takes; without that the interface's nets read as
+// undriven while the task plainly wrote them.
 
 interface simple_bus(input logic clk);
     logic       vld;
     logic [7:0] data;
     modport src(output vld, output data, input clk);
+
+    // Writes one of its own variables from another. The formal `x` is not a
+    // net of the interface -- no procedure of its own walks this body -- so
+    // what it contributes stays an unresolved reference, exactly as a
+    // package subroutine's formal does.
+    task automatic stamp(input logic [7:0] x);
+        data = x ^ {8{vld}};
+    endtask
 endinterface
 
 module producer(simple_bus.src bus);
@@ -43,6 +58,24 @@ module driver_pair(simple_bus.src bus, input logic ready, input logic [7:0] payl
 endmodule
 
 module sink(input logic s);
+endmodule
+
+// Calls the interface's own task. The body's write to `data` and its read of
+// `vld` belong to the interface instance this occurrence is bound to, not to
+// this module, and must arrive as cross-instance dataflow.
+module stamper(simple_bus bus, input logic [7:0] din);
+    always_comb bus.stamp(din);
+endmodule
+
+// The same call with a SECOND interface port in scope. A call does not
+// record which port it went through, so the only handle on the body's names
+// is the interface body they are declared in -- and here two terminals reach
+// it, because `u_pair_same` binds both ports to one instance. That says
+// nothing about `u_pair_apart`, which binds them apart: a terminal chosen
+// from the analysed occurrence would send the write to `alt`. Both stay
+// unresolved rather than one of them being wrong.
+module stamp_pair(simple_bus bus, simple_bus alt, input logic [7:0] din);
+    always_comb bus.stamp(din);
 endmodule
 
 // A child port tied to a signal this module cannot name. The row must still
@@ -75,4 +108,13 @@ module interfaces;
     logic       ready = 1'b0;
     logic [7:0] payload = 8'h00;
     driver_pair u_drv(.bus(bus2), .ready(ready), .payload(payload));
+
+    simple_bus  bus3(clk);
+    logic [7:0] stamp_in = 8'h00;
+    stamper     u_stamp(.bus(bus3), .din(stamp_in));
+
+    simple_bus bus4(clk);
+    simple_bus bus5(clk);
+    stamp_pair u_pair_same (.bus(bus4), .alt(bus4), .din(stamp_in));
+    stamp_pair u_pair_apart(.bus(bus4), .alt(bus5), .din(stamp_in));
 endmodule

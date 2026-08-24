@@ -22,6 +22,7 @@
 #include "slang/ast/Symbol.h"
 #include "slang/ast/TimingControl.h"
 #include "slang/ast/expressions/AssertionExpr.h"
+#include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/symbols/BlockSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
@@ -98,6 +99,30 @@ inline Where whereOf(SourceLocation loc, const SourceManager& sm) {
                  static_cast<uint32_t>(sm.getColumnNumber(at))};
 }
 
+/// slang's escaping rule for one path segment: a name that is not a plain
+/// identifier is spelled `\name ` -- verbatim, terminating space included,
+/// with no quoting of an embedded dot -- exactly as appendHierarchicalPath
+/// spells it, so a segment built here matches the paths slang builds.
+inline bool needsEscaping(std::string_view t) {
+    if (t.empty())
+        return false;
+    auto plain = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_';
+    };
+    if (!plain(t[0]) || (t[0] >= '0' && t[0] <= '9'))
+        return true;
+    for (size_t i = 1; i < t.size(); i++) {
+        if (!plain(t[i]) && t[i] != '$')
+            return true;
+    }
+    return false;
+}
+
+inline std::string escapedSegment(std::string_view t) {
+    return needsEscaping(t) ? "\\" + std::string(t) + " " : std::string(t);
+}
+
 /// The canonical text of a reference that leaves its instance: the path as
 /// written, with every select resolved to the constant it elaborated to.
 /// (See v9's history for why not the raw source text: generate loops share a
@@ -127,11 +152,11 @@ inline std::string canonicalPath(const Expression* e, EvalContext& eval) {
                 if (auto* scope = sym.getParentScope()) {
                     auto& owner = scope->asSymbol();
                     if (owner.kind == SymbolKind::Package && !owner.name.empty()) {
-                        out += owner.name;
+                        out += escapedSegment(owner.name);
                         out += "::";
                     }
                 }
-                out += sym.name;
+                out += escapedSegment(sym.name);
                 return true;
             }
             case ExpressionKind::MemberAccess: {
@@ -141,7 +166,49 @@ inline std::string canonicalPath(const Expression* e, EvalContext& eval) {
                 if (ma.member.name.empty())
                     return false;
                 out += '.';
-                out += ma.member.name;
+                out += escapedSegment(ma.member.name);
+                return true;
+            }
+            // The resolved path of a cross-module reference, element by
+            // element -- which is where a select spelled through a genvar
+            // (`u_arr[i+2].cnt`) gets the constant each iteration resolved
+            // to, instead of one shared spelling for every iteration. Only
+            // the plain downward shape: an upward reference re-enters the
+            // hierarchy somewhere this walk cannot spell, and falls through
+            // to the as-written text.
+            case ExpressionKind::HierarchicalValue: {
+                auto& hr = x->as<HierarchicalValueExpression>().ref;
+                if (hr.upwardCount != 0 || hr.path.empty())
+                    return false;
+                bool first = true;
+                for (auto& el : hr.path) {
+                    if (auto* name = std::get_if<std::string_view>(&el.selector)) {
+                        if (name->empty())
+                            return false;
+                        if (!first)
+                            out += '.';
+                        // `$root`/`$unit` head an absolute path as the bare
+                        // system name the source wrote -- not an identifier,
+                        // so the escaping rule does not apply to it.
+                        if (first && (*name == "$root" || *name == "$unit"))
+                            out += *name;
+                        else
+                            out += escapedSegment(*name);
+                    }
+                    else if (auto* idx = std::get_if<int32_t>(&el.selector)) {
+                        if (first)
+                            return false;
+                        out += '[' + std::to_string(*idx) + ']';
+                    }
+                    else {
+                        auto& rng = std::get<std::pair<int32_t, int32_t>>(el.selector);
+                        if (first)
+                            return false;
+                        out += '[' + std::to_string(rng.first) + ':' +
+                               std::to_string(rng.second) + ']';
+                    }
+                    first = false;
+                }
                 return true;
             }
             case ExpressionKind::ElementSelect: {
@@ -198,6 +265,18 @@ inline std::string normalizedText(const Expression* e, const SourceManager& sm,
             if (nl == std::string_view::npos)
                 break;
             i = nl;
+            continue;
+        }
+        // An escaped identifier runs to the next whitespace, and that
+        // terminator is PART of the name: eating it respells `\u.1 ` as the
+        // different identifier `u.1`. Copied verbatim, terminator normalised
+        // to one space.
+        if (raw[i] == '\\') {
+            out += '\\';
+            while (i + 1 < raw.size() &&
+                   !std::isspace(static_cast<unsigned char>(raw[i + 1])))
+                out += raw[++i];
+            out += ' ';
             continue;
         }
         if (!std::isspace(static_cast<unsigned char>(raw[i])))
@@ -388,12 +467,13 @@ inline std::string parameterText(const InstanceBodySymbol& body) {
 
 
 /// The path segment slang gives a generate block: the genvar's *value* for a
-/// loop iteration, the block's name otherwise.
+/// loop iteration, the block's name otherwise -- escaped like every other
+/// segment, or `begin : \g.1 ` spells a node the net paths beside it escape.
 inline std::string generateSegment(const GenerateBlockSymbol& block) {
     if (auto* index = block.getArrayIndex())
         return "[" + index->toString(LiteralBase::Decimal, false) + "]";
-    std::string name(block.name);
-    return name.empty() ? block.getExternalName() : name;
+    return block.name.empty() ? escapedSegment(block.getExternalName())
+                              : escapedSegment(block.name);
 }
 
 /// The last segment of a symbol's hierarchical path: the leaf name with
@@ -410,24 +490,6 @@ inline std::string leafSegment(const Symbol& sym) {
     // Splitting it named the tree node `1 `, and no path lookup could reach
     // that instance.
     //
-    // Same escaping rule and same array-index suffixes slang's own
-    // appendHierarchicalPath applies, so the segment matches what the rest of
-    // the path spells.
-    auto needsEscaping = [](std::string_view t) {
-        if (t.empty())
-            return false;
-        auto plain = [](char c) {
-            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9') || c == '_';
-        };
-        if (!plain(t[0]) || (t[0] >= '0' && t[0] <= '9'))
-            return true;
-        for (size_t i = 1; i < t.size(); i++) {
-            if (!plain(t[i]) && t[i] != '$')
-                return true;
-        }
-        return false;
-    };
     // An array element carries no name of its own -- slang spells `u[0]` as
     // the ARRAY symbol's name plus the element's index suffix, with no
     // separator between them -- so the base comes from the nearest named
@@ -465,8 +527,7 @@ inline std::string leafSegment(const Symbol& sym) {
         // scope would spell their elements identically.
         return {};
     }
-    std::string out = needsEscaping(base) ? "\\" + std::string(base) + " "
-                                          : std::string(base);
+    std::string out = escapedSegment(base);
     // Every kind InstanceSymbolBase covers, primitives included: `buf u[2:1]`
     // spells its elements `u[1]` and `u[2]` exactly as `sub u[2:1]` does, and
     // naming them from the bare array name gave one scope two nodes called

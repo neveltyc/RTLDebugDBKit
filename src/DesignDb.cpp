@@ -185,28 +185,82 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
             exec(ddl.c_str());
         }
 
-        prepare("INSERT INTO module VALUES(?,?,?,?,?,?)", &ins[InsModule]);
-        prepare("INSERT INTO tree_node VALUES(?,?,?,?,?)", &ins[InsTreeNode]);
-        prepare("INSERT INTO inst VALUES(?,?,?,?,?,?,?,?)", &ins[InsInst]);
-        prepare("INSERT INTO inst_param VALUES(?,?,?,?)", &ins[InsInstParam]);
-        prepare("INSERT INTO prim VALUES(?,?,?,?,?,?,?)", &ins[InsPrimitive]);
-        prepare("INSERT INTO net VALUES(?,?,?,?,?,?,?,?,?,?,?)", &ins[InsNet]);
-        prepare("INSERT INTO term VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsTerm]);
-        prepare("INSERT INTO term_map VALUES(?,?,?,?,?,?,?,?,?,?)", &ins[InsTermMap]);
-        prepare("INSERT INTO net_conn VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        // Column lists are spelled out so a schema reorder or mid-table
+        // insertion surfaces as a prepare error, never a silent transposition
+        // of same-typed neighbours the bind indices cannot notice.
+        prepare("INSERT INTO module(id, name, def_kind, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?)",
+                &ins[InsModule]);
+        prepare("INSERT INTO tree_node(id, parent_node_id, name, node_kind, ordinal)"
+                " VALUES(?,?,?,?,?)",
+                &ins[InsTreeNode]);
+        prepare("INSERT INTO inst(id, module_id, parent_inst_id, param_signature,"
+                " unresolved_def, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                &ins[InsInst]);
+        prepare("INSERT INTO inst_param(inst_id, ordinal, name, value)"
+                " VALUES(?,?,?,?)",
+                &ins[InsInstParam]);
+        prepare("INSERT INTO prim(id, inst_id, prim_kind, def_name, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?)",
+                &ins[InsPrimitive]);
+        prepare("INSERT INTO net(id, inst_id, scope_node_id, name, decl_kind,"
+                " data_type_id, width, is_implicit, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsNet]);
+        prepare("INSERT INTO term(id, inst_id, name, term_kind, direction,"
+                " data_type_id, width, ordinal, is_const, modport, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsTerm]);
+        prepare("INSERT INTO term_map(term_id, ordinal, inner_net_id,"
+                " term_lo, term_hi, term_exact, inner_lo, inner_hi, inner_exact,"
+                " map_exact)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsTermMap]);
+        prepare("INSERT INTO net_conn(id, outer_net_id, term_id, ordinal, conn_kind,"
+                " outer_lo, outer_hi, outer_exact, term_lo, term_hi, term_exact,"
+                " map_exact, outer_intf_inst_id, outer_hier_ref_id, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetConn]);
-        prepare("INSERT INTO proc VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcedure]);
-        prepare("INSERT INTO call_site VALUES(?,?,?,?,?,?)", &ins[InsCallSite]);
-        prepare("INSERT INTO stmt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &ins[InsStmt]);
-        prepare("INSERT INTO stmt_target VALUES(?,?,?,?,?,?,?)",
+        prepare("INSERT INTO proc(id, inst_id, scope_node_id, name, proc_kind,"
+                " ordinal, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                &ins[InsProcedure]);
+        prepare("INSERT INTO call_site(id, inst_id, caller_stmt_id,"
+                " parent_call_site_id, subroutine_name, depth)"
+                " VALUES(?,?,?,?,?,?)",
+                &ins[InsCallSite]);
+        prepare("INSERT INTO stmt(id, inst_id, scope_node_id, proc_id, ordinal,"
+                " sequence, stmt_kind, construct, assign_kind, delay,"
+                " dropped_operand_count, call_site_id, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsStmt]);
+        prepare("INSERT INTO stmt_target(id, stmt_id, ordinal, net_id, lo, hi, is_exact)"
+                " VALUES(?,?,?,?,?,?,?)",
                 &ins[InsStmtTarget]);
-        prepare("INSERT INTO assign_operand VALUES(?,?,?,?,?,?,?)",
+        prepare("INSERT INTO assign_operand(id, stmt_id, ordinal, net_id, lo, hi,"
+                " is_exact)"
+                " VALUES(?,?,?,?,?,?,?)",
                 &ins[InsAssignOperand]);
-        prepare("INSERT INTO expr_ref VALUES(?,?,?,?,?,?,?,?)", &ins[InsExprRef]);
-        prepare("INSERT INTO proc_event VALUES(?,?,?,?,?,?,?,?,?)", &ins[InsProcEvent]);
-        prepare("INSERT INTO net_dep VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        prepare("INSERT INTO expr_ref(id, stmt_id, ordinal, net_id, role, lo, hi,"
+                " is_exact)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                &ins[InsExprRef]);
+        prepare("INSERT INTO proc_event(id, proc_id, stmt_id, net_id, event_kind,"
+                " edge_kind, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                &ins[InsProcEvent]);
+        prepare("INSERT INTO net_dep(id, src_net_id, tgt_net_id, stmt_id,"
+                " assign_operand_id, stmt_target_id, expr_ref_id, prim_id,"
+                " src_hier_ref_id, tgt_hier_ref_id, dep_kind,"
+                " src_lo, src_hi, src_exact, tgt_lo, tgt_hi, tgt_exact, map_exact,"
+                " call_site_id)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetDep]);
-        prepare("INSERT INTO hier_ref VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        prepare("INSERT INTO hier_ref(id, inst_id, stmt_id, path, access,"
+                " resolved_inst_id, resolved_net_id, lo, hi, is_exact,"
+                " file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsHierRef]);
         begin();
     }
@@ -276,7 +330,7 @@ void Writer::bumped() {
 
 void Writer::setMeta(std::string_view key, std::string_view value) {
     sqlite3_stmt* s = nullptr;
-    prepare("INSERT OR REPLACE INTO meta VALUES(?,?)", &s);
+    prepare("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", &s);
     sqlite3_bind_text(s, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT);
     int rc = sqlite3_step(s);
@@ -536,8 +590,9 @@ void Writer::addStmt(const StmtRow& r) {
     sqlite3_bind_int64(s, 3, r.scopeNodeId);
     bindOptId(s, 4, r.procedureId);
     sqlite3_bind_int64(s, 5, r.ordinal);
-    // NULL exactly when the statement is in no procedure: a continuous
-    // assign has no execution order among statements that all run always.
+    // NULL outside a procedure (a continuous assign has no execution order)
+    // and on the procedure-header event_control row, which the walk hands
+    // over without a sequence.
     if (r.procedureId == 0 || r.sequence < 0)
         sqlite3_bind_null(s, 6);
     else

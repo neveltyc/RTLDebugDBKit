@@ -1,7 +1,8 @@
 // Copyright (c) 2026 neveltyc
 // released under the BSD 3-Clause License (see LICENSE)
 //
-// check-rtl: expect-fail icarus -- no output arguments on a function
+// check-rtl: expect-fail icarus -- no output arguments on a function, and
+// no queue methods
 //
 // References that leave the instance and have no dotted path to be stored
 // under. A reference with no hier_ref row leaves a net_dep with a null source
@@ -13,12 +14,12 @@
 //
 //   * a $unit-scope object, whose name is bare -- no '.' and no '::' to
 //     recognise it by;
-//   * a name built partly by a macro. canonicalPath has no case for a
-//     hierarchical value, so a cross-module reference falls back to slicing
-//     the source buffer, which returns nothing when the reference's ends sit
-//     in different buffers. `\`TOPNAME.glob` and `outward_tb.glob` are the
-//     same reference and only the second survives that. The symbol knows its
-//     own name in both cases, which is what the fallback uses.
+//   * a name built partly by a macro. canonicalPath declines an upward
+//     reference, which then falls back to slicing the source buffer -- and
+//     that returns nothing when the reference's ends sit in different
+//     buffers. `\`TOPNAME.glob` and `outward_tb.glob` are the same reference
+//     and only the second survives that. The symbol knows its own name in
+//     both cases, which is what the fallback uses.
 //   * a subroutine declared outside the instance body -- here in a package.
 //     Its formal is not a net of this module, so the binding has no source to
 //     name. What holds `taken` up is the write-back: a dependency with no
@@ -72,6 +73,13 @@ module outward_leaf (input logic clk, output logic [7:0] q, gated, taken,
         if (chk(unit_cfg, condb))
             hit = 1'b1;
     end
+
+    // A built-in method registers as a system call in slang, but nothing
+    // here leaves the language: stmt_kind must say `call`, construct the
+    // method's own word.
+    int log_q[$];
+    always_ff @(posedge clk)
+        log_q.push_back(int'(q));
 endmodule
 
 module outward_tb;

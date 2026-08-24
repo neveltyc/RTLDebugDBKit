@@ -21,6 +21,7 @@
 #include <optional>
 #include <span>
 
+#include "slang/ast/expressions/AssignmentExpressions.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
 
 #include "Bits.h"
@@ -55,18 +56,35 @@ private:
 
 /// Whether `expr` is walked element by element.
 inline bool isElementwise(const slang::ast::Expression& expr) {
-    using slang::ast::ExpressionKind;
-    return expr.kind == ExpressionKind::Concatenation ||
-           expr.kind == ExpressionKind::SimpleAssignmentPattern;
+    using namespace slang::ast;
+    if (expr.kind == ExpressionKind::Concatenation ||
+        expr.kind == ExpressionKind::SimpleAssignmentPattern)
+        return true;
+    // A structured pattern whose every element is its own written setter
+    // positions exactly like a simple one: elements() is the per-member
+    // list in declaration order. A default or type setter is ONE written
+    // expression standing for several members -- positioning it would turn
+    // one recorded read into a row per member, a granularity this schema
+    // does not claim.
+    if (expr.kind == ExpressionKind::StructuredAssignmentPattern) {
+        auto& p = expr.as<StructuredAssignmentPatternExpression>();
+        return !p.defaultSetter && p.typeSetters.empty();
+    }
+    return false;
 }
 
 /// The operands of an element-wise expression, MSB first, as written.
 inline std::span<const slang::ast::Expression* const>
 elementOperands(const slang::ast::Expression& expr) {
     using namespace slang::ast;
-    return expr.kind == ExpressionKind::Concatenation
-               ? expr.as<ConcatenationExpression>().operands()
-               : expr.as<SimpleAssignmentPatternExpression>().elements();
+    switch (expr.kind) {
+        case ExpressionKind::Concatenation:
+            return expr.as<ConcatenationExpression>().operands();
+        case ExpressionKind::SimpleAssignmentPattern:
+            return expr.as<SimpleAssignmentPatternExpression>().elements();
+        default:
+            return expr.as<StructuredAssignmentPatternExpression>().elements();
+    }
 }
 
 /// Drive one element-wise expression. Per operand in written (MSB-first)

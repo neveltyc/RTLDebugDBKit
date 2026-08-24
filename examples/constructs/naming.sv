@@ -25,10 +25,16 @@
 //     makes the two tables contradict each other and `g[0]`'s initialiser
 //     indistinguishable from `g[1]`'s.
 //
+//   * a generate LABEL and a reference PATH are segments too, and take the
+//     same escaping. An unescaped label writes a tree node the net paths
+//     beside it spell differently; a reference path that drops the
+//     terminating space respells `\u.1 .v` as `u.1.v`, an identifier that
+//     names something else.
+//
 // (`alias {a, b} = c;` is the same class of name recovery and lives in
 // aliascat.sv, which Verilator cannot lint.)
 
-module naming_leaf; endmodule
+module naming_leaf; logic v; endmodule
 
 module naming (input logic [1:0] ia, ib, output logic [1:0] o,
                output logic [1:0] pe, output logic [1:0] pv);
@@ -49,4 +55,10 @@ module naming (input logic [1:0] ia, ib, output logic [1:0] o,
         alias z = w;              // likewise
         assign o[i] = z;
     end
+
+    if (1) begin : \gn.1          // an escaped generate label is a segment too
+        wire gw = ia[0] ^ ib[0];
+    end
+
+    wire ev = \u.1 .v;            // a reference path keeps the terminator
 endmodule

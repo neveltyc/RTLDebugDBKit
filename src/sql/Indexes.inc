@@ -16,6 +16,11 @@ CREATE INDEX inst_param_by_name     ON inst_param(name, value);
 CREATE INDEX prim_by_inst      ON prim(inst_id);
 CREATE INDEX net_by_inst            ON net(inst_id, name);
 CREATE INDEX net_by_scope           ON net(scope_node_id, name);
+-- "Where is wr_en" -- name first, instance unknown -- is the opening query
+-- of a debug session, and the two instance-first indexes cannot serve it:
+-- without these it is a full scan of the largest object table per lookup.
+CREATE INDEX net_by_name            ON net(name);
+CREATE INDEX term_by_name           ON term(name);
 CREATE INDEX term_by_inst           ON term(inst_id, ordinal);
 CREATE INDEX term_by_inst_name      ON term(inst_id, name);
 CREATE INDEX term_map_by_net        ON term_map(inner_net_id);
@@ -48,12 +53,14 @@ CREATE INDEX proc_event_by_net      ON proc_event(net_id)
     WHERE net_id IS NOT NULL;
 CREATE INDEX net_dep_by_src      ON net_dep(src_net_id);
 CREATE INDEX net_dep_by_tgt      ON net_dep(tgt_net_id);
-CREATE INDEX net_dep_by_stmt        ON net_dep(stmt_id);
+CREATE INDEX net_dep_by_stmt        ON net_dep(stmt_id)
+    WHERE stmt_id IS NOT NULL;
 CREATE INDEX net_dep_by_call_site   ON net_dep(call_site_id)
     WHERE call_site_id IS NOT NULL;
 CREATE INDEX net_dep_by_operand     ON net_dep(assign_operand_id)
     WHERE assign_operand_id IS NOT NULL;
-CREATE INDEX net_dep_by_tgt_ref  ON net_dep(stmt_target_id);
+CREATE INDEX net_dep_by_tgt_ref  ON net_dep(stmt_target_id)
+    WHERE stmt_target_id IS NOT NULL;
 CREATE INDEX net_dep_by_expr_ref    ON net_dep(expr_ref_id)
     WHERE expr_ref_id IS NOT NULL;
 CREATE INDEX net_dep_by_primitive   ON net_dep(prim_id)
@@ -63,7 +70,8 @@ CREATE INDEX net_dep_by_src_href ON net_dep(src_hier_ref_id)
 CREATE INDEX net_dep_by_tgt_href ON net_dep(tgt_hier_ref_id)
     WHERE tgt_hier_ref_id IS NOT NULL;
 CREATE INDEX hier_ref_by_inst       ON hier_ref(inst_id);
-CREATE INDEX hier_ref_by_stmt       ON hier_ref(stmt_id);
+CREATE INDEX hier_ref_by_stmt       ON hier_ref(stmt_id)
+    WHERE stmt_id IS NOT NULL;
 CREATE INDEX hier_ref_by_net        ON hier_ref(resolved_net_id)
     WHERE resolved_net_id IS NOT NULL;
 )SQL"
