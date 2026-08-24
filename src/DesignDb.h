@@ -413,7 +413,9 @@ namespace designdb {
 ///
 /// v17 narrows two published value domains to what a producer can write.
 /// Nothing that was exported stops being exported and no row changes; the
-/// DDL a consumer reads back does, which is why it moves the version.
+/// documented value domain does -- an exhaustive consumer loses a branch --
+/// and the domain is contract. (Its CHECK spelling in the shipped file is
+/// not: the default export strips the clauses entirely.)
 ///
 /// `module.def_kind` loses `checker`. slang's DefinitionKind is Module,
 /// Interface and Program -- a checker is a symbol kind, not a definition kind
@@ -445,12 +447,16 @@ inline constexpr int SchemaVersion = 17;
 /// absent range with exact=true is the whole object, an absent range with
 /// exact=false is "somewhere inside it, unknown where", and a present range
 /// with exact=false is an upper bound rather than the bits actually touched.
+///
+/// Closed vocabularies (kinds, directions, roles) live in extract/ir/Vocab.h;
+/// a field holding one names its enum rather than re-listing the words, which
+/// drifted every time a domain moved.
 
-/// One source definition: module, interface or program.
+/// One source definition.
 struct ModuleRow {
     int64_t id = 0;
     std::string name;
-    std::string definitionKind;   // module | interface | program
+    std::string definitionKind;   // DefKind's word
     int64_t fileId = 0;
     uint32_t line = 0;
     uint32_t column = 0;
@@ -461,7 +467,8 @@ struct TreeNodeRow {
     int64_t id = 0;
     int64_t parentNodeId = 0;     // 0 = root (stored NULL)
     std::string name;             // one path segment, never more
-    std::string nodeKind;         // root | instance | generate | primitive | unresolved
+    std::string nodeKind;         // root | instance | generate | primitive |
+                                  // unresolved | package
     int64_t ordinal = 0;          // order among siblings
 };
 
@@ -490,7 +497,7 @@ struct InstParamRow {
 struct PrimitiveRow {
     int64_t id = 0;
     int64_t instId = 0;           // the module instance whose body wrote it
-    std::string primitiveKind;    // gate | switch | udp
+    std::string primitiveKind;    // PrimKind's word
     std::string definitionName;   // and | bufif1 | the UDP's name
     int64_t fileId = 0;
     uint32_t line = 0;
@@ -503,8 +510,10 @@ struct PrimitiveRow {
 struct NetRow {
     int64_t id = 0;
     int64_t instId = 0;
-    int64_t scopeNodeId = 0;      // the instance or generate node declaring it
-    std::string name;             // scope-relative dotted path (`g[0].sig`, `bump.v`)
+    int64_t scopeNodeId = 0;      // the instance or generate node declaring it;
+                                  // NOT the name's anchor
+    std::string name;             // dotted path relative to instId, generate and
+                                  // subroutine segments included (`g[0].sig`, `bump.v`)
     std::string declarationKind;  // wire | tri | ... | variable
     int64_t dataTypeId = 0;
     int64_t width = -1;           // flattened bits; -1 = not integral, stored NULL
@@ -520,8 +529,8 @@ struct TermRow {
     int64_t id = 0;
     int64_t instId = 0;
     std::string name;
-    std::string terminalKind;     // signal | interface
-    std::string direction;        // input | output | inout | ref; "" = none (interface,
+    std::string terminalKind;     // TermKind's word
+    std::string direction;        // Direction's word; "" = none (interface,
                                   // or an unresolved instance), stored NULL
     int64_t dataTypeId = 0;
     int64_t width = -1;           // -1 = NULL
@@ -551,8 +560,7 @@ struct NetConnRow {
     int64_t netId = 0;            // parent-side net; 0 when the kind has none
     int64_t termId = 0;
     int64_t ordinal = 0;
-    std::string connectionKind;   // signal | constant | unconnected |
-                                  // expression_operand | interface | external_reference
+    std::string connectionKind;   // ConnKind's word
     std::optional<std::pair<uint64_t, uint64_t>> netBits;
     int netExact = -1;            // -1 = no net end at all, stored NULL
     std::optional<std::pair<uint64_t, uint64_t>> termBits;
@@ -565,14 +573,15 @@ struct NetConnRow {
     uint32_t column = 0;
 };
 
-/// One procedure: an always/initial/final block, or a task/function body.
+/// One procedure: an always/initial/final block. Task and function bodies get
+/// no row; their statements belong to the calling procedure.
 struct ProcedureRow {
     int64_t id = 0;
     int64_t instId = 0;
     int64_t scopeNodeId = 0;
-    std::string name;             // task/function name; "" = anonymous, stored NULL
-    std::string procedureKind;    // always | always_ff | always_comb | always_latch |
-                                  // initial | final | task | function
+    std::string name;             // "" = NULL; nothing sets it since v17 removed
+                                  // task/function rows, the only named procedures
+    std::string procedureKind;    // ProcKind's word
     int64_t ordinal = 0;
     int64_t fileId = 0;
     uint32_t line = 0;
@@ -587,10 +596,9 @@ struct StmtRow {
     int64_t procedureId = 0;      // 0 = not in a procedure (continuous assign)
     int64_t ordinal = 0;          // order within the instance
     int64_t sequence = -1;        // execution order within the procedure; -1 = NULL
-    std::string statementKind;    // assignment | assertion | wait | call |
-                                  // system_task | event_control
+    std::string statementKind;    // StmtKind's word
     std::string construct;        // assign | always_ff | assert | $display | ...
-    std::string assignmentKind;   // continuous | blocking | nonblocking; "" = NULL
+    std::string assignmentKind;   // AssignKind's word; "" = NULL
     std::string delay;            // normalised delay control text; "" = NULL
     int64_t droppedOperandCount = 0;
     int64_t callSiteId = 0;       // the call-site expansion this belongs to; 0 = NULL
@@ -636,8 +644,7 @@ struct ExprRefRow {
     int64_t stmtId = 0;
     int64_t ordinal = 0;
     int64_t netId = 0;
-    std::string role;             // control | assertion | wait | event |
-                                  // call_argument | system_task
+    std::string role;             // RefRole's word
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
 };
@@ -648,8 +655,8 @@ struct ProcEventRow {
     int64_t procedureId = 0;
     int64_t stmtId = 0;           // the wait statement; 0 for a sensitivity list
     int64_t netId = 0;            // 0 when the event expression is not a plain net
-    std::string eventKind;        // sensitivity | wait
-    std::string edgeKind;         // posedge | negedge | both; "" = NULL
+    std::string eventKind;        // EventKind's word
+    std::string edgeKind;         // Edge's word; "" = NULL
     int64_t fileId = 0;
     uint32_t line = 0;
     uint32_t column = 0;
@@ -660,7 +667,11 @@ struct ProcEventRow {
 /// and names the hier_ref row instead of an operand/target row.
 struct NetDepRow {
     int64_t id = 0;
-    int64_t sourceNetId = 0;      // 0 = a constant drives the target
+    int64_t sourceNetId = 0;      // 0 = no nameable source (stored NULL): a
+                                  // constant, an unresolved external reference,
+                                  // an input-less primitive, or a procedure
+                                  // write-back -- dependencyKind and the
+                                  // reference ids tell which (see v_driver)
     int64_t targetNetId = 0;
     int64_t stmtId = 0;
     int64_t assignOperandId = 0;
@@ -669,7 +680,7 @@ struct NetDepRow {
     int64_t primitiveId = 0;
     int64_t sourceHierRefId = 0;
     int64_t targetHierRefId = 0;
-    std::string dependencyKind;   // data | control | primitive | procedure
+    std::string dependencyKind;   // DepKind's word
     std::optional<std::pair<uint64_t, uint64_t>> sourceBits;
     int sourceExact = -1;         // -1 = no source end, stored NULL
     std::optional<std::pair<uint64_t, uint64_t>> targetBits;
@@ -685,7 +696,7 @@ struct HierRefRow {
     int64_t instId = 0;
     int64_t stmtId = 0;           // 0 = made by a port connection, not a statement
     std::string path;             // as written, normalised
-    std::string access;           // read | write | connect
+    std::string access;           // Access's word
     int64_t resolvedInstId = 0;   // 0 = not resolved to an object in this export
     int64_t resolvedNetId = 0;
     std::optional<std::pair<uint64_t, uint64_t>> bits;
