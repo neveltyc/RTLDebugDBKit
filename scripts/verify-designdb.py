@@ -1380,6 +1380,15 @@ if mode:
 
 
 if mode == "constructs":
+    # A system task's written argument is not a read of it, wherever the
+    # call sits. From inside a condition the gating used to pick it up, so
+    # the signal a plusarg fills gated whatever the branch wrote.
+    check(one("""SELECT count(*) FROM v_driver
+                 WHERE driver_name='seed' AND driver_kind='control'""") == 0,
+          "a plusarg's destination does not gate the branch")
+    check(one("""SELECT count(*) FROM v_load WHERE signal_name='seed'""") == 0,
+          "and is not read by it")
+
     # force/release: the force is a blocking assignment whose construct
     # word marks the hijack, the release is its own statement kind naming
     # the signal it lets go of -- and neither pollutes the driver count:
