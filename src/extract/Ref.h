@@ -77,8 +77,25 @@ struct Ref {
     const Expression* origin = nullptr;
 };
 
+/// The width the schema's bit offsets index into: slang's selectable space,
+/// which flattens an unpacked aggregate where getBitWidth -- the PACKED
+/// width -- answers zero. Positioning arithmetic must use this one, or a
+/// window computed here cannot be compared with a range recorded there.
+inline uint64_t flattenedWidth(const Type& type) {
+    const Type& ct = type.getCanonicalType();
+    // An unpacked aggregate is flattened; everything else is its packed
+    // width, and a type with no bits has none. slang's getSelectableWidth
+    // answers 1 for that last case so a non-aggregate always has one
+    // selectable element -- a count, not a width, and positioning against
+    // it puts a void replication operand or an unelaborated port on a bit
+    // it does not have.
+    if (ct.isUnpackedArray() || ct.isUnpackedStruct() || ct.isUnpackedUnion())
+        return ct.getSelectableWidth();
+    return ct.getBitWidth();
+}
+
 inline uint64_t bitWidthOf(const ValueSymbol& sym) {
-    return sym.getType().getSelectableWidth();
+    return flattenedWidth(sym.getType());
 }
 
 /// Builds a Ref from one of slang's value paths; nullopt when the path has
@@ -152,7 +169,7 @@ struct Slot {
 constexpr int64_t kCallExpansionBudget = 4000;
 
 inline uint64_t exprWidthOf(const Expression& e) {
-    return e.type ? e.type->getBitWidth() : 0;
+    return e.type ? flattenedWidth(*e.type) : 0;
 }
 
 /// Whether the expression *is* a reference to storage rather than a
