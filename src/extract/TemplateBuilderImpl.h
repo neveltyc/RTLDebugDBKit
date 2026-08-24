@@ -71,7 +71,6 @@
 #include "extract/Ref.h"
 #include "extract/SymbolText.h"
 #include "extract/ir/Nodes.h"
-#include "extract/ir/SlangFacts.h"
 
 using namespace slang;
 using namespace slang::ast;
@@ -79,9 +78,15 @@ using namespace slang::analysis;
 
 namespace designdb::detail {
 
+/// The body slang analysed for an instance. Identical instances share one
+/// canonical body, and that shared one is what the analysis manager holds
+/// procedures for; `inst.body` is the occurrence's own and may have none.
+inline const InstanceBodySymbol& canonicalBodyOf(const InstanceSymbol& inst) {
+    return inst.getCanonicalBody() ? *inst.getCanonicalBody() : inst.body;
+}
+
 /// A Ref's coverage in the template row encoding: bits only when a specific
-/// run is known, exactness as claimed. Lived in Template.h until the IR
-/// severed Template from the AST vocabulary.
+/// run is known, exactness as claimed.
 inline TplRange rangeOf(const Ref& r) {
     TplRange out;
     if (r.sym && r.cover.isRange())

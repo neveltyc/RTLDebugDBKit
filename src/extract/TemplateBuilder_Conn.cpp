@@ -63,11 +63,6 @@ void TemplateBuilder::collectConnRefs(const Expression& expr, EvalContext& ctx,
                         collectConnRefs(*op, ctx, out, 0, true);
                 return;
             }
-            // The shared walk supplies the two corner rules this copy used
-            // to answer differently: a zero-width operand now moves no
-            // cursor and poisons nothing -- it used to degrade the whole
-            // side, though the members after it keep their positions -- and
-            // a width overflow degrades the rest, as before.
             walkElements(
                 expr, base, width, exprWidthOf,
                 [&](const Expression& op, BitRange window) {
@@ -120,9 +115,8 @@ void TemplateBuilder::collectConnRefs(const Expression& expr, EvalContext& ctx,
                 if (have.insert(s).second) {
                     Ref r;
                     r.sym = s;
-                    // Parity with the pre-BitInterval default: a read found
-                    // without bounds claimed the whole object exactly. The
-                    // claim is unaudited and the emission rework revisits it.
+                    // collectReads answers with symbols, not paths, so the
+                    // whole object is all this reference can name.
                     r.cover = BitInterval::whole();
                     r.exact = true;
                     refs.push_back(r);
