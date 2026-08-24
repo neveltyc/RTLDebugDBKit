@@ -1408,10 +1408,24 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         b.t->deps.push_back(std::move(d));
     }
     if (writes) {
+        // The calling statement writes the actual, so it is a target of that
+        // statement -- the same row an assignment to it would make. Without
+        // it v_driver reports the write and v_stmt_target reports nothing.
+        int32_t targetIdx = -1;
+        if (stmt >= 0) {
+            TplStmtRef tr;
+            tr.stmt = stmt;
+            tr.ordinal = b.targetOrdinal++;
+            tr.net = actualNet;
+            tr.r = rangeOf(actual);
+            targetIdx = int32_t(b.t->targets.size());
+            b.t->targets.push_back(std::move(tr));
+        }
         TplDep d;
         d.src.net = formalNet;
         d.tgt.net = actualNet;
         d.stmt = stmt;
+        d.targetRef = targetIdx;
         d.kind = DepKind::Procedure;
         d.tgtR = rangeOf(actual);
         d.mappingExact = oneToOne ? 1 : 0;

@@ -6,11 +6,15 @@
 // body walk produces carries a call_site_id, so a consumer can follow, at
 // each hop through the subroutine, only the rows of one call and keep each
 // call's real combination: {g1, a} and {g2, b}, never {g1, b}.
+//
+// It also carries the argument form whose row set is decided by the binding
+// rather than by the body: an `output` actual, which the calling statement
+// writes as it writes any other target.
 
 module callsite_top(input logic g1, input logic g2,
                     input logic [7:0] a, input logic [7:0] b,
                     input logic [7:0] c, output logic [7:0] r,
-                    output logic [7:0] s);
+                    output logic [7:0] s, output logic [7:0] w);
     task automatic bump(input logic [7:0] v);
         r = v;                 // the body's write, walked once per call site
     endtask
@@ -21,11 +25,18 @@ module callsite_top(input logic g1, input logic g2,
     function automatic logic pick(input logic [7:0] v);
         return v != 8'h00;
     endfunction
+    // An output actual is written BY the call, so it is a target of the
+    // calling statement like any other write -- v_stmt_target's own
+    // vocabulary names it.
+    task automatic store(input logic [7:0] v, output logic [7:0] o);
+        o = v;
+    endtask
     always_comb begin
         r = 8'h00;
         s = 8'h00;
         if (g1) bump(a);       // call site 1: gated by g1, argument a
         if (g2) bump(b);       // call site 2: gated by g2, argument b
         if (pick(c)) s = c;    // call site 3: call in a control expression
+        store(a, w);           // an output actual: w is written by the call
     end
 endmodule
