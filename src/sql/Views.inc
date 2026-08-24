@@ -849,9 +849,9 @@ SELECT
     CASE WHEN s.stmt_kind = 'release' THEN 'release_target'
          WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
          ELSE 'written_by' END AS target_kind,
-    a.lo       AS tgt_lo,
-    a.hi       AS tgt_hi,
-    a.is_exact AS tgt_exact,
+    a.lo       AS lo,
+    a.hi       AS hi,
+    a.is_exact AS is_exact,
     s.call_site_id AS call_site_id
 FROM stmt_target a
 JOIN net n ON n.id = a.net_id
@@ -869,9 +869,9 @@ SELECT
     o.ordinal  AS ordinal,
     o.net_id   AS net_id,
     n.name     AS net_name,
-    o.lo       AS operand_lo,
-    o.hi       AS operand_hi,
-    o.is_exact AS operand_exact,
+    o.lo       AS lo,
+    o.hi       AS hi,
+    o.is_exact AS is_exact,
     s.call_site_id AS call_site_id
 FROM assign_operand o
 JOIN net n ON n.id = o.net_id
@@ -949,7 +949,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 CREATE VIEW v_net_attachment AS
 SELECT m.inner_net_id AS net_id, n.inst_id AS inst_id, n.name AS net_name,
        'terminal_inside' AS attachment_kind,
-       m.inner_lo AS lo, m.inner_hi AS hi, m.inner_exact AS exact,
+       m.inner_lo AS lo, m.inner_hi AS hi, m.inner_exact AS is_exact,
        NULL AS stmt_id,
        m.id AS term_map_id, NULL AS conn_id, NULL AS stmt_target_id,
        NULL AS assign_operand_id,
@@ -1080,9 +1080,9 @@ SELECT
     h.resolved_inst_id  AS resolved_inst_id,
     h.resolved_net_id   AS resolved_net_id,
     rn.name             AS resolved_net_name,
-    h.lo                AS ref_lo,
-    h.hi                AS ref_hi,
-    h.is_exact          AS ref_exact,
+    h.lo                AS lo,
+    h.hi                AS hi,
+    h.is_exact          AS is_exact,
     f.path              AS file_path,
     sf.path             AS src_path,
     h.line              AS src_line,
