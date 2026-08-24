@@ -449,6 +449,17 @@ namespace designdb {
 /// and both rows said `term_id=48` with nothing to tell them apart, though
 /// the view's contract is that its typed id names the relation's own row.
 /// `v_term_map` publishes the new id so the join stays inside the view set.
+///
+/// Three columns join the view surface. `v_driver` and `v_load` gain
+/// `signal_ref` beside the `driver_ref`/`load_ref` they already had: either
+/// end of an arc can be the hierarchically named one -- `assign q = u.x`
+/// names the driver, `always_comb u.x = a` names the signal -- and with
+/// only one spelling published the second was reachable in three joins from
+/// the side that asks who drives `x`. `v_tree_node` gains `def_kind`, so an
+/// interface instance and a module instance, both `node_kind='instance'`,
+/// are told apart without joining a table the view set does not cover.
+/// `v_db_info` gains `tool`, which was a required meta key with no column;
+/// the required set is now exactly the view's columns less `top`.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.

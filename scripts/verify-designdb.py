@@ -873,7 +873,7 @@ check(one("""
 # a column added to the view then demands its meta key without this list
 # needing to know.
 required = [r[1] for r in con.execute("PRAGMA table_info(v_db_info)")
-            if r[1] != "top"] + ["tool"]
+            if r[1] != "top"]
 if required == ["tool"]:
     fatal("v_db_info is missing")
 meta = dict(con.execute("SELECT key, value FROM meta"))
@@ -924,13 +924,14 @@ for k in COUNTS:
 # absent from this list.
 VIEW_COLUMNS = {
     "v_db_info": [
-        "schema_version", "tool_version", "slang_version", "producer_revision",
+        "schema_version", "tool", "tool_version", "slang_version",
+        "producer_revision",
         "top", "analysis_status", "error_count", "unresolved_count",
         "empty_procedure_count", "duplicate_path_count", "recursion_count",
         "truncated_call_count", "unanalysed_inst_count", "config_digest"],
     "v_tree_node": [
         "node_id", "parent_node_id", "node_name", "node_kind", "ordinal",
-        "inst_id", "parent_inst_id", "module_id", "module_name",
+        "inst_id", "parent_inst_id", "module_id", "module_name", "def_kind",
         "param_signature", "def_name", "file_path", "src_path",
         "src_line", "src_col"],
     "v_net": [
@@ -965,15 +966,17 @@ VIEW_COLUMNS = {
         "dep_kind", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
     "v_driver": [
-        "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
-        "signal_hi", "signal_exact", "driver_net_id", "driver_inst_id",
+        "signal_net_id", "signal_inst_id", "signal_name", "signal_ref",
+        "signal_lo", "signal_hi", "signal_exact",
+        "driver_net_id", "driver_inst_id",
         "driver_name", "driver_ref", "driver_lo", "driver_hi", "driver_exact",
         "driver_kind", "dep_id", "conn_id", "stmt_id",
         "prim_id", "term_id", "map_exact", "call_site_id", "file_path",
         "src_path", "src_line", "src_col"],
     "v_load": [
-        "signal_net_id", "signal_inst_id", "signal_name", "signal_lo",
-        "signal_hi", "signal_exact", "load_net_id", "load_inst_id",
+        "signal_net_id", "signal_inst_id", "signal_name", "signal_ref",
+        "signal_lo", "signal_hi", "signal_exact",
+        "load_net_id", "load_inst_id",
         "load_name", "load_ref", "load_lo", "load_hi", "load_exact",
         "load_kind", "dep_id", "conn_id", "stmt_id", "proc_id",
         "term_id", "map_exact", "call_site_id", "file_path", "src_path",
@@ -2545,6 +2548,17 @@ if mode == "rootref":
           "while the local path beside it follows the occurrence")
 
 if mode == "xmr":
+    # A hierarchical WRITE names its target, and the driver view says so on
+    # the row itself: `always_comb u.x = a` is one lookup from the far net,
+    # not a walk out to net_dep and back through hier_ref.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='x' AND driver_name='a' AND signal_ref='u.x'""") == 1,
+          "a hierarchically written signal carries its spelling on the arc")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='a' AND load_name='x' AND load_ref='u.x'""") == 1,
+          "and the load view mirrors it")
     # A path that climbs out of a twice-instantiated body and back into it
     # lands on a symbol of that body, and is still not the occurrence's own
     # net: both occurrences answer with the reference, neither with itself.
