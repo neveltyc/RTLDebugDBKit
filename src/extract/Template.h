@@ -93,7 +93,6 @@ struct TplTerm {
     Direction direction = Direction::None;
     int64_t dataTypeId = 0;
     int64_t width = -1;
-    int isConst = -1;
     std::string modport;
     TplLoc loc;
 };
@@ -108,7 +107,6 @@ struct TplTermMap {
 
 struct TplProcedure {
     int32_t scope = 0;
-    std::string name;
     ProcKind kind = ProcKind::Always;
     TplLoc loc;
 };

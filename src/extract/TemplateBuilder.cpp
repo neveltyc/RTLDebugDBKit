@@ -209,16 +209,8 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
                 term.kind = TermKind::Signal;
                 term.direction = directionOf(p.direction);
                 term.dataTypeId = writer.internDataType(p.getType().toString());
-                if (p.getType().isIntegral())
-                    term.width = static_cast<int64_t>(p.getType().getBitWidth());
-                term.isConst = 0;
-                if (p.direction == ArgumentDirection::Ref && p.internalSymbol &&
-                    ValueSymbol::isKind(p.internalSymbol->kind)) {
-                    auto& vs = p.internalSymbol->as<ValueSymbol>();
-                    if (vs.kind == SymbolKind::Variable &&
-                        vs.as<VariableSymbol>().flags.has(VariableFlags::Const))
-                        term.isConst = 1;
-                }
+                if (const uint64_t w = flattenedWidth(p.getType()))
+                    term.width = static_cast<int64_t>(w);
                 break;
             }
             case SymbolKind::MultiPort: {
@@ -226,9 +218,8 @@ void TemplateBuilder::buildTerms(Template& t, const InstanceBodySymbol& body) {
                 term.kind = TermKind::Signal;
                 term.direction = directionOf(mp.direction);
                 term.dataTypeId = writer.internDataType(mp.getType().toString());
-                if (mp.getType().isIntegral())
-                    term.width = static_cast<int64_t>(mp.getType().getBitWidth());
-                term.isConst = 0;
+                if (const uint64_t w = flattenedWidth(mp.getType()))
+                    term.width = static_cast<int64_t>(w);
                 break;
             }
             case SymbolKind::InterfacePort: {

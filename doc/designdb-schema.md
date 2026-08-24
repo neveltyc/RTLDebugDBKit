@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 17. The version is the *consumption contract*, not the DDL: a
+Schema version 18. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
@@ -237,9 +237,10 @@ they are not connectivity. `decl_kind` is
 the net type's own word (`wire`, `wand`, `trireg`, a user-defined nettype's
 name) or `variable`. `is_implicit=1` marks a net slang created for an
 undeclared identifier under the active `` `default_nettype ``; its location
-is the first use. `width` is the flattened bit width, NULL when the type is
-not integral — bit *offsets* still index the flattened space slang computes
-for unpacked objects, so ranges on a NULL-width net remain meaningful.
+is the first use. `width` is the flattened bit width — the space bit
+offsets index, so an unpacked array reports the whole of it (`logic [7:0]
+a [0:3]` is 32) and a range on it is measurable against something. NULL only
+for a type with no bits at all: an `event`, a `string`, a class handle.
 
 **`term`** — one terminal per port, in port-list order (`ordinal`). The
 root's terminals are the design's top-level ports; a child's are the pins
@@ -571,7 +572,7 @@ segments `net_name` already carries (see `net`).
 
 **`v_term`** — one row per terminal: `term_id, inst_id,
 module_id, module_name, term_name, term_kind, direction, data_type,
-width, ordinal, is_const, modport, file_path, src_path, src_line,
+width, ordinal, modport, file_path, src_path, src_line,
 src_col`.
 
 **`v_term_map`** — one row per inside segment: `term_id,

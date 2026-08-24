@@ -424,7 +424,23 @@ namespace designdb {
 /// same reason and one more: the doc has said since v2 that task and function
 /// bodies get no procedure row, their statements belonging to the calling
 /// procedure, so the constraint contradicted the contract beside it.
-inline constexpr int SchemaVersion = 17;
+///
+/// v18 drops two columns nothing can fill and widens one NULL rule.
+///
+/// `term.is_const` marked a `const ref` port. There is no such thing:
+/// `const` is rejected on a port declaration, so the column could only ever
+/// hold 0 or NULL and never the fact it existed to carry. `proc.name` held
+/// a task or function name, and v17 removed the rows that had one. Both are
+/// gone rather than kept as columns a consumer must ask about and never
+/// learn from.
+///
+/// `net.width` and `term.width` were NULL for every non-integral type,
+/// which left an unpacked object's ranges unmeasurable: bit offsets index
+/// the FLATTENED space, so `[4:11]` of a four-element byte array is a
+/// window into 32 bits that the row would not name. Both now carry the
+/// flattened width -- the space the offsets are in -- and are NULL only for
+/// a type with no bits at all.
+inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -516,7 +532,8 @@ struct NetRow {
                                   // subroutine segments included (`g[0].sig`, `bump.v`)
     std::string declarationKind;  // wire | tri | ... | variable
     int64_t dataTypeId = 0;
-    int64_t width = -1;           // flattened bits; -1 = not integral, stored NULL
+    int64_t width = -1;           // flattened bits, the space offsets index;
+                                  // -1 = a type with no bits, stored NULL
     bool isImplicit = false;
     int64_t fileId = 0;
     uint32_t line = 0;
@@ -535,7 +552,6 @@ struct TermRow {
     int64_t dataTypeId = 0;
     int64_t width = -1;           // -1 = NULL
     int64_t ordinal = 0;          // position in the port list
-    int isConst = -1;             // const ref; -1 = does not apply, stored NULL
     std::string modport;          // "" = NULL
     int64_t fileId = 0;
     uint32_t line = 0;
@@ -579,8 +595,6 @@ struct ProcedureRow {
     int64_t id = 0;
     int64_t instId = 0;
     int64_t scopeNodeId = 0;
-    std::string name;             // "" = NULL; nothing sets it since v17 removed
-                                  // task/function rows, the only named procedures
     std::string procedureKind;    // ProcKind's word
     int64_t ordinal = 0;
     int64_t fileId = 0;

@@ -159,7 +159,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "17"
+SCHEMA_VERSION = "18"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
@@ -271,7 +271,6 @@ for tbl, col, values, nullable in DOMAINS:
 
 for tbl, cols in (
     ("net", ("is_implicit",)),
-    ("term", ("is_const",)),
     ("term_map", ("term_exact", "inner_exact", "map_exact")),
     ("net_conn", ("outer_exact", "term_exact", "map_exact")),
     ("stmt_target", ("is_exact",)),
@@ -942,7 +941,7 @@ VIEW_COLUMNS = {
     "v_term": [
         "term_id", "inst_id", "module_id", "module_name",
         "term_name", "term_kind", "direction", "data_type", "width",
-        "ordinal", "is_const", "modport", "file_path", "src_path",
+        "ordinal", "modport", "file_path", "src_path",
         "src_line", "src_col"],
     "v_term_map": [
         "term_id", "term_inst_id", "term_name",
@@ -2377,6 +2376,12 @@ if mode == "naming":
           "and never a respelling of it")
 
 if mode == "concatcursor":
+    # An unpacked object's width is the flattened space its offsets index,
+    # not its packed width -- without it a range like [8:15] on a byte array
+    # names a window into a size the row does not state.
+    for name, w in (("arr", 32), ("slice_src", 32), ("slice_dst", 16)):
+        check(one("SELECT width FROM v_net WHERE net_name = ?", name) == w,
+              f"the unpacked net {name} reports its flattened width")
     # An unpacked-array range select: slang's bounds cover one element
     # however many the select names, so no range is claimed at all rather
     # than one that says the rest is untouched.

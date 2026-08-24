@@ -208,7 +208,6 @@ CREATE TABLE term(
     data_type_id  INTEGER REFERENCES data_type(id),
     width         INTEGER,
     ordinal       INTEGER NOT NULL,
-    is_const      INTEGER CHECK(is_const IN (0,1)),
     modport       TEXT,
     file_id       INTEGER REFERENCES file(id),
     line          INTEGER,
@@ -288,7 +287,6 @@ CREATE TABLE proc(
     id             INTEGER PRIMARY KEY,
     inst_id        INTEGER NOT NULL REFERENCES inst(id),
     scope_node_id  INTEGER NOT NULL REFERENCES tree_node(id),
-    name           TEXT,
     proc_kind      TEXT NOT NULL
         /*!*/CHECK(proc_kind IN ('always','always_ff','always_comb','always_latch',
                                  'initial','final'))/*!*/,
