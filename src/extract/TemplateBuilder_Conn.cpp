@@ -278,7 +278,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
         if (conn->port.kind == SymbolKind::InterfacePort) {
             auto [ifaceSym, modport] = conn->getIfaceConn();
             TplConn tc;
-            tc.kind = "interface";
+            tc.kind = ConnKind::Interface;
             tc.childTerm = termIdx;
             tc.ordinal = nextOrdinal();
             tc.loc = at;
@@ -308,7 +308,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
 
         if (!connExpr) {
             TplConn tc;
-            tc.kind = "unconnected";
+            tc.kind = ConnKind::Unconnected;
             tc.childTerm = termIdx;
             tc.ordinal = nextOrdinal();
             tc.loc = at;
@@ -320,7 +320,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
         collectConnRefs(*connExpr, evalCtx, nets);
         if (nets.empty()) {
             TplConn tc;
-            tc.kind = "constant";
+            tc.kind = ConnKind::Constant;
             tc.childTerm = termIdx;
             tc.ordinal = nextOrdinal();
             tc.termExact = 1;   // the whole formal, trivially
@@ -366,7 +366,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 tc.termExact = 0;
             }
             if (!cn.ref.sym) {
-                tc.kind = "constant";
+                tc.kind = ConnKind::Constant;
                 c.conns.push_back(std::move(tc));
                 continue;
             }
@@ -384,10 +384,10 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 const int32_t saved = b.curStmt;
                 b.curStmt = -1;
                 const int32_t href =
-                    addHierRef(b, /*isWrite=*/false, r, at, evalCtx, "connect");
+                    addHierRef(b, /*isWrite=*/false, r, at, evalCtx, Access::Connect);
                 b.curStmt = saved;
-                tc.kind = cn.expression ? "expression_operand"
-                                        : "external_reference";
+                tc.kind = cn.expression ? ConnKind::ExpressionOperand
+                                        : ConnKind::ExternalReference;
                 tc.hierRef = href;
                 // An external tie has a formal to measure against like
                 // any other connection to a resolved child, so it
@@ -404,7 +404,8 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 continue;
             }
             tc.parentNet = netIdx;
-            tc.kind = cn.expression ? "expression_operand" : "signal";
+            tc.kind = cn.expression ? ConnKind::ExpressionOperand
+                                    : ConnKind::Signal;
             if (inArray) {
                 // An element shares the whole array's connection
                 // expression: somewhere in the object, honestly.
@@ -414,7 +415,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 tc.netR = rangeOf(cn.ref);
                 tc.netExact = cn.ref.exact ? 1 : 0;
             }
-            tc.mappingExact = tc.kind == "expression_operand"
+            tc.mappingExact = tc.kind == ConnKind::ExpressionOperand
                                   ? 0
                                   : (cn.positional && !inArray &&
                                              !widthMismatch
@@ -486,7 +487,7 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
                 if (!r.sym)
                     continue;
                 TplConn tc;
-                tc.kind = "expression_operand";
+                tc.kind = ConnKind::ExpressionOperand;
                 tc.childTerm = termSlot;
                 tc.ordinal = seqOrdinal++;
                 tc.loc = at;
@@ -494,7 +495,7 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
                 if (netIdx < 0) {
                     const int32_t saved = b.curStmt;
                     b.curStmt = -1;
-                    tc.hierRef = addHierRef(b, false, r, at, evalCtx, "connect");
+                    tc.hierRef = addHierRef(b, false, r, at, evalCtx, Access::Connect);
                     b.curStmt = saved;
                 }
                 else {
@@ -510,7 +511,7 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
         }
         if (!expr) {
             TplConn tc;
-            tc.kind = "unconnected";
+            tc.kind = ConnKind::Unconnected;
             tc.childTerm = termSlot;
             tc.loc = at;
             c.conns.push_back(std::move(tc));
@@ -520,7 +521,7 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
         collectConnRefs(*expr, evalCtx, nets);
         if (nets.empty()) {
             TplConn tc;
-            tc.kind = "constant";
+            tc.kind = ConnKind::Constant;
             tc.childTerm = termSlot;
             tc.loc = at;
             c.conns.push_back(std::move(tc));
@@ -534,7 +535,7 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
             tc.loc = at;
             // No formal knowledge: the terminal side stays NULL.
             if (!cn.ref.sym) {
-                tc.kind = "constant";
+                tc.kind = ConnKind::Constant;
                 c.conns.push_back(std::move(tc));
                 continue;
             }
@@ -543,19 +544,20 @@ void TemplateBuilder::buildUnresolvedConns(Build& b, const UninstantiatedDefSymb
                 const int32_t saved = b.curStmt;
                 b.curStmt = -1;
                 const int32_t href = addHierRef(b, false, cn.ref, at,
-                                                evalCtx, "connect");
+                                                evalCtx, Access::Connect);
                 b.curStmt = saved;
-                tc.kind = cn.expression ? "expression_operand"
-                                        : "external_reference";
+                tc.kind = cn.expression ? ConnKind::ExpressionOperand
+                                        : ConnKind::ExternalReference;
                 tc.hierRef = href;
                 c.conns.push_back(std::move(tc));
                 continue;
             }
             tc.parentNet = netIdx;
-            tc.kind = cn.expression ? "expression_operand" : "signal";
+            tc.kind = cn.expression ? ConnKind::ExpressionOperand
+                                    : ConnKind::Signal;
             tc.netR = rangeOf(cn.ref);
             tc.netExact = cn.ref.exact ? 1 : 0;
-            tc.mappingExact = tc.kind == "expression_operand" ? 0 : -1;
+            tc.mappingExact = tc.kind == ConnKind::ExpressionOperand ? 0 : -1;
             c.conns.push_back(std::move(tc));
         }
     }
