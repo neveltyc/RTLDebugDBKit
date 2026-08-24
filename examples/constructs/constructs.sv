@@ -78,12 +78,20 @@ endmodule
 // and waits on them.
 module observers(input logic clk, input logic [7:0] watched, input logic done);
     logic [7:0] loaded [0:1];
+    int seed;
+    logic picked = 1'b0;
     initial begin
         $display("watched=%0h", watched);   // a system task's argument
         wait (done);                        // a wait condition
         // The argument a system task *writes* is not a read of it. Recorded
         // as one, `loaded` said it read itself at the line that loads it.
         $readmemh("nonexistent.hex", loaded);
+        // The same argument, written by a call in a CONDITION. The gating a
+        // condition contributes is its reads, and this one is not read --
+        // recorded as one, the signal a plusarg fills reads as a condition
+        // operand of whatever the branch writes, and as driving nothing.
+        if ($value$plusargs("SEED=%d", seed))
+            picked <= 1'b1;
     end
     final $display("last watched=%0h", watched);
 endmodule
