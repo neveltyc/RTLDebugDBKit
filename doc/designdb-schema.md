@@ -555,7 +555,7 @@ asserts all of it on every export. Ground rules:
 `schema_version, tool, tool_version, slang_version, producer_revision, top,
 analysis_status, error_count, unresolved_count, empty_procedure_count,
 duplicate_path_count, recursion_count, truncated_call_count,
-unanalysed_inst_count, config_digest`.
+checker_inst_count, unanalysed_inst_count, config_digest`.
 
 **`v_tree_node`** — one row per node: `node_id, parent_node_id, node_name,
 node_kind, ordinal, inst_id, parent_inst_id, module_id, module_name,
@@ -917,7 +917,9 @@ occurrence stamped from a module body the analysis never reached, which has
 hierarchy and connections and no procedure at all, though no design measured
 here produces one. Any of the five non-zero makes `partial`, and `partial`
 with all five zero is a malformed file: the status is never a claim a
-consumer cannot look at. Unresolved instantiations do not make `partial`. `hierarchy_only` has one cause: the compilation was fatally
+consumer cannot look at. Unresolved instantiations do not make `partial`,
+and neither do checkers: both are things the export declines to model, not
+places the walk fell short. `hierarchy_only` has one cause: the compilation was fatally
 errored, so slang analysed no dataflow to export. `unresolved_count`
 counts unresolved instantiation *sites* (one per written instantiation, however many
 occurrences stamp out); the per-occurrence picture is
@@ -985,8 +987,10 @@ no dataflow, not that the hierarchy stops early.
   which driver "wins" while a force is active — that is simulation, not
   structure.
 * Checkers are not modelled: a `checker` instantiation produces no rows —
-  no tree node, no nets, none of its assertions — and no `meta` count
-  reports it.
+  no tree node, no nets, none of its assertions. `meta.checker_inst_count`
+  says how many were passed over, so the absence is readable; it is not a
+  cause of `partial`, since a construct this tool declines is not a walk
+  that fell short.
 * Variable initialisers (`logic [7:0] c = 0`) are not drivers; net
   initialisers (`wire w = a & b`) are, because the LRM says so.
 

@@ -521,6 +521,15 @@ namespace designdb {
 ///
 /// A built-in method's effect on its receiver stays unmodelled, and the
 /// doc says so where the other testbench constructs are declined.
+///
+/// `meta.checker_inst_count` joins the required set, and `v_db_info` the
+/// column for it. A checker instantiation produces no rows at all -- its
+/// symbol is not an InstanceSymbol, so the walk never reaches its ports,
+/// assertions or scope -- and nothing said so, leaving a design that has
+/// checkers indistinguishable from one that has none. It does not make
+/// the export `partial`: a construct this tool declines is not a walk that
+/// fell short, which is the same reason an unresolved instantiation does
+/// not.
 inline constexpr int SchemaVersion = 18;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.

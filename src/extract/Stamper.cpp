@@ -138,6 +138,7 @@ private:
     /// taken here and not beside either caller.
     void stampBody(Template& t, int64_t instId, std::vector<std::vector<int64_t>> ifaceBind) {
         stats.stampedBodies++;
+        stats.checkerInsts += t.checkerInsts;
         if (!t.analysedBody)
             stats.unanalysedInsts++;
         // Scope nodes: index 0 is the instance itself; the rest are

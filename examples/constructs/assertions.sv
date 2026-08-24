@@ -14,6 +14,15 @@
 // though no part of the design looked at it, which for verification-heavy RTL
 // is most of what the file says.
 
+// A CHECKER, which this tool does not model at all: its instance is not an
+// InstanceSymbol, so the walk never reaches it and its ports, assertions and
+// scope produce no rows. Counted in `meta.checker_inst_count` so the absence
+// is a fact a consumer can read rather than one indistinguishable from a
+// design that instantiates none.
+checker never_unknown(logic clk, logic sig);
+    assert property (@(posedge clk) !$isunknown(sig));
+endchecker
+
 module monitored(input logic clk, input logic req, input logic ack,
                  input logic [3:0] tag);
     // Bound to a property, so the reads arrive through an assertion expression
@@ -45,4 +54,5 @@ module assertions;
     logic [3:0] tag = 4'h0;
 
     monitored u_mon(.clk(clk), .req(req), .ack(ack), .tag(tag));
+    never_unknown u_chk(clk, req);
 endmodule

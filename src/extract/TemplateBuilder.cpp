@@ -662,6 +662,13 @@ void TemplateBuilder::buildTemplate(Template& t, const InstanceBodySymbol& body)
     // below can name a net or a scope until it exists.
     DeclIndex decl(t, body, body.getHierarchicalPath(), locator, writer);
 
+    // Checkers are not modelled. A CheckerInstanceSymbol is not an
+    // InstanceSymbol, so the walk never reaches one and its whole
+    // subtree -- ports, assertions, everything -- is absent. Counting
+    // them is what keeps that absence readable.
+    forEachOfKind<SymbolKind::CheckerInstance, CheckerInstanceSymbol>(
+        body, [&](const CheckerInstanceSymbol&) { t.checkerInsts++; });
+
     Build b;
     b.t = &t;
     b.termOf = &termSlots[&t];
