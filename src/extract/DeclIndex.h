@@ -125,9 +125,8 @@ public:
                 }
                 case SymbolKind::GenerateBlockArray: {
                     auto& arr = member.as<GenerateBlockArraySymbol>();
-                    std::string base(arr.name);
-                    if (base.empty())
-                        base = arr.getExternalName();
+                    std::string base = escapedSegment(
+                        arr.name.empty() ? arr.getExternalName() : arr.name);
                     for (auto& entry : arr.entries) {
                         std::string segment = base;
                         if (entry->kind == SymbolKind::GenerateBlock)
@@ -163,7 +162,7 @@ public:
         if (sym.kind == SymbolKind::GenerateBlock)
             seg = generateSegment(sym.as<GenerateBlockSymbol>());
         else
-            seg = std::string(sym.name);
+            seg = escapedSegment(sym.name);
         return addScope(sym, parent, std::move(seg));
     }
 
