@@ -1903,7 +1903,10 @@ if mode == "procedural":
     # binding, plus a source-less row that v_driver renders as a constant
     # tie-off, because the copy-back was recognised by expression kind and
     # only the bare form has that kind.
-    for actual, exact in (("scratch", 1), ("nib", 0)):
+    # The narrower actual takes only the formal's low nibble, and those four
+    # bits do correspond one for one -- the truncation is the source range,
+    # not a lost correspondence.
+    for actual, src_hi in (("scratch", None), ("nib", 3)):
         kinds = sorted(r[0] for r in con.execute("""
             SELECT driver_kind FROM v_driver d JOIN net n ON n.id = d.signal_net_id
             WHERE n.name = ?""", (actual,)))
@@ -1913,8 +1916,8 @@ if mode == "procedural":
         check(one("""
             SELECT count(*) FROM v_net_dep
             WHERE dep_kind='procedure' AND tgt_name=? AND src_name='pass.o'
-              AND map_exact=?""", actual, exact) == 1,
-              f"{actual} binds the formal with map_exact={exact}")
+              AND src_hi IS ? AND map_exact=1""", actual, src_hi) == 1,
+              f"{actual} binds the formal's own bits, one for one")
 
 
 if mode == "structural":

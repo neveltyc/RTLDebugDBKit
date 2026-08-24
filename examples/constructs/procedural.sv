@@ -146,8 +146,8 @@ module macroloc (input logic [7:0] a, output logic [7:0] via_macro, direct,
         // handling, whose right side has no operands, and `nib` gained a
         // source-less dependency on top of its real `procedure` one: a
         // CONSTANT tie-off in v_driver on a signal the task plainly drives.
-        pass(a, nib);       // narrower, so map_exact must be 0 -- and this
-    end                     // must remain its ONLY driver
+        pass(a, nib);       // narrower: the formal's low nibble reaches it,
+    end                     // and stays its ONLY driver
     assign out_arg = scratch;
     assign narrow_arg = nib;
 endmodule
