@@ -827,6 +827,13 @@ check(one("""
     SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
     WHERE h.resolved_inst_id IS NULL OR n.inst_id != h.resolved_inst_id""") == 0,
       "a resolved net lies inside its resolved instance")
+# The two resolved columns answer together or not at all. An instance
+# without a net names where the reference landed and not what it landed on,
+# which is a third state for consumers written against "resolved or NULL".
+check(one("""
+    SELECT count(*) FROM hier_ref
+    WHERE (resolved_inst_id IS NULL) != (resolved_net_id IS NULL)""") == 0,
+      "a reference resolves to both halves or to neither")
 check(one("""
     SELECT count(*) FROM net_conn c JOIN hier_ref h ON h.id = c.outer_hier_ref_id
     WHERE h.access != 'connect'""") == 0,
@@ -1645,6 +1652,48 @@ if mode == "interfaces":
     check(one("""
         SELECT count(*) FROM term WHERE term_kind='interface'""") >= 3,
           "interface terminals")
+    # A task declared in the interface, called through a port: its body is
+    # walked in the CALLER's template, so its bare names belong to a body
+    # the caller cannot place. They resolve through the bound terminal, and
+    # the interface's own nets carry the dataflow -- the write cross-instance
+    # from the statement that made the call.
+    for path, access, net in (("data", "write", "data"), ("vld", "read", "vld")):
+        check(one("""
+            SELECT count(*) FROM hier_ref h
+            JOIN net n ON n.id = h.resolved_net_id
+            JOIN tree_node t ON t.id = h.resolved_inst_id
+            WHERE h.path = ? AND h.access = ? AND n.name = ?
+              AND t.name = 'bus3'""", path, access, net) == 1,
+              f"the interface task's {path} resolves to the bound instance")
+    check(one("""
+        SELECT count(*) FROM v_driver v
+        JOIN tree_node t ON t.id = v.signal_inst_id
+        WHERE t.name = 'bus3' AND v.signal_name = 'data'
+          AND v.driver_name = 'vld' AND v.driver_kind = 'data'""") == 1,
+          "and the interface's own net carries the task's dataflow")
+    # The formal is no net of the interface -- nothing walks that body's
+    # subroutines -- so it stays wholly unresolved rather than naming an
+    # instance it cannot name a net in.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path = 'x' AND resolved_inst_id IS NULL
+          AND resolved_net_id IS NULL""") >= 1,
+          "while its formal resolves to neither half")
+    # Two terminals of one module reaching one interface: the call does not
+    # say which port it went through, and the occurrence that binds them
+    # apart would take the write to the wrong instance. Unresolved from
+    # BOTH occurrences -- a missing answer, never a wrong one.
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'stamp_pair' AND h.path = 'data'
+          AND h.resolved_inst_id IS NOT NULL""") == 0,
+          "an ambiguous interface binding resolves to no instance at all")
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name = 'stamp_pair' AND h.path = 'data'""") == 2,
+          "and both occurrences still record the reference")
     check(one("""
         SELECT count(*) FROM term
         WHERE term_kind='interface' AND modport IS NOT NULL""") >= 2,
