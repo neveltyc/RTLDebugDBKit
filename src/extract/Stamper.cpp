@@ -192,7 +192,7 @@ private:
             PrimitiveRow p;
             p.id = id;
             p.instId = instId;
-            p.primitiveKind = t.prims[i].primKind;
+            p.primitiveKind = word(t.prims[i].primKind);
             p.definitionName = t.prims[i].defName;
             p.fileId = t.prims[i].loc.fileId;
             p.line = t.prims[i].loc.line;
@@ -225,8 +225,8 @@ private:
             row.id = base.term + int64_t(i) + 1;
             row.instId = instId;
             row.name = tm.name;
-            row.terminalKind = tm.kind;
-            row.direction = tm.direction;
+            row.terminalKind = word(tm.kind);
+            row.direction = word(tm.direction);
             row.dataTypeId = tm.dataTypeId;
             row.width = tm.width;
             row.ordinal = int64_t(i);
@@ -259,7 +259,7 @@ private:
             row.instId = instId;
             row.scopeNodeId = scopeNode[size_t(p.scope)];
             row.name = p.name;
-            row.procedureKind = p.kind;
+            row.procedureKind = word(p.kind);
             row.ordinal = int64_t(i);
             row.fileId = p.loc.fileId;
             row.line = p.loc.line;
@@ -293,9 +293,9 @@ private:
             row.procedureId = stampId(base.proc, s.proc);
             row.ordinal = int64_t(i);
             row.sequence = s.sequence;
-            row.statementKind = s.kind;
+            row.statementKind = word(s.kind);
             row.construct = s.construct;
-            row.assignmentKind = s.assignKind;
+            row.assignmentKind = word(s.assignKind);
             row.delay = s.delay;
             row.droppedOperandCount = s.dropped;
             row.callSiteId = stampId(base.callSite, s.callSite);
@@ -335,7 +335,7 @@ private:
             row.stmtId = base.stmt + r.stmt + 1;
             row.ordinal = r.ordinal;
             row.netId = base.net + r.net + 1;
-            row.role = r.role;
+            row.role = word(r.role);
             row.bits = r.r.bits;
             row.exact = r.r.exact;
             writer.addExprRef(row);
@@ -347,8 +347,8 @@ private:
             row.procedureId = base.proc + e.proc + 1;
             row.stmtId = stampId(base.stmt, e.stmt);
             row.netId = stampId(base.net, e.net);
-            row.eventKind = e.eventKind;
-            row.edgeKind = e.edgeKind;
+            row.eventKind = word(e.eventKind);
+            row.edgeKind = word(e.edgeKind);
             row.fileId = e.loc.fileId;
             row.line = e.loc.line;
             row.column = e.loc.column;
@@ -370,7 +370,7 @@ private:
             row.stmtTargetId = stampId(base.target, d.targetRef);
             row.exprRefId = stampId(base.exprRef, d.exprRef);
             row.primitiveId = d.prim < 0 ? 0 : primNode[size_t(d.prim)];
-            row.dependencyKind = d.kind;
+            row.dependencyKind = word(d.kind);
             row.sourceBits = d.srcR.bits;
             row.sourceExact = d.src.net < 0 ? -1 : (d.srcR.exact ? 1 : 0);
             row.targetBits = d.tgtR.bits;
@@ -444,7 +444,7 @@ private:
             connIfaceId[i].assign(c.conns.size(), 0);
             for (size_t k = 0; k < c.conns.size(); k++) {
                 auto& conn = c.conns[k];
-                if (conn.kind != "interface" || conn.childTerm < 0)
+                if (conn.kind != ConnKind::Interface || conn.childTerm < 0)
                     continue;
                 int64_t bound = 0;
                 if (conn.ifaceChild >= 0)
@@ -528,13 +528,13 @@ private:
             row.netId = conn.parentNet < 0 ? 0 : parentBase.net + conn.parentNet + 1;
             row.termId = childTermBase + conn.childTerm + 1;
             row.ordinal = conn.ordinal;
-            row.connectionKind = conn.kind;
+            row.connectionKind = word(conn.kind);
             row.netBits = conn.netR.bits;
             row.netExact = conn.netExact;
             row.termBits = conn.termR.bits;
             row.termExact = conn.termExact;
             row.mappingExact = conn.mappingExact;
-            if (conn.kind == "interface" && k < ifaceIds.size())
+            if (conn.kind == ConnKind::Interface && k < ifaceIds.size())
                 row.interfaceInstId = ifaceIds[k];
             row.hierRefId = conn.hierRef < 0 ? 0
                                              : parentBase.hierRef + conn.hierRef + 1;
@@ -574,7 +574,7 @@ private:
             row.id = ++termCounter;
             row.instId = nodeId;
             row.name = c.unresolvedPorts[i];
-            row.terminalKind = "signal";
+            row.terminalKind = word(TermKind::Signal);
             row.ordinal = int64_t(i);
             row.fileId = c.loc.fileId;
             row.line = c.loc.line;
@@ -595,7 +595,7 @@ private:
             if (row.termId == 0)
                 continue;
             row.ordinal = conn.ordinal;
-            row.connectionKind = conn.kind;
+            row.connectionKind = word(conn.kind);
             row.netBits = conn.netR.bits;
             row.netExact = conn.netExact;
             row.termBits = conn.termR.bits;
@@ -641,7 +641,7 @@ private:
             ModuleRow mrow;
             mrow.id = ++nextModuleId;
             mrow.name = std::string(pkg->name);
-            mrow.definitionKind = "package";
+            mrow.definitionKind = word(DefKind::Package);
             mrow.fileId = at.fileId;
             mrow.line = at.line;
             mrow.column = at.column;
@@ -714,7 +714,7 @@ private:
             row.instId = job.instNode;
             row.stmtId = stampId(job.base.stmt, ref.stmt);
             row.path = ref.path;
-            row.access = ref.access;
+            row.access = word(ref.access);
             row.bits = ref.r.bits;
             row.exact = ref.r.exact;
             row.fileId = ref.loc.fileId;
@@ -820,7 +820,7 @@ private:
             row.stmtTargetId =
                 stampId(job.base.target, d.targetRef);
             row.exprRefId = stampId(job.base.exprRef, d.exprRef);
-            row.dependencyKind = d.kind;
+            row.dependencyKind = word(d.kind);
             row.sourceBits = d.srcR.bits;
             row.sourceExact = d.srcR.exact ? 1 : 0;
             row.targetBits = d.tgtR.bits;

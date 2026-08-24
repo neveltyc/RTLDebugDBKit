@@ -224,7 +224,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// control is carried onto the statements it prefixes.
     void handle(const TimedStatement& stmt) {
         if (&stmt.timing != sensitivityTiming) {
-            std::vector<std::pair<const Expression*, std::string>> raw;
+            std::vector<std::pair<const Expression*, Edge>> raw;
             // The `iff` qualifier travels too. collectEdgeEvents takes the
             // vector for it and buildProcedure passes one for the sensitivity
             // list; this path did not, so `@(posedge clk iff en)` written as a

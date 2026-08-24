@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "extract/ir/Vocab.h"
+
 namespace designdb::detail {
 
 /// Holds one key in a set for the lifetime of a walk down, and takes it out
@@ -87,8 +89,8 @@ struct TplNet {
 
 struct TplTerm {
     std::string name;
-    std::string kind;        // signal | interface
-    std::string direction;   // "" = NULL
+    TermKind kind = TermKind::Signal;
+    Direction direction = Direction::None;
     int64_t dataTypeId = 0;
     int64_t width = -1;
     int isConst = -1;
@@ -107,7 +109,7 @@ struct TplTermMap {
 struct TplProcedure {
     int32_t scope = 0;
     std::string name;
-    std::string kind;
+    ProcKind kind = ProcKind::Always;
     TplLoc loc;
 };
 
@@ -115,9 +117,10 @@ struct TplStmt {
     int32_t scope = 0;
     int32_t proc = -1;
     int64_t sequence = -1;
-    std::string kind;
+    StmtKind kind = StmtKind::Assignment;
+    /// Open domain: a system task's own name, a construct word.
     std::string construct;
-    std::string assignKind;  // "" = NULL
+    AssignKind assignKind = AssignKind::None;
     std::string delay;
     int64_t dropped = 0;
     int32_t callSite = -1;   // the call-site expansion this belongs to (-1 = none)
@@ -148,7 +151,7 @@ struct TplExprRef {
     int32_t stmt = 0;
     int64_t ordinal = 0;
     int32_t net = 0;
-    std::string role;
+    RefRole role = RefRole::Control;
     TplRange r;
 };
 
@@ -156,15 +159,15 @@ struct TplProcEvent {
     int32_t proc = 0;
     int32_t stmt = -1;
     int32_t net = -1;
-    std::string eventKind;
-    std::string edgeKind;
+    EventKind eventKind = EventKind::Sensitivity;
+    Edge edgeKind = Edge::None;
     TplLoc loc;
 };
 
 struct TplPrim {
     int32_t scope = 0;
     std::string name;
-    std::string primKind;
+    PrimKind primKind = PrimKind::Gate;
     std::string defName;
     TplLoc loc;
 };
@@ -199,7 +202,7 @@ struct TplDep {
     int32_t targetRef = -1;
     int32_t exprRef = -1;
     int32_t prim = -1;
-    std::string kind;        // data | control | procedure | primitive | alias
+    DepKind kind = DepKind::Data;
     TplRange srcR, tgtR;
     int mappingExact = -1;
     int32_t callSite = -1;   // the call-site expansion, or -1 at module level
@@ -212,7 +215,7 @@ struct TplDep {
 struct TplHierRef {
     int32_t stmt = -1;
     std::string path;
-    std::string access;      // read | write | connect
+    Access access = Access::Read;
     TplRange r;
     TplLoc loc;
     /// How the reference resolves per occurrence -- or why it does not.
@@ -238,7 +241,7 @@ struct TplHierRef {
 };
 
 struct TplConn {
-    std::string kind;        // net_conn.conn_kind
+    ConnKind kind = ConnKind::Signal;
     int32_t parentNet = -1;  // index into the PARENT template's nets
     int32_t childTerm = -1;  // index into the child template's terms
     int64_t ordinal = 0;     // segment ordinal within that terminal

@@ -144,35 +144,31 @@ def rows_of(cur, table, cols, drop_ids=False):
     return cur.fetchall()
 
 
-def diff_sorted(old_rows, new_rows, limit=5):
-    # Both inputs are sorted the same way, so one merge pass yields the two
-    # only-in sets without materialising a giant dict.
-    only_old, only_new, samples = 0, 0, []
-    i = j = 0
-    while i < len(old_rows) and j < len(new_rows):
-        a, b = old_rows[i], new_rows[j]
-        if a == b:
-            i += 1
-            j += 1
-        elif a < b:
-            only_old += 1
-            if len(samples) < limit:
-                samples.append(("-", a))
-            i += 1
-        else:
-            only_new += 1
-            if len(samples) < limit:
-                samples.append(("+", b))
-            j += 1
-    for a in old_rows[i:]:
-        only_old += 1
-        if len(samples) < limit:
-            samples.append(("-", a))
-    for b in new_rows[j:]:
-        only_new += 1
-        if len(samples) < limit:
-            samples.append(("+", b))
-    return only_old, only_new, samples
+def diff_rows(old_rows, new_rows, limit=5):
+    # Multiset difference. Comparing rows for ORDER would re-implement
+    # SQLite's collation across NULLs and mixed types -- and get it wrong,
+    # which is how this function's first, merge-based version died. Samples
+    # keep the tables' own row order.
+    co = collections.Counter(old_rows)
+    cn = collections.Counter(new_rows)
+    gone = co - cn
+    born = cn - co
+    samples = []
+    for r in old_rows:
+        if len(samples) >= limit:
+            break
+        if gone.get(r):
+            samples.append(("-", r))
+            gone[r] -= 1
+    gone = co - cn
+    for r in new_rows:
+        if len(samples) >= 2 * limit:
+            break
+        if born.get(r):
+            samples.append(("+", r))
+            born[r] -= 1
+    born = cn - co
+    return sum(gone.values()), sum(born.values()), samples
 
 
 def compare_case(name, old_db, new_db, triage):
@@ -199,7 +195,7 @@ def compare_case(name, old_db, new_db, triage):
             new_rows = rows_of(pn, t, cn_cols)
             if old_rows == new_rows:
                 continue
-            oo, on, samples = diff_sorted(old_rows, new_rows)
+            oo, on, samples = diff_rows(old_rows, new_rows)
             note = ""
             if triage:
                 # Multiset equality; sorting would trip over NULLs, which

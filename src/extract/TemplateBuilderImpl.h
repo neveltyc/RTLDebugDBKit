@@ -230,11 +230,11 @@ private:
 
     // ----------------------------------------------------- statement rows
 
-    int32_t newStmt(Build& b, std::string kind, std::string construct,
-                    std::string assignKind, int64_t seq, std::string delay,
+    int32_t newStmt(Build& b, StmtKind kind, std::string construct,
+                    AssignKind assignKind, int64_t seq, std::string delay,
                     int64_t dropped, const TplLoc& loc);
 
-    int32_t addExprRef(Build& b, int32_t stmt, const Ref& r, std::string role,
+    int32_t addExprRef(Build& b, int32_t stmt, const Ref& r, RefRole role,
                        int32_t netIdx);
 
     /// Records one reference that leaves the instance -- and, when slang
@@ -248,7 +248,7 @@ private:
     /// they describe a particular dependency rather than the reference.
     int32_t addHierRef(Build& b, bool isWrite, const Ref& r,
                        const TplLoc& at, EvalContext& eval,
-                       const char* access = nullptr,
+                       std::optional<Access> access = std::nullopt,
                        const Ref* asWritten = nullptr);
 
     /// How to reach the reference's target from an occurrence. Downward
@@ -270,8 +270,9 @@ private:
     /// instance and the scope-relative net name inside it. The instance
     /// chain is recovered from the target symbol's own ancestry: every
     /// enclosing InstanceSymbol contributes its path segments.
-    void splitSegsAndNet(const std::string& rel, const Symbol& target,
-                         TplHierRef& row);
+    static bool segsFromAncestry(const InstanceBodySymbol* stopBody,
+                                 const Symbol* stopInst,
+                                 const Symbol& target, TplHierRef& row);
 
     // ----------------------------------------------------- template build
 
@@ -303,12 +304,11 @@ private:
 
     /// One read of a statement, wherever it lands: an expr_ref for a net of
     /// this instance, a hier_ref for anything outside it.
-    void recordRead(Build& b, int32_t stmt, const Ref& r, const std::string& role,
+    void recordRead(Build& b, int32_t stmt, const Ref& r, RefRole role,
                     const TplLoc& at, EvalContext& evalCtx);
 
     void addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
-                      const Expression* expr, const std::string& edge,
-                      const std::string& eventKind, const TplLoc& at,
+                      const Expression* expr, Edge edge, EventKind eventKind, const TplLoc& at,
                       EvalContext& evalCtx,
                       const std::function<int32_t()>& readStmt);
 
