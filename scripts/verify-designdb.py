@@ -2614,6 +2614,20 @@ if mode == "rootref":
           "while the local path beside it follows the occurrence")
 
 if mode == "xmr":
+    # A system task called in a CONDITION still writes its argument. The
+    # call belongs to no statement of its own, and v_driver tells a system
+    # write from a tie-off by the statement it came from -- so the call
+    # gets a row, as the procedure header does for reads with no statement.
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name = 'seeded' AND driver_kind = 'system_task'
+          AND driver_net_id IS NULL""") == 1,
+          "a system write inside a condition is attributed, not lost")
+    check(one("""
+        SELECT count(*) FROM v_stmt
+        WHERE stmt_kind = 'system_task' AND construct = '$value$plusargs'""") == 1,
+          "and the call it came from is the statement that carries it")
+
     # A hierarchical WRITE names its target, and the driver view says so on
     # the row itself: `always_comb u.x = a` is one lookup from the far net,
     # not a walk out to net_dep and back through hier_ref.

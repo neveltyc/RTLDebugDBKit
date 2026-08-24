@@ -342,6 +342,35 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                        refs.end());
         }
         gating.insert(gating.end(), refs.begin(), refs.end());
+        emitSystemWritesIn(expr);
+    }
+
+    /// A system task called in a CONDITION still writes its argument, and
+    /// the write has nowhere to go: the call belongs to no statement, so
+    /// v_driver cannot tell it from a tie-off the way it does for a
+    /// statement-level one. It gets a row of its own -- the same answer the
+    /// procedure-header `event_control` row is to reads with no statement.
+    /// Only the write travels; what the condition reads is gating already.
+    void emitSystemWritesIn(const Expression& expr) {
+        struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
+            StatementWalker& self;
+            explicit Finder(StatementWalker& self) : self(self) {}
+            void handle(const CallExpression& call) {
+                visitDefault(call);
+                if (!call.isSystemCall())
+                    return;
+                std::set<const ValueSymbol*> syms;
+                std::vector<Ref> writes;
+                self.collectWrittenTargets(call, syms, &writes);
+                if (writes.empty())
+                    return;
+                self.emit(SystemTaskNode{{}, std::move(writes),
+                                         callWord(call), self.gateId(),
+                                         self.seq++, 0, call.sourceRange});
+            }
+        };
+        Finder f(*this);
+        expr.visit(f);
     }
 
     /// The expressions a call inside `expr` writes without reading: the

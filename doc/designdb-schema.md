@@ -971,7 +971,10 @@ no dataflow, not that the hierarchy stops early.
   destination — records a target and a source-less dependency, surfacing
   in `v_driver` as `system_task`. The signal is driven; the source is a
   file or a plusarg, outside anything this schema names, and the kind is
-  distinct from `constant`.
+  distinct from `constant`. Called inside a CONDITION it still writes, and
+  gets a `stmt` row of its own so the write has a statement to be told
+  apart by — the answer the procedure-header `event_control` row is to
+  reads with nowhere to belong.
 * `force` records as a blocking assignment marked `construct='force'`
   (procedural `assign`, `'proc_assign'`) — the hijack is findable with
   one WHERE, and its dataflow stays a blocking assignment's.
