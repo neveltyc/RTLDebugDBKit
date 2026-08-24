@@ -269,6 +269,32 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
 
         if (conn->port.kind == SymbolKind::InterfacePort) {
             auto [ifaceSym, modport] = conn->getIfaceConn();
+            // Which segment of one of THIS body's own interface terminals an
+            // instance arrived on. slang normalises every port's view of an
+            // array to that port's own index order, so the element identity
+            // is the whole question -- no index arithmetic, and a port fed
+            // by a slice of a wider array lands on the right segment.
+            auto ownSegmentOf = [&](const Symbol* elem)
+                -> std::pair<int32_t, int32_t> {
+                for (auto& member : b.body->members()) {
+                    if (member.kind != SymbolKind::InterfacePort)
+                        continue;
+                    auto ownIt = b.termOf->find(&member);
+                    if (ownIt == b.termOf->end())
+                        continue;
+                    auto [ownIface, ownModport] =
+                        member.as<InterfacePortSymbol>().getConnection();
+                    if (!ownIface)
+                        continue;
+                    std::vector<const Symbol*> mine;
+                    flattenIfaceBinding(*ownIface, mine);
+                    for (size_t j = 0; j < mine.size(); j++) {
+                        if (mine[j] == elem)
+                            return {ownIt->second.term, int32_t(j)};
+                    }
+                }
+                return {-1, -1};
+            };
             // An interface ARRAY port binds one element per segment, the
             // shape a concatenated actual already has on an ordinary port:
             // one terminal, a row per piece, in declaration order. Recorded
@@ -284,10 +310,17 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                     tc.childTerm = termIdx;
                     tc.ordinal = nextOrdinal();
                     tc.loc = at;
-                    if (auto it = childOf.find(elem); it != childOf.end())
+                    if (auto it = childOf.find(elem); it != childOf.end()) {
                         tc.ifaceChild = it->second;
-                    else
+                    }
+                    else if (auto [ownTerm, ownSeg] = ownSegmentOf(elem);
+                             ownTerm >= 0) {
+                        tc.ifaceOwnTerm = ownTerm;
+                        tc.ifaceOwnSeg = ownSeg;
+                    }
+                    else {
                         stats.external++;
+                    }
                     c.conns.push_back(std::move(tc));
                 }
                 continue;
@@ -305,7 +338,7 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                              passedThrough(*b.body, ifaceSym)) {
                     auto ownIt = b.termOf->find(through);
                     if (ownIt != b.termOf->end())
-                        tc.ifaceOwnTerm = ownIt->second.term;
+                        tc.ifaceOwnTerm = ownIt->second.term;  // one segment
                 }
                 else {
                     // A synthesized shape with no per-occurrence object to
