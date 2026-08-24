@@ -50,6 +50,7 @@ MODES = {
     "naming": "naming",
     "incomplete": "incomplete",
     "recursion": "recursion",
+    "modport": "modport_top",
 }
 
 # Every closed value domain the schema publishes, as (table, column, values,
@@ -1617,6 +1618,28 @@ if mode == "constructs":
         JOIN net s ON s.id=d.src_net_id JOIN net t ON t.id=d.tgt_net_id
         WHERE s.name='a' AND t.name='r2' AND d.dep_kind='data'""") == 2,
           "the same pair from two statements stays two dependencies")
+
+if mode == "modport":
+    # An explicit modport port (`output .d(data)`) resolves past the rename
+    # to the net behind it, exactly as a named port does -- and the renamed
+    # net is driven through it.
+    check(one("""
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path = 'p.d' AND h.access = 'write' AND n.name = 'data'""") == 1,
+          "an explicit modport port resolves to the net it renames")
+    check(one("""
+        SELECT count(*) FROM v_driver v JOIN net n ON n.id = v.signal_net_id
+        WHERE n.name = 'data' AND v.driver_kind = 'constant'
+          AND v.signal_inst_id = (SELECT resolved_inst_id FROM hier_ref
+                                  WHERE path = 'p.d')""") == 1,
+          "and the renamed net is driven through it")
+    # The select form keeps the port's own geometry, which is not the
+    # net's: it stays unresolved rather than claiming bits of `data` the
+    # reference does not touch.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path = 'p.n' AND resolved_net_id IS NULL""") == 1,
+          "a selected connection stays honestly unresolved")
 
 if mode == "interfaces":
     check(one("""

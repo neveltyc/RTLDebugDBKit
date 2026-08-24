@@ -405,9 +405,20 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // path carries the modport level (`bus.src.vld`) that the stamped
     // net names do not.
     if (target->kind == SymbolKind::ModportPort) {
-        auto* inner = target->as<ModportPortSymbol>().internalSymbol;
+        auto& mp = target->as<ModportPortSymbol>();
+        const Symbol* inner = mp.internalSymbol;
+        // An explicit port (`output .d(data)`) has no internalSymbol; the
+        // connection expression says what stands behind it. Only a plain
+        // name resolves: through a select or a composition the port's bit
+        // geometry is not the net's, and this row's range -- spelled on the
+        // port -- replayed onto the net would claim bits the reference
+        // does not touch.
         if (!inner) {
-            // An explicit modport expression names no one net.
+            if (auto* conn = mp.getConnectionExpr();
+                conn && conn->kind == ExpressionKind::NamedValue)
+                inner = &conn->as<NamedValueExpression>().symbol;
+        }
+        if (!inner) {
             row.resolve = TplHierRef::Failed;
             return;
         }
