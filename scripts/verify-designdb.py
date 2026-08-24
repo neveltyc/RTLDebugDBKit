@@ -2489,6 +2489,20 @@ if mode == "naming":
           "and never a respelling of it")
 
 if mode == "concatcursor":
+    # The two flattening directions, which a consumer cannot guess from one
+    # example: a packed member declared first takes the HIGH offsets, an
+    # unpacked element declared first takes the LOW ones.
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name = 'a' AND tgt_name = 'packed_o'
+          AND tgt_lo = 4 AND tgt_hi = 7""") == 1,
+          "a packed pattern's first member takes the high offsets")
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE src_name = 'a' AND tgt_name = 'arr' AND tgt_lo = 0
+          AND tgt_hi = 7""") == 1,
+          "while an unpacked array's first element takes the low ones")
+
     # An unpacked object's width is the flattened space its offsets index,
     # not its packed width -- without it a range like [8:15] on a byte array
     # names a window into a size the row does not state.
