@@ -145,10 +145,9 @@ def rows_of(cur, table, cols, drop_ids=False):
 
 
 def diff_rows(old_rows, new_rows, limit=5):
-    # Multiset difference. Comparing rows for ORDER would re-implement
-    # SQLite's collation across NULLs and mixed types -- and get it wrong,
-    # which is how this function's first, merge-based version died. Samples
-    # keep the tables' own row order.
+    # Multiset difference: comparing rows for ORDER would re-implement
+    # SQLite's collation across NULLs and mixed types. Samples keep the
+    # tables' own row order.
     co = collections.Counter(old_rows)
     cn = collections.Counter(new_rows)
     gone = co - cn

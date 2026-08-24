@@ -3,11 +3,10 @@
 //
 // Walking one procedure, statement by statement.
 //
-// The visitor reports through four callbacks and knows nothing about the
-// template, the database or the hierarchy -- a target arrives with its paired
-// operands and the gating stack in one call, and what to do with that is the
-// caller's business. It was already decoupled that way; this file is where
-// that stops being a convention and starts being visible.
+// The visitor emits the node stream of extract/ir/Nodes.h and knows nothing
+// about the template, the database or the hierarchy: a statement arrives with
+// its targets, its paired operands and its gate, and what to do with that is
+// the caller's business.
 //
 // Header-only, like the layers under it. Splitting the handlers into a .cpp
 // would buy compile isolation and cost the reader: for a class that is 25
@@ -51,11 +50,9 @@ using namespace slang::ast;
 
 struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood> {
     /// The walk's one output: a stream of self-contained nodes
-    /// (extract/ir/Nodes.h). An assignment arrives owning its targets; a
-    /// read-only statement arrives with its gate, because a branch holding
-    /// nothing but `$display` or an assertion used to drop its condition
-    /// entirely -- `if (gate) $display(payload);` knew about payload and
-    /// not about gate.
+    /// (extract/ir/Nodes.h). A read-only statement carries its gate too:
+    /// `if (gate) $display(payload);` reads gate, and no dependency row can
+    /// carry that read because the statement writes nothing.
     using EmitNode = std::function<void(Node&&)>;
 
     EmitNode emit;
@@ -537,10 +534,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             const bool reads = dir == ArgumentDirection::In ||
                                dir == ArgumentDirection::InOut ||
                                dir == ArgumentDirection::Ref;
-            // The formal and the actual travel as their own fields now; the
-            // old interface folded them into one Ref whose sym was the
-            // formal and whose origin was the actual's expression -- the
-            // trap two receiver comments document.
             // An output or inout actual is not args[i]: Expression::bindLValue
             // wraps it in an AssignmentExpression whose left is the actual and
             // whose right is an EmptyArgumentExpression. Unwrapped, every such
@@ -717,9 +710,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 Ref r;
                 r.sym = &root->as<ValueExpressionBase>().symbol;
                 r.origin = root;
-                // Parity with the pre-BitInterval default: a target recovered
-                // by hand claimed the whole object exactly. The claim is
-                // unaudited and the emission rework revisits it.
+                // Reached only when the slot walk and this recovery
+                // disagree on how many targets there are, so no narrower
+                // claim than the whole object is available.
                 r.cover = BitInterval::whole();
                 r.exact = true;
                 targets.push_back(r);
