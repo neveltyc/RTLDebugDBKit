@@ -57,9 +57,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     using EmitNode = std::function<void(Node&&)>;
 
     EmitNode emit;
-    /// The interned gating contexts, owned by the receiver so it outlives
-    /// the walk and the nodes that reference into it.
-    GateTable& gates;
+    /// The branch levels, owned by the receiver so they outlive the walk
+    /// and the nodes that reference into them.
+    BranchTable& branches;
     EvalContext& eval;
     const TimingControl* sensitivityTiming = nullptr;
     /// The delay control in force for statements below a `#d` timed statement,
@@ -68,7 +68,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// The construct word an enclosing `force`/procedural `assign` stamps
     /// on its assignment; null outside one.
     const char* constructOverride = nullptr;
-    std::vector<Ref> gating;
     int64_t seq = 0;
     std::set<const SubroutineSymbol*> activeSubs;
     std::set<const ValueSymbol*> loopVars;
@@ -94,18 +93,88 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     std::function<int32_t(const SubroutineSymbol&, int64_t depth, bool bindable)>
         allocCallSite;
 
-    StatementWalker(GateTable& gates, EmitNode emit, EvalContext& eval) :
-        emit(std::move(emit)), gates(gates), eval(eval) {}
+    StatementWalker(BranchTable& branches, EmitNode emit, EvalContext& eval) :
+        emit(std::move(emit)), branches(branches), eval(eval) {}
 
-    /// The gating stack as it stands, interned.
-    GateId gateId() { return gates.intern(gating); }
+    /// One branch level pushed but not yet given a row.
+    struct Pending {
+        BranchFrame frame;
+        BranchId id = -1;
+    };
+    std::vector<Pending> levels;
+
+    /// The level the statement being walked sits in, materialising the
+    /// pending chain down to it.
+    ///
+    /// On demand, so an `if` arm or a loop that gates nothing leaves no row
+    /// behind. A case arm is materialised by its handler regardless: the
+    /// arms under a point are the whole case.
+    BranchId currentBranch() {
+        BranchId parent = -1;
+        for (size_t i = 0; i < levels.size(); i++) {
+            auto& p = levels[i];
+            if (p.id < 0) {
+                p.frame.parent = parent;
+                p.frame.depth = int32_t(i) + 1;
+                p.id = branches.add(std::move(p.frame));
+            }
+            parent = p.id;
+        }
+        return parent;
+    }
+
+    /// Holds one branch level in force for the statements under it.
+    class Level {
+    public:
+        Level(StatementWalker& w, BranchFrame frame) : w_(w) {
+            w_.levels.push_back(Pending{std::move(frame), -1});
+        }
+        ~Level() { w_.levels.pop_back(); }
+        Level(const Level&) = delete;
+        Level& operator=(const Level&) = delete;
+
+    private:
+        StatementWalker& w_;
+    };
+
+    /// Drops the loop indices in force from a set of DATAFLOW references.
+    ///
+    /// An index is not a design signal: it takes every value of the
+    /// iteration space on the way through, so `hi[i] = a[i+2]` recorded
+    /// `i -> hi` as data -- three times, in picorv32's multiplier twelve of
+    /// eighteen dependency rows -- for a variable no debugging question
+    /// reaches. What the loop does with it is the iteration space on the
+    /// loop's own branch row.
+    ///
+    /// Only the data and control paths. Where the RTL reads the index as a
+    /// VALUE -- `t(i)`, `$display("%d", i)`, `assert (i < 4)` -- the read
+    /// stays: dropping it leaves a bound formal with no driver at all.
+    void dropLoopVars(std::vector<Ref>& refs, size_t from = 0) {
+        if (loopVars.empty())
+            return;
+        refs.erase(std::remove_if(refs.begin() + std::ptrdiff_t(from), refs.end(),
+                                  [&](const Ref& r) {
+                                      return loopVars.count(r.sym) > 0;
+                                  }),
+                   refs.end());
+    }
+
+    void dropLoopVars(std::vector<Slot>& slots) {
+        if (loopVars.empty())
+            return;
+        slots.erase(std::remove_if(slots.begin(), slots.end(),
+                                   [&](const Slot& s) {
+                                       return loopVars.count(s.ref.sym) > 0;
+                                   }),
+                    slots.end());
+    }
 
     void handle(const ImmediateAssertionStatement& stmt) {
         std::vector<Ref> reads;
         filteredConstants = 0;
         collectRefs(stmt.cond, eval, reads);
         emit(ReadNode{std::move(reads), ReadNode::Kind::Assertion,
-                      assertionWord(stmt.assertionKind), gateId(), seq++,
+                      assertionWord(stmt.assertionKind), currentBranch(), seq++,
                       filteredConstants, stmt.sourceRange});
         visitDefault(stmt);
     }
@@ -115,7 +184,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         filteredConstants = 0;
         collectStatementRefs(stmt.propertySpec, reads);
         emit(ReadNode{std::move(reads), ReadNode::Kind::Assertion,
-                      assertionWord(stmt.assertionKind), gateId(), seq++,
+                      assertionWord(stmt.assertionKind), currentBranch(), seq++,
                       filteredConstants, stmt.sourceRange});
         visitDefault(stmt);
     }
@@ -124,7 +193,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         std::vector<Ref> reads;
         filteredConstants = 0;
         collectRefs(stmt.cond, eval, reads);
-        emit(ReadNode{std::move(reads), ReadNode::Kind::Wait, "wait", gateId(),
+        emit(ReadNode{std::move(reads), ReadNode::Kind::Wait, "wait", currentBranch(),
                       seq++, filteredConstants, stmt.sourceRange});
         visitDefault(stmt);
     }
@@ -198,12 +267,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         if (call.isSystemCall() &&
             (call.getSubroutineName().starts_with('$') || !writeRefs.empty())) {
             emit(SystemTaskNode{std::move(reads), std::move(writeRefs),
-                                callWord(call), gateId(), seq++,
+                                callWord(call), currentBranch(), seq++,
                                 filteredConstants, stmt.sourceRange});
         }
         else {
             emit(ReadNode{std::move(reads), ReadNode::Kind::Call,
-                          callWord(call), gateId(), seq++, filteredConstants,
+                          callWord(call), currentBranch(), seq++, filteredConstants,
                           stmt.sourceRange});
         }
         visitDefault(stmt);
@@ -277,7 +346,8 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             std::vector<const Expression*> iffs;
             collectEdgeEvents(&stmt.timing, raw, &iffs);
             for (auto& [expr, edge] : raw)
-                emit(EventNode{expr, edge, seq++, stmt.sourceRange});
+                emit(EventNode{expr, edge, currentBranch(), seq++,
+                               stmt.sourceRange});
             if (!iffs.empty()) {
                 std::vector<Ref> reads;
                 filteredConstants = 0;
@@ -285,7 +355,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                     collectRefs(*c, eval, reads);
                 if (!reads.empty())
                     emit(ReadNode{std::move(reads), ReadNode::Kind::Wait,
-                                  "wait", gateId(), seq++, filteredConstants,
+                                  "wait", currentBranch(), seq++, filteredConstants,
                                   stmt.sourceRange});
             }
         }
@@ -330,22 +400,24 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// rather than its symbol, so `chk(y, y)` keeps its read: the two
     /// occurrences are two nodes.
     ///
-    /// It happens before the expression is visited because the body of the
-    /// called subroutine is walked under this gating stack; after, a formal
-    /// the body assigns would take the same wrong source.
-    void collectGating(const Expression& expr) {
-        std::vector<Ref> refs;
-        collectRefs(expr, eval, refs);
+    /// The reads land on the level being built, and the condition is
+    /// visited BEFORE that level is pushed: a call written in a condition
+    /// runs when control reaches the branch, whichever arm it then takes,
+    /// so its body's statements belong to the enclosing context and not to
+    /// either arm.
+    void collectGating(const Expression& expr, std::vector<Ref>& out) {
+        const size_t mark = out.size();
+        collectRefs(expr, eval, out);
+        dropLoopVars(out, mark);
         std::set<const Expression*> written;
         collectCallOutputs(expr, written);
         if (!written.empty()) {
-            refs.erase(std::remove_if(refs.begin(), refs.end(),
-                                      [&](const Ref& r) {
-                                          return written.count(r.origin) > 0;
-                                      }),
-                       refs.end());
+            out.erase(std::remove_if(out.begin() + std::ptrdiff_t(mark), out.end(),
+                                     [&](const Ref& r) {
+                                         return written.count(r.origin) > 0;
+                                     }),
+                      out.end());
         }
-        gating.insert(gating.end(), refs.begin(), refs.end());
         emitSystemWritesIn(expr);
     }
 
@@ -377,7 +449,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                     return;
                 }
                 self.emit(SystemTaskNode{{}, std::move(writes),
-                                         callWord(call), self.gateId(),
+                                         callWord(call), self.currentBranch(),
                                          self.seq++, 0, call.sourceRange});
             }
         };
@@ -432,79 +504,495 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         expr.visit(f);
     }
 
+    static CheckKind checkOf(UniquePriorityCheck c) {
+        switch (c) {
+            case UniquePriorityCheck::Unique:   return CheckKind::Unique;
+            case UniquePriorityCheck::Unique0:  return CheckKind::Unique0;
+            case UniquePriorityCheck::Priority: return CheckKind::Priority;
+            default:                            return CheckKind::None;
+        }
+    }
+
+    static CaseKind caseKindOf(CaseStatementCondition c) {
+        switch (c) {
+            case CaseStatementCondition::WildcardJustZ: return CaseKind::Casez;
+            case CaseStatementCondition::WildcardXOrZ:  return CaseKind::Casex;
+            case CaseStatementCondition::Inside:        return CaseKind::Inside;
+            default:                                    return CaseKind::Case;
+        }
+    }
+
+    /// Whether the condition is settled at elaboration, and which way: 1 the
+    /// then arm runs, 0 the else arm does, -1 nothing is decided. A value
+    /// with unknown bits decides nothing -- `if (1'bx)` takes the else arm
+    /// in simulation, but calling that a constant verdict states more than
+    /// the fold knows.
+    int staticCondition(const ConditionalStatement& stmt) {
+        bool allKnownTrue = true;
+        for (auto& cond : stmt.conditions) {
+            if (cond.pattern) {
+                allKnownTrue = false;
+                continue;
+            }
+            ConstantValue cv = cond.expr->eval(eval);
+            if (!cv || cv.hasUnknown()) {
+                allKnownTrue = false;
+                continue;
+            }
+            if (!cv.isTrue())
+                return 0;
+        }
+        return allKnownTrue ? 1 : -1;
+    }
+
     void handle(const ConditionalStatement& stmt) {
-        const size_t mark = gating.size();
+        BranchFrame arm;
+        arm.kind = BranchKind::If;
+        arm.check = checkOf(stmt.check);
+        arm.where = stmt.sourceRange;
         visitGuarded([&] {
             for (auto& cond : stmt.conditions) {
-                collectGating(*cond.expr);
+                collectGating(*cond.expr, arm.refs);
                 cond.expr->visit(*this);
             }
         });
-        stmt.ifTrue.visit(*this);
-        if (stmt.ifFalse)
+        const int taken = staticCondition(stmt);
+        {
+            BranchFrame t = arm;
+            t.sense = BranchSense::Then;
+            t.staticTaken = taken;
+            Level level(*this, std::move(t));
+            stmt.ifTrue.visit(*this);
+        }
+        if (stmt.ifFalse) {
+            BranchFrame e = std::move(arm);
+            e.sense = BranchSense::Else;
+            e.staticTaken = taken < 0 ? -1 : 1 - taken;
+            Level level(*this, std::move(e));
             stmt.ifFalse->visit(*this);
-        gating.resize(mark);
+        }
     }
 
+    /// Whether a body can gate anything at all: `2'b01: ;` and `2'b01: begin
+    /// end` cannot. Their arm makes no level on demand, so the labels' reads
+    /// would have no statement anywhere to land on, and a signal the case
+    /// reads would end with no load row in the database at all.
+    static bool gatesNothing(const Statement& body) {
+        switch (body.kind) {
+            case StatementKind::Empty:
+                return true;
+            case StatementKind::List:
+                for (auto* child : body.as<StatementList>().list) {
+                    if (!child || !gatesNothing(*child))
+                        return false;
+                }
+                return true;
+            case StatementKind::Block:
+                return gatesNothing(body.as<BlockStatement>().body);
+            default:
+                return false;
+        }
+    }
+
+    /// One label, evaluated. nullopt is a label constant evaluation does not
+    /// reach -- an `inside` range over a variable -- whose reads stay on the
+    /// item's level like any other control read.
+    ///
+    /// The normalisation is inst_param's: the elaborated value in full
+    /// precision, not the spelling the source used.
+    std::optional<std::string> labelValue(const Expression& label) {
+        ConstantValue cv = label.eval(eval);
+        if (!cv)
+            return std::nullopt;
+        return cv.toString(SVInt::MAX_BITS, /*exactUnknowns=*/true);
+    }
+
+    /// A case is a branch POINT with one level per arm below it: the
+    /// selector's reads go on the point, where every arm shares them, and
+    /// each item's labels on the item. One level for both would leave a
+    /// consumer no way to tell whose label a read was.
     void handle(const CaseStatement& stmt) {
-        const size_t mark = gating.size();
+        BranchFrame point;
+        point.kind = BranchKind::Case;
+        point.caseKind = caseKindOf(stmt.condition);
+        point.check = checkOf(stmt.check);
+        point.where = stmt.sourceRange;
+        const auto [knownBranch, isKnown] = stmt.getKnownBranch(eval);
+
+        // Selector and labels first, under the ENCLOSING level: both are
+        // evaluated on reaching the case, whichever arm then runs, so a call
+        // or a system write inside one belongs outside every arm -- and
+        // materialising the point from a label would leave a point with no
+        // arm under it.
+        std::vector<BranchFrame> arms;
         visitGuarded([&] {
-            collectGating(stmt.expr);
+            collectGating(stmt.expr, point.refs);
             stmt.expr.visit(*this);
             for (auto& item : stmt.items) {
+                BranchFrame arm;
+                arm.kind = BranchKind::CaseItem;
+                arm.ordinal = int32_t(arms.size());
+                arm.where = item.expressions.empty() ? item.stmt->sourceRange
+                                                     : item.expressions[0]->sourceRange;
+                if (isKnown)
+                    arm.staticTaken = knownBranch == item.stmt ? 1 : 0;
                 for (auto* label : item.expressions) {
-                    collectGating(*label);
+                    collectGating(*label, arm.refs);
                     label->visit(*this);
+                    arm.labels.push_back(labelValue(*label));
                 }
+                // An arm that gates nothing hands its labels' reads to the
+                // point, where the matching reads them anyway. Left on the
+                // arm they would reach no statement and vanish.
+                if (gatesNothing(*item.stmt)) {
+                    point.refs.insert(point.refs.end(), arm.refs.begin(),
+                                      arm.refs.end());
+                    arm.refs.clear();
+                }
+                arms.push_back(std::move(arm));
             }
         });
-        for (auto& item : stmt.items) {
-            if (item.stmt)
-                item.stmt->visit(*this);
+
+        Level pointLevel(*this, std::move(point));
+        for (size_t i = 0; i < stmt.items.size(); i++) {
+            Level armLevel(*this, std::move(arms[i]));
+            // Materialised whether or not the body gates anything: one arm
+            // missing makes "which values fall through to default"
+            // unanswerable.
+            currentBranch();
+            stmt.items[i].stmt->visit(*this);
         }
-        if (stmt.defaultCase)
+        if (stmt.defaultCase) {
+            BranchFrame arm;
+            arm.kind = BranchKind::CaseDefault;
+            arm.ordinal = int32_t(arms.size());
+            arm.where = stmt.defaultCase->sourceRange;
+            if (isKnown)
+                arm.staticTaken = knownBranch == stmt.defaultCase ? 1 : 0;
+            Level armLevel(*this, std::move(arm));
+            currentBranch();
             stmt.defaultCase->visit(*this);
-        gating.resize(mark);
+        }
     }
 
-    // The three loop handlers visit their condition under visitGuarded and
-    // then the BODY, rather than handing the whole statement to visitDefault.
+    /// The object an lvalue ultimately writes, through any number of
+    /// selects and member accesses.
+    static const ValueSymbol* rootValueSymbol(const Expression& expr) {
+        const Expression* e = &expr;
+        for (;;) {
+            switch (e->kind) {
+                case ExpressionKind::ElementSelect:
+                    e = &e->as<ElementSelectExpression>().value();
+                    continue;
+                case ExpressionKind::RangeSelect:
+                    e = &e->as<RangeSelectExpression>().value();
+                    continue;
+                case ExpressionKind::MemberAccess:
+                    e = &e->as<MemberAccessExpression>().value();
+                    continue;
+                case ExpressionKind::NamedValue:
+                case ExpressionKind::HierarchicalValue:
+                    return &e->as<ValueExpressionBase>().symbol;
+                default:
+                    return nullptr;
+            }
+        }
+    }
+
+    /// One index a `for` header steps, with the expression that starts it
+    /// where the header gives one. Both spellings count: `for (int i = 0;
+    /// …)` declares the variable in the header, and `integer i; for (i = 0;
+    /// …)` -- what picorv32 and most pre-2005 RTL writes -- steps one
+    /// declared outside.
+    struct LoopIndex {
+        const ValueSymbol* var = nullptr;
+        const Expression* init = nullptr;
+    };
+
+    /// The objects an expression assigns, by any spelling: `i = e`, `i++`.
+    /// In first-encounter order, because a set of pointers iterates by
+    /// address and the walk has to be reproducible.
+    struct AssignedFinder : ASTVisitor<AssignedFinder, VisitFlags::AllGood> {
+        std::vector<const ValueSymbol*>& out;
+        std::set<const ValueSymbol*> seen;
+        explicit AssignedFinder(std::vector<const ValueSymbol*>& out) : out(out) {}
+        void note(const Expression& lvalue) {
+            if (auto* v = rootValueSymbol(lvalue); v && seen.insert(v).second)
+                out.push_back(v);
+        }
+        void handle(const AssignmentExpression& e) {
+            note(e.left());
+            visitDefault(e);
+        }
+        void handle(const UnaryExpression& e) {
+            switch (e.op) {
+                case UnaryOperator::Preincrement:
+                case UnaryOperator::Predecrement:
+                case UnaryOperator::Postincrement:
+                case UnaryOperator::Postdecrement:
+                    note(e.operand());
+                    break;
+                default:
+                    break;
+            }
+            visitDefault(e);
+        }
+        /// An actual bound to an `output`/`inout`/non-const `ref` formal is
+        /// moved by the call, and slang models only the output copy-back as
+        /// an assignment -- so the two other directions need naming here.
+        void handle(const CallExpression& call) {
+            visitDefault(call);
+            auto sub = std::get_if<const SubroutineSymbol*>(&call.subroutine);
+            if (!sub || !*sub)
+                return;
+            auto args = call.arguments();
+            auto formals = (*sub)->getArguments();
+            for (size_t i = 0; i < std::min(args.size(), formals.size()); i++) {
+                if (!args[i] || !formals[i])
+                    continue;
+                const auto dir = formals[i]->direction;
+                const bool constRef =
+                    dir == ArgumentDirection::Ref &&
+                    formals[i]->flags.has(VariableFlags::Const);
+                if (dir == ArgumentDirection::Out ||
+                    dir == ArgumentDirection::InOut ||
+                    (dir == ArgumentDirection::Ref && !constRef))
+                    note(*args[i]);
+            }
+        }
+    };
+
+    /// The header's indices: the variables its STEP expressions move.
+    ///
+    /// The step is what makes a variable an iterator, and testing for it is
+    /// what keeps `for (acc = 8'd0; kk < 4; kk = kk + 1)` from losing acc:
+    /// an initialiser list may hold ordinary variables, and a variable taken
+    /// for an index is suppressed as an operand AND as an assignment target,
+    /// so acc's rows would vanish outright and whoever read acc would trace
+    /// to a signal nothing drives.
+    ///
+    /// The start value is a separate question -- an index stepped here but
+    /// started somewhere else has no iteration space to publish -- so `init`
+    /// is null where the header does not give one.
+    void registerLoopIndices(const ForLoopStatement& stmt,
+                             std::vector<LoopIndex>& mine) {
+        std::vector<const ValueSymbol*> stepped;
+        AssignedFinder f(stepped);
+        for (auto* step : stmt.steps) {
+            if (step)
+                step->visit(f);
+        }
+        if (stepped.empty())
+            return;
+        auto startOf = [&](const ValueSymbol* var) -> const Expression* {
+            for (auto* v : stmt.loopVars) {
+                if (v == var)
+                    return v->getInitializer();
+            }
+            for (auto* init : stmt.initializers) {
+                if (!init || init->kind != ExpressionKind::Assignment)
+                    continue;
+                auto& a = init->as<AssignmentExpression>();
+                if (!a.isCompound() && rootValueSymbol(a.left()) == var)
+                    return &a.right();
+            }
+            return nullptr;
+        };
+        for (auto* var : stepped) {
+            if (loopVars.insert(var).second)
+                mine.push_back(LoopIndex{var, startOf(var)});
+        }
+    }
+
+    /// Whether the body moves `var` -- by assignment, by increment, or by
+    /// passing it to a formal that writes. The iteration space is a claim
+    /// about the values the index takes, and a body that moves it makes the
+    /// claim false; a false window is worse than none.
+    static bool bodyAssigns(const Statement& body, const ValueSymbol* var) {
+        std::vector<const ValueSymbol*> moved;
+        AssignedFinder f(moved);
+        body.visit(f);
+        return std::find(moved.begin(), moved.end(), var) != moved.end();
+    }
+
+    /// The iteration space of a `for`: how many times the body runs and what
+    /// values the index takes.
+    ///
+    /// This is what lets a consumer read a whole-signal `a -> hi` back as
+    /// the per-iteration mapping it is, and it is four columns on one row
+    /// where unrolling the body would be one statement per iteration --
+    /// sixteen for picorv32's carry chain, and the product of the bounds for
+    /// a nested pair. The index arithmetic itself stays in the source, where
+    /// every other expression shape in this schema lives.
+    ///
+    /// The enumeration follows slang's own (FlowAnalysisBase::
+    /// tryGetLoopIterValues): a local for the index, then step until the
+    /// stop condition fails. The local is deleted before the body is walked
+    /// -- left in place, every `a[i]` below would fold to whichever value
+    /// the enumeration stopped at and claim an exact window from it.
+    void describeIterationSpace(const ForLoopStatement& stmt,
+                                const std::vector<LoopIndex>& indices,
+                                BranchFrame& f) {
+        if (indices.size() != 1 || !stmt.stopExpr || stmt.steps.empty())
+            return;
+        const ValueSymbol* var = indices.front().var;
+        f.iterVar = var;
+        if (bodyAssigns(stmt.body, var))
+            return;
+        // No start in the header, no space: taking the type's default would
+        // claim an index begins at 0 when a preceding statement set it.
+        if (!indices.front().init)
+            return;
+        ConstantValue start = indices.front().init->eval(eval);
+        if (!start)
+            return;
+        ConstantValue* local = eval.createLocal(var, std::move(start));
+        if (!local)
+            return;
+        struct DropLocal {
+            EvalContext& eval;
+            const ValueSymbol* var;
+            ~DropLocal() { eval.deleteLocal(var); }
+        } dropLocal{eval, var};
+
+        std::vector<int64_t> values;
+        for (;;) {
+            ConstantValue stop = stmt.stopExpr->eval(eval);
+            if (!stop || stop.hasUnknown())
+                return;
+            if (!stop.isTrue())
+                break;
+            if (values.size() >= kLoopDescribeSteps)
+                return;             // longer than this description will run
+            if (!local->isInteger())
+                return;
+            auto v = local->integer().as<int64_t>();
+            if (!v)
+                return;
+            values.push_back(*v);
+            for (auto* step : stmt.steps) {
+                if (!step->eval(eval))
+                    return;
+            }
+        }
+        f.iterCount = int64_t(values.size());
+        // A loop the stop condition rejects on the first test runs its body
+        // never, which is the same fact about reachability an unreachable
+        // arm carries -- and a dead-code filter reads one column, not two.
+        if (values.empty())
+            f.staticTaken = 0;
+        // first/step describe the values only when they really are an
+        // arithmetic progression: `i *= 2` is enumerable and not affine, and
+        // a consumer substituting first + k*step there would be wrong.
+        if (values.size() == 1) {
+            f.hasProgression = true;
+            f.iterFirst = values.front();
+            f.iterStep = 0;
+        }
+        else if (values.size() >= 2) {
+            const int64_t d = values[1] - values[0];
+            bool affine = true;
+            for (size_t i = 2; i < values.size() && affine; i++)
+                affine = values[i] - values[i - 1] == d;
+            if (affine) {
+                f.hasProgression = true;
+                f.iterFirst = values.front();
+                f.iterStep = d;
+            }
+        }
+    }
+
+    // The loop handlers visit their condition under visitGuarded and then the
+    // BODY, rather than handing the whole statement to visitDefault.
     // visitDefault walks the condition with bindable still true, so a call in
     // a loop condition -- `while (pred(x))` -- was attributed to whatever
     // statement happened to precede it, since curStmt there is a stale earlier
     // one. handle(ConditionalStatement) has always got this right; the loops
     // had not.
     void handle(const ForLoopStatement& stmt) {
-        const size_t mark = gating.size();
-        const size_t loopMark = loopVars.size();
-        for (auto* v : stmt.loopVars)
-            loopVars.insert(v);
+        std::vector<LoopIndex> mine;
+        registerLoopIndices(stmt, mine);
+        BranchFrame f;
+        f.kind = BranchKind::Loop;
+        f.where = stmt.sourceRange;
         visitGuarded([&] {
             for (auto* init : stmt.initializers)
                 init->visit(*this);
             if (stmt.stopExpr) {
-                collectGating(*stmt.stopExpr);
+                collectGating(*stmt.stopExpr, f.refs);
                 stmt.stopExpr->visit(*this);
             }
             for (auto* step : stmt.steps)
                 step->visit(*this);
         });
-        stmt.body.visit(*this);
-        if (loopVars.size() != loopMark) {
-            for (auto* v : stmt.loopVars)
-                loopVars.erase(v);
+        describeIterationSpace(stmt, mine, f);
+        {
+            Level level(*this, std::move(f));
+            stmt.body.visit(*this);
         }
-        gating.resize(mark);
+        for (auto& idx : mine)
+            loopVars.erase(idx.var);
+    }
+
+    /// `foreach` had no handler at all: its index leaked into every
+    /// dependency of the body exactly as a `for`'s did, and the body carried
+    /// no loop level. There is no guard expression here -- the dimension
+    /// decides the count -- so what the level carries is its iteration
+    /// space.
+    void handle(const ForeachLoopStatement& stmt) {
+        std::vector<const ValueSymbol*> mine;
+        for (auto& dim : stmt.loopDims) {
+            if (dim.loopVar && loopVars.insert(dim.loopVar).second)
+                mine.push_back(dim.loopVar);
+        }
+        BranchFrame f;
+        f.kind = BranchKind::Loop;
+        f.where = stmt.sourceRange;
+        // One dimension with a static range: the index runs it left to
+        // right, which DESCENDS for the ordinary packed declaration --
+        // `foreach (src[j])` over `logic [7:0] src` runs 7 down to 0, and
+        // publishing 0 upward would mirror every window a consumer
+        // reconstructs. More than one dimension and no single variable
+        // describes the space.
+        if (stmt.loopDims.size() == 1 && stmt.loopDims[0].loopVar &&
+            stmt.loopDims[0].range) {
+            auto& range = *stmt.loopDims[0].range;
+            f.iterVar = stmt.loopDims[0].loopVar;
+            f.iterFirst = range.left;
+            f.iterStep = range.isDescending() ? -1 : 1;
+            f.iterCount = int64_t(range.width());
+            f.hasProgression = true;
+        }
+        {
+            Level level(*this, std::move(f));
+            visitDefault(stmt);
+        }
+        for (auto* v : mine)
+            loopVars.erase(v);
+    }
+
+    /// `forever` has no guard to gate with -- that is what makes it forever
+    /// -- so the level carries nothing but the fact that its statements are
+    /// a loop body. Without it `while (1)` and `forever`, the same loop,
+    /// recorded differently.
+    void handle(const ForeverLoopStatement& stmt) {
+        BranchFrame f;
+        f.kind = BranchKind::Loop;
+        f.where = stmt.sourceRange;
+        Level level(*this, std::move(f));
+        stmt.body.visit(*this);
     }
 
     void handle(const WhileLoopStatement& stmt) {
-        const size_t mark = gating.size();
+        BranchFrame f;
+        f.kind = BranchKind::Loop;
+        f.where = stmt.sourceRange;
         visitGuarded([&] {
-            collectGating(stmt.cond);
+            collectGating(stmt.cond, f.refs);
             stmt.cond.visit(*this);
         });
+        Level level(*this, std::move(f));
         stmt.body.visit(*this);
-        gating.resize(mark);
     }
 
     /// `do … while (c)` had no handler at all, so it fell to visitDefault,
@@ -513,23 +1001,35 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// even the read. The condition signal had zero load rows in the whole
     /// database despite being read every iteration.
     void handle(const DoWhileLoopStatement& stmt) {
-        const size_t mark = gating.size();
+        BranchFrame f;
+        f.kind = BranchKind::Loop;
+        f.where = stmt.sourceRange;
         visitGuarded([&] {
-            collectGating(stmt.cond);
+            collectGating(stmt.cond, f.refs);
             stmt.cond.visit(*this);
         });
+        Level level(*this, std::move(f));
         stmt.body.visit(*this);
-        gating.resize(mark);
     }
 
     void handle(const RepeatLoopStatement& stmt) {
-        const size_t mark = gating.size();
+        BranchFrame f;
+        f.kind = BranchKind::Loop;
+        f.where = stmt.sourceRange;
         visitGuarded([&] {
-            collectGating(stmt.count);
+            collectGating(stmt.count, f.refs);
             stmt.count.visit(*this);
         });
+        // No index of its own, and the count is still the iteration space:
+        // `repeat (4) q <= q + 1;` runs its body four times, which is the
+        // one thing a reader of that single row needs and could not get.
+        if (ConstantValue n = stmt.count.eval(eval);
+            n && n.isInteger() && !n.hasUnknown()) {
+            if (auto v = n.integer().as<int64_t>(); v && *v >= 0)
+                f.iterCount = *v;
+        }
+        Level level(*this, std::move(f));
         stmt.body.visit(*this);
-        gating.resize(mark);
     }
 
     /// `x++` / `--x`: an assignment in everything but its expression kind.
@@ -553,7 +1053,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             // positional as a mapping gets. Each target is its own
             // statement, as it always was here.
             emit(AssignmentNode{{TargetRecord{dst, {PairedSrc{dst, dst, true, dst}}}},
-                                gateId(), expr.sourceRange, seq++,
+                                currentBranch(), expr.sourceRange, seq++,
                                 /*blocking=*/true, 0, subDepth > 0,
                                 pendingDelay, constructOverride});
         }
@@ -566,7 +1066,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         std::vector<Ref> events;
         filteredConstants = 0;
         collectRefs(stmt.target, eval, events, /*skipSelectors=*/true);
-        emit(TriggerNode{std::move(events), gateId(), seq++,
+        emit(TriggerNode{std::move(events), currentBranch(), seq++,
                          filteredConstants, stmt.sourceRange});
         visitDefault(stmt);
     }
@@ -574,7 +1074,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// `disable blk`. It names a block, not a net, so the row exists for
     /// its gating: the condition reaching it is a read of that signal.
     void handle(const DisableStatement& stmt) {
-        emit(ReadNode{{}, ReadNode::Kind::Disable, "disable", gateId(),
+        emit(ReadNode{{}, ReadNode::Kind::Disable, "disable", currentBranch(),
                       seq++, 0, stmt.sourceRange});
         visitDefault(stmt);
     }
@@ -745,7 +1245,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         std::vector<Ref> writes;
         filteredConstants = 0;
         collectRefs(s.lvalue, eval, writes, /*skipSelectors=*/true);
-        emit(ReleaseNode{std::move(writes), s.isRelease, gateId(), seq++,
+        emit(ReleaseNode{std::move(writes), s.isRelease, currentBranch(), seq++,
                          filteredConstants, s.sourceRange});
         visitDefault(s);
     }
@@ -756,22 +1256,51 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// Modelled on handle(CaseStatement): the subject and each item's filter
     /// are conditions, the item bodies are not.
     void handle(const PatternCaseStatement& stmt) {
-        const size_t mark = gating.size();
+        BranchFrame point;
+        point.kind = BranchKind::Case;
+        // `matches` whatever wildcard word it carries: the items are
+        // patterns, so they have no label values, and that is what a
+        // consumer must branch on.
+        point.caseKind = CaseKind::Matches;
+        point.check = checkOf(stmt.check);
+        point.where = stmt.sourceRange;
+        std::vector<BranchFrame> arms;
         visitGuarded([&] {
-            collectGating(stmt.expr);
+            collectGating(stmt.expr, point.refs);
             stmt.expr.visit(*this);
             for (auto& item : stmt.items) {
+                BranchFrame arm;
+                arm.kind = BranchKind::CaseItem;
+                arm.ordinal = int32_t(arms.size());
+                arm.where = item.stmt->sourceRange;
                 if (item.filter) {
-                    collectGating(*item.filter);
+                    collectGating(*item.filter, arm.refs);
                     item.filter->visit(*this);
+                    if (gatesNothing(*item.stmt)) {
+                        point.refs.insert(point.refs.end(), arm.refs.begin(),
+                                          arm.refs.end());
+                        arm.refs.clear();
+                    }
                 }
+                arms.push_back(std::move(arm));
             }
         });
-        for (auto& item : stmt.items)
-            item.stmt->visit(*this);
-        if (stmt.defaultCase)
+
+        Level pointLevel(*this, std::move(point));
+        for (size_t i = 0; i < stmt.items.size(); i++) {
+            Level armLevel(*this, std::move(arms[i]));
+            currentBranch();
+            stmt.items[i].stmt->visit(*this);
+        }
+        if (stmt.defaultCase) {
+            BranchFrame arm;
+            arm.kind = BranchKind::CaseDefault;
+            arm.ordinal = int32_t(arms.size());
+            arm.where = stmt.defaultCase->sourceRange;
+            Level armLevel(*this, std::move(arm));
+            currentBranch();
             stmt.defaultCase->visit(*this);
-        gating.resize(mark);
+        }
     }
 
     /// `return expr;` writes the subroutine's implicit result variable, and
@@ -808,6 +1337,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         filteredConstants = 0;
         collectSlots(src, eval, 0, rhsSlots);
         collectAuxSlots(src, 0, rhsSlots, /*selectors=*/false);
+        dropLoopVars(rhsSlots);
         const int64_t dropped = filteredConstants;
         eval.reset();
 
@@ -821,7 +1351,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                                       narrowed(dstSlot, span),
                                       false, srcSlot.ref});
         }
-        emit(AssignmentNode{{TargetRecord{dst, std::move(pairs)}}, gateId(),
+        emit(AssignmentNode{{TargetRecord{dst, std::move(pairs)}}, currentBranch(),
                             where, seq++, /*blocking=*/true, dropped,
                             subDepth > 0, pendingDelay, constructOverride});
     }
@@ -915,6 +1445,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 sr.positional = false;
             rhsSlots.insert(rhsSlots.end(), selfRead.begin(), selfRead.end());
         }
+        dropLoopVars(rhsSlots);
         const int64_t droppedConstants = filteredConstants;
 
         eval.reset();
@@ -948,7 +1479,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         // One node owning every target of the statement -- what the old
         // firstTarget flag reconstructed. No targets, no statement.
         if (!records.empty()) {
-            emit(AssignmentNode{std::move(records), gateId(), expr.sourceRange,
+            emit(AssignmentNode{std::move(records), currentBranch(), expr.sourceRange,
                                 stmtSeq, expr.isBlocking(), droppedConstants,
                                 subDepth > 0, delay, constructOverride});
         }

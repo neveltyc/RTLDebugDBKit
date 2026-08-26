@@ -7,7 +7,7 @@
 // Each node owns everything about its statement -- an assignment owns its
 // targets, so statement identity is the node rather than a flag on the first
 // of several calls; a system task names its reads and its writes apart. The
-// gate is an id into the walk's interned table, so a branch context is stored
+// branch is an id into the walk's BranchTable, so a branch context is stored
 // once however many statements it gates.
 //
 // Nodes carry slang pointers, as Ref does: a hier_ref's text is recovered
@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -25,40 +26,93 @@
 #include "slang/text/SourceLocation.h"
 
 #include "../Ref.h"
+#include "Vocab.h"
 
 namespace designdb::detail {
 
-/// Index into the walk's gate table. Every node carries one; 0 is always the
-/// empty gate, so "ungated" needs no special case.
-using GateId = int32_t;
+/// Index into the walk's BranchTable; -1 is ungated.
+using BranchId = int32_t;
 
-inline bool sameRef(const Ref& a, const Ref& b) {
-    return a.sym == b.sym && a.origin == b.origin && a.exact == b.exact &&
-           a.cover == b.cover;
-}
+/// One level of the gating context, as the walk pushed it.
+///
+/// The level is identified by WHERE it was pushed, never by what it reads.
+/// Interning gate stacks by content -- what v18 did -- gave the two arms of
+/// one `if` a single id, since both carry exactly the condition's
+/// references, and no consumer could then tell a then-arm assignment from an
+/// else-arm one.
+struct BranchFrame {
+    BranchId parent = -1;
+    int32_t depth = 1;
+    /// Position among the arms of one case point, in written order; -1 on
+    /// every level that is not an arm. It is what makes a plain `case`'s
+    /// priority readable -- arm k runs only if arms 0..k-1 did not match --
+    /// which source line cannot when the arms share one.
+    int32_t ordinal = -1;
+    BranchKind kind = BranchKind::If;
+    BranchSense sense = BranchSense::None;
+    CaseKind caseKind = CaseKind::None;
+    CheckKind check = CheckKind::None;
+    /// The compile-time verdict for this arm: 1 taken, 0 unreachable, -1
+    /// when the condition is not a constant. A statically false arm keeps
+    /// its rows -- the statement is in the elaborated design and a source
+    /// view shows it -- and says so here.
+    int staticTaken = -1;
+    /// The iteration variable of a `for`/`foreach`; null for the loops that
+    /// have none, and on every non-loop level.
+    const slang::ast::ValueSymbol* iterVar = nullptr;
+    /// How many times the body runs, or -1 when that is not statically
+    /// known. `first`/`step` describe the values the variable takes and are
+    /// published only when they form an arithmetic progression, which
+    /// `hasProgression` says.
+    int64_t iterCount = -1;
+    int64_t iterFirst = 0;
+    int64_t iterStep = 0;
+    bool hasProgression = false;
+    /// This level's own control reads: an `if`'s condition, a case point's
+    /// selector, one item's labels, a loop's guard.
+    std::vector<Ref> refs;
+    /// A case item's labels, evaluated. nullopt is a label no constant
+    /// evaluation reaches -- an `inside` range over a variable -- whose
+    /// reads are in `refs` like any other.
+    std::vector<std::optional<std::string>> labels;
+    slang::SourceRange where;
+};
 
-/// The interned gating contexts of one procedure walk. Interning is a linear
-/// scan over content: gate stacks hold a handful of refs and one procedure
-/// interns a handful of contexts, so an index would cost more than it saves.
-class GateTable {
+/// One control read together with the level that contributed it.
+struct GateRef {
+    Ref ref;
+    BranchId branch = -1;
+};
+
+/// The branch levels of one procedure walk, as a tree. Levels are only ever
+/// appended, so an index stays valid for the whole walk and the parent link
+/// is the nesting.
+class BranchTable {
 public:
-    GateTable() : sets_(1) {}   // id 0: the empty gate
-
-    GateId intern(const std::vector<Ref>& gate) {
-        for (size_t i = 0; i < sets_.size(); i++) {
-            if (sets_[i].size() == gate.size() &&
-                std::equal(sets_[i].begin(), sets_[i].end(), gate.begin(),
-                           sameRef))
-                return GateId(i);
-        }
-        sets_.push_back(gate);
-        return GateId(sets_.size() - 1);
+    BranchId add(BranchFrame frame) {
+        frames_.push_back(std::move(frame));
+        return BranchId(frames_.size() - 1);
     }
 
-    const std::vector<Ref>& refs(GateId id) const { return sets_[size_t(id)]; }
+    const BranchFrame& at(BranchId id) const { return frames_[size_t(id)]; }
+    size_t size() const { return frames_.size(); }
+
+    /// The reads of the chain ending at `id`, outermost level first, each
+    /// naming the level it came from. The order is the order the walk
+    /// pushed them in, which is the order the flat gating stack had.
+    std::vector<GateRef> chain(BranchId id) const {
+        std::vector<BranchId> levels;
+        for (BranchId cur = id; cur >= 0; cur = frames_[size_t(cur)].parent)
+            levels.push_back(cur);
+        std::vector<GateRef> out;
+        for (auto it = levels.rbegin(); it != levels.rend(); ++it)
+            for (auto& r : frames_[size_t(*it)].refs)
+                out.push_back(GateRef{r, *it});
+        return out;
+    }
 
 private:
-    std::vector<std::vector<Ref>> sets_;
+    std::vector<BranchFrame> frames_;
 };
 
 /// One assignment target with the operands paired onto its bits.
@@ -71,7 +125,7 @@ struct TargetRecord {
 /// one node with two TargetRecords.
 struct AssignmentNode {
     std::vector<TargetRecord> targets;
-    GateId gate = 0;
+    BranchId branch = -1;
     slang::SourceRange where;
     int64_t seq = 0;
     bool blocking = false;
@@ -106,6 +160,7 @@ struct BindNode {
 struct EventNode {
     const slang::ast::Expression* expr = nullptr;
     Edge edge = Edge::None;
+    BranchId branch = -1;
     int64_t seq = 0;
     slang::SourceRange where;
 };
@@ -118,7 +173,7 @@ struct ReadNode {
     std::vector<Ref> reads;
     Kind kind = Kind::Call;
     std::string construct;
-    GateId gate = 0;
+    BranchId branch = -1;
     int64_t seq = 0;
     int64_t dropped = 0;
     slang::SourceRange where;
@@ -130,7 +185,7 @@ struct SystemTaskNode {
     std::vector<Ref> reads;
     std::vector<Ref> writes;
     std::string construct;
-    GateId gate = 0;
+    BranchId branch = -1;
     int64_t seq = 0;
     int64_t dropped = 0;
     slang::SourceRange where;
@@ -141,7 +196,7 @@ struct SystemTaskNode {
 /// a system task's write already has.
 struct TriggerNode {
     std::vector<Ref> events;
-    GateId gate = 0;
+    BranchId branch = -1;
     int64_t seq = 0;
     int64_t dropped = 0;
     slang::SourceRange where;
@@ -151,7 +206,7 @@ struct TriggerNode {
 struct ReleaseNode {
     std::vector<Ref> lvalues;
     bool isRelease = true;
-    GateId gate = 0;
+    BranchId branch = -1;
     int64_t seq = 0;
     int64_t dropped = 0;
     slang::SourceRange where;

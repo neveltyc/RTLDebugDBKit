@@ -217,6 +217,12 @@ private:
         /// answered nothing.
         std::map<std::tuple<const Expression*, bool, int32_t>, int32_t> hierSeen;
         int32_t curStmt = -1;      // where call bindings attach
+        /// The gating level the node being filed sits in, template-local
+        /// (-1 = ungated), and the offset of the procedure's walk into the
+        /// template's branch rows. One BranchTable per procedure, one branch
+        /// vector per template, so a walk-local id needs the base added.
+        int32_t curBranch = -1;
+        int32_t branchBase = 0;
         int32_t curProc = -1;      // procedure of statements being created
         int32_t curCallSite = -1;  // the call-site body walk in force (-1 = top)
         int32_t curScope = 0;
@@ -296,7 +302,7 @@ private:
                     int64_t dropped, const TplLoc& loc);
 
     int32_t addExprRef(Build& b, int32_t stmt, const Ref& r, RefRole role,
-                       int32_t netIdx);
+                       int32_t netIdx, int32_t branch = -1);
 
     /// Records one reference that leaves the instance -- and, when slang
     /// resolved it, how to find the target again from any occurrence.
@@ -310,7 +316,7 @@ private:
     int32_t addHierRef(Build& b, bool isWrite, const Ref& r,
                        const TplLoc& at, EvalContext& eval,
                        std::optional<Access> access = std::nullopt,
-                       const Ref* asWritten = nullptr);
+                       const Ref* asWritten = nullptr, int32_t branch = -1);
 
     /// How to reach the reference's target from an occurrence. Downward
     /// targets replay inside the occurrence's own subtree; absolute ones --
@@ -366,7 +372,8 @@ private:
     /// One read of a statement, wherever it lands: an expr_ref for a net of
     /// this instance, a hier_ref for anything outside it.
     void recordRead(Build& b, int32_t stmt, const Ref& r, RefRole role,
-                    const TplLoc& at, EvalContext& evalCtx);
+                    const TplLoc& at, EvalContext& evalCtx,
+                    int32_t branch = -1);
 
     void addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
                       const Expression* expr, Edge edge, EventKind eventKind, const TplLoc& at,
@@ -378,7 +385,7 @@ private:
     /// dependencies, and per target its row, its operand rows, and the
     /// dependencies that pair them.
     void fileAssignment(Build& b, const std::vector<TargetRecord>& targets,
-                        const std::vector<Ref>& gate, const TplLoc& at,
+                        const std::vector<GateRef>& gate, const TplLoc& at,
                         int64_t seq, bool blocking, int64_t dropped,
                         bool inSubroutine, const std::string& delay,
                         bool isContinuous, const std::string& construct,

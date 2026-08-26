@@ -70,7 +70,7 @@ private:
     struct Bases {
         int64_t net = 0, term = 0, termMap = 0, proc = 0, stmt = 0, target = 0,
                 operand = 0, exprRef = 0, procEvent = 0, dep = 0, hierRef = 0,
-                callSite = 0;
+                callSite = 0, branch = 0, branchLabel = 0;
     };
 
     struct ReplayJob {
@@ -182,6 +182,9 @@ private:
         base.hierRef = hierRefCounter; hierRefCounter += int64_t(t.hierRefs.size());
         base.callSite = callSiteCounter;
         callSiteCounter += int64_t(t.callSites.size());
+        base.branch = branchCounter; branchCounter += int64_t(t.branches.size());
+        base.branchLabel = branchLabelCounter;
+        branchLabelCounter += int64_t(t.branchLabels.size());
 
         // Primitives are tree nodes; their ids come from the node counter.
         std::vector<int64_t> primNode(t.prims.size(), 0);
@@ -275,6 +278,42 @@ private:
         }
         stats.procedures += int64_t(t.procedures.size());
 
+        // Branch levels first, for the same reason call sites come before
+        // statements: a stmt row names the level it sits in.
+        for (size_t i = 0; i < t.branches.size(); i++) {
+            auto& br = t.branches[i];
+            BranchRow row;
+            row.id = base.branch + int64_t(i) + 1;
+            row.instId = instId;
+            row.parentBranchId = stampId(base.branch, br.parent);
+            row.depth = br.depth;
+            row.ordinal = br.ordinal;
+            row.branchKind = word(br.kind);
+            row.sense = word(br.sense);
+            row.caseKind = word(br.caseKind);
+            row.checkKind = word(br.check);
+            row.staticTaken = br.staticTaken;
+            row.iterNetId = stampId(base.net, br.iterNet);
+            row.iterCount = br.iterCount;
+            row.iterFirst = br.iterFirst;
+            row.iterStep = br.iterStep;
+            row.hasProgression = br.hasProgression;
+            row.fileId = br.loc.fileId;
+            row.line = br.loc.line;
+            row.column = br.loc.column;
+            writer.addBranch(row);
+        }
+        for (size_t i = 0; i < t.branchLabels.size(); i++) {
+            auto& lb = t.branchLabels[i];
+            BranchLabelRow row;
+            row.id = base.branchLabel + int64_t(i) + 1;
+            row.branchId = base.branch + lb.branch + 1;
+            row.ordinal = lb.ordinal;
+            row.value = lb.value;
+            row.hasValue = lb.hasValue;
+            writer.addBranchLabel(row);
+        }
+
         // Call sites first: a stmt row names the site it belongs to, so the
         // site ids must be issued before the statements reference them.
         for (size_t i = 0; i < t.callSites.size(); i++) {
@@ -306,6 +345,7 @@ private:
             row.delay = s.delay;
             row.droppedOperandCount = s.dropped;
             row.callSiteId = stampId(base.callSite, s.callSite);
+            row.branchId = stampId(base.branch, s.branch);
             row.fileId = s.loc.fileId;
             row.line = s.loc.line;
             row.column = s.loc.column;
@@ -343,6 +383,7 @@ private:
             row.ordinal = r.ordinal;
             row.netId = base.net + r.net + 1;
             row.role = word(r.role);
+            row.branchId = stampId(base.branch, r.branch);
             row.bits = r.r.bits;
             row.exact = r.r.exact;
             writer.addExprRef(row);
@@ -733,6 +774,7 @@ private:
             row.id = job.rowId;
             row.instId = job.instNode;
             row.stmtId = stampId(job.base.stmt, ref.stmt);
+            row.branchId = stampId(job.base.branch, ref.branch);
             row.path = ref.path;
             row.access = word(ref.access);
             row.bits = ref.r.bits;
@@ -897,6 +939,8 @@ private:
     int64_t connCounter = 0;
     int64_t hierRefCounter = 0;
     int64_t callSiteCounter = 0;
+    int64_t branchCounter = 0;
+    int64_t branchLabelCounter = 0;
     int64_t rootOrdinal = 0;
 
     /// The templates on the branch of the tree `stampBody` is currently
