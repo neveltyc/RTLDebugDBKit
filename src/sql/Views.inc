@@ -1,4 +1,5 @@
-// The stable query interface: fifteen views, the consumption contract.
+// The stable query interface: eighteen contracted views (v_conn_arc is the
+// nineteenth and is scaffolding, see below), the consumption contract.
 // Their existence, column sets and order, column semantics, NULL rules and
 // row granularity are what a consumer may rely on; changing any of those --
 // adding a column included, since the version integer is the only capability
@@ -10,9 +11,10 @@
 //
 //   * A FACT view's row is one base-table row -- v_tree_node, v_net,
 //     v_term, v_term_map, v_net_conn, v_net_dep,
-//     v_stmt, v_stmt_target, v_stmt_operand, v_call_site, v_hier_ref -- and
-//     the verifier checks count(view) == count(base). Every internal join is
-//     against a primary key, so nothing fans out.
+//     v_stmt, v_stmt_target, v_stmt_operand, v_branch, v_call_site,
+//     v_hier_ref -- and the verifier checks count(view) == count(base). Every
+//     internal join is against a primary key, so nothing fans out;
+//     v_branch.labels is a scalar subquery, which likewise cannot.
 //   * v_driver and v_load are COMPOSITE: UNION ALL branches discriminated by
 //     driver_kind/load_kind, each branch's row count reconcilable against
 //     its base tables by a formula the verifier evaluates. They are the one
@@ -811,6 +813,7 @@ SELECT
     s.delay                 AS delay,
     s.dropped_operand_count AS dropped_operand_count,
     s.call_site_id          AS call_site_id,
+    s.branch_id             AS branch_id,
     f.path                  AS file_path,
     sf.path                 AS src_path,
     s.line                  AS src_line,
@@ -1033,6 +1036,48 @@ SELECT h.resolved_net_id, n.inst_id, n.name, 'named_from_outside',
        NULL, NULL, NULL, NULL, NULL, NULL, NULL, h.id
 FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
 WHERE h.resolved_net_id IS NOT NULL;
+
+-- One row per branch: a gating level with its file resolved and its labels
+-- gathered. The chain outward is `parent_branch_id`, one step per row --
+-- the transitive walk is the consumer's recursive query, as it is for
+-- net_dep and call_site.
+--
+-- labels is the item's evaluated label values in written order, comma
+-- separated, for the common read; `branch_label` is the row-per-label form
+-- and the only one that tells a NULL value from an absent label. `ordinal`
+-- is the arm's position under its case point, NULL on every other level.
+CREATE VIEW v_branch AS
+SELECT
+    b.id               AS branch_id,
+    b.inst_id          AS inst_id,
+    i.module_id        AS module_id,
+    m.name             AS module_name,
+    b.parent_branch_id AS parent_branch_id,
+    b.depth            AS depth,
+    b.ordinal          AS ordinal,
+    b.branch_kind      AS branch_kind,
+    b.sense            AS sense,
+    b.case_kind        AS case_kind,
+    b.check_kind       AS check_kind,
+    b.static_taken     AS static_taken,
+    b.iter_net_id      AS iter_net_id,
+    itn.name           AS iter_name,
+    b.iter_first       AS iter_first,
+    b.iter_step        AS iter_step,
+    b.iter_count       AS iter_count,
+    (SELECT group_concat(v, ',') FROM
+        (SELECT l.value AS v FROM branch_label l
+          WHERE l.branch_id = b.id ORDER BY l.ordinal)) AS labels,
+    f.path             AS file_path,
+    sf.path            AS src_path,
+    b.line             AS src_line,
+    b.col              AS src_col
+FROM branch b
+JOIN inst i           ON i.id = b.inst_id
+LEFT JOIN module m    ON m.id = i.module_id
+LEFT JOIN net itn     ON itn.id = b.iter_net_id
+LEFT JOIN file f      ON f.id = b.file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- One row per call_site: a subroutine-body expansion, the context a
 -- net_dep or stmt names in its call_site_id. Walk parent_call_site_id to

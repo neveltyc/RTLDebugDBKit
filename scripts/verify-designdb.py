@@ -77,6 +77,12 @@ DOMAINS = (
     ("stmt", "assign_kind", ("continuous", "blocking", "nonblocking"), True),
     ("expr_ref", "role",
      ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
+    ("branch", "branch_kind",
+     ("if", "case", "case_item", "case_default", "loop"), False),
+    ("branch", "sense", ("then", "else"), True),
+    ("branch", "case_kind",
+     ("case", "casez", "casex", "inside", "matches"), True),
+    ("branch", "check_kind", ("unique", "unique0", "priority"), True),
     ("proc_event", "event_kind", ("sensitivity", "wait"), False),
     ("proc_event", "edge_kind", ("posedge", "negedge", "both"), True),
     ("net_dep", "dep_kind",
@@ -159,7 +165,7 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
 con = sqlite3.connect(sys.argv[1])
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "18"
+SCHEMA_VERSION = "19"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
@@ -530,6 +536,153 @@ check(one("""
     JOIN stmt s ON s.id = t.stmt_id
     WHERE s.stmt_kind='release'""") == 0,
       "no dependency borrows a release's target")
+
+# ------------------------------------------------------------- branches
+# The gating tree: what each kind carries, what must be NULL beside it, and
+# that the chain is a proper nesting.
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE (branch_kind = 'if') != (sense IS NOT NULL)""") == 0,
+      "sense is set exactly on if levels")
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE (branch_kind = 'case') != (case_kind IS NOT NULL)""") == 0,
+      "case_kind is set exactly on case points")
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE check_kind IS NOT NULL AND branch_kind NOT IN ('if', 'case')""") == 0,
+      "a unique/priority qualifier belongs to an if or a case point")
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE branch_kind != 'loop'
+      AND (iter_net_id IS NOT NULL OR iter_first IS NOT NULL
+        OR iter_step IS NOT NULL OR iter_count IS NOT NULL)""") == 0,
+      "an iteration space belongs to a loop level")
+# first and step describe the values the index takes and are published
+# together: one without the other is nothing a consumer can substitute.
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE (iter_first IS NULL) != (iter_step IS NULL)""") == 0,
+      "iter_first and iter_step are published together")
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE iter_first IS NOT NULL AND iter_count IS NULL""") == 0,
+      "a published progression comes with its iteration count")
+check(one("""
+    SELECT count(*) FROM branch WHERE iter_count < 0""") == 0,
+      "an iteration count is never negative")
+# Labels hang on the arms that have them: a `default` matches no value, and
+# a pattern-case item's patterns are not label values.
+check(one("""
+    SELECT count(*) FROM branch_label l JOIN branch b ON b.id = l.branch_id
+    WHERE b.branch_kind != 'case_item'""") == 0,
+      "only a case item carries labels")
+check(one("""
+    SELECT count(*) FROM branch_label l
+    JOIN branch b ON b.id = l.branch_id
+    JOIN branch p ON p.id = b.parent_branch_id
+    WHERE p.case_kind = 'matches'""") == 0,
+      "a pattern-case item carries no label values")
+# The chain is a proper nesting: depth 1 at a root, one deeper per level,
+# never leaving the instance. Strictly increasing depth makes it acyclic.
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE (parent_branch_id IS NULL) != (depth = 1)""") == 0,
+      "an outermost branch level is exactly depth 1")
+check(one("""
+    SELECT count(*) FROM branch b JOIN branch p ON p.id = b.parent_branch_id
+    WHERE b.depth != p.depth + 1 OR b.inst_id != p.inst_id""") == 0,
+      "a nested branch level is one below its parent, same instance")
+# A case arm is an arm OF something, and only of a case point.
+check(one("""
+    SELECT count(*) FROM branch b
+    LEFT JOIN branch p ON p.id = b.parent_branch_id
+    WHERE b.branch_kind IN ('case_item', 'case_default')
+      AND (p.branch_kind IS NULL OR p.branch_kind != 'case')""") == 0,
+      "a case arm hangs on a case point")
+check(one("""
+    SELECT count(*) FROM branch b
+    WHERE b.branch_kind = 'case'
+      AND NOT EXISTS (SELECT 1 FROM branch c
+                      WHERE c.parent_branch_id = b.id)""") == 0,
+      "a case point has at least one arm")
+check(one("""
+    SELECT count(*) FROM branch b JOIN net n ON n.id = b.iter_net_id
+    WHERE n.inst_id != b.inst_id""") == 0,
+      "a loop index is a net of the level's own instance")
+# The whole point of the table: a statement and the levels gating it are in
+# one instance, and every control read names the level that contributed it,
+# which is on that statement's own chain.
+check(one("""
+    SELECT count(*) FROM stmt s JOIN branch b ON b.id = s.branch_id
+    WHERE s.inst_id != b.inst_id""") == 0,
+      "a statement's gating level is in its own instance")
+check(one("""
+    SELECT count(*) FROM expr_ref
+    WHERE (role = 'control') != (branch_id IS NOT NULL)""") == 0,
+      "branch_id is set on exactly the control reads")
+check(one("""
+    SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
+    WHERE e.role = 'control' AND s.branch_id IS NULL""") == 0,
+      "a statement with a control read names the level it sits in")
+check(one("""
+    WITH RECURSIVE chain(stmt_id, branch_id) AS (
+        SELECT id, branch_id FROM stmt WHERE branch_id IS NOT NULL
+      UNION ALL
+        SELECT c.stmt_id, b.parent_branch_id
+        FROM chain c JOIN branch b ON b.id = c.branch_id
+        WHERE b.parent_branch_id IS NOT NULL)
+    SELECT count(*) FROM expr_ref e
+    WHERE e.role = 'control'
+      AND NOT EXISTS (SELECT 1 FROM chain c
+                      WHERE c.stmt_id = e.stmt_id
+                        AND c.branch_id = e.branch_id)""") == 0,
+      "a control read's level is on its statement's own chain")
+check(one("""
+    SELECT count(*) FROM hier_ref h
+    WHERE h.branch_id IS NOT NULL AND h.access != 'read'""") == 0,
+      "only a read leaves the instance as a branch condition")
+check(one("""
+    SELECT count(*) FROM hier_ref h JOIN branch b ON b.id = h.branch_id
+    WHERE h.inst_id != b.inst_id""") == 0,
+      "an outward condition's level is in its own instance")
+# A loop index sources no dataflow: that is what the iteration space
+# replaced. A `procedure` arc survives -- `t(i)` really does feed the formal,
+# and dropping it would leave the formal with no driver at all.
+check(one("""
+    SELECT count(*) FROM net_dep d
+    JOIN branch b ON b.iter_net_id = d.src_net_id
+    JOIN net n ON n.id = d.src_net_id AND n.inst_id = b.inst_id
+    WHERE d.dep_kind IN ('data', 'control')""") == 0,
+      "a loop index sources no data or control dependency")
+check(one("""
+    SELECT count(*) FROM assign_operand o
+    JOIN branch b ON b.iter_net_id = o.net_id
+    JOIN net n ON n.id = o.net_id AND n.inst_id = b.inst_id""") == 0,
+      "and is never an assignment operand")
+# `ordinal` is the arm order under one case point, and nothing else has one.
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE (branch_kind IN ('case_item', 'case_default'))
+       != (ordinal IS NOT NULL)""") == 0,
+      "ordinal is set on exactly the case arms")
+# Ordinal is the arm's WRITTEN position, so it is unique and increasing
+# under one point but not contiguous: an arm whose body gates nothing has no
+# row, and closing the gap would misstate which arms precede which.
+check(one("""SELECT count(*) FROM branch WHERE ordinal < 0""") == 0,
+      "an arm ordinal is never negative")
+check(one("""
+    SELECT count(*) FROM branch a JOIN branch b
+      ON b.parent_branch_id = a.parent_branch_id
+    WHERE a.ordinal < b.ordinal
+      AND (a.line > b.line OR (a.line = b.line AND a.col > b.col))""") == 0,
+      "arm ordinals run in source order under their point")
+# A loop that provably never runs is dead code, and says so in the one
+# column a dead-code filter reads.
+check(one("""
+    SELECT count(*) FROM branch
+    WHERE iter_count = 0 AND static_taken IS NOT 0""") == 0,
+      "a zero-trip loop level is marked unreachable")
 
 # ------------------------------------------------------------ call sites
 # A call site is a subroutine-body expansion, and the stmt/net_dep rows that
@@ -985,7 +1138,7 @@ VIEW_COLUMNS = {
         "stmt_id", "inst_id", "module_id", "module_name",
         "scope_node_id", "proc_id", "ordinal", "sequence",
         "stmt_kind", "construct", "assign_kind", "delay",
-        "dropped_operand_count", "call_site_id",
+        "dropped_operand_count", "call_site_id", "branch_id",
         "file_path", "src_path", "src_line", "src_col"],
     "v_stmt_target": [
         "target_id", "stmt_id", "ordinal", "net_id", "net_name",
@@ -1002,6 +1155,13 @@ VIEW_COLUMNS = {
     "v_proc_event": [
         "proc_event_id", "proc_id", "inst_id", "proc_kind", "stmt_id",
         "net_id", "net_name", "event_kind", "edge_kind",
+        "file_path", "src_path", "src_line", "src_col"],
+    "v_branch": [
+        "branch_id", "inst_id", "module_id", "module_name",
+        "parent_branch_id", "depth", "ordinal", "branch_kind", "sense",
+        "case_kind",
+        "check_kind", "static_taken", "iter_net_id", "iter_name",
+        "iter_first", "iter_step", "iter_count", "labels",
         "file_path", "src_path", "src_line", "src_col"],
     "v_call_site": [
         "call_site_id", "inst_id", "module_id", "module_name",
@@ -1030,6 +1190,7 @@ for view, base in (
     ("v_net_dep", "net_dep"), ("v_stmt", "stmt"),
     ("v_stmt_target", "stmt_target"),
     ("v_stmt_operand", "assign_operand"),
+    ("v_branch", "branch"),
     ("v_call_site", "call_site"),
     ("v_hier_ref", "hier_ref"),
     ("v_proc_event", "proc_event"),
@@ -1413,11 +1574,24 @@ for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
                   ("v_net_dep", "call_site_id"),
                   ("v_stmt", "call_site_id"),
                   ("v_stmt_target", "call_site_id"),
-                  ("v_stmt_operand", "call_site_id")):
+                  ("v_stmt_operand", "call_site_id"),
+                  # The branch chain is walked a level at a time, upward from
+                  # a statement and downward to the statements a level gates,
+                  # so both directions have to seek: a dead-code filter over
+                  # a real design does one of each per level.
+                  ("v_branch", "branch_id"),
+                  ("v_branch", "parent_branch_id"),
+                  ("v_stmt", "branch_id")):
     plan = con.execute(
         f"EXPLAIN QUERY PLAN SELECT * FROM {view} WHERE {col} = 1").fetchall()
+    # A base table scanned is the fault. `SCAN (subquery-N)` is not one: it
+    # reads back the rows a correlated co-routine produced, and whether THAT
+    # seeks shows as its own line -- so a scan hidden inside one is still
+    # caught by the table's own row.
     scanned = [r[3] for r in plan
-               if r[3].startswith("SCAN ") and not r[3].startswith(f"SCAN {view}")]
+               if r[3].startswith("SCAN ")
+               and not r[3].startswith(f"SCAN {view}")
+               and not r[3].startswith("SCAN (subquery")]
     check(not scanned, f"{view} seeks rather than scans for one {col}",
           "; ".join(scanned))
 
@@ -1909,6 +2083,33 @@ if mode == "assertions":
           "an assertion's reads are statement-kind loads")
 
 if mode == "params":
+    # ---- a procedural if on a parameter, one variant per value
+    # The elaboration settles the branch and the rows stay: a simulator has
+    # the statement, a source view shows the line, and the level says which
+    # arm nothing can reach. v18 filtered the parameter out of the gating as
+    # a constant operand, so the dead arm carried no condition at all and q
+    # read as unconditionally driven from two places.
+    verdicts = sorted(con.execute("""
+        SELECT i.param_signature, b.sense, b.static_taken
+        FROM v_branch b JOIN inst i ON i.id = b.inst_id
+        WHERE b.module_name='deadarm'""").fetchall())
+    check(verdicts == [("EN=1'b0", "else", 1), ("EN=1'b0", "then", 0),
+                       ("EN=1'b1", "else", 0), ("EN=1'b1", "then", 1)],
+          "each variant marks the arm its own parameter value cannot reach",
+          f"got {verdicts}")
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_stmt s ON s.stmt_id = d.stmt_id
+        WHERE s.module_name='deadarm' AND d.signal_name='q'""") == 4,
+          "and both arms keep their driver rows in both variants")
+    check(one("""
+        SELECT count(*) FROM v_driver d
+        JOIN v_stmt s ON s.stmt_id = d.stmt_id
+        JOIN v_branch b ON b.branch_id = s.branch_id
+        WHERE s.module_name='deadarm' AND d.signal_name='q'
+          AND b.static_taken = 1""") == 2,
+          "so a live-driver query is one predicate on the level")
+
     # LRM 23.10 -- three ways a parameterisation key goes wrong.
     # ---- two values that print alike
     # A template is keyed by (definition, parameter values), so the parameter
@@ -2077,19 +2278,122 @@ if mode == "procedural":
         WHERE src_name='b' AND tgt_name='looped'
           AND dep_kind='control'""") == 1,
           "a do-while condition gates its body")
-    # LRM 12.7.1 -- a for loop's initialiser runs once, before the condition
-    # is ever evaluated, so it is not gated by it. The body is.
+    # LRM 12.7.1 -- a for loop's initialiser and step move the INDEX, which
+    # is not a design signal: it takes every value of the space on the way
+    # through, so `i -> sum` said sum depended on something no debugging
+    # question reaches. The loop level carries the space instead, and the
+    # body sits in it.
     check(one("""
-        SELECT count(*) FROM v_stmt_target t
-        WHERE t.net_name='i'
-          AND NOT EXISTS (SELECT 1 FROM v_net_dep d
-                          WHERE d.stmt_id = t.stmt_id
-                            AND d.dep_kind='control')""") == 1,
-          "a for-loop initialiser is not gated by the loop condition")
+        SELECT count(*) FROM v_stmt_target t JOIN v_stmt s
+          ON s.stmt_id = t.stmt_id
+        WHERE t.net_name='i' AND s.module_name='stmtgaps'""") == 0,
+          "a for-loop index is written by no statement row")
     check(one("""
-        SELECT count(*) FROM v_net_dep
-        WHERE src_name='i' AND tgt_name='sum' AND dep_kind='control'""") == 1,
-          "while the body it guards is")
+        SELECT count(*) FROM v_net_dep d JOIN v_stmt s ON s.stmt_id = d.stmt_id
+        WHERE d.src_name='i' AND s.module_name='stmtgaps'""") == 0,
+          "and sources no dependency")
+    check(one("""
+        SELECT count(*) FROM v_branch
+        WHERE module_name='stmtgaps' AND branch_kind='loop' AND iter_name='i'
+          AND iter_first=0 AND iter_step=1 AND iter_count=4""") == 1,
+          "the loop level carries the space it runs -- i = 0,1,2,3")
+    check(one("""
+        SELECT count(*) FROM v_stmt s
+        JOIN v_branch b ON b.branch_id = s.branch_id
+        JOIN v_stmt_operand o ON o.stmt_id = s.stmt_id
+        WHERE s.module_name='stmtgaps' AND b.branch_kind='loop'
+          AND b.iter_name='i' AND o.net_name='x'""") == 1,
+          "and the body it guards sits in it")
+
+    # LRM 12.7 -- the four ways taking a header variable for an index goes
+    # wrong, each with the row that proves it did not.
+    check(one("""
+        SELECT count(*) FROM v_net_dep d JOIN v_stmt s ON s.stmt_id = d.stmt_id
+        WHERE s.module_name='loopspace' AND d.src_name='i'""") == 1
+          and one("""
+        SELECT dep_kind FROM v_net_dep d JOIN v_stmt s ON s.stmt_id = d.stmt_id
+        WHERE s.module_name='loopspace' AND d.src_name='i'""") == "procedure",
+          "an index read as a value still feeds the formal it is bound to")
+    check(one("""
+        SELECT count(*) FROM v_driver d JOIN v_stmt s ON s.stmt_id = d.stmt_id
+        WHERE s.module_name='loopspace' AND d.signal_name='acc'
+          AND d.driver_name='d'""") == 1,
+          "a header variable the header does not step keeps its rows")
+    space = con.execute("""
+        SELECT iter_name, iter_first, iter_step, iter_count, static_taken
+        FROM v_branch WHERE module_name='loopspace' AND branch_kind='loop'
+        ORDER BY src_line""").fetchall()
+    check(space == [("i", 0, 1, 4, None), ("kk", None, None, None, None),
+                    ("j", 7, -1, 8, None), ("z", None, None, 0, 0)],
+          "each loop publishes exactly the space it can stand behind",
+          f"got {space}")
+
+    # LRM 12.4 -- the red line the branch table exists for. `gating` writes q
+    # from all four arms of one if/else-if chain, and in v18 the two arms of
+    # each `if` produced rows that were equal column for column: same
+    # conditions, same expr_ref set, same everything but the operand. Each
+    # must now name a level of its own, and the levels must nest by the
+    # desugaring rather than flatten.
+    arms = con.execute("""
+        SELECT s.src_line, b.depth, b.sense
+        FROM v_stmt s
+        JOIN v_stmt_target t ON t.stmt_id = s.stmt_id
+        JOIN v_branch b ON b.branch_id = s.branch_id
+        WHERE s.module_name='gating' AND t.net_name='q'
+        ORDER BY s.src_line""").fetchall()
+    check([(d, sn) for _, d, sn in arms]
+          == [(1, "then"), (2, "then"), (3, "then"), (3, "else")],
+          "an if/else-if chain nests one level per else, not one flat set",
+          f"got {arms}")
+    check(one("""
+        SELECT count(DISTINCT s.branch_id) FROM v_stmt s
+        JOIN v_stmt_target t ON t.stmt_id = s.stmt_id
+        WHERE s.module_name='gating' AND t.net_name='q'""") == 4,
+          "so the four arms writing one target sit in four levels")
+    # The reads stay identical -- that was never the problem -- which is why
+    # the level is the only thing that can tell the arms apart.
+    check(one("""
+        SELECT count(DISTINCT reads) FROM (
+            SELECT s.stmt_id AS sid,
+                   group_concat(e.net_id) AS reads
+            FROM v_stmt s
+            JOIN v_stmt_target t ON t.stmt_id = s.stmt_id
+            JOIN expr_ref e ON e.stmt_id = s.stmt_id AND e.role='control'
+            WHERE s.module_name='gating' AND t.net_name='q'
+              AND s.src_line IN (189, 190)
+            GROUP BY s.stmt_id)""") == 1,
+          "while the two innermost arms still read exactly the same nets")
+    # LRM 12.5 -- the qualifier and the matching semantics belong to the case
+    # POINT; the labels belong to the item, one row each, and no item sees
+    # another's. v18 pushed the selector and every label onto one gate.
+    check(sorted(con.execute("""
+        SELECT case_kind, check_kind FROM v_branch
+        WHERE module_name='gating' AND branch_kind='case'""").fetchall(),
+        key=lambda r: (r[0], r[1] or "")) ==
+        [("case", None), ("case", "priority"), ("casex", "unique0"),
+         ("casez", "unique")],
+          "each case point carries its own matching semantics and qualifier")
+    check(one("""
+        SELECT count(*) FROM branch_label l
+        JOIN branch b ON b.id = l.branch_id
+        JOIN branch p ON p.id = b.parent_branch_id
+        JOIN inst i ON i.id = b.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name='gating' AND p.case_kind='casez'""") == 2,
+          "a casez arm carries only its own label")
+    check(one("""
+        SELECT l.value FROM branch_label l
+        JOIN branch b ON b.id = l.branch_id
+        JOIN branch p ON p.id = b.parent_branch_id
+        JOIN inst i ON i.id = b.inst_id
+        JOIN module m ON m.id = i.module_id
+        WHERE m.name='gating' AND p.case_kind='casez' AND b.line=208""")
+          == "4'b1zzz",
+          "and publishes it as the elaborated value, not the spelling")
+    check(one("""
+        SELECT count(*) FROM v_branch
+        WHERE module_name='gating' AND branch_kind='case_default'""") == 4,
+          "every case here has its default arm as a level of its own")
     # LRM 10.6.2 -- a release drives nothing, so it carries no dependency to
     # hang its gating on. What decides when the hijack ends is a control
     # reference on the release statement itself.
@@ -2399,8 +2703,55 @@ if mode == "patterncase":
           AND dep_kind='control'""") == 2,
           "a pattern-case selector gates each of its branches")
     check(one("""
-        SELECT count(*) FROM v_load WHERE signal_name='sel'""") == 2,
+        SELECT count(*) FROM v_load
+        WHERE signal_name='sel' AND load_name='q'""") == 2,
           "so the selector reads as a load")
+    # LRM 12.6 -- a pattern-case item matches a pattern, not a value, so it
+    # has no label to publish; the case_kind is what a consumer branches on.
+    check(one("""
+        SELECT count(*) FROM v_branch
+        WHERE branch_kind='case' AND case_kind='matches'""") == 1,
+          "a pattern case is a case point spelled 'matches'")
+    check(one("""
+        SELECT count(*) FROM branch_label l
+        JOIN branch b ON b.id = l.branch_id
+        JOIN branch p ON p.id = b.parent_branch_id
+        WHERE p.case_kind='matches'""") == 0,
+          "and its items publish no label values")
+    # LRM 12.5.4 -- a range label reaches no single constant, so its value is
+    # NULL while the row itself stays: "this item has a label this export
+    # could not evaluate" is a different fact from "this item has no label".
+    check(one("""
+        SELECT count(*) FROM branch_label l
+        JOIN branch b ON b.id = l.branch_id
+        JOIN branch p ON p.id = b.parent_branch_id
+        WHERE p.case_kind='inside' AND l.value IS NULL""") == 1,
+          "an inside range is a label row with no value")
+    # Two labels on one arm, each its own row, in written order.
+    check(one("""
+        SELECT group_concat(v, ' ') FROM (
+            SELECT l.value AS v FROM branch_label l
+            JOIN branch b ON b.id = l.branch_id
+            JOIN branch p ON p.id = b.parent_branch_id
+            WHERE p.case_kind='inside' AND l.value IS NOT NULL
+            ORDER BY l.ordinal)""") == "4'b111 4'b1001",
+          "and a multi-label arm keeps each label, evaluated, in order")
+    check(one("""
+        SELECT labels FROM v_branch
+        WHERE case_kind IS NULL AND labels LIKE '%,%'""")
+          == "4'b111,4'b1001",
+          "which v_branch.labels joins in the same order")
+    # LRM 12.4.2 -- the qualifier is on the `if` that carries it, not on the
+    # `else if` nested inside its else arm.
+    check(one("""
+        SELECT count(*) FROM v_branch
+        WHERE branch_kind='if' AND check_kind='priority'""") == 2,
+          "a priority if qualifies both its own arms")
+    check(one("""
+        SELECT count(*) FROM v_branch b
+        JOIN v_branch p ON p.branch_id = b.parent_branch_id
+        WHERE p.check_kind='priority' AND b.check_kind IS NOT NULL""") == 0,
+          "and does not reach the else-if nested below it")
     check(one("""
         SELECT count(*) FROM v_net_dep
         WHERE src_name='x' AND tgt_name='q' AND dep_kind='data'""") == 1,
@@ -3171,6 +3522,19 @@ if mode == "callsite":
     check(one("""SELECT count(*) FROM v_call_site
                  WHERE subroutine_name='bump' AND depth=1""") == 2,
           "the task is called from two call sites")
+    # And each expansion carries the gating of ITS site: one body walked
+    # twice is two sets of statements under two different levels, which is
+    # the whole reason the walk is per call site rather than per subroutine.
+    levels = sorted(con.execute("""
+        SELECT cs.call_site_id, b.branch_kind, b.sense, b.src_line
+        FROM v_stmt s
+        JOIN v_call_site cs ON cs.call_site_id = s.call_site_id
+        JOIN v_branch b ON b.branch_id = s.branch_id
+        WHERE cs.subroutine_name='bump'""").fetchall())
+    check(len(levels) == 2 and levels[0][3] != levels[1][3]
+          and all(r[1] == "if" and r[2] == "then" for r in levels),
+          "each expansion sits in the level of its own call site",
+          f"got {levels}")
     # A call in a control expression (`pick(c)` in the condition) has no
     # owning statement: its call_site names no caller statement, and its
     # argument binding carries no call_site_id (the universal invariant

@@ -21,6 +21,16 @@
 //               names comes from the analysed body it was built from, so all
 //               four flops are stamped and the status stays complete.
 //
+//   deadarm     a procedural `if` on a parameter, one variant per value.
+//               Where the generate form elaborates the untaken branch away,
+//               this one keeps its statement -- a simulator executes the
+//               procedure and a source view shows the line -- so both arms
+//               record their rows and the branch level says which one
+//               nothing can reach. v18 dropped the constant out of the
+//               gating altogether (a parameter is filtered as a constant
+//               operand), leaving the dead arm with no condition at all and
+//               `q` reading as unconditionally driven from two places.
+//
 //   paramrec    a module that instantiates ITSELF, legally, because the
 //               parameter shrinks each level. The recursion guard keys on
 //               (module, parameters); keyed on the module alone it would cut
@@ -86,6 +96,19 @@ module redtree #(parameter int W = 8) (input logic [W-1:0] a, output logic y);
     end
 endmodule
 
+module deadarm #(parameter bit EN = 1'b0)
+                (input logic dead, live, output logic q);
+    always_comb begin
+        if (EN) q = dead;
+        else    q = live;
+    end
+endmodule
+
+module deadarm_pair (input logic dead, live, output logic q_off, q_on);
+    deadarm #(.EN(1'b0)) u_off (.dead(dead), .live(live), .q(q_off));
+    deadarm #(.EN(1'b1)) u_on  (.dead(dead), .live(live), .q(q_on));
+endmodule
+
 module paramrec (input logic [7:0] a, output logic y);
     redtree #(.W(8)) u (.a(a), .y(y));
 endmodule
@@ -94,9 +117,12 @@ module params (input logic clk, input logic bit_in, input logic [7:0] word_in,
                output logic fold_a, output logic fold_b,
                output logic [7:0] tp0a, output logic [7:0] tp0b,
                output logic [7:0] tp1a, output logic [7:0] tp1b,
-               output logic rec_y);
+               output logic rec_y,
+               output logic dead_off, dead_on);
     paramfold u_fold (.i(bit_in), .a(fold_a), .b(fold_b));
     typeparam u_type (.clk(clk), .d(word_in),
                       .q0a(tp0a), .q0b(tp0b), .q1a(tp1a), .q1b(tp1b));
     paramrec  u_rec  (.a(word_in), .y(rec_y));
+    deadarm_pair u_dead (.dead(bit_in), .live(~bit_in),
+                         .q_off(dead_off), .q_on(dead_on));
 endmodule

@@ -316,6 +316,116 @@ CREATE TABLE call_site(
     subroutine_name      TEXT NOT NULL,
     depth                INTEGER NOT NULL);
 
+-- One level of the gating context a statement sits under: an `if` arm, a
+-- case point, one case arm, a loop body. `parent_branch_id` chains them
+-- outward, so a statement's conditions are the walk from `stmt.branch_id` up
+-- to a root, outermost last -- the shape `call_site` already uses for nested
+-- calls. Levels are SHARED: every statement in one arm names the same row,
+-- and only a level that gates something has a row at all.
+--
+-- What each kind carries, and what is NULL beside it:
+--
+--   if            sense says which arm ('then'/'else'); check_kind carries a
+--                 `priority if`/`unique if` qualifier. The level's control
+--                 reads ARE the condition, so both arms name the same nets
+--                 and `sense` is what tells the two apart -- v18 gave them
+--                 one gate and a consumer could not.
+--   case          the branch POINT, one per case statement: case_kind is the
+--                 matching semantics in the LRM's word, check_kind the
+--                 unique/priority qualifier, and the level's control reads
+--                 are the SELECTOR's. Its children are the arms.
+--   case_item     one arm. Its control reads are that item's own labels, and
+--                 `branch_label` holds their evaluated values -- v18 pushed
+--                 every item's labels onto one gate before walking any body,
+--                 so each arm saw all of them and none could be told apart.
+--                 Arms are SIBLINGS, not a chain: an arm carries its own
+--                 label and not the preceding arms', so the priority a plain
+--                 `case` has -- arm k is reached only if arms 0..k-1 did not
+--                 match -- is `ordinal`, their written order under the point,
+--                 not a read repeated onto every later arm. `ordinal` is set
+--                 on exactly the arms: source line cannot carry the order,
+--                 since a whole case may be written on one. It matters for
+--                 the `case (1'b1)` one-hot idiom, whose labels are
+--                 expressions: picorv32's decoder read `instr_trap` on 207
+--                 control rows in v18 and reads it on 36 here, one per
+--                 statement of the three arms whose label actually names it.
+--   case_default  the `default` arm. No labels.
+--   loop          a loop body. The control reads are the guard (`while`'s
+--                 condition, `for`'s stop expression, `repeat`'s count), and
+--                 the iter_* columns are the iteration space -- see below.
+--
+-- static_taken is the compile-time verdict: 1 this arm runs, 0 it cannot,
+-- NULL the condition is not a constant. `localparam bit EN = 0; if (EN) …`
+-- keeps its statement and its dependency rows -- the statement is in the
+-- elaborated design, and a source view shows it where a pruned database
+-- would not -- and says here that nothing reaches them. A consumer filtering
+-- dead code excludes a statement whose level chain holds any static_taken=0.
+--
+-- A loop level with iter_count = 0 carries static_taken = 0: a body the
+-- stop condition rejects on its first test runs never, which is the same
+-- fact about reachability an unreachable arm has, and a dead-code filter
+-- should read one column rather than two.
+--
+-- The iteration space, on a loop level, is what makes a whole-signal
+-- dependency out of a loop body readable as the per-iteration mapping it is:
+-- `for (int j = 0; j < 8; j++) rev[j] = din[7-j];` is ONE statement whose
+-- `din -> rev` row spans both signals, and iter_net_id/iter_first/iter_step/
+-- iter_count say the index j runs 0,1,…,7 so a consumer can substitute. The
+-- index arithmetic itself is not here, for the same reason no expression
+-- shape is: it is in the source at the location this row names. iter_step is
+-- NEGATIVE where the loop counts down, which `foreach` over an ordinary
+-- packed dimension does. iter_count NULL is "not statically known";
+-- iter_first/iter_step are NULL together when the values are not an
+-- arithmetic progression; iter_net_id is NULL for the loops that name no
+-- index (`while`, `repeat`, `forever`) and for a header that names more
+-- than one, which no single set of these columns describes.
+--
+-- A loop index is deliberately not a `data` or `control` dependency source,
+-- and never an assign_operand: it takes every value of this space on the way
+-- through, so `i -> hi` said the target depended on a variable no debugging
+-- question reaches. Where the RTL reads it as a VALUE -- `t(i)`,
+-- `$display("%d", i)` -- the read stays: it is a fact about the source, and
+-- dropping it would leave a bound formal with no driver at all.
+--
+-- What counts as an index is a variable the header both INITIALISES and
+-- STEPS. `for (k = 0, acc = 0; k < 4; k = k + 1)` initialises acc and never
+-- steps it, so acc is an ordinary variable of the body and keeps every row.
+CREATE TABLE branch(
+    id               INTEGER PRIMARY KEY,
+    inst_id          INTEGER NOT NULL REFERENCES inst(id),
+    parent_branch_id INTEGER REFERENCES branch(id),
+    depth            INTEGER NOT NULL,
+    ordinal          INTEGER,
+    branch_kind      TEXT NOT NULL
+        /*!*/CHECK(branch_kind IN ('if','case','case_item','case_default',
+                                   'loop'))/*!*/,
+    sense            TEXT /*!*/CHECK(sense IN ('then','else'))/*!*/,
+    case_kind        TEXT
+        /*!*/CHECK(case_kind IN ('case','casez','casex','inside','matches'))/*!*/,
+    check_kind       TEXT
+        /*!*/CHECK(check_kind IN ('unique','unique0','priority'))/*!*/,
+    static_taken     INTEGER /*!*/CHECK(static_taken IN (0,1))/*!*/,
+    iter_net_id      INTEGER REFERENCES net(id),
+    iter_first       INTEGER,
+    iter_step        INTEGER,
+    iter_count       INTEGER,
+    file_id          INTEGER REFERENCES file(id),
+    line             INTEGER,
+    col              INTEGER);
+
+-- One label of a case item, in written order, evaluated. `value` is the
+-- elaborated constant in full precision -- the same normalisation
+-- `inst_param.value` uses, not the spelling the source happened to give it
+-- -- and NULL where constant evaluation does not reach the label, as for an
+-- `inside` range over a variable. Such a label's reads are still control
+-- reads on the item's level.
+CREATE TABLE branch_label(
+    id        INTEGER PRIMARY KEY,
+    branch_id INTEGER NOT NULL REFERENCES branch(id),
+    ordinal   INTEGER NOT NULL,
+    value     TEXT,
+    UNIQUE(branch_id, ordinal));
+
 -- One statement, or one statement-level construct. The statement is the
 -- object; its targets, operands and other reads are child rows -- v9's
 -- `assignment` was one row per TARGET, so `{a,b} = {x,y}` was two rows
@@ -328,6 +438,11 @@ CREATE TABLE call_site(
 -- assign_kind is NULL for non-assignments. delay is the delay control's
 -- normalised source text (`#3`, `#(rise, fall)`), not a number this tool
 -- pretended to evaluate; NULL when there is none.
+--
+-- branch_id is the gating context (`branch`), NULL outside every branch.
+-- It is the complete answer to "what gates this statement": the level's own
+-- reads are expr_ref rows with role='control', and a statement kind that
+-- records no reads of its own -- an event control -- still names its level.
 --
 -- What is deliberately NOT here, unchanged from v9: no branch-condition
 -- text, no clocked flag, no source text.
@@ -355,6 +470,7 @@ CREATE TABLE stmt(
     delay                 TEXT,
     dropped_operand_count INTEGER NOT NULL,
     call_site_id          INTEGER REFERENCES call_site(id),
+    branch_id             INTEGER REFERENCES branch(id),
     file_id               INTEGER REFERENCES file(id),
     line                  INTEGER,
     col                   INTEGER);
@@ -388,7 +504,9 @@ CREATE TABLE assign_operand(
 
 -- One statement read that is not an assignment operand, classified by role:
 --
---   control        a branch condition the statement's targets sit under
+--   control        a branch condition the statement's targets sit under.
+--                  branch_id names WHICH level of the gating contributed it
+--                  -- always set for this role, always NULL for the others.
 --   assertion      read by an assert/assume/cover/expect
 --   wait           a wait statement's condition
 --   event          a sensitivity/event expression that is not a plain net
@@ -397,16 +515,17 @@ CREATE TABLE assign_operand(
 --   call_argument  an actual at a call site
 --   system_task    read by $display and friends
 CREATE TABLE expr_ref(
-    id       INTEGER PRIMARY KEY,
-    stmt_id  INTEGER NOT NULL REFERENCES stmt(id),
-    ordinal  INTEGER NOT NULL,
-    net_id   INTEGER NOT NULL REFERENCES net(id),
-    role     TEXT NOT NULL
+    id        INTEGER PRIMARY KEY,
+    stmt_id   INTEGER NOT NULL REFERENCES stmt(id),
+    ordinal   INTEGER NOT NULL,
+    net_id    INTEGER NOT NULL REFERENCES net(id),
+    role      TEXT NOT NULL
         /*!*/CHECK(role IN ('control','assertion','wait','event',
                        'call_argument','system_task'))/*!*/,
-    lo       INTEGER,
-    hi       INTEGER,
-    is_exact INTEGER NOT NULL CHECK(is_exact IN (0,1)),
+    branch_id INTEGER REFERENCES branch(id),
+    lo        INTEGER,
+    hi        INTEGER,
+    is_exact  INTEGER NOT NULL CHECK(is_exact IN (0,1)),
     UNIQUE(stmt_id, ordinal));
 
 -- One edge event a procedure triggers on or waits on. All of them, because
@@ -512,11 +631,15 @@ CREATE TABLE net_dep(
 -- resolved_* is "not resolved here", never a fabricated object.
 --
 -- access: read | write | connect (a port connection tied outward; its
--- net_conn row points back here).
+-- net_conn row points back here). branch_id is set on exactly the
+-- references that are branch conditions -- `if (top.dbg_en) …` reads a name
+-- outside the instance, so its control read lands here rather than in
+-- expr_ref, and it names its level for the same reason those do.
 CREATE TABLE hier_ref(
     id               INTEGER PRIMARY KEY,
     inst_id          INTEGER NOT NULL REFERENCES inst(id),
     stmt_id          INTEGER REFERENCES stmt(id),
+    branch_id        INTEGER REFERENCES branch(id),
     path             TEXT NOT NULL,
     access           TEXT NOT NULL /*!*/CHECK(access IN ('read','write','connect'))/*!*/,
     resolved_inst_id INTEGER REFERENCES inst(id),

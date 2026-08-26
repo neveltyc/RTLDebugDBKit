@@ -61,6 +61,66 @@ inline const char* word(RefRole r) {
     SLANG_UNREACHABLE;
 }
 
+/// One level of the control context a statement sits under.
+///
+/// `Case` is the branch POINT -- it carries the selector's reads and the
+/// case semantics -- and its arms are its children, because a selector read
+/// belongs to the case and a label read belongs to one item, and a single
+/// level per item cannot tell the two apart. An `If` is point and arm at
+/// once: its two arms share one condition, so every read of the level IS
+/// the condition and `sense` says which arm this is.
+enum class BranchKind : uint8_t { If, Case, CaseItem, CaseDefault, Loop };
+inline const char* word(BranchKind k) {
+    switch (k) {
+        case BranchKind::If:          return "if";
+        case BranchKind::Case:        return "case";
+        case BranchKind::CaseItem:    return "case_item";
+        case BranchKind::CaseDefault: return "case_default";
+        case BranchKind::Loop:        return "loop";
+    }
+    SLANG_UNREACHABLE;
+}
+
+/// None spells the NULL of a branch that is not an `if`.
+enum class BranchSense : uint8_t { None, Then, Else };
+inline const char* word(BranchSense s) {
+    switch (s) {
+        case BranchSense::None: return "";
+        case BranchSense::Then: return "then";
+        case BranchSense::Else: return "else";
+    }
+    SLANG_UNREACHABLE;
+}
+
+/// The matching semantics of a case point, in the LRM's own spelling.
+/// `Matches` covers `case ... matches` whatever wildcard word it carries:
+/// what a consumer must branch on there is that the items are patterns
+/// rather than values. None spells the NULL of a branch that is not one.
+enum class CaseKind : uint8_t { None, Case, Casez, Casex, Inside, Matches };
+inline const char* word(CaseKind k) {
+    switch (k) {
+        case CaseKind::None:    return "";
+        case CaseKind::Case:    return "case";
+        case CaseKind::Casez:   return "casez";
+        case CaseKind::Casex:   return "casex";
+        case CaseKind::Inside:  return "inside";
+        case CaseKind::Matches: return "matches";
+    }
+    SLANG_UNREACHABLE;
+}
+
+/// None spells the NULL of a branch carrying no unique/priority qualifier.
+enum class CheckKind : uint8_t { None, Unique, Unique0, Priority };
+inline const char* word(CheckKind c) {
+    switch (c) {
+        case CheckKind::None:     return "";
+        case CheckKind::Unique:   return "unique";
+        case CheckKind::Unique0:  return "unique0";
+        case CheckKind::Priority: return "priority";
+    }
+    SLANG_UNREACHABLE;
+}
+
 enum class EventKind : uint8_t { Sensitivity, Wait };
 inline const char* word(EventKind k) {
     return k == EventKind::Sensitivity ? "sensitivity" : "wait";
