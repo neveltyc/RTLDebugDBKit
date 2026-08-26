@@ -7,7 +7,7 @@
 # Two layers. The universal checks run against any database and assert what the
 # schema contracts for every export: the subtype bijections, the ownership
 # rules, the provenance matrix behind net_dep, the range discipline, and the
-# fifteen stable views with their exact columns and row formulas. A mode adds
+# stable views with their exact columns and row formulas. A mode adds
 # the facts one fixture in examples/constructs/ must produce -- every fixture
 # has one, so a file that carries no assertion of its own is a gap rather than
 # a category.
@@ -22,6 +22,8 @@
 #   verify-designdb.py --domain-coverage <db>...
 #                                           fail unless the corpus together
 #                                           produces every published value
+import os
+import re
 import sqlite3
 import sys
 
@@ -1035,6 +1037,25 @@ if missing:
     fatal(f"meta lacks required key(s): {', '.join(missing)}")
 check(meta["schema_version"] == SCHEMA_VERSION,
       f"schema_version is {SCHEMA_VERSION}", f"got {meta['schema_version']}")
+
+# The version is stated in four independent places -- this constant, the
+# exporter's SchemaVersion, the field reference's opening line and the
+# README's measurements table -- and a bump that misses one leaves a consumer
+# reading the wrong contract from a document that looks authoritative. Run
+# only when the repository is beside this script, so verifying a database on
+# its own is unaffected.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _rel, _pattern in (("src/DesignDb.h", r"SchemaVersion\s*=\s*(\d+)"),
+                       ("doc/designdb-schema.md", r"^Schema version (\d+)\."),
+                       ("README.md", r"schema v(\d+)")):
+    try:
+        _text = open(os.path.join(_REPO, _rel), encoding="utf-8").read()
+    except OSError:
+        continue
+    _m = re.search(_pattern, _text, re.M)
+    check(_m is not None and _m.group(1) == SCHEMA_VERSION,
+          f"{_rel} states schema version {SCHEMA_VERSION}",
+          f"got {_m.group(1) if _m else 'no version line'}")
 COUNTS = ("error_count", "unresolved_count", "empty_procedure_count",
           "duplicate_path_count", "recursion_count", "truncated_call_count",
           "checker_inst_count", "unanalysed_inst_count")
