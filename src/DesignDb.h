@@ -532,7 +532,73 @@ namespace designdb {
 /// the export `partial`: a construct this tool declines is not a walk that
 /// fell short, which is the same reason an unresolved instantiation does
 /// not.
-inline constexpr int SchemaVersion = 18;
+/// v19 gives the gating a shape. v18 recorded WHICH nets gate a statement
+/// and nothing else, so the two arms of one `if` were indistinguishable
+/// row for row -- same conditions, same `expr_ref` rows, same everything --
+/// and a case statement pushed its selector and EVERY item's labels onto
+/// one gate before walking any body, so each arm saw all of them and the
+/// labels themselves, being constants, were filtered away entirely. None of
+/// that was recoverable from the rows.
+///
+/// `branch` is the gating context as a tree, one row per level, shared by
+/// every statement under it and chained outward by `parent_branch_id` --
+/// the shape `call_site` already uses for nested calls. `stmt.branch_id`
+/// names the level a statement sits in, and `expr_ref.branch_id` (with
+/// `hier_ref.branch_id` for an outward condition) says which level each
+/// control read came from, so a read is attributable to the condition that
+/// made it. An `if` is one level per arm carrying `sense`; a `case` is a
+/// point level carrying the selector's reads and the matching semantics,
+/// with one child level per arm carrying that item's labels -- `branch_label`
+/// holds their evaluated values, normalised as `inst_param.value` is.
+///
+/// Arms are siblings, which changes what a `case (1'b1)` one-hot idiom
+/// records: each arm reads only its own label expression, where v18 gave
+/// every arm every arm's labels. picorv32's decoder read `instr_trap` on 207
+/// control rows and reads it on 36 here, one per statement of the three arms
+/// whose label names it. The priority a plain `case` carries -- arm k is
+/// reached only if arms 0..k-1 did not match -- is `branch.ordinal`, the
+/// written order under the point, rather than a read repeated onto every
+/// later arm; source line cannot carry it, since a whole case may be written
+/// on one. Every written arm gets a row, empty body or not, so the arms
+/// under a point are the whole case; an arm whose body gates nothing has no
+/// statement to carry a read, so its labels' reads go on the point.
+///
+/// `branch.static_taken` publishes the compile-time verdict rather than
+/// acting on it. `localparam bit EN = 0; if (EN) q = b; else q = c;` used
+/// to export `b` as an unconditional driver of q -- EN is a constant symbol,
+/// so it was filtered out of the gating and the dead arm carried no
+/// condition at all, leaving q with two drivers and no way to tell which
+/// one the elaboration had already decided against. The rows stay, because
+/// the statement is in the elaborated design and a source view shows it
+/// where a pruned database would not; what changes is that the database
+/// says which arm cannot be reached. A loop whose stop condition rejects on
+/// its first test carries the same 0.
+///
+/// A loop index is no longer a `data` or `control` dependency source, and
+/// never an operand. `for (int i = 0; i < 2; i++) hi[i] = a[i+2];` recorded
+/// `i -> hi` as data three times -- in picorv32's multiplier, twelve of one
+/// statement's eighteen dependency rows were the two indices -- for a
+/// variable that takes every value of the iteration space and answers no
+/// debugging question. Where the RTL reads it as a VALUE the read stays:
+/// `t(i)` is a `procedure` dependency onto the formal, and suppressing that
+/// would leave the formal with no driver at all. An index is a variable the
+/// header STEPS, not one it merely initialises -- `for (acc = 0; kk < 4; kk
+/// = kk + 1)` would otherwise lose acc's rows outright.
+///
+/// What the loop does with the index is on its branch level: `iter_net_id`
+/// and the iteration space beside it, so a whole-signal `din -> rev` out of
+/// `for (j…) rev[j] = din[7-j];` reads back as the per-iteration mapping it
+/// is. `iter_step` is negative where the loop counts down, which `foreach`
+/// over a packed dimension does. The index arithmetic is not stored, for the
+/// same reason no expression shape is: it is in the source at the location
+/// the row names.
+///
+/// `foreach` and `forever` gained handlers at the same time -- neither had
+/// one, so a `foreach` index leaked exactly as a `for`'s did and both bodies
+/// carried no level at all. A statement-level event control inside a branch
+/// records its gating like every other statement kind; `if (en) @(posedge
+/// clk);` recorded nothing of en.
+inline constexpr int SchemaVersion = 19;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -708,9 +774,41 @@ struct StmtRow {
     std::string delay;            // normalised delay control text; "" = NULL
     int64_t droppedOperandCount = 0;
     int64_t callSiteId = 0;       // the call-site expansion this belongs to; 0 = NULL
+    int64_t branchId = 0;         // the gating level it sits in; 0 = NULL
     int64_t fileId = 0;
     uint32_t line = 0;
     uint32_t column = 0;
+};
+
+/// One level of the gating context a statement sits under.
+struct BranchRow {
+    int64_t id = 0;
+    int64_t instId = 0;
+    int64_t parentBranchId = 0;   // the level outside this one; 0 = NULL
+    int64_t depth = 1;
+    int64_t ordinal = -1;         // arm position under a case point; -1 = NULL
+    std::string branchKind;       // BranchKind's word
+    std::string sense;            // BranchSense's word; "" = NULL
+    std::string caseKind;         // CaseKind's word; "" = NULL
+    std::string checkKind;        // CheckKind's word; "" = NULL
+    int staticTaken = -1;         // -1 = NULL
+    int64_t iterNetId = 0;        // the loop index; 0 = NULL
+    int64_t iterCount = -1;       // -1 = NULL
+    int64_t iterFirst = 0;
+    int64_t iterStep = 0;
+    bool hasProgression = false;  // false NULLs iter_first and iter_step
+    int64_t fileId = 0;
+    uint32_t line = 0;
+    uint32_t column = 0;
+};
+
+/// One label of a case item, evaluated.
+struct BranchLabelRow {
+    int64_t id = 0;
+    int64_t branchId = 0;
+    int64_t ordinal = 0;
+    std::string value;
+    bool hasValue = false;        // false = NULL: not constant-evaluable
 };
 
 /// One subroutine-body expansion: a body walked once per call site.
@@ -751,6 +849,7 @@ struct ExprRefRow {
     int64_t ordinal = 0;
     int64_t netId = 0;
     std::string role;             // RefRole's word
+    int64_t branchId = 0;         // which gating level; 0 = NULL (role != control)
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
 };
@@ -801,6 +900,7 @@ struct HierRefRow {
     int64_t id = 0;
     int64_t instId = 0;
     int64_t stmtId = 0;           // 0 = made by a port connection, not a statement
+    int64_t branchId = 0;         // set only on a branch condition; 0 = NULL
     std::string path;             // as written, normalised
     std::string access;           // Access's word
     int64_t resolvedInstId = 0;   // 0 = not resolved to an object in this export
@@ -862,6 +962,8 @@ public:
     void addTermMap(const TermMapRow& r);
     void addNetConn(const NetConnRow& r);
     void addProcedure(const ProcedureRow& r);
+    void addBranch(const BranchRow& r);
+    void addBranchLabel(const BranchLabelRow& r);
     void addCallSite(const CallSiteRow& r);
     void addStmt(const StmtRow& r);
     void addStmtTarget(const StmtTargetRow& r);
@@ -886,7 +988,8 @@ private:
 
     enum Ins {
         InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
-        InsTerm, InsTermMap, InsNetConn, InsProcedure, InsCallSite, InsStmt,
+        InsTerm, InsTermMap, InsNetConn, InsProcedure, InsBranch,
+        InsBranchLabel, InsCallSite, InsStmt,
         InsStmtTarget, InsAssignOperand, InsExprRef, InsProcEvent,
         InsNetDep, InsHierRef,
         InsCount

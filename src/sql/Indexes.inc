@@ -35,7 +35,22 @@ CREATE INDEX proc_by_inst      ON proc(inst_id, ordinal);
 CREATE INDEX call_site_by_inst      ON call_site(inst_id);
 CREATE INDEX call_site_by_parent    ON call_site(parent_call_site_id)
     WHERE parent_call_site_id IS NOT NULL;
+CREATE INDEX branch_by_inst         ON branch(inst_id);
+-- The chain walk: enumerating a statement's conditions climbs
+-- parent_branch_id, and finding the statements under one level descends it.
+CREATE INDEX branch_by_parent       ON branch(parent_branch_id)
+    WHERE parent_branch_id IS NOT NULL;
+-- One arm per position under one case point, which is also the seek for
+-- "the arms before this one" -- the priority a plain case carries.
+-- branch_label needs none: its UNIQUE(branch_id, ordinal) already indexes
+-- that pair.
+CREATE UNIQUE INDEX branch_arm_by_point ON branch(parent_branch_id, ordinal)
+    WHERE ordinal IS NOT NULL;
 CREATE INDEX stmt_by_inst           ON stmt(inst_id, ordinal);
+-- "Which statements does this level gate" -- the other direction of
+-- stmt.branch_id, and the join a dead-code filter makes once per level.
+CREATE INDEX stmt_by_branch         ON stmt(branch_id)
+    WHERE branch_id IS NOT NULL;
 CREATE INDEX stmt_by_proc      ON stmt(proc_id, sequence)
     WHERE proc_id IS NOT NULL;
 -- The statement-side twin of net_dep_by_call_site. v15 put `call_site_id` on
@@ -48,6 +63,11 @@ CREATE INDEX stmt_by_call_site      ON stmt(call_site_id)
 CREATE INDEX stmt_target_by_net   ON stmt_target(net_id);
 CREATE INDEX assign_operand_by_net  ON assign_operand(net_id);
 CREATE INDEX expr_ref_by_net        ON expr_ref(net_id);
+-- A level's read set, across every statement it gates: the answer to "what
+-- does this condition read" for a statement kind that records no reads of
+-- its own.
+CREATE INDEX expr_ref_by_branch     ON expr_ref(branch_id)
+    WHERE branch_id IS NOT NULL;
 CREATE INDEX proc_event_by_proc ON proc_event(proc_id);
 CREATE INDEX proc_event_by_net      ON proc_event(net_id)
     WHERE net_id IS NOT NULL;

@@ -29,7 +29,7 @@ No database is upgraded in place: a version bump means re-exporting the RTL.
 
 ## Tables
 
-Twenty-two tables in six groups. Every relationship is a foreign key: a
+Twenty-four tables in six groups. Every relationship is a foreign key: a
 column named `<x>_id` holds the primary key of another table, and nowhere
 else does `_id` appear. The map (arrow points from the table that carries
 the key to the table it references; `╌╌` marks the two same-id subtype
@@ -59,6 +59,8 @@ flowchart LR
   subgraph statements
     proc[proc]
     call_site[call_site]
+    branch[branch]
+    branch_label[branch_label]
     stmt[stmt]
     stmt_target[stmt_target]
     assign_operand[assign_operand]
@@ -91,13 +93,19 @@ flowchart LR
   stmt -->|inst_id| inst
   stmt -.->|proc_id| proc
   stmt -.->|call_site_id| call_site
+  stmt -.->|branch_id| branch
+  branch -->|inst_id| inst
+  branch -.->|parent| branch
+  branch -.->|iter_net_id| net
+  branch_label --> branch
   call_site -->|inst_id| inst
   call_site -.->|caller_stmt_id| stmt
   call_site -.->|parent| call_site
   stmt_target -->|stmt_id| stmt
   stmt_target -->|net_id| net
   assign_operand --> stmt
-  expr_ref --> stmt
+  expr_ref -->|stmt_id| stmt
+  expr_ref -.->|branch_id| branch
   proc_event -->|proc_id| proc
   proc_event -.->|net_id| net
 
@@ -107,6 +115,7 @@ flowchart LR
   net_dep -.->|call_site_id| call_site
   net_dep -.->|src/tgt_hier_ref_id| hier_ref
   hier_ref -->|inst_id| inst
+  hier_ref -.->|branch_id| branch
   hier_ref -.->|resolved_net_id| net
 ```
 
@@ -133,13 +142,15 @@ does not apply to); solid edges are always present.
 | | `net_conn` | one segment of a terminal's outside | `term_id → term`, `outer_net_id → net`, `outer_intf_inst_id → inst`, `outer_hier_ref_id → hier_ref` |
 | statements | `proc` | one always/initial/final block | `inst_id → inst`, `scope_node_id → tree_node` |
 | | `call_site` | one subroutine-body expansion (a call) | `inst_id → inst`, `caller_stmt_id → stmt`, `parent_call_site_id → call_site` |
-| | `stmt` | one statement or statement-level construct | `inst_id → inst`, `scope_node_id → tree_node`, `proc_id → proc`, `call_site_id → call_site` |
+| | `branch` | one level of the gating context | `inst_id → inst`, `parent_branch_id → branch`, `iter_net_id → net` |
+| | `branch_label` | one label of a case item, evaluated | `branch_id → branch` |
+| | `stmt` | one statement or statement-level construct | `inst_id → inst`, `scope_node_id → tree_node`, `proc_id → proc`, `call_site_id → call_site`, `branch_id → branch` |
 | | `stmt_target` | one statement's target reference (LHS, release, system write) | `stmt_id → stmt`, `net_id → net` |
 | | `assign_operand` | one assignment right-hand-side reference | `stmt_id → stmt`, `net_id → net` |
-| | `expr_ref` | one non-operand read, classified by role | `stmt_id → stmt`, `net_id → net` |
+| | `expr_ref` | one non-operand read, classified by role | `stmt_id → stmt`, `net_id → net`, `branch_id → branch` |
 | | `proc_event` | one edge event triggered or waited on | `proc_id → proc`, `stmt_id → stmt`, `net_id → net` |
 | dataflow | `net_dep` | one net-to-net dependency occurrence | `src_net_id`/`tgt_net_id → net`, `stmt_id → stmt`, `prim_id → prim`, `call_site_id → call_site`, `assign_operand_id`, `stmt_target_id`, `expr_ref_id`, `src_hier_ref_id`/`tgt_hier_ref_id → hier_ref` |
-| boundary | `hier_ref` | one reference that leaves its instance | `inst_id`/`resolved_inst_id → inst`, `stmt_id → stmt`, `resolved_net_id → net` |
+| boundary | `hier_ref` | one reference that leaves its instance | `inst_id`/`resolved_inst_id → inst`, `stmt_id → stmt`, `branch_id → branch`, `resolved_net_id → net` |
 
 The DDL in `src/sql/Schema.inc` carries the authoritative per-column comments;
 this file states the semantics a consumer builds on. The columns of each
@@ -317,6 +328,77 @@ call sites it skipped, and reports `analysis_status='partial'`. Measured
 RTL does not come close — the heaviest caller among the designs exported
 here has thirteen call statements.
 
+**`branch` / `branch_label`** — the gating context a statement sits under,
+as a tree. One row per *level* — an `if` arm, a case point, one case arm, a
+loop body — shared by every statement under it, with `parent_branch_id`
+chaining outward and `depth` 1 at the outermost. `stmt.branch_id` names the
+level a statement is in; its conditions are the walk up that chain,
+outermost last.
+
+| `branch_kind` | what the level carries |
+|---|---|
+| `if` | `sense` = `then`/`else`; `check_kind` a `priority if`/`unique if` qualifier. Its control reads are the condition, so both arms name the same nets and `sense` is what separates them. |
+| `case` | the branch **point**, one per case statement: `case_kind` the matching semantics (`case`/`casez`/`casex`/`inside`/`matches`), `check_kind` the qualifier, and its control reads are the selector's. Its children are the arms. |
+| `case_item` | one arm, `ordinal` its written position under the point. Its control reads are that item's own labels; `branch_label` holds their evaluated values. |
+| `case_default` | the `default` arm, with an `ordinal` like any other. No labels. |
+| `loop` | a loop body. Its control reads are the guard — `while`'s condition, `for`'s stop expression, `repeat`'s count; `forever` and `foreach` have none — and the `iter_*` columns are the iteration space. |
+
+An `if` level and a `loop` level exist only where they gate a row. Every
+written case arm has a row, empty body or not, so the arms under a point are
+the whole case.
+
+`branch_label` is `(branch_id, ordinal, value)` in written order. `value` is
+the elaborated constant in full precision — the same normalisation
+`inst_param.value` uses, so `4'b1?` in a `casez` reads `4'b1z` — and NULL
+where constant evaluation does not reach the label, as for an `inside` range
+over a variable. Such a label's reads are control reads on its level like
+any other.
+
+Arms are siblings, not a chain: an arm's control reads are its own labels
+and not the preceding arms'. The priority a plain `case` has — arm *k* is
+reached only if arms 0…*k*−1 did not match — is `ordinal`, the written order
+under the point. Source line does not carry it: a whole case may be written
+on one. An arm whose body gates nothing (`2'b01: ;`) has no statement to
+carry a read, so its labels' reads are on the point instead.
+
+`static_taken` is the compile-time verdict: 1 this arm runs, 0 it cannot,
+NULL the condition is not a constant. `localparam bit EN = 0; if (EN) q = b;
+else q = c;` keeps the statement and the dependency rows of both arms and
+marks the `then` level 0. A dead-code filter excludes a statement whose
+level chain holds any `static_taken=0`; a parameterisation is per variant,
+so the two `EN` values mark opposite arms.
+
+The **iteration space** on a loop level says what the index runs over:
+
+```systemverilog
+for (int j = 0; j < 8; j++) rev[j] = din[7-j];
+```
+
+is ONE statement whose `din → rev` row spans both signals at `exact=0`, with
+`iter_net_id`/`iter_first`/`iter_step`/`iter_count` giving `j` = 0,1,…,7 to
+substitute back. It is what separates that `exact=0` row from a bit smear.
+The index arithmetic is not here — no expression shape is; read it in the
+source at the location the row names.
+
+`iter_step` is negative where the loop counts down, which `foreach` over a
+packed dimension does: `foreach (din[j])` on `logic [7:0] din` publishes
+`iter_first=7, iter_step=-1, iter_count=8`. `iter_count` NULL is "not
+statically known"; `iter_first`/`iter_step` are NULL together when the
+values are not an arithmetic progression and when the header gives the index
+no start. `iter_net_id` is NULL for the loops that name no index (`while`,
+`repeat`, `forever`) and for a header that steps more than one, which one
+set of these columns does not describe. `iter_count = 0` comes with
+`static_taken = 0`.
+
+An index is a variable the header **steps**. `for (acc = 8'd0; kk < 4; kk =
+kk + 1)` initialises `acc` and never steps it, so `acc` is an ordinary
+variable of the body.
+
+An index is not a `data` or `control` dependency source and never an
+`assign_operand`. Where the RTL reads it as a value — `t(i)`,
+`$display("%d", i)`, `assert (i < 4)` — the read is recorded like any other:
+`t(i)` is a `procedure` dependency onto the formal.
+
 **`call_site`** — `id, inst_id, caller_stmt_id, parent_call_site_id,
 subroutine_name, depth`. One row per subroutine-body expansion, i.e. per
 call. It exists because a body is walked once per call site and the formal
@@ -344,7 +426,9 @@ reads). `delay` is the delay control's normalised source text — `#3`,
 `#(rise, fall)` — never a number this tool pretended to evaluate; intra-
 assignment delays land on their own statement. `dropped_operand_count` is
 operands not recorded: compile-time constants, and references that could not
-be stored as a path.
+be stored as a path. `branch_id` is the gating level (`branch`), NULL
+outside every branch — the complete answer to "what gates this statement",
+including for a kind that records no reads of its own.
 
 **`stmt_target` / `assign_operand`** — the statement's target and its
 right-hand references, (stmt_id, ordinal)-unique, in written order.
@@ -364,7 +448,8 @@ statement.
 **`expr_ref`** — every statement read that is not an assignment operand,
 classified: `control` (a branch condition over the statement — including one that
 writes nothing this instance names, where no dependency can carry it and
-this reference is the only record),
+this reference is the only record; `branch_id` names *which* level of the
+gating contributed it, and is set on exactly this role),
 `assertion`, `wait` (a wait's condition), `event` (a sensitivity expression
 that is not a plain net), `call_argument`, `system_task`. One read lands in
 exactly one of `assign_operand`, `expr_ref` or `proc_event` — the verifier
@@ -514,7 +599,7 @@ flag marks the hop where bit precision is lost.
 
 ## The stable query interface
 
-Seventeen views. Their existence, column sets and order, column semantics,
+Eighteen views. Their existence, column sets and order, column semantics,
 NULL rules and row granularity are the contract; `verify-designdb.py`
 asserts all of it on every export. Ground rules:
 
@@ -522,7 +607,7 @@ asserts all of it on every export. Ground rules:
   `v_net`,
   `v_term`, `v_term_map`, `v_net_conn`, `v_net_dep`,
   `v_stmt`, `v_stmt_target`, `v_stmt_operand`, `v_proc_event`,
-  `v_call_site`,
+  `v_branch`, `v_call_site`,
   `v_hier_ref` — and
   count(view) == count(base) is checked. Every internal join is against a
   primary key; nothing fans out.
@@ -815,6 +900,35 @@ flops does this net clock, on which edge" is `edge_kind` beside
 a level-sensitive event written explicitly; `net_id` is NULL when the event
 expression is not a plain net. A point query by `net_id` seeks.
 
+**`v_branch`** — one row per gating level, with its file resolved, its loop
+index named and its labels gathered: `branch_id, inst_id, module_id,
+module_name, parent_branch_id, depth, ordinal, branch_kind, sense, case_kind,
+check_kind, static_taken, iter_net_id, iter_name, iter_first, iter_step,
+iter_count, labels, file_path, src_path, src_line, src_col`. `labels` is the
+item's evaluated label values comma-separated, for the common read;
+`branch_label` is the row-per-label form and the only one that tells a NULL
+value from an absent label. The chain outward is `parent_branch_id`, one
+step per row; the transitive walk is the consumer's recursive query, as it
+is for `net_dep` and `call_site`:
+
+```sql
+WITH RECURSIVE chain(stmt_id, branch_id) AS (
+    SELECT id, branch_id FROM stmt WHERE id = ?
+  UNION ALL
+    SELECT c.stmt_id, b.parent_branch_id
+    FROM chain c JOIN branch b ON b.id = c.branch_id
+    WHERE b.parent_branch_id IS NOT NULL)
+SELECT v.depth, v.branch_kind, v.sense, v.case_kind, v.check_kind,
+       v.static_taken, v.labels, v.src_line,
+       (SELECT group_concat(n.net_name)
+          FROM expr_ref e JOIN v_net n ON n.net_id = e.net_id
+         WHERE e.branch_id = v.branch_id AND e.stmt_id = c.stmt_id) AS reads
+FROM chain c JOIN v_branch v ON v.branch_id = c.branch_id
+ORDER BY v.depth;
+```
+
+Point queries by `branch_id` and by `parent_branch_id` both seek.
+
 **`v_call_site`** — one row per subroutine-body expansion: `call_site_id,
 inst_id, module_id, module_name, caller_stmt_id, parent_call_site_id,
 subroutine_name, depth`. The context a `stmt`, a `stmt_target`, an
@@ -960,6 +1074,15 @@ consumer should not go looking for them in `vpi_user.h`:
   window.
 * `call_site` — one subroutine-body expansion. Needed because a body is
   walked once per call, which the standard's model does not represent.
+* `branch` / `branch_label` — the gating context as a tree of levels. The
+  standard has `vpiIf`, `vpiIfElse`, `vpiCase` and the loops as statement
+  objects with a `vpiStmt` relation, i.e. the control flow as containers.
+  Here they are not statements at all (see *What is not here*): a level is
+  a context statements point AT, so "what gates this" is a chain walk from
+  the statement rather than a search for the statement inside a tree.
+  `vpiCaseItem`'s labels are rows with their values elaborated.
+  `static_taken` and the iteration space have no counterpart: both are
+  facts about the elaboration the standard leaves to a simulator.
 * `stmt_target`, `assign_operand`, `expr_ref` — positioned, classified
   references. The standard keeps expression trees; these are the flattened
   reference rows the trees are reduced to (see *What is not here*).
@@ -1023,16 +1146,26 @@ no dataflow, not that the hierarchy stops early.
   reader's.
 * No branch-condition truth tables on statements. Which assignment "was in
   effect" is not evaluable from a waveform by SQL. The conditions are
-  recorded — as `control` dependencies with their expression references —
-  and the evaluation is the reader's.
-* No rows for control-flow constructs. `if`, `case`, loops and blocks are
-  not statements here and `stmt` has no parent-statement column; a
-  procedure's shape is `sequence` order plus each statement's gating. The
-  complete source of "what gates this statement" is its `expr_ref` rows
-  with `role='control'` — flatly, `v_net_attachment` rows with
-  `attachment_kind='condition'` and this `stmt_id` — not its `control`
-  dependencies: a gated statement that drives nothing (a `release`) has
-  gating and no dependencies at all.
+  recorded — their structure in `branch`, their reads as `control`
+  dependencies with their expression references — and the evaluation is the
+  reader's. `branch.static_taken` is not an evaluation: it reports what the
+  elaboration settled.
+* No `stmt` rows for control-flow constructs. `if`, `case`, loops and blocks
+  are not statements here and `stmt` has no parent-statement column; a
+  procedure's shape is `sequence` order plus each statement's `branch_id`.
+  "What gates this statement" is that level and the chain above it; the
+  *reads* of those levels are its `expr_ref` rows with `role='control'` —
+  flatly, `v_net_attachment` rows with `attachment_kind='condition'` and
+  this `stmt_id` — not its `control` dependencies: a gated statement that
+  drives nothing (a `release`) has gating and no dependencies at all.
+* No unrolled loop bodies. A constant-bounded loop is one statement with the
+  iteration space on its `branch` row, not one statement per iteration. Bit
+  precision inside the body is what that costs: `din[7-j] → rev[j]` is a
+  whole-signal row at `exact=0`, recovered from the iteration space and the
+  source at the location the row names.
+* No pattern structure for `case … matches`. The point records
+  `case_kind='matches'` and each arm is a level whose reads are its filter's;
+  the patterns are not modelled.
 * No source text. The file, line and column are here; the text is in the
   file.
 * An assignment pattern is positioned per element only where its element
