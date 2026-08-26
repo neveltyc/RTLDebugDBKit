@@ -256,6 +256,7 @@ int32_t TemplateBuilder::newStmt(Build& b, StmtKind kind, std::string construct,
     s.delay = std::move(delay);
     s.dropped = dropped;
     s.callSite = b.curCallSite;
+    s.branch = b.curBranch;
     s.loc = loc;
     const int32_t idx = int32_t(b.t->stmts.size());
     b.t->stmts.push_back(std::move(s));
@@ -267,12 +268,13 @@ int32_t TemplateBuilder::newStmt(Build& b, StmtKind kind, std::string construct,
 }
 
 int32_t TemplateBuilder::addExprRef(Build& b, int32_t stmt, const Ref& r, RefRole role,
-                                    int32_t netIdx) {
+                                    int32_t netIdx, int32_t branch) {
     TplExprRef e;
     e.stmt = stmt;
     e.ordinal = b.exprOrdinal++;
     e.net = netIdx;
     e.role = role;
+    e.branch = branch;
     e.r = rangeOf(r);
     const int32_t idx = int32_t(b.t->exprRefs.size());
     b.t->exprRefs.push_back(std::move(e));
@@ -291,7 +293,7 @@ int32_t TemplateBuilder::addExprRef(Build& b, int32_t stmt, const Ref& r, RefRol
 int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
                                     const TplLoc& at, EvalContext& eval,
                                     std::optional<Access> access,
-                                    const Ref* asWritten) {
+                                    const Ref* asWritten, int32_t branch) {
     auto key = std::make_tuple(r.origin, isWrite, b.curStmt);
     if (auto it = b.hierSeen.find(key); it != b.hierSeen.end())
         return it->second;
@@ -324,6 +326,7 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
     stats.external++;
     TplHierRef row;
     row.stmt = b.curStmt;
+    row.branch = branch;
     row.path = std::move(text);
     row.access = access.value_or(isWrite ? Access::Write : Access::Read);
     row.r = rangeOf(asWritten ? *asWritten : r);
@@ -873,23 +876,30 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
     // null-symbol guard on the way in, because neither could fire: slang
     // builds every driver with DriverFlags::None, and every Ref in a node
     // came from collectRefs or collectSlots, which never emit a null symbol.
-    GateTable gates;
+    BranchTable branches;
+    b.branchBase = int32_t(b.t->branches.size());
 
     // ---- a statement-level event control (a wait)
     auto onEvent =
-        [&](const Expression* e, Edge edge, int64_t seq, SourceRange where) {
+        [&](const Expression* e, Edge edge, const std::vector<GateRef>& gating,
+            int64_t seq, SourceRange where) {
             if (procIdx < 0)
                 return;
             const TplLoc at = locator.locate(where.start(), procAt);
             const int32_t s = newStmt(b, StmtKind::EventControl, "wait",
                                       AssignKind::None, seq, std::string(), 0,
                                       at);
+            // `if (en) @(posedge clk);` is gated like any other statement,
+            // and v18 recorded nothing of en here at all.
+            for (auto& g : gating)
+                recordRead(b, s, g.ref, RefRole::Control, at, evalCtx,
+                           b.branchBase + g.branch);
             addProcEvent(b, procIdx, s, e, edge, EventKind::Wait, at, evalCtx,
                          [&]() { return s; });
         };
     // ---- a statement that reads without writing anything nameable
     auto fileReadLike =
-        [&](const std::vector<Ref>& reads, const std::vector<Ref>& gating,
+        [&](const std::vector<Ref>& reads, const std::vector<GateRef>& gating,
             const std::vector<Ref>& writes, StmtKind stmtKind, RefRole role,
             bool writesAreReleased, const std::string& construct2,
             int64_t seq, int64_t dropped, SourceRange where) {
@@ -904,7 +914,8 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
             // the condition IS read, and dropping it lost the signal
             // from every load query.
             for (auto& g : gating)
-                recordRead(b, s, g, RefRole::Control, at, evalCtx);
+                recordRead(b, s, g.ref, RefRole::Control, at, evalCtx,
+                           b.branchBase + g.branch);
             // What the task writes. The source is genuinely unknowable
             // -- a file, a plusarg, a format string -- so the row has
             // no source, and v_driver tells it apart from a constant
@@ -925,14 +936,20 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
         };
 
     StatementWalker walker(
-        gates,
+        branches,
         [&](Node&& node) {
             std::visit(
                 [&](auto&& n) {
                     using T = std::decay_t<decltype(n)>;
+                    // Every node but a binding is a statement of its own, so
+                    // it carries the gating level its row records; a binding
+                    // hangs on the calling statement, which already has one.
+                    if constexpr (!std::is_same_v<T, BindNode>)
+                        b.curBranch = n.branch < 0 ? -1
+                                                   : b.branchBase + n.branch;
                     if constexpr (std::is_same_v<T, AssignmentNode>) {
                         reached = true;
-                        fileAssignment(b, n.targets, gates.refs(n.gate),
+                        fileAssignment(b, n.targets, branches.chain(n.branch),
                                        locator.locate(n.where.start(), procAt),
                                        n.seq, n.blocking, n.dropped,
                                        n.inSubroutine, n.delay, isContinuous,
@@ -947,7 +964,8 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                                     evalCtx);
                     }
                     else if constexpr (std::is_same_v<T, EventNode>) {
-                        onEvent(n.expr, n.edge, n.seq, n.where);
+                        onEvent(n.expr, n.edge, branches.chain(n.branch),
+                                n.seq, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReadNode>) {
                         const auto [kind, role] =
@@ -961,24 +979,24 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
                                             RefRole::CallArgument}
                                 : std::pair{StmtKind::Call,
                                             RefRole::CallArgument};
-                        fileReadLike(n.reads, gates.refs(n.gate), {}, kind,
+                        fileReadLike(n.reads, branches.chain(n.branch), {}, kind,
                                      role, /*writesAreReleased=*/false,
                                      n.construct, n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, SystemTaskNode>) {
-                        fileReadLike(n.reads, gates.refs(n.gate), n.writes,
+                        fileReadLike(n.reads, branches.chain(n.branch), n.writes,
                                      StmtKind::SystemTask, RefRole::SystemTask,
                                      /*writesAreReleased=*/false, n.construct,
                                      n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, TriggerNode>) {
-                        fileReadLike({}, gates.refs(n.gate), n.events,
+                        fileReadLike({}, branches.chain(n.branch), n.events,
                                      StmtKind::Trigger, RefRole::CallArgument,
                                      /*writesAreReleased=*/false, "trigger",
                                      n.seq, n.dropped, n.where);
                     }
                     else if constexpr (std::is_same_v<T, ReleaseNode>) {
-                        fileReadLike({}, gates.refs(n.gate), n.lvalues,
+                        fileReadLike({}, branches.chain(n.branch), n.lvalues,
                                      StmtKind::Release, RefRole::CallArgument,
                                      /*writesAreReleased=*/true,
                                      n.isRelease ? "release" : "deassign",
@@ -1015,10 +1033,44 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
     else if (isContinuous)
         sym.as<ContinuousAssignSymbol>().getAssignment().visit(walker);
 
+    // The levels the walk materialised, in the order it made them, so a
+    // walk-local id plus branchBase is the template index the rows above
+    // already recorded.
+    for (size_t i = 0; i < branches.size(); i++) {
+        const BranchFrame& f = branches.at(BranchId(i));
+        TplBranch row;
+        row.parent = f.parent < 0 ? -1 : b.branchBase + f.parent;
+        row.depth = f.depth;
+        row.ordinal = f.ordinal;
+        row.kind = f.kind;
+        row.sense = f.sense;
+        row.caseKind = f.caseKind;
+        row.check = f.check;
+        row.staticTaken = f.staticTaken;
+        row.iterNet = f.iterVar ? b.decl->netFor(*f.iterVar) : -1;
+        row.iterCount = f.iterCount;
+        row.iterFirst = f.iterFirst;
+        row.iterStep = f.iterStep;
+        row.hasProgression = f.hasProgression;
+        row.loc = locator.locate(f.where.start(), procAt);
+        const int32_t idx = int32_t(b.t->branches.size());
+        b.t->branches.push_back(std::move(row));
+        for (size_t j = 0; j < f.labels.size(); j++) {
+            TplBranchLabel label;
+            label.branch = idx;
+            label.ordinal = int64_t(j);
+            label.hasValue = f.labels[j].has_value();
+            if (label.hasValue)
+                label.value = *f.labels[j];
+            b.t->branchLabels.push_back(std::move(label));
+        }
+    }
+
     if (!reached && !proc.getDrivers().empty())
         stats.emptyProcedures++;
     b.curProc = -1;
     b.curStmt = -1;
+    b.curBranch = -1;
 }
 
     /// The lvalue a release/deassign lets go of: a real stmt_target row
@@ -1100,18 +1152,19 @@ void TemplateBuilder::recordSystemWrite(Build& b, int32_t stmt, const Ref& r,
     /// One read of a statement, wherever it lands: an expr_ref for a net of
     /// this instance, a hier_ref for anything outside it.
 void TemplateBuilder::recordRead(Build& b, int32_t stmt, const Ref& r, RefRole role,
-                                 const TplLoc& at, EvalContext& evalCtx) {
+                                 const TplLoc& at, EvalContext& evalCtx,
+                                 int32_t branch) {
     if (!r.sym)
         return;
     const int32_t netIdx = netOfRef(*b.decl, r);
     if (netIdx < 0) {
         const int32_t saved = b.curStmt;
         b.curStmt = stmt;
-        addHierRef(b, false, r, at, evalCtx);
+        addHierRef(b, false, r, at, evalCtx, std::nullopt, nullptr, branch);
         b.curStmt = saved;
         return;
     }
-    addExprRef(b, stmt, r, role, netIdx);
+    addExprRef(b, stmt, r, role, netIdx, branch);
 }
 
 void TemplateBuilder::addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
@@ -1160,7 +1213,7 @@ void TemplateBuilder::addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
     /// One target of one assignment statement, with its statement row on the
     /// first target, its operand rows, and the dependencies that pair them.
 void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& targets,
-                                     const std::vector<Ref>& gate, const TplLoc& at,
+                                     const std::vector<GateRef>& gate, const TplLoc& at,
                                      int64_t seq, bool blocking, int64_t dropped,
                                      bool inSubroutine, const std::string& delay,
                                      bool isContinuous, const std::string& construct,
@@ -1186,15 +1239,18 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
     };
     std::vector<ControlRec> controls;
     for (auto& g : gate) {
-        if (!g.sym)
+        if (!g.ref.sym)
             continue;
         ControlRec c;
-        c.src = g;
-        const int32_t netIdx = netOfRef(*b.decl, g);
+        c.src = g.ref;
+        const int32_t level = b.branchBase + g.branch;
+        const int32_t netIdx = netOfRef(*b.decl, g.ref);
         if (netIdx < 0)
-            c.href = addHierRef(b, false, g, at, evalCtx);
+            c.href = addHierRef(b, false, g.ref, at, evalCtx, std::nullopt,
+                                nullptr, level);
         else
-            c.exprRef = addExprRef(b, stmt, g, RefRole::Control, netIdx);
+            c.exprRef = addExprRef(b, stmt, g.ref, RefRole::Control, netIdx,
+                                   level);
         controls.push_back(std::move(c));
     }
 

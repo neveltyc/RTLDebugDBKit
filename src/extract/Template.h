@@ -122,6 +122,7 @@ struct TplStmt {
     std::string delay;
     int64_t dropped = 0;
     int32_t callSite = -1;   // the call-site expansion this belongs to (-1 = none)
+    int32_t branch = -1;     // the gating level it sits in (-1 = ungated)
     TplLoc loc;
 };
 
@@ -138,6 +139,39 @@ struct TplCallSite {
     int64_t depth = 0;
 };
 
+/// One level of the gating context, template-local. `parent` is the level
+/// outside this one; the chain from a statement's level up to a root is what
+/// a consumer walks to enumerate its conditions, outermost last.
+///
+/// A loop level also carries its iteration space: `iterCount` -1 is "not
+/// statically known", and `hasProgression` says whether first/step describe
+/// the values the index takes.
+struct TplBranch {
+    int32_t parent = -1;
+    int32_t depth = 1;
+    int32_t ordinal = -1;    // position among one case point's arms; -1 = none
+    BranchKind kind = BranchKind::If;
+    BranchSense sense = BranchSense::None;
+    CaseKind caseKind = CaseKind::None;
+    CheckKind check = CheckKind::None;
+    int staticTaken = -1;
+    int32_t iterNet = -1;
+    int64_t iterCount = -1;
+    int64_t iterFirst = 0;
+    int64_t iterStep = 0;
+    bool hasProgression = false;
+    TplLoc loc;
+};
+
+/// One label of a case item, evaluated. `hasValue` false is a label constant
+/// evaluation does not reach.
+struct TplBranchLabel {
+    int32_t branch = 0;
+    int64_t ordinal = 0;
+    std::string value;
+    bool hasValue = false;
+};
+
 struct TplStmtRef {          // stmt_target and assign_operand share the shape
     int32_t stmt = 0;
     int64_t ordinal = 0;
@@ -150,6 +184,9 @@ struct TplExprRef {
     int64_t ordinal = 0;
     int32_t net = 0;
     RefRole role = RefRole::Control;
+    /// Which gating level this read belongs to; -1 for every role but
+    /// Control, whose reads all come from one.
+    int32_t branch = -1;
     TplRange r;
 };
 
@@ -209,6 +246,9 @@ struct TplDep {
 /// occurrence of this template. `kind` decides the walk.
 struct TplHierRef {
     int32_t stmt = -1;
+    /// The gating level, for a condition that names an object outside the
+    /// instance; -1 for every other reference.
+    int32_t branch = -1;
     std::string path;
     Access access = Access::Read;
     TplRange r;
@@ -284,6 +324,8 @@ struct Template {
     std::vector<TplProcedure> procedures;
     std::vector<TplStmt> stmts;
     std::vector<TplCallSite> callSites;
+    std::vector<TplBranch> branches;
+    std::vector<TplBranchLabel> branchLabels;
     std::vector<TplStmtRef> targets;
     std::vector<TplStmtRef> operands;
     std::vector<TplExprRef> exprRefs;

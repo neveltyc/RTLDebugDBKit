@@ -168,6 +168,116 @@ module macroloc (input logic [7:0] a, output logic [7:0] via_macro, direct,
     assign narrow_arg = nib;
 endmodule
 
+// LRM 12.4 and 12.5 -- the gating a statement sits under, which v18 recorded
+// as a flat set of nets and nothing more. Every `if` here assigns the SAME
+// target from both arms, so a database that cannot tell the arms apart
+// reports two unconditional drivers of it; every case arm differs from its
+// siblings only by its label, so one that cannot tell those apart hands each
+// arm every other arm's labels. The qualifiers ride along because slang
+// carries them on the same node and nothing else in the corpus reaches them.
+module gating (input  logic clk, rst_n, en,
+               input  logic [7:0] a, b, c,
+               input  logic [3:0] sel,
+               output logic [7:0] q, y, z, w, v);
+
+    // Three levels deep, both arms assigning at each. `else if` is not
+    // flattened: slang desugars it into an else arm holding a new
+    // conditional, so `q <= c` is gated else -> else -> else.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)      q <= '0;
+        else if (en)     q <= a;
+        else if (sel[0]) q <= b;
+        else             q <= c;
+    end
+
+    // The qualifier belongs to the level, not to the statement under it.
+    // (`priority if` and `case … inside` are the two spellings Icarus does
+    // not parse, and live in patterncase.sv beside `case … matches`.)
+    always_comb begin
+        priority case (sel)
+            4'd8:    z = a;
+            4'd4:    z = b;
+            default: z = c;
+        endcase
+    end
+
+    // `?` is a synonym for z in a label, so the evaluated value reads 4'b1zzz
+    // -- the elaborated constant, not the spelling.
+    always_comb begin
+        unique casez (sel)
+            4'b1???: y = a;
+            4'b01??: y = b;
+            default: y = c;
+        endcase
+    end
+
+    always_comb begin
+        unique0 casex (sel)
+            4'b??01: w = a;
+            4'b0010: w = b;
+            default: w = c;
+        endcase
+    end
+
+    // Two labels on one arm: both are that item's, and v18 put every arm's
+    // labels on one gate where a consumer could not tell whose was whose.
+    always_comb begin
+        case (sel)
+            4'd7, 4'd9: v = a;
+            4'd1:       v = b;
+            default:    v = c;
+        endcase
+    end
+endmodule
+
+// LRM 12.7 -- what a loop level has to say, and the four ways taking its
+// index for granted goes wrong.
+//
+//   passed      an index read as a VALUE is a real read: `add1(i)` feeds the
+//               formal, and suppressing it there would leave the formal with
+//               no driver at all -- the one direction a debug database must
+//               not err in. Only the dataflow paths drop it.
+//   header      an index is a variable the header STEPS. Here it steps kk
+//               and initialises acc, so acc is an ordinary variable of the
+//               body; taking every initialised variable for an index
+//               suppressed it as an operand AND as a target, and acc's rows
+//               vanished outright -- `carried` traced to a signal nothing
+//               drove. kk is an index and starts outside the header, so its
+//               level names it and publishes no space: a start value the
+//               header does not give is not one to assume.
+//   descending  `foreach` runs its dimension LEFT to right, which descends
+//               for the ordinary packed declaration: publishing 0 upward
+//               mirrors every window a consumer reconstructs.
+//   never       a loop the stop condition rejects on its first test is dead
+//               code, and says so where an unreachable arm does.
+module loopspace (input logic [7:0] d, din,
+                  output logic [7:0] summed, carried, mirrored, dead);
+    function automatic logic [7:0] add1(input logic [7:0] v);
+        add1 = v + 8'd1;
+    endfunction
+
+    integer i;
+    always_comb begin
+        summed = 8'd0;
+        for (i = 0; i < 4; i = i + 1) summed = summed + add1(i[7:0]);
+    end
+
+    integer kk;
+    logic [7:0] acc;
+    always_comb begin
+        kk = 0;
+        for (acc = 8'd0; kk < 4; kk = kk + 1) acc = acc + d;
+        carried = acc;
+    end
+
+    always_comb foreach (din[j]) mirrored[j] = din[j];
+
+    always_comb begin
+        dead = 8'd0;
+        for (int z = 4; z < 4; z++) dead = d;
+    end
+endmodule
+
 module procedural (input logic clk, input logic [7:0] x, k,
                    input logic [3:0] sel, input logic b, g, en, ev,
                    output logic [7:0] explicit_self, compound_self,
@@ -176,7 +286,11 @@ module procedural (input logic clk, input logic [7:0] x, k,
                    output logic [7:0] matched, looped, sum, output logic held,
                    output logic [7:0] latched, both_q, waited,
                    output logic [7:0] via_macro, direct, out_arg,
-                   output logic [3:0] narrow_arg);
+                   output logic [3:0] narrow_arg,
+                   input  logic rst_n,
+                   output logic [7:0] gated_q, gated_y, gated_z, gated_w,
+                   output logic [7:0] gated_v,
+                   output logic [7:0] summed, carried, mirrored, dead);
     compound u_cmp (.clk(clk), .x(x), .explicit_self(explicit_self),
                     .compound_self(compound_self), .shift_self(shift_self),
                     .masked(masked));
@@ -187,4 +301,9 @@ module procedural (input logic clk, input logic [7:0] x, k,
                     .both_q(both_q), .waited(waited));
     macroloc u_mac (.a(x), .via_macro(via_macro), .direct(direct),
                     .out_arg(out_arg), .narrow_arg(narrow_arg));
+    gating   u_gat (.clk(clk), .rst_n(rst_n), .en(en), .a(x), .b(k), .c(x),
+                    .sel(sel), .q(gated_q), .y(gated_y), .z(gated_z),
+                    .w(gated_w), .v(gated_v));
+    loopspace u_lsp (.d(x), .din(k), .summed(summed), .carried(carried),
+                     .mirrored(mirrored), .dead(dead));
 endmodule

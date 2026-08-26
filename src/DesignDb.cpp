@@ -226,14 +226,24 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " ordinal, file_id, line, col)"
                 " VALUES(?,?,?,?,?,?,?,?)",
                 &ins[InsProcedure]);
+        prepare("INSERT INTO branch(id, inst_id, parent_branch_id, depth,"
+                " ordinal, branch_kind, sense, case_kind, check_kind,"
+                " static_taken, iter_net_id, iter_first, iter_step,"
+                " iter_count, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                &ins[InsBranch]);
+        prepare("INSERT INTO branch_label(id, branch_id, ordinal, value)"
+                " VALUES(?,?,?,?)",
+                &ins[InsBranchLabel]);
         prepare("INSERT INTO call_site(id, inst_id, caller_stmt_id,"
                 " parent_call_site_id, subroutine_name, depth)"
                 " VALUES(?,?,?,?,?,?)",
                 &ins[InsCallSite]);
         prepare("INSERT INTO stmt(id, inst_id, scope_node_id, proc_id, ordinal,"
                 " sequence, stmt_kind, construct, assign_kind, delay,"
-                " dropped_operand_count, call_site_id, file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " dropped_operand_count, call_site_id, branch_id,"
+                " file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsStmt]);
         prepare("INSERT INTO stmt_target(id, stmt_id, ordinal, net_id, lo, hi, is_exact)"
                 " VALUES(?,?,?,?,?,?,?)",
@@ -242,9 +252,9 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " is_exact)"
                 " VALUES(?,?,?,?,?,?,?)",
                 &ins[InsAssignOperand]);
-        prepare("INSERT INTO expr_ref(id, stmt_id, ordinal, net_id, role, lo, hi,"
-                " is_exact)"
-                " VALUES(?,?,?,?,?,?,?,?)",
+        prepare("INSERT INTO expr_ref(id, stmt_id, ordinal, net_id, role,"
+                " branch_id, lo, hi, is_exact)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
                 &ins[InsExprRef]);
         prepare("INSERT INTO proc_event(id, proc_id, stmt_id, net_id, event_kind,"
                 " edge_kind, file_id, line, col)"
@@ -257,10 +267,10 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " call_site_id)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetDep]);
-        prepare("INSERT INTO hier_ref(id, inst_id, stmt_id, path, access,"
-                " resolved_inst_id, resolved_net_id, lo, hi, is_exact,"
+        prepare("INSERT INTO hier_ref(id, inst_id, stmt_id, branch_id, path,"
+                " access, resolved_inst_id, resolved_net_id, lo, hi, is_exact,"
                 " file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsHierRef]);
         begin();
     }
@@ -603,7 +613,63 @@ void Writer::addStmt(const StmtRow& r) {
     bindOptText(s, 10, r.delay);
     sqlite3_bind_int64(s, 11, r.droppedOperandCount);
     bindOptId(s, 12, r.callSiteId);
-    bindLoc(s, 13, r.fileId, r.line, r.column);
+    bindOptId(s, 13, r.branchId);
+    bindLoc(s, 14, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addBranch(const BranchRow& r) {
+    auto* s = ins[InsBranch];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.instId);
+    bindOptId(s, 3, r.parentBranchId);
+    sqlite3_bind_int64(s, 4, r.depth);
+    if (r.ordinal < 0)
+        sqlite3_bind_null(s, 5);
+    else
+        sqlite3_bind_int64(s, 5, r.ordinal);
+    sqlite3_bind_text(s, 6, r.branchKind.c_str(),
+                      static_cast<int>(r.branchKind.size()), SQLITE_STATIC);
+    bindOptText(s, 7, r.sense);
+    bindOptText(s, 8, r.caseKind);
+    bindOptText(s, 9, r.checkKind);
+    bindTri(s, 10, r.staticTaken);
+    bindOptId(s, 11, r.iterNetId);
+    // first and step describe the values the index takes and are published
+    // together or not at all: without the progression there is nothing for a
+    // consumer to substitute into.
+    if (r.hasProgression) {
+        sqlite3_bind_int64(s, 12, r.iterFirst);
+        sqlite3_bind_int64(s, 13, r.iterStep);
+    }
+    else {
+        sqlite3_bind_null(s, 12);
+        sqlite3_bind_null(s, 13);
+    }
+    if (r.iterCount < 0)
+        sqlite3_bind_null(s, 14);
+    else
+        sqlite3_bind_int64(s, 14, r.iterCount);
+    bindLoc(s, 15, r.fileId, r.line, r.column);
+    step(s);
+    bumped();
+}
+
+void Writer::addBranchLabel(const BranchLabelRow& r) {
+    auto* s = ins[InsBranchLabel];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.branchId);
+    sqlite3_bind_int64(s, 3, r.ordinal);
+    // NULL is a label constant evaluation does not reach, which is not the
+    // same fact as a label whose value is the empty string.
+    if (r.hasValue)
+        sqlite3_bind_text(s, 4, r.value.c_str(),
+                          static_cast<int>(r.value.size()), SQLITE_STATIC);
+    else
+        sqlite3_bind_null(s, 4);
     step(s);
     bumped();
 }
@@ -655,7 +721,8 @@ void Writer::addExprRef(const ExprRefRow& r) {
     sqlite3_bind_int64(s, 4, r.netId);
     sqlite3_bind_text(s, 5, r.role.c_str(), static_cast<int>(r.role.size()),
                       SQLITE_STATIC);
-    bindRange(s, 6, r.bits, r.exact);
+    bindOptId(s, 6, r.branchId);
+    bindRange(s, 7, r.bits, r.exact);
     step(s);
     bumped();
 }
@@ -722,14 +789,15 @@ void Writer::addHierRef(const HierRefRow& r) {
     sqlite3_bind_int64(s, 1, r.id);
     sqlite3_bind_int64(s, 2, r.instId);
     bindOptId(s, 3, r.stmtId);
-    sqlite3_bind_text(s, 4, r.path.data(), static_cast<int>(r.path.size()),
+    bindOptId(s, 4, r.branchId);
+    sqlite3_bind_text(s, 5, r.path.data(), static_cast<int>(r.path.size()),
                       SQLITE_STATIC);
-    sqlite3_bind_text(s, 5, r.access.c_str(), static_cast<int>(r.access.size()),
+    sqlite3_bind_text(s, 6, r.access.c_str(), static_cast<int>(r.access.size()),
                       SQLITE_STATIC);
-    bindOptId(s, 6, r.resolvedInstId);
-    bindOptId(s, 7, r.resolvedNetId);
-    bindRange(s, 8, r.bits, r.exact);
-    bindLoc(s, 11, r.fileId, r.line, r.column);
+    bindOptId(s, 7, r.resolvedInstId);
+    bindOptId(s, 8, r.resolvedNetId);
+    bindRange(s, 9, r.bits, r.exact);
+    bindLoc(s, 12, r.fileId, r.line, r.column);
     step(s);
     bumped();
 }

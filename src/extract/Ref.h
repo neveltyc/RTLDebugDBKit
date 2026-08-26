@@ -189,6 +189,14 @@ struct Slot {
 /// counted and reported, never silently dropped.
 constexpr int64_t kCallExpansionBudget = 4000;
 
+/// How many iterations a loop's description will enumerate before giving up
+/// on saying how many there are. The enumeration is a constant-fold per
+/// iteration and runs ONCE per written loop -- the body is still walked once,
+/// so nested loops do not multiply it -- and real RTL loops are a few dozen
+/// iterations. Past this the branch row keeps its index and publishes no
+/// count, which is the honest answer rather than a slow one.
+constexpr size_t kLoopDescribeSteps = 65536;
+
 inline uint64_t exprWidthOf(const Expression& e) {
     return e.type ? flattenedWidth(*e.type) : 0;
 }
