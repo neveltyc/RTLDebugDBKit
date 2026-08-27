@@ -125,6 +125,15 @@ jobs:
             echo "the verifier accepted a database that is not there"; exit 1
           fi
           [ ! -e no-such.db ] || { echo "the verifier created it"; exit 1; }
+          # A downloaded release asset has to be able to say what it is, and
+          # the schema version is what decides whether a consumer can read what
+          # it writes -- so --version carries both, and agrees with the seal.
+          ./build/rtl-designdb --version | grep -qE '^rtl-designdb [0-9]+\.[0-9]+\.[0-9]+ \(schema v[0-9]+, slang v' \
+            || { echo "--version does not name the version and schema"; exit 1; }
+          ver_schema=$(./build/rtl-designdb --version | sed -E 's/.*schema v([0-9]+).*/\1/')
+          db_schema=$(sqlite3 design.db "SELECT schema_version FROM db_info")
+          [ "$ver_schema" = "$db_schema" ] \
+            || { echo "--version says schema $ver_schema, the database says $db_schema"; exit 1; }
           # A log the caller NAMED is a contract: a pipeline step greps it
           # next, and an absent file reads there as "no errors". So an
           # unopenable --log stops the run before the export costs anything

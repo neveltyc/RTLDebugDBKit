@@ -39,7 +39,14 @@ jobs:
             bin: dist/rtl-designdb-macos-arm64
             python: python3
     steps:
+      # fetch-depth 0 so `git describe --tags` in CMakeLists can see the tag:
+      # a shallow checkout resolves it to a bare SHA, and that string is what
+      # the binary reports as its build revision and writes into
+      # db_info.producer_revision. A release that names a commit where it
+      # could have named v0.1.0 is the one place this matters.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # slang is a large dependency and the pin is exact, so the key is the
       # CMakeLists that carries it: the cache is reused until the pin moves.

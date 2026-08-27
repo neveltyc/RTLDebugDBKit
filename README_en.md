@@ -165,6 +165,7 @@ Every release ships a `sha256sums.txt` and
 curl -fsSL -o rtl-designdb \
   https://github.com/neveltyc/RTLDebugDBKit/releases/latest/download/rtl-designdb-linux-amd64
 chmod +x rtl-designdb
+./rtl-designdb --version
 ```
 
 The platform set is [rwave](https://github.com/neveltyc/RWaveAnalyzer)'s,
@@ -220,6 +221,7 @@ whatever drives it.
 | `--nolog` | Do not write the elaboration log. |
 | `--time-report` | Report how long each phase took. |
 | `--quiet` | Only report problems. |
+| `--version` | Print the tool version, the schema version, the slang version and the commit it was built from. |
 
 Bare paths are taken as source files.
 

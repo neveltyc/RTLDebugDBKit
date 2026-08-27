@@ -275,6 +275,7 @@ void usage() {
         "                   leading defines file reaches every later file (VCS and\n"
         "                   Verilator behave this way; slang defaults to per-file units)\n"
         "  --quiet          only report errors\n"
+        "  --version        print the version, schema version and build revision\n"
         "  --time-report    report how long each phase took\n"
         "  --diag [N]       print elaboration diagnostics (all of them; N caps it)\n"
         "  --log <file>     write the elaboration log here instead of beside the\n"
@@ -492,6 +493,16 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             return argv[++i];
         };
         if (a == "-h" || a == "--help") { usage(); std::exit(0); }
+        // Everything db_info would say about the producer, without exporting a
+        // database to read it back: a release asset is downloaded on its own,
+        // and the schema version is what decides whether a consumer can read
+        // what this binary writes.
+        else if (a == "--version") {
+            std::printf("rtl-designdb %s (schema v%d, slang %s, built from %s)\n",
+                        RTLDESIGNDB_VERSION, designdb::SchemaVersion,
+                        RTLDESIGNDB_SLANG_TAG, RTLDESIGNDB_PRODUCER_REVISION);
+            std::exit(0);
+        }
         else if (a == "--quiet") opt.quiet = true;
         else if (a == "--single-unit") opt.singleUnit = true;
         else if (a == "--time-report") opt.timeReport = true;

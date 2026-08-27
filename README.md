@@ -159,6 +159,7 @@ depth  branch_kind  sense  src_line  reads
 curl -fsSL -o rtl-designdb \
   https://github.com/neveltyc/RTLDebugDBKit/releases/latest/download/rtl-designdb-linux-amd64
 chmod +x rtl-designdb
+./rtl-designdb --version
 ```
 
 这套平台组合和 [rwave](https://github.com/neveltyc/RWaveAnalyzer) 一致，是有意的：
@@ -207,6 +208,7 @@ Windows 宿主（CI 提供）。
 | `--nolog` | 不写精化日志。 |
 | `--time-report` | 报告每个阶段耗时。 |
 | `--quiet` | 只报告问题。 |
+| `--version` | 打印工具版本、schema 版本、slang 版本和构建自哪次提交。 |
 
 裸路径被当作源文件。
 
