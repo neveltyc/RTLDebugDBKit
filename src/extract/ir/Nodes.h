@@ -82,6 +82,9 @@ struct BranchFrame {
 struct GateRef {
     Ref ref;
     BranchId branch = -1;
+    /// Where the LEVEL is written, not the statement it gates: the condition
+    /// is read once where it stands, however many statements sit under it.
+    SourceRange where;
 };
 
 /// The branch levels of one procedure walk, as a tree. Levels are only ever
@@ -107,7 +110,7 @@ public:
         std::vector<GateRef> out;
         for (auto it = levels.rbegin(); it != levels.rend(); ++it)
             for (auto& r : frames_[size_t(*it)].refs)
-                out.push_back(GateRef{r, *it});
+                out.push_back(GateRef{r, *it, frames_[size_t(*it)].where});
         return out;
     }
 

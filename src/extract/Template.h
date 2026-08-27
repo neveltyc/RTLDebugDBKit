@@ -165,6 +165,16 @@ struct TplBranch {
 
 /// One label of a case item, evaluated. `hasValue` false is a label constant
 /// evaluation does not reach.
+/// One read of one level's condition. Owned by the level and not by the
+/// statements under it: the condition is written once and evaluated once,
+/// and a level that gates nothing at all still reads what it reads.
+struct TplBranchRef {
+    int32_t branch = -1;
+    int64_t ordinal = 0;
+    int32_t net = -1;
+    TplRange r;
+};
+
 struct TplBranchLabel {
     int32_t branch = 0;
     int64_t ordinal = 0;
@@ -183,10 +193,7 @@ struct TplExprRef {
     int32_t stmt = 0;
     int64_t ordinal = 0;
     int32_t net = 0;
-    RefRole role = RefRole::Control;
-    /// Which gating level this read belongs to; -1 for every role but
-    /// Control, whose reads all come from one.
-    int32_t branch = -1;
+    RefRole role = RefRole::Assertion;
     TplRange r;
 };
 
@@ -233,6 +240,10 @@ struct TplDep {
     int32_t operandRef = -1;
     int32_t targetRef = -1;
     int32_t exprRef = -1;
+    /// Control: the level whose condition produced this dependency. The read
+    /// itself is that level's -- `branch_ref` -- and this says which one,
+    /// where an operand or expr_ref names the reference directly.
+    int32_t branch = -1;
     int32_t prim = -1;
     DepKind kind = DepKind::Data;
     TplRange srcR, tgtR;
@@ -335,6 +346,7 @@ struct Template {
     std::vector<TplCallSite> callSites;
     std::vector<TplBranch> branches;
     std::vector<TplBranchLabel> branchLabels;
+    std::vector<TplBranchRef> branchRefs;
     std::vector<TplStmtRef> targets;
     std::vector<TplStmtRef> operands;
     std::vector<TplExprRef> exprRefs;

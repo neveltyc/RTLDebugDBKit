@@ -285,12 +285,16 @@ endmodule
 // demand: this pair recorded ONE arm where the source has two, and no loop
 // level at all, so a reader counting senses got a level the design does not
 // have and missed one it does.
-module emptylevel (input logic clk, input logic en, input logic [7:0] a,
-                   output logic [7:0] q);
+module emptylevel (input logic clk, input logic en, input logic gate,
+                   input logic [7:0] a, output logic [7:0] q);
     always_ff @(posedge clk) begin
         if (en) ;                             // an arm that gates nothing
         else    q <= a;
         for (int i = 0; i < 2; i = i + 1) ;   // a body that does nothing
+        // A level that gates nothing AT ALL. The condition is read by the
+        // design; with the read filed on a statement there was no statement
+        // to file it on, and `gate` appeared in no row of the database.
+        if (gate) ; else ;
     end
 endmodule
 
@@ -323,5 +327,6 @@ module procedural (input logic clk, input logic [7:0] x, k,
                     .w(gated_w), .v(gated_v));
     loopspace u_lsp (.d(x), .din(k), .summed(summed), .carried(carried),
                      .mirrored(mirrored), .dead(dead));
-    emptylevel u_emp (.clk(clk), .en(en), .a(x), .q(empty_arm_q));
+    emptylevel u_emp (.clk(clk), .en(en), .gate(g), .a(x),
+                      .q(empty_arm_q));
 endmodule

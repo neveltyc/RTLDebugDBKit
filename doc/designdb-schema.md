@@ -61,6 +61,7 @@ flowchart LR
     call_site[call_site]
     branch[branch]
     branch_label[branch_label]
+    branch_ref[branch_ref]
     stmt[stmt]
     stmt_target[stmt_target]
     assign_operand[assign_operand]
@@ -98,6 +99,8 @@ flowchart LR
   branch -.->|parent| branch
   branch -.->|iter_net_id| net
   branch_label --> branch
+  branch_ref --> branch
+  branch_ref -->|net_id| net
   call_site -->|inst_id| inst
   call_site -.->|caller_stmt_id| stmt
   call_site -.->|parent| call_site
@@ -105,7 +108,6 @@ flowchart LR
   stmt_target -->|net_id| net
   assign_operand --> stmt
   expr_ref -->|stmt_id| stmt
-  expr_ref -.->|branch_id| branch
   proc_event -->|proc_id| proc
   proc_event -.->|net_id| net
 
@@ -145,12 +147,13 @@ does not apply to); solid edges are always present.
 | | `call_site` | one subroutine-body expansion (a call) | `inst_id → inst`, `caller_stmt_id → stmt`, `parent_call_site_id → call_site` |
 | | `branch` | one level of the gating context | `inst_id → inst`, `parent_branch_id → branch`, `iter_net_id → net` |
 | | `branch_label` | one label of a case item, evaluated | `branch_id → branch` |
+| | `branch_ref` | one read of a level's condition | `branch_id → branch`, `net_id → net` |
 | | `stmt` | one statement or statement-level construct | `inst_id → inst`, `scope_node_id → tree_node`, `proc_id → proc`, `call_site_id → call_site`, `branch_id → branch` |
 | | `stmt_target` | one statement's target reference (LHS, release, system write) | `stmt_id → stmt`, `net_id → net` |
 | | `assign_operand` | one assignment right-hand-side reference | `stmt_id → stmt`, `net_id → net` |
-| | `expr_ref` | one non-operand read, classified by role | `stmt_id → stmt`, `net_id → net`, `branch_id → branch` |
+| | `expr_ref` | one non-operand read of a statement, classified by role | `stmt_id → stmt`, `net_id → net` |
 | | `proc_event` | one edge event triggered or waited on | `proc_id → proc`, `stmt_id → stmt`, `net_id → net` |
-| dataflow | `net_dep` | one net-to-net dependency occurrence | `src_net_id`/`tgt_net_id → net`, `stmt_id → stmt`, `prim_id → prim`, `call_site_id → call_site`, `assign_operand_id`, `stmt_target_id`, `expr_ref_id`, `src_hier_ref_id`/`tgt_hier_ref_id → hier_ref` |
+| dataflow | `net_dep` | one net-to-net dependency occurrence | `src_net_id`/`tgt_net_id → net`, `stmt_id → stmt`, `branch_id → branch`, `prim_id → prim`, `call_site_id → call_site`, `assign_operand_id`, `stmt_target_id`, `expr_ref_id`, `src_hier_ref_id`/`tgt_hier_ref_id → hier_ref` |
 | boundary | `hier_ref` | one reference that leaves its instance | `inst_id → inst`, `stmt_id → stmt`, `branch_id → branch`, `resolved_net_id → net` |
 
 The DDL in `src/sql/Schema.inc` carries the authoritative per-column comments;
@@ -446,15 +449,21 @@ twice is two rows. A target outside the instance
 is not here — it is a `hier_ref` with `access='write'` on the same
 statement.
 
-**`expr_ref`** — every statement read that is not an assignment operand,
-classified: `control` (a branch condition over the statement — including one that
-writes nothing this instance names, where no dependency can carry it and
-this reference is the only record; `branch_id` names *which* level of the
-gating contributed it, and is set on exactly this role),
-`assertion`, `wait` (a wait's condition), `event` (a sensitivity expression
-that is not a plain net), `call_argument`, `system_task`. One read lands in
-exactly one of `assign_operand`, `expr_ref` or `proc_event` — the verifier
-holds the view formulas that make double counting visible.
+**`branch_ref`** — one read of one level's condition, `(branch_id, ordinal,
+net_id, lo, hi, is_exact)`. The level owns it: a condition is written once
+and evaluated once, however many statements sit under it, and a level that
+gates nothing at all still reads what it reads — `if (c) ; else ;` records c
+here and nowhere else. What each gated statement gets is the *dependency*,
+one per target, naming the level in `net_dep.branch_id`. A condition that
+names something outside the instance is a `hier_ref` keyed the same way:
+`branch_id` set, `stmt_id` NULL.
+
+**`expr_ref`** — every read of a STATEMENT that is not an assignment operand,
+classified: `assertion`, `wait` (a wait's condition), `event` (a sensitivity
+expression that is not a plain net), `call_argument`, `system_task`. A branch
+condition is not among them — it belongs to its level, above. One read lands
+in exactly one of `assign_operand`, `expr_ref`, `branch_ref` or `proc_event`
+— the verifier holds the view formulas that make double counting visible.
 
 **`proc_event`** — one row per event a procedure triggers on
 (`event_kind='sensitivity'`, `stmt_id` NULL) or waits on (`'wait'`, the
@@ -483,7 +492,7 @@ never the four-way cross product. `dep_kind`, and what must be set
 | kind | means | names |
 |---|---|---|
 | `data` | an assignment moves it | `stmt_id`, and per end either the local reference (`stmt_target_id` / `assign_operand_id`) or the hierarchical one (`tgt_hier_ref_id` / `src_hier_ref_id`) — exactly one of the two per end. `src_net_id` NULL *with no source reference of either kind* is a constant driver (`q <= 8'h0`); the row still names the statement, and every src column is NULL with it. `src_net_id` NULL *with* `src_hier_ref_id` is an **external** driver: the reference did not resolve to a net row, the spelled window survives, and `v_driver` says `'external'`. |
-| `control` | it reaches the target through a branch condition | `stmt_id`, the condition as `expr_ref_id` (role `control`) or `src_hier_ref_id`, the target as `stmt_target_id` or `tgt_hier_ref_id`; `map_exact` 0 — a condition gates, it does not map |
+| `control` | it reaches the target through a branch condition | `stmt_id`, the level in `branch_id` — whose reads are `branch_ref` rows — or `src_hier_ref_id` when the condition names something outside the instance, the target as `stmt_target_id` or `tgt_hier_ref_id`; `map_exact` 0 — a condition gates, it does not map |
 | `primitive` | a gate/switch/UDP couples them | `prim_id`, per LRM (input, output) pairing; scalar-to-scalar couplings are per-bit |
 | `alias` | an `alias` statement binds them into one object | `stmt_id`, and both an `stmt_target_id` and an `assign_operand_id`, since every name an alias binds is written and read at once. One row per ordered pair: `alias a = b = c;` binds every pair mutually rather than in a chain, so it is six rows, not two. `map_exact` is 1 — an alias is bit for bit by definition — unless a side could not be narrowed. |
 | `procedure` | a call binds them | actual to formal by argument direction, formal to actual for outputs; `stmt_id` the calling statement (NULL for a call in a control expression), `expr_ref_id` (role `call_argument`) or `src_hier_ref_id` on the reading side |
@@ -723,7 +732,7 @@ composition.
 src_net_id, src_inst_id, src_name, src_lo, src_hi,
 src_exact, tgt_net_id, tgt_inst_id, tgt_name, tgt_lo,
 tgt_hi, tgt_exact, stmt_id, assign_operand_id, stmt_target_id,
-expr_ref_id, prim_id, src_hier_ref_id,
+expr_ref_id, branch_id, prim_id, src_hier_ref_id,
 tgt_hier_ref_id, dep_kind, map_exact, call_site_id, file_path, src_path,
 src_line, src_col`. Location is the statement's, or the
 primitive's for a primitive arc. A row whose `src_inst_id` and
@@ -827,13 +836,14 @@ all of them is the cross product that would cost this view its one row per
 read. `load_kind`: `dataflow` (a dependency reads
 it), `connection` (the crossing reads it; `load_net` is the far side),
 `alias` (the other name the same object goes by),
-`sensitivity`, `wait`, `statement` (an assertion, a `$display`, a read
-whose statement has no local target — including the *condition* gating
-such a statement, which no dependency can carry), `terminal` (a root output/inout/ref
+`sensitivity`, `wait`, `statement` (an assertion, a `$display` or a call
+argument whose statement has no local target), `condition` (a level reads it
+and gates nothing this instance names — `stmt_id` is NULL, the read being the
+level's), `terminal` (a root output/inout/ref
 terminal reads the net it stands for — the boundary counterpart of
-v_driver's `terminal`). The last four have `load_*` NULL: a reader with no
+v_driver's `terminal`). The last five have `load_*` NULL: a reader with no
 nameable target. One read, one row: a reference already carried into
-`dataflow` by a dependency is not repeated as `statement`. Membership
+`dataflow` by a dependency is not repeated as `statement` or `condition`. Membership
 follows the netlist model — a clock net's loads include the flop clock
 pins, so a sensitivity is a load.
 
@@ -869,15 +879,15 @@ which expansion it belongs to.
 **`v_net_attachment`** — everything touching one net, one row per
 attachment: `net_id, inst_id, net_name, attachment_kind, lo, hi, is_exact,
 stmt_id, term_map_id, conn_id, stmt_target_id, assign_operand_id,
-expr_ref_id, proc_event_id, dep_id, hier_ref_id`. The structural adjacency the
+expr_ref_id, proc_event_id, dep_id, hier_ref_id, branch_ref_id`. The structural adjacency the
 directional views cannot ask flatly — "what hangs off this net" — with
 `attachment_kind` naming the relation and exactly ONE of the eight typed
 id columns pointing at that relation's own row (the exclusive-arc shape
 `net_dep` uses, not one polymorphic id): `terminal_inside` →
 `term_map_id`; `actual_outside` → `conn_id`; `written_by` /
 `release_target` / `alias_binding` →
-`stmt_target_id`; `read_by` → `assign_operand_id`; `condition` /
-`statement_read` → `expr_ref_id`; `event` → `proc_event_id`; `dep_in` /
+`stmt_target_id`; `read_by` → `assign_operand_id`; `statement_read` →
+`expr_ref_id`; `condition` → `branch_ref_id`; `event` → `proc_event_id`; `dep_in` /
 `dep_out` → `dep_id`; `named_from_outside` → `hier_ref_id`. The two
 wiring kinds name the segment, not the terminal: one pin takes several —
 `.q({2{r}})` tiles it twice — and a terminal id cannot tell those rows
@@ -890,8 +900,9 @@ row and is the one `attachment_kind` implies.
 No location columns — eleven kinds sit at eleven different "where"s, and
 one column would overload NULL again. The location is one join away
 through the id the kind implies: the statement kinds (`written_by`,
-`read_by`, `condition`, `statement_read`, `release_target`,
-`alias_binding`) through `stmt_id` against `v_stmt`; `terminal_inside` through
+`read_by`, `statement_read`, `release_target`,
+`alias_binding`) through `stmt_id` against `v_stmt`; `condition` through
+`branch_ref_id` against `v_branch`; `terminal_inside` through
 `term_map_id` against `v_term_map` and `actual_outside` through `conn_id`
 against `v_net_conn`; `event` through `proc_event_id` against
 `v_proc_event`;
@@ -945,9 +956,11 @@ subroutine_name, depth`. The context a `stmt`, a `stmt_target`, an
 string. See *Tracing across calls*.
 
 **`v_hier_ref`** — one row per reference that leaves its instance:
-`hier_ref_id, inst_id, module_id, module_name, stmt_id, ref_path, access,
-resolved_inst_id, resolved_net_id, resolved_net_name, lo, hi,
-is_exact, file_path, src_path, src_line, src_col`. The target of the four
+`hier_ref_id, inst_id, module_id, module_name, stmt_id, branch_id, ref_path,
+access, resolved_inst_id, resolved_net_id, resolved_net_name, lo, hi,
+is_exact, file_path, src_path, src_line, src_col`. Exactly one of `stmt_id`
+and `branch_id` is set: a statement's reference belongs to the statement, a
+condition's to the level that reads it. The target of the four
 `hier_ref` ids the other views publish — `v_net_dep`'s
 `src_hier_ref_id`/`tgt_hier_ref_id`, `v_net_conn`'s `outer_hier_ref_id`,
 `v_net_attachment`'s `hier_ref_id`. `ref_path` rather than `path` because

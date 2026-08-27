@@ -834,6 +834,16 @@ struct BranchLabelRow {
     bool hasValue = false;        // false = NULL: not constant-evaluable
 };
 
+/// One read of one level's condition.
+struct BranchRefRow {
+    int64_t id = 0;
+    int64_t branchId = 0;
+    int64_t ordinal = 0;
+    int64_t netId = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> bits;
+    int exact = 0;
+};
+
 /// One subroutine-body expansion: a body walked once per call site.
 struct CallSiteRow {
     int64_t id = 0;
@@ -872,7 +882,6 @@ struct ExprRefRow {
     int64_t ordinal = 0;
     int64_t netId = 0;
     std::string role;             // RefRole's word
-    int64_t branchId = 0;         // which gating level; 0 = NULL (role != control)
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
 };
@@ -905,6 +914,7 @@ struct NetDepRow {
     int64_t assignOperandId = 0;
     int64_t stmtTargetId = 0;
     int64_t exprRefId = 0;
+    int64_t branchId = 0;
     int64_t primitiveId = 0;
     int64_t sourceHierRefId = 0;
     int64_t targetHierRefId = 0;
@@ -1014,6 +1024,7 @@ public:
     void addProcedure(const ProcedureRow& r);
     void addBranch(const BranchRow& r);
     void addBranchLabel(const BranchLabelRow& r);
+    void addBranchRef(const BranchRefRow& r);
     void addCallSite(const CallSiteRow& r);
     void addStmt(const StmtRow& r);
     void addStmtTarget(const StmtTargetRow& r);
@@ -1039,7 +1050,8 @@ private:
     enum Ins {
         InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
         InsTerm, InsTermMap, InsNetConn, InsProcedure, InsBranch,
-        InsBranchLabel, InsCallSite, InsStmt,
+        InsBranchLabel,
+        InsBranchRef, InsCallSite, InsStmt,
         InsStmtTarget, InsAssignOperand, InsExprRef, InsProcEvent,
         InsNetDep, InsHierRef,
         InsCount

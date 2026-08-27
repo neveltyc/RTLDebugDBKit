@@ -79,7 +79,7 @@ DOMAINS = (
       "alias", "release", "trigger", "disable"), False),
     ("stmt", "assign_kind", ("continuous", "blocking", "nonblocking"), True),
     ("expr_ref", "role",
-     ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
+     ("assertion", "wait", "event", "call_argument", "system_task"), False),
     ("branch", "branch_kind",
      ("if", "case", "case_item", "case_default", "loop"), False),
     ("branch", "sense", ("then", "else"), True),
@@ -102,8 +102,8 @@ VIEW_DOMAINS = (
       "connection_expression", "constant", "terminal", "system_task", "alias",
       "external", "trigger")),
     ("v_load", "load_kind",
-     ("dataflow", "connection", "sensitivity", "wait", "statement", "terminal",
-      "alias")),
+     ("dataflow", "connection", "sensitivity", "wait", "statement", "condition",
+      "terminal", "alias")),
     ("v_net_attachment", "attachment_kind",
      ("terminal_inside", "actual_outside", "written_by", "release_target",
       "alias_binding", "read_by", "condition", "statement_read", "event",
@@ -632,14 +632,29 @@ check(one("""
     SELECT count(*) FROM stmt s JOIN branch b ON b.id = s.branch_id
     WHERE s.inst_id != b.inst_id""") == 0,
       "a statement's gating level is in its own instance")
+# A condition's reads belong to the level, wherever they land: a net of this
+# instance is a branch_ref row, a name outside it a hier_ref keyed on the
+# level instead of on a statement. Neither is a statement's read.
 check(one("""
-    SELECT count(*) FROM expr_ref
-    WHERE (role = 'control') != (branch_id IS NOT NULL)""") == 0,
-      "branch_id is set on exactly the control reads")
+    SELECT count(*) FROM branch_ref r JOIN branch b ON b.id = r.branch_id
+    JOIN net n ON n.id = r.net_id
+    WHERE n.inst_id != b.inst_id""") == 0,
+      "a level reads nets of its own instance")
 check(one("""
-    SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
-    WHERE e.role = 'control' AND s.branch_id IS NULL""") == 0,
-      "a statement with a control read names the level it sits in")
+    SELECT count(*) FROM hier_ref h
+    WHERE h.branch_id IS NOT NULL AND h.stmt_id IS NOT NULL""") == 0,
+      "an outward condition belongs to its level and to no statement")
+check(one("""
+    SELECT count(*) FROM hier_ref h
+    WHERE h.branch_id IS NOT NULL AND h.access != 'read'""") == 0,
+      "only a read leaves the instance as a branch condition")
+check(one("""
+    SELECT count(*) FROM net_dep
+    WHERE (dep_kind = 'control') != (branch_id IS NOT NULL)""") == 0,
+      "a dependency names a level exactly when a condition made it")
+# The level a control dependency names is one its statement actually sits
+# under, which is what makes the two halves -- the read on the level, the
+# dependency on the statement -- describe one gating and not two.
 check(one("""
     WITH RECURSIVE chain(stmt_id, branch_id) AS (
         SELECT id, branch_id FROM stmt WHERE branch_id IS NOT NULL
@@ -647,16 +662,12 @@ check(one("""
         SELECT c.stmt_id, b.parent_branch_id
         FROM chain c JOIN branch b ON b.id = c.branch_id
         WHERE b.parent_branch_id IS NOT NULL)
-    SELECT count(*) FROM expr_ref e
-    WHERE e.role = 'control'
+    SELECT count(*) FROM net_dep d
+    WHERE d.dep_kind = 'control' AND d.stmt_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM chain c
-                      WHERE c.stmt_id = e.stmt_id
-                        AND c.branch_id = e.branch_id)""") == 0,
-      "a control read's level is on its statement's own chain")
-check(one("""
-    SELECT count(*) FROM hier_ref h
-    WHERE h.branch_id IS NOT NULL AND h.access != 'read'""") == 0,
-      "only a read leaves the instance as a branch condition")
+                      WHERE c.stmt_id = d.stmt_id
+                        AND c.branch_id = d.branch_id)""") == 0,
+      "a control dependency's level is on its statement's own chain")
 check(one("""
     SELECT count(*) FROM hier_ref h JOIN branch b ON b.id = h.branch_id
     WHERE h.inst_id != b.inst_id""") == 0,
@@ -754,9 +765,6 @@ check(one("""
 check(one("""
     SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
     WHERE CASE e.role
-        -- A condition gates whatever statement it encloses, including one
-        -- that writes nothing this instance names.
-        WHEN 'control'     THEN 0
         WHEN 'assertion'   THEN s.stmt_kind != 'assertion'
         WHEN 'wait'        THEN s.stmt_kind NOT IN ('wait', 'event_control')
         WHEN 'event'       THEN s.stmt_kind != 'event_control'
@@ -792,7 +800,10 @@ check(one("""
              -- ('external'), but it must exist as a row of one of the two.
              OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
              OR d.assign_operand_id IS NOT NULL OR d.prim_id IS NOT NULL
-             OR (d.expr_ref_id IS NULL) = (d.src_hier_ref_id IS NULL)
+             OR d.expr_ref_id IS NOT NULL
+             -- The read is the level's; a source net comes with the level
+             -- that read it, an outward one with the reference instead.
+             OR d.branch_id IS NULL
              OR (d.stmt_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
              -- NULL-safe: `NULL != 0` is NULL, so the plain comparison read
              -- as "0 or NULL" and let an unset mapping through.
@@ -893,7 +904,6 @@ check(one("""
     SELECT count(*) FROM net_dep d JOIN expr_ref e ON e.id = d.expr_ref_id
     WHERE e.net_id != d.src_net_id
        OR (d.stmt_id IS NOT NULL AND e.stmt_id != d.stmt_id)
-       OR (d.dep_kind = 'control' AND e.role != 'control')
        OR (d.dep_kind = 'procedure' AND e.role != 'call_argument')""") == 0,
       "net_dep's expression reference agrees with the expr_ref row")
 # Locality holds exactly where no end went through a hierarchical
@@ -1131,7 +1141,7 @@ VIEW_COLUMNS = {
         "src_lo", "src_hi", "src_exact", "tgt_net_id",
         "tgt_inst_id", "tgt_name", "tgt_lo", "tgt_hi",
         "tgt_exact", "stmt_id", "assign_operand_id",
-        "stmt_target_id", "expr_ref_id", "prim_id",
+        "stmt_target_id", "expr_ref_id", "branch_id", "prim_id",
         "src_hier_ref_id", "tgt_hier_ref_id",
         "dep_kind", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
@@ -1167,7 +1177,8 @@ VIEW_COLUMNS = {
         "net_id", "inst_id", "net_name", "attachment_kind",
         "lo", "hi", "is_exact", "stmt_id",
         "term_map_id", "conn_id", "stmt_target_id", "assign_operand_id",
-        "expr_ref_id", "proc_event_id", "dep_id", "hier_ref_id"],
+        "expr_ref_id", "proc_event_id", "dep_id", "hier_ref_id",
+        "branch_ref_id"],
     "v_node_path": ["node_id", "node_path"],
     "v_proc_event": [
         "proc_event_id", "proc_id", "inst_id", "proc_kind", "stmt_id",
@@ -1185,7 +1196,8 @@ VIEW_COLUMNS = {
         "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
     "v_hier_ref": [
         "hier_ref_id", "inst_id", "module_id", "module_name", "stmt_id",
-        "ref_path", "access", "resolved_inst_id", "resolved_net_id",
+        "branch_id", "ref_path", "access", "resolved_inst_id",
+        "resolved_net_id",
         "resolved_net_name", "lo", "hi", "is_exact",
         "file_path", "src_path", "src_line", "src_col"],
 }
@@ -1278,7 +1290,11 @@ want = (one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
                                    WHERE d.expr_ref_id = e.id)""")
         + one("""SELECT count(*) FROM assign_operand o
                  WHERE NOT EXISTS (SELECT 1 FROM net_dep d
-                                   WHERE d.assign_operand_id = o.id)"""))
+                                   WHERE d.assign_operand_id = o.id)""")
+        + one("""SELECT count(*) FROM branch_ref r
+                 WHERE NOT EXISTS (SELECT 1 FROM net_dep d
+                                   WHERE d.branch_id = r.branch_id
+                                     AND d.src_net_id = r.net_id)"""))
 check(n_load == want, "v_load reconciles with its branch formula",
       f"{n_load} rows, branch sum says {want}")
 
@@ -1291,6 +1307,7 @@ want = (one("SELECT count(*) FROM term_map")
         + one("SELECT count(*) FROM stmt_target")
         + one("SELECT count(*) FROM assign_operand")
         + one("SELECT count(*) FROM expr_ref")
+        + one("SELECT count(*) FROM branch_ref")
         + one("SELECT count(*) FROM proc_event WHERE net_id IS NOT NULL")
         + one("SELECT count(*) FROM net_dep")
         + one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
@@ -1368,7 +1385,7 @@ for view in ("v_driver", "v_load", "v_net_dep"):
                           WHERE c.id = v.call_site_id
                             AND c.caller_stmt_id = v.stmt_id)""") == 0,
           f"{view}.call_site_id is its statement's, or the call it opens")
-# Exclusive arc, like net_dep: exactly one of the seven typed id columns is
+# Exclusive arc, like net_dep: exactly one of the typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
 # an id into a slot its kind does not own.
@@ -1378,7 +1395,7 @@ check(one("""
         + (stmt_target_id IS NOT NULL)
         + (assign_operand_id IS NOT NULL) + (expr_ref_id IS NOT NULL)
         + (proc_event_id IS NOT NULL) + (dep_id IS NOT NULL)
-        + (hier_ref_id IS NOT NULL) != 1""") == 0,
+        + (hier_ref_id IS NOT NULL) + (branch_ref_id IS NOT NULL) != 1""") == 0,
       "every attachment names exactly one typed id")
 check(one("""
     SELECT count(*) FROM v_net_attachment WHERE CASE attachment_kind
@@ -1388,7 +1405,7 @@ check(one("""
         WHEN 'release_target'     THEN stmt_target_id IS NULL
         WHEN 'alias_binding'      THEN stmt_target_id IS NULL
         WHEN 'read_by'            THEN assign_operand_id IS NULL
-        WHEN 'condition'          THEN expr_ref_id IS NULL
+        WHEN 'condition'          THEN branch_ref_id IS NULL
         WHEN 'statement_read'     THEN expr_ref_id IS NULL
         WHEN 'event'              THEN proc_event_id IS NULL
         WHEN 'dep_in'             THEN dep_id IS NULL
@@ -1551,9 +1568,11 @@ check(one("""
       "terminal drivers are exactly the rows naming a terminal")
 check(one("""
     SELECT count(*) FROM v_load
-    WHERE (load_kind IN ('sensitivity','wait','statement','terminal'))
+    WHERE (load_kind IN ('sensitivity','wait','statement','condition',
+                         'terminal'))
           != (load_net_id IS NULL)""") == 0,
-      "target-less loads are exactly sensitivity/wait/statement/terminal")
+      "target-less loads are exactly sensitivity/wait/statement/condition/"
+      "terminal")
 check(one("""
     SELECT count(*) FROM v_load
     WHERE (load_kind = 'terminal') != (term_id IS NOT NULL)""") == 0,
@@ -1568,7 +1587,7 @@ check(one("""
 check(one("""
     SELECT count(*) FROM v_load
     WHERE load_kind NOT IN ('dataflow','connection','sensitivity','wait',
-                            'statement','terminal','alias')""") == 0,
+                            'statement','condition','terminal','alias')""") == 0,
       "load_kind stays in its vocabulary")
 
 # ------------------------------------------------- query plan discipline
@@ -2235,15 +2254,16 @@ if mode == "procedural":
         SELECT count(*) FROM v_load
         WHERE signal_name = 'fired' AND load_kind = 'sensitivity'""") == 1,
           "and the procedure waiting on it is still its load")
-    # Both statements exist so their gating has somewhere to land: the
-    # condition reaching them is a read, and it had nowhere else to go.
+    # Both statements exist so their gating has somewhere to land -- and it
+    # lands on the LEVEL they sit in, which is where the condition is
+    # written and evaluated.
     for kind in ("trigger", "disable"):
         check(one("""
-            SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
-            JOIN net n ON n.id = e.net_id
-            WHERE s.stmt_kind = ? AND e.role = 'control' AND n.name = 'en'""",
-                  kind) == 1,
-              f"a gated {kind} records the condition it was reached under")
+            SELECT count(*) FROM stmt s
+            JOIN branch_ref r ON r.branch_id = s.branch_id
+            JOIN net n ON n.id = r.net_id
+            WHERE s.stmt_kind = ? AND n.name = 'en'""", kind) == 1,
+              f"a gated {kind} sits in a level that reads its condition")
     check(one("""
         SELECT count(*) FROM stmt WHERE stmt_kind = 'disable'
           AND NOT EXISTS (SELECT 1 FROM stmt_target t WHERE t.stmt_id = stmt.id)
@@ -2323,13 +2343,27 @@ if mode == "procedural":
     check(sorted(r[0] for r in con.execute("""
         SELECT sense FROM v_branch
         WHERE module_name='emptylevel' AND branch_kind='if'""")) ==
-          ["else", "then"],
+          ["else", "else", "then", "then"],
           "an if arm that gates nothing is still an arm, on both senses")
     check(one("""
         SELECT count(*) FROM v_branch
         WHERE module_name='emptylevel' AND branch_kind='loop'
           AND iter_count=2""") == 1,
           "and a loop with an empty body still carries its iteration space")
+    # `if (gate) ; else ;` gates nothing at all, so there is no statement
+    # anywhere to hang the condition on -- and the design still reads gate.
+    # The level reads it, once per arm, which is what the source says.
+    check(one("""
+        SELECT count(*) FROM branch_ref r
+        JOIN branch b ON b.id = r.branch_id
+        JOIN net n ON n.id = r.net_id
+        JOIN inst i ON i.id = b.inst_id JOIN module m ON m.id = i.module_id
+        WHERE m.name='emptylevel' AND n.name='gate'""") == 2,
+          "a level that gates nothing still reads its condition")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='gate' AND load_kind='condition'""") == 2,
+          "and the signal reads back as loaded, which it was not before")
     check(one("""
         SELECT count(*) FROM v_stmt s
         JOIN v_branch b ON b.branch_id = s.branch_id
@@ -2387,14 +2421,14 @@ if mode == "procedural":
     # the level is the only thing that can tell the arms apart.
     check(one("""
         SELECT count(DISTINCT reads) FROM (
-            SELECT s.stmt_id AS sid,
-                   group_concat(e.net_id) AS reads
+            SELECT s.branch_id AS bid,
+                   group_concat(r.net_id) AS reads
             FROM v_stmt s
             JOIN v_stmt_target t ON t.stmt_id = s.stmt_id
-            JOIN expr_ref e ON e.stmt_id = s.stmt_id AND e.role='control'
+            JOIN branch_ref r ON r.branch_id = s.branch_id
             WHERE s.module_name='gating' AND t.net_name='q'
               AND s.src_line IN (189, 190)
-            GROUP BY s.stmt_id)""") == 1,
+            GROUP BY s.branch_id)""") == 1,
           "while the two innermost arms still read exactly the same nets")
     # LRM 12.5 -- the qualifier and the matching semantics belong to the case
     # POINT; the labels belong to the item, one row each, and no item sees
@@ -2432,15 +2466,14 @@ if mode == "procedural":
     # reference on the release statement itself.
     check(one("""
         SELECT count(*) FROM v_stmt s
-        JOIN expr_ref e ON e.stmt_id = s.stmt_id
-        JOIN net n ON n.id = e.net_id
-        WHERE s.stmt_kind='release' AND e.role='control'
-          AND n.name='g'""") == 1,
-          "a release records the condition that ends the hijack")
+        JOIN branch_ref r ON r.branch_id = s.branch_id
+        JOIN net n ON n.id = r.net_id
+        WHERE s.stmt_kind='release' AND n.name='g'""") == 1,
+          "a release sits in the level that ends the hijack")
     check(one("""
         SELECT count(*) FROM v_load
-        WHERE signal_name='g' AND load_kind='statement'""") == 1,
-          "and that condition reads g as a statement-kind load")
+        WHERE signal_name='g' AND load_kind='condition'""") == 1,
+          "and that condition reads g as a condition-kind load")
     # ---- LRM 9.2.2.3 / 9.4.2: the procedure kind and edge kind that have
     # ---- no posedge/negedge spelling to be mistaken for
     check(one("""
@@ -3374,15 +3407,16 @@ if mode == "xmr":
           AND t.term_name='p' AND tn.node_name='u_sink'""") == 1,
           "the resolved external tie shows g feeding u_sink.p as an attachment")
     # A condition gating a statement that writes nothing this instance
-    # names is still a read of that signal.
+    # names is still a read of that signal -- and it is the LEVEL's read, so
+    # it survives however little the statements under it turn out to be.
     check(one("""
         SELECT count(*) FROM v_load
-        WHERE signal_name='quiet_gate' AND load_kind='statement'""") == 1,
+        WHERE signal_name='quiet_gate' AND load_kind='condition'""") == 1,
           "a condition gating a targetless statement is still a load")
     check(one("""
-        SELECT count(*) FROM expr_ref e JOIN net n ON n.id = e.net_id
-        WHERE n.name='quiet_gate' AND e.role='control'""") == 1,
-          "and it is recorded as the control reference it is")
+        SELECT count(*) FROM branch_ref r JOIN net n ON n.id = r.net_id
+        WHERE n.name='quiet_gate'""") == 1,
+          "and it is recorded once, on the level that reads it")
     # One reference split across two targets: the row names the whole of
     # what the RTL wrote, the dependencies take their own halves.
     check(one("""

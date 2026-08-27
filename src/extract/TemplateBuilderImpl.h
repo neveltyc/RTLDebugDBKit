@@ -215,7 +215,11 @@ private:
         /// statement's dependency pointed at a reference belonging to the
         /// first -- so "what does statement 4 read outside this instance"
         /// answered nothing.
-        std::map<std::tuple<const Expression*, bool, int32_t>, int32_t> hierSeen;
+        /// Keyed (expression, written, statement, level): a statement's
+        /// reference is the statement's, a condition's is its level's, and
+        /// exactly one of the last two is set on any key.
+        std::map<std::tuple<const Expression*, bool, int32_t, int32_t>,
+                 int32_t> hierSeen;
         int32_t curStmt = -1;      // where call bindings attach
         /// The gating level the node being filed sits in, template-local
         /// (-1 = ungated), and the offset of the procedure's walk into the
@@ -302,7 +306,7 @@ private:
                     int64_t dropped, const TplLoc& loc);
 
     int32_t addExprRef(Build& b, int32_t stmt, const Ref& r, RefRole role,
-                       int32_t netIdx, int32_t branch = -1);
+                       int32_t netIdx);
 
     /// Records one reference that leaves the instance -- and, when slang
     /// resolved it, how to find the target again from any occurrence.
@@ -375,8 +379,7 @@ private:
     /// One read of a statement, wherever it lands: an expr_ref for a net of
     /// this instance, a hier_ref for anything outside it.
     void recordRead(Build& b, int32_t stmt, const Ref& r, RefRole role,
-                    const TplLoc& at, EvalContext& evalCtx,
-                    int32_t branch = -1);
+                    const TplLoc& at, EvalContext& evalCtx);
 
     void addProcEvent(Build& b, int32_t procIdx, int32_t stmtIdx,
                       const Expression* expr, Edge edge, EventKind eventKind, const TplLoc& at,

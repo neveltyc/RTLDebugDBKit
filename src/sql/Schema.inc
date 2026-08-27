@@ -455,6 +455,26 @@ CREATE TABLE branch(
 -- -- and NULL where constant evaluation does not reach the label, as for an
 -- `inside` range over a variable. Such a label's reads are still control
 -- reads on the item's level.
+-- One read of one level's condition. The level owns it: a condition is
+-- written once and evaluated once, however many statements sit under it, and
+-- a level that gates nothing at all still reads what it reads -- `if (c) ;`
+-- recorded c nowhere. Filing a copy per gated statement instead cost three
+-- to six times the rows on real designs and still could not say that.
+--
+-- What a statement gets is the DEPENDENCY, one per target, naming the level
+-- it came from (`net_dep.branch_id`). "Everything gating this statement" is
+-- the level chain from `stmt.branch_id` outward, which `branch_ancestor`
+-- makes one join.
+CREATE TABLE branch_ref(
+    id        INTEGER PRIMARY KEY,
+    branch_id INTEGER NOT NULL REFERENCES branch(id),
+    ordinal   INTEGER NOT NULL,
+    net_id    INTEGER NOT NULL REFERENCES net(id),
+    lo        INTEGER,
+    hi        INTEGER,
+    is_exact  INTEGER NOT NULL CHECK(is_exact IN (0,1)),
+    UNIQUE(branch_id, ordinal));
+
 CREATE TABLE branch_label(
     id        INTEGER PRIMARY KEY,
     branch_id INTEGER NOT NULL REFERENCES branch(id),
@@ -538,11 +558,11 @@ CREATE TABLE assign_operand(
     is_exact INTEGER NOT NULL CHECK(is_exact IN (0,1)),
     UNIQUE(stmt_id, ordinal));
 
--- One statement read that is not an assignment operand, classified by role:
+-- One statement read that is not an assignment operand, classified by role.
+-- A branch condition is not among them: it is read where it is written, so
+-- it belongs to its level (`branch_ref`) and not to each statement the level
+-- happens to gate.
 --
---   control        a branch condition the statement's targets sit under.
---                  branch_id names WHICH level of the gating contributed it
---                  -- always set for this role, always NULL for the others.
 --   assertion      read by an assert/assume/cover/expect
 --   wait           a wait statement's condition
 --   event          a sensitivity/event expression that is not a plain net
@@ -556,9 +576,8 @@ CREATE TABLE expr_ref(
     ordinal   INTEGER NOT NULL,
     net_id    INTEGER NOT NULL REFERENCES net(id),
     role      TEXT NOT NULL
-        /*!*/CHECK(role IN ('control','assertion','wait','event',
-                       'call_argument','system_task'))/*!*/,
-    branch_id INTEGER REFERENCES branch(id),
+        /*!*/CHECK(role IN ('assertion','wait','event',
+                            'call_argument','system_task'))/*!*/,
     lo        INTEGER,
     hi        INTEGER,
     is_exact  INTEGER NOT NULL CHECK(is_exact IN (0,1)),
@@ -605,9 +624,11 @@ CREATE TABLE proc_event(
 --              not resolve to a net row, the source range survives, and
 --              v_driver reports 'external'.
 --   control    it reaches the target through a branch condition: stmt_id,
---              the condition's expr_ref_id (role='control') or
---              src_hier_ref_id, and the target's reference as above.
---              map_exact is 0 -- a condition gates, it does not map.
+--              the level it came from in branch_id -- whose reads are
+--              branch_ref rows -- or src_hier_ref_id when the condition
+--              names something outside the instance, and the target's
+--              reference as above. map_exact is 0: a condition gates, it
+--              does not map.
 --   primitive  a gate/switch/UDP couples them: prim_id, per LRM
 --              (input, output) pairing.
 --   procedure  a call binds them: actual to formal by argument direction,
@@ -645,6 +666,10 @@ CREATE TABLE net_dep(
     assign_operand_id  INTEGER REFERENCES assign_operand(id),
     stmt_target_id   INTEGER REFERENCES stmt_target(id),
     expr_ref_id        INTEGER REFERENCES expr_ref(id),
+    -- Control: the level whose condition produced this row. The read itself
+    -- is that level's (`branch_ref`); this says which level, where the
+    -- columns above name a reference directly.
+    branch_id          INTEGER REFERENCES branch(id),
     prim_id            INTEGER REFERENCES prim(id),
     src_hier_ref_id    INTEGER REFERENCES hier_ref(id),
     tgt_hier_ref_id    INTEGER REFERENCES hier_ref(id),
