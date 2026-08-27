@@ -621,6 +621,31 @@ namespace designdb {
 /// in the verifier. `v_db_info` keeps its sixteen columns in their order, so
 /// again a consumer reading the view sees nothing move; one reading `meta`
 /// reads `db_info` instead, by column rather than by key.
+///
+/// The third is the gating. A branch condition was filed as a read of every
+/// statement it gated, which is three to six times the rows on real designs
+/// -- VeeRwolf 10 849 control reads for 3 563 distinct ones, one pair
+/// repeated eighty times -- and could not record the case where there is no
+/// statement at all: `if (gate) ; else ;` produced no row of any kind, so a
+/// signal the design reads appeared nowhere in the database. A condition is
+/// written once and evaluated once, so it belongs to its level:
+/// `branch_ref` is that read set, `expr_ref` keeps the reads that really are
+/// a statement's and loses the `control` role and its `branch_id`, and a
+/// gated statement gets the DEPENDENCY, one per target, naming the level in
+/// `net_dep.branch_id`. An outward condition follows the same rule: a
+/// `hier_ref` keyed on the level, `stmt_id` NULL, published on `v_hier_ref`
+/// beside a new `branch_id`. `v_load` gains `condition` for a level that
+/// reads a net and gates nothing this instance names -- `statement` was the
+/// old spelling and it needed a statement.
+///
+/// `branch_ancestor` is what keeps that affordable. Everything gating one
+/// statement was a single indexed lookup and would have become a walk up
+/// `parent_branch_id`: 62.8 us per statement as a recursive CTE against
+/// v19's 3.50 us, and 2 361 us through a view, since SQLite materialises
+/// every chain in the design before it filters. The closure is computed once
+/// per module template, where a tree is a few dozen rows, and shifted per
+/// occurrence like every other id; the query is back to 3.83 us, and both
+/// directions are indexed because both are asked.
 inline constexpr int SchemaVersion = 20;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.

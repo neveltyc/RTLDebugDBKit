@@ -335,38 +335,39 @@ call sites it skipped, and reports `analysis_status='partial'`. Measured
 RTL does not come close — the heaviest caller among the designs exported
 here has thirteen call statements.
 
-**`branch` / `branch_label`** — the gating context a statement sits under,
-as a tree. One row per *level* — an `if` arm, a case point, one case arm, a
-loop body — shared by every statement under it, with `parent_branch_id`
-chaining outward and `depth` 1 at the outermost. `stmt.branch_id` names the
-level a statement is in; its conditions are the walk up that chain,
-outermost last.
+**`branch` / `branch_label` / `branch_ref`** — the gating context a
+statement sits under, as a tree. One row per *level* — an `if` arm, a case
+point, one case arm, a loop body — shared by every statement under it, with
+`parent_branch_id` chaining outward and `depth` 1 at the outermost.
+`stmt.branch_id` names the level a statement is in; its conditions are the
+levels up that chain, which `branch_ancestor` gives in one join. A level's
+own reads are `branch_ref` rows.
 
 | `branch_kind` | what the level carries |
 |---|---|
-| `if` | `sense` = `then`/`else`; `check_kind` a `priority if`/`unique if` qualifier. Its control reads are the condition, so both arms name the same nets and `sense` is what separates them. |
-| `case` | the branch **point**, one per case statement: `case_kind` the matching semantics (`case`/`casez`/`casex`/`inside`/`matches`), `check_kind` the qualifier, and its control reads are the selector's. Its children are the arms. |
-| `case_item` | one arm, `ordinal` its written position under the point. Its control reads are that item's own labels; `branch_label` holds their evaluated values. |
+| `if` | `sense` = `then`/`else`; `check_kind` a `priority if`/`unique if` qualifier. Its reads are the condition, so both arms name the same nets and `sense` is what separates them. |
+| `case` | the branch **point**, one per case statement: `case_kind` the matching semantics (`case`/`casez`/`casex`/`inside`/`matches`), `check_kind` the qualifier, and its reads are the selector's. Its children are the arms. |
+| `case_item` | one arm, `ordinal` its written position under the point. Its reads are that item's own labels; `branch_label` holds their evaluated values. |
 | `case_default` | the `default` arm, with an `ordinal` like any other. No labels. |
-| `loop` | a loop body. Its control reads are the guard — `while`'s condition, `for`'s stop expression, `repeat`'s count; `forever` and `foreach` have none — and the `iter_*` columns are the iteration space. |
+| `loop` | a loop body. Its reads are the guard — `while`'s condition, `for`'s stop expression, `repeat`'s count; `forever` and `foreach` have none — and the `iter_*` columns are the iteration space. |
 
-An `if` level and a `loop` level exist only where they gate a row. Every
-written case arm has a row, empty body or not, so the arms under a point are
-the whole case.
+A level exists because the source spells it, not because something under it
+landed a row: both arms of an `if`, every written case arm, a loop body that
+does nothing. `if (c) ; else ;` is the case that says why — the condition is
+read by the design, and there is no statement anywhere to hang that read on.
 
 `branch_label` is `(branch_id, ordinal, value)` in written order. `value` is
 the elaborated constant in full precision — the same normalisation
 `inst_param.value` uses, so `4'b1?` in a `casez` reads `4'b1z` — and NULL
 where constant evaluation does not reach the label, as for an `inside` range
-over a variable. Such a label's reads are control reads on its level like
+over a variable. Such a label's reads are `branch_ref` rows on its level like
 any other.
 
-Arms are siblings, not a chain: an arm's control reads are its own labels
+Arms are siblings, not a chain: an arm's reads are its own labels
 and not the preceding arms'. The priority a plain `case` has — arm *k* is
 reached only if arms 0…*k*−1 did not match — is `ordinal`, the written order
 under the point. Source line does not carry it: a whole case may be written
-on one. An arm whose body gates nothing (`2'b01: ;`) has no statement to
-carry a read, so its labels' reads are on the point instead.
+on one.
 
 `static_taken` is the compile-time verdict: 1 this arm runs, 0 it cannot,
 NULL the condition is not a constant. `localparam bit EN = 0; if (EN) q = b;

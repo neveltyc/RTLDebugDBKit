@@ -714,9 +714,9 @@ check(one("""
     WHERE (branch_kind IN ('case_item', 'case_default'))
        != (ordinal IS NOT NULL)""") == 0,
       "ordinal is set on exactly the case arms")
-# Ordinal is the arm's WRITTEN position, so it is unique and increasing
-# under one point but not contiguous: an arm whose body gates nothing has no
-# row, and closing the gap would misstate which arms precede which.
+# Ordinal is the arm's WRITTEN position under one point, which is the
+# priority a plain `case` has. Every written arm has a row, so it is also
+# contiguous -- but written position is what it means, not row order.
 check(one("""SELECT count(*) FROM branch WHERE ordinal < 0""") == 0,
       "an arm ordinal is never negative")
 check(one("""
