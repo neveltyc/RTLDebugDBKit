@@ -8,7 +8,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.0-3366cc?style=flat-square">
+  <img alt="Release" src="https://img.shields.io/github/v/release/neveltyc/RTLDebugDBKit?sort=semver&style=flat-square&color=3366cc">
+  <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/neveltyc/RTLDebugDBKit/ci.yml?branch=main&style=flat-square&label=CI">
   <img alt="schema" src="https://img.shields.io/badge/schema-v20-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
@@ -143,9 +144,9 @@ depth  branch_kind  sense  src_line  reads
 
 ## 安装
 
-仓库目前是私有的，还没有打过 tag，所以 GitHub Release 页面是空的。要么从源码构建
-（见下），要么等第一个 `v*` tag——`release.yml` 会在那时把四个平台的二进制连同
-`sha256sums.txt` 一起发布：
+从[最新 release](https://github.com/neveltyc/RTLDebugDBKit/releases/latest)下载对应
+平台的二进制，每个版本都附一份 `sha256sums.txt` 和
+[third-party-licenses.md](third-party-licenses.md)：
 
 | 平台 | 二进制 | 链接方式 |
 |:--|:--|:--|
@@ -153,6 +154,12 @@ depth  branch_kind  sense  src_line  reads
 | Linux ARM64 | `rtl-designdb-linux-arm64` | musl，完全静态 |
 | Windows x86-64 | `rtl-designdb-windows-amd64.exe` | MSVC，静态 CRT |
 | macOS (Apple Silicon) | `rtl-designdb-macos-arm64` | 原生 |
+
+```sh
+curl -fsSL -o rtl-designdb \
+  https://github.com/neveltyc/RTLDebugDBKit/releases/latest/download/rtl-designdb-linux-amd64
+chmod +x rtl-designdb
+```
 
 这套平台组合和 [rwave](https://github.com/neveltyc/RWaveAnalyzer) 一致，是有意的：
 这个数据库是配着波形读的，波形工具去哪它就得去哪。rwave 的 linux-amd64 保持 glibc
@@ -386,4 +393,9 @@ sqlite3 -box design.db "SELECT * FROM v_db_info"
 
 ## 许可证
 
-BSD 3-Clause，见 [LICENSE](LICENSE)。slang 和 SQLite 在构建时拉取，各自保留自己的许可证。
+BSD 3-Clause，见 [LICENSE](LICENSE)——覆盖这个导出器自己的代码。
+
+发布的二进制是静态链接的，下载下来身边没有仓库，所以它所含依赖在二进制再分发时要求的
+声明收在 [third-party-licenses.md](third-party-licenses.md) 里，随每个 release 一起发布：
+slang、mimalloc 和 BS::thread_pool 是 MIT，Boost.Unordered 与 nonstd::expected 是
+BSL-1.0，SQLite 属于公有领域、不附加条件。

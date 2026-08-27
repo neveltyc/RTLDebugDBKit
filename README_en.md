@@ -8,7 +8,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.0-3366cc?style=flat-square">
+  <img alt="Release" src="https://img.shields.io/github/v/release/neveltyc/RTLDebugDBKit?sort=semver&style=flat-square&color=3366cc">
+  <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/neveltyc/RTLDebugDBKit/ci.yml?branch=main&style=flat-square&label=CI">
   <img alt="schema" src="https://img.shields.io/badge/schema-v20-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
@@ -148,10 +149,10 @@ statement" is one join rather than a walk up `parent_branch_id`.
 
 ## Install
 
-The repository is private and carries no tags yet, so the GitHub release page is
-empty. Build from source (below), or wait for the first `v*` tag — `release.yml`
-publishes the four platform binaries alongside a `sha256sums.txt` when one is
-pushed:
+Download the binary for your platform from the
+[latest release](https://github.com/neveltyc/RTLDebugDBKit/releases/latest).
+Every release ships a `sha256sums.txt` and
+[third-party-licenses.md](third-party-licenses.md) beside the binaries:
 
 | Platform | Binary | Linking |
 |:--|:--|:--|
@@ -159,6 +160,12 @@ pushed:
 | Linux ARM64 | `rtl-designdb-linux-arm64` | musl, fully static |
 | Windows x86-64 | `rtl-designdb-windows-amd64.exe` | MSVC, static CRT |
 | macOS (Apple Silicon) | `rtl-designdb-macos-arm64` | native |
+
+```sh
+curl -fsSL -o rtl-designdb \
+  https://github.com/neveltyc/RTLDebugDBKit/releases/latest/download/rtl-designdb-linux-amd64
+chmod +x rtl-designdb
+```
 
 The platform set is [rwave](https://github.com/neveltyc/RWaveAnalyzer)'s,
 deliberately: this database is read next to a waveform, so it ships everywhere
@@ -435,5 +442,12 @@ versioning; the database contract carries its own integer,
 
 ## Licence
 
-BSD 3-Clause — see [LICENSE](LICENSE). slang and SQLite are fetched at build time
-and keep their own licences.
+BSD 3-Clause — see [LICENSE](LICENSE), which covers the exporter's own code.
+
+Because the release binary is statically linked, a downloaded asset carries no
+repository around it, so the notices its dependencies require in a binary
+redistribution are collected in
+[third-party-licenses.md](third-party-licenses.md) and published with every
+release: slang, mimalloc and BS::thread_pool are MIT, Boost.Unordered and
+nonstd::expected are BSL-1.0, and SQLite is public domain with no condition
+attached.
