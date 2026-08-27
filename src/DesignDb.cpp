@@ -338,15 +338,44 @@ void Writer::bumped() {
     }
 }
 
-void Writer::setMeta(std::string_view key, std::string_view value) {
+void Writer::setDbInfo(const DbInfoRow& r) {
     sqlite3_stmt* s = nullptr;
-    prepare("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", &s);
-    sqlite3_bind_text(s, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT);
+    prepare("INSERT INTO db_info(id, schema_version, tool, tool_version,"
+            " slang_version, producer_revision, top, analysis_status,"
+            " error_count, unresolved_count, empty_procedure_count,"
+            " duplicate_path_count, recursion_count, truncated_call_count,"
+            " checker_inst_count, unanalysed_inst_count, config_digest)"
+            " VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &s);
+    auto text = [&](int at, const std::string& v) {
+        sqlite3_bind_text(s, at, v.data(), static_cast<int>(v.size()), SQLITE_STATIC);
+    };
+    sqlite3_bind_int64(s, 1, r.schemaVersion);
+    text(2, r.tool);
+    text(3, r.toolVersion);
+    text(4, r.slangVersion);
+    text(5, r.producerRevision);
+    // The one nullable column: no top elaborated is a fact, and an empty
+    // string would be a top whose name is nothing.
+    if (r.top.empty())
+        sqlite3_bind_null(s, 6);
+    else
+        text(6, r.top);
+    text(7, r.analysisStatus);
+    sqlite3_bind_int64(s, 8, r.errorCount);
+    sqlite3_bind_int64(s, 9, r.unresolvedCount);
+    sqlite3_bind_int64(s, 10, r.emptyProcedureCount);
+    sqlite3_bind_int64(s, 11, r.duplicatePathCount);
+    sqlite3_bind_int64(s, 12, r.recursionCount);
+    sqlite3_bind_int64(s, 13, r.truncatedCallCount);
+    sqlite3_bind_int64(s, 14, r.checkerInstCount);
+    sqlite3_bind_int64(s, 15, r.unanalysedInstCount);
+    text(16, r.configDigest);
     int rc = sqlite3_step(s);
     sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        throw std::runtime_error(std::string("sqlite: writing meta: ") + sqlite3_errmsg(db));
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error(std::string("sqlite: writing db_info: ") +
+                                 sqlite3_errmsg(db));
+    }
 }
 
 void Writer::addSourceFile(const std::string& path, const std::string& digest) {

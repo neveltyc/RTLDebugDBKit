@@ -63,7 +63,10 @@ cpmaddpackage(
 # database does not depend on whatever libsqlite3 the host happens to ship.
 option(DESIGNDB_SYSTEM_SQLITE "Link the host's libsqlite3 instead of bundling" OFF)
 if(DESIGNDB_SYSTEM_SQLITE)
-  find_package(SQLite3 REQUIRED)
+  # 3.37 is where STRICT tables arrive, and db_info is one: an older
+  # libsqlite3 cannot parse the schema at all, so the floor belongs here
+  # rather than in a runtime error from the first export.
+  find_package(SQLite3 3.37 REQUIRED)
   add_library(designdb_sqlite INTERFACE)
   target_link_libraries(designdb_sqlite INTERFACE SQLite::SQLite3)
 else()

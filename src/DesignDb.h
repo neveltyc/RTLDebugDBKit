@@ -609,6 +609,18 @@ namespace designdb {
 /// names the instance. `v_hier_ref` publishes `resolved_inst_id` unchanged,
 /// off the net row it was already joining for `resolved_net_name`, so a
 /// consumer reading the view sees nothing move.
+///
+/// The seal is the second: `meta(key, value)` becomes `db_info`, one STRICT
+/// row of typed columns. Sixteen facts that are neither optional nor
+/// open-ended were stored as text pairs, so presence was the verifier's to
+/// check, the counts were TEXT a view had to CAST, and a mistyped key would
+/// have become a seventeenth fact rather than an error. Now every column is
+/// NOT NULL but `top` (NULL when the design elaborated none), a count is an
+/// integer, and the rule that `analysis_status` agrees with the counts
+/// beside it is a CHECK rather than prose in the exporter and an assertion
+/// in the verifier. `v_db_info` keeps its sixteen columns in their order, so
+/// again a consumer reading the view sees nothing move; one reading `meta`
+/// reads `db_info` instead, by column rather than by key.
 inline constexpr int SchemaVersion = 20;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
@@ -905,6 +917,31 @@ struct NetDepRow {
     int64_t callSiteId = 0;       // the call-site expansion this belongs to; 0 = NULL
 };
 
+/// The seal: the whole of `db_info`, written once.
+///
+/// Every field is required, which is why they are values and not options --
+/// a writer that forgets one no longer produces a database missing a fact,
+/// it fails to compile. `top` is the exception the schema names: NULL when
+/// the design elaborated no top at all.
+struct DbInfoRow {
+    int schemaVersion = 0;
+    std::string tool;
+    std::string toolVersion;
+    std::string slangVersion;
+    std::string producerRevision;
+    std::string top;              // empty = no top elaborated, written NULL
+    std::string analysisStatus;
+    int64_t errorCount = 0;
+    int64_t unresolvedCount = 0;
+    int64_t emptyProcedureCount = 0;
+    int64_t duplicatePathCount = 0;
+    int64_t recursionCount = 0;
+    int64_t truncatedCallCount = 0;
+    int64_t checkerInstCount = 0;
+    int64_t unanalysedInstCount = 0;
+    std::string configDigest;
+};
+
 /// One reference that leaves the instance, as written and, when slang could
 /// resolve it, as the object it lands on.
 struct HierRefRow {
@@ -940,7 +977,10 @@ public:
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;
 
-    void setMeta(std::string_view key, std::string_view value);
+    /// The seal, in one statement. Called after finish(), for the reason the
+    /// caller gives: the data and the indexes are complete before the row
+    /// that says the export ran to completion exists at all.
+    void setDbInfo(const DbInfoRow& r);
 
     /// Records a source file and its SHA-256, so a consumer can tell that the
     /// database and the RTL have diverged instead of answering from stale data.

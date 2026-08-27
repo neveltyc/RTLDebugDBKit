@@ -28,7 +28,7 @@ import re
 import sqlite3
 import sys
 
-# mode -> the meta.top that fixture must elect. CI takes its loop from this
+# mode -> the db_info.top that fixture must elect. CI takes its loop from this
 # table (--list-modes), so the fixture set is named in one place.
 MODES = {
     "constructs": "constructs",
@@ -184,7 +184,7 @@ SCHEMA_VERSION = "20"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
-# cannot run without -- a missing view, a meta key later code indexes -- stops
+# cannot run without -- a missing view, a seal later code indexes -- stops
 # it early, through fatal().
 failures = []
 checked = 0
@@ -434,7 +434,7 @@ check(one("""
     SELECT COALESCE(SUM(n - 1), 0) FROM (
         SELECT count(*) AS n FROM tree_node
         GROUP BY parent_node_id, name HAVING count(*) > 1)""") ==
-      int(one("SELECT value FROM meta WHERE key='duplicate_path_count'")),
+      one("SELECT duplicate_path_count FROM v_db_info"),
       "sibling name collisions match duplicate_path_count")
 
 # ------------------------------------------------- parameter round-trip
@@ -1024,21 +1024,23 @@ check(one("""
         ELSE 1 END""") == 0,
       "connection columns match conn_kind")
 
-# ------------------------------------------------------------------ meta
-# The doc states the required set as a rule -- the v_db_info columns minus
-# `top` -- so it is derived here rather than hand-copied: a column added to
-# the view then demands its meta key without this list needing to know.
-required = [r[1] for r in con.execute("PRAGMA table_info(v_db_info)")
-            if r[1] != "top"]
-if not required:
-    fatal("v_db_info is missing")
-meta = dict(con.execute("SELECT key, value FROM meta"))
-# Fatal rather than collected: every check below indexes these keys.
-missing = [k for k in required if k not in meta or meta[k] is None]
-if missing:
-    fatal(f"meta lacks required key(s): {', '.join(missing)}")
-check(meta["schema_version"] == SCHEMA_VERSION,
-      f"schema_version is {SCHEMA_VERSION}", f"got {meta['schema_version']}")
+# --------------------------------------------------------------- db_info
+# One row, typed, every column required but `top`. The schema says all of
+# that now -- NOT NULL, INTEGER, and the CHECK that ties the status to its
+# counts -- so what is left here is what the schema cannot say: that the row
+# is there at all, and that this file's contract is the one this script
+# knows.
+info_cols = [d[0] for d in con.execute("SELECT * FROM v_db_info LIMIT 0").description]
+info = con.execute("SELECT * FROM v_db_info").fetchone()
+# Fatal rather than collected: every check below reads these.
+if info is None:
+    fatal("db_info holds no row -- the export did not seal")
+by = dict(zip(info_cols, info))
+unset = [k for k, v in by.items() if v is None and k != "top"]
+if unset:
+    fatal(f"db_info leaves required column(s) NULL: {', '.join(unset)}")
+check(str(by["schema_version"]) == SCHEMA_VERSION,
+      f"schema_version is {SCHEMA_VERSION}", f"got {by['schema_version']}")
 
 # The version is stated in four independent places -- this constant, the
 # exporter's SchemaVersion, the field reference's opening line and the
@@ -1061,10 +1063,12 @@ for _rel, _pattern in (("src/DesignDb.h", r"SchemaVersion\s*=\s*(\d+)"),
 COUNTS = ("error_count", "unresolved_count", "empty_procedure_count",
           "duplicate_path_count", "recursion_count", "truncated_call_count",
           "checker_inst_count", "unanalysed_inst_count")
-nonnumeric = [k for k in COUNTS if not meta[k].isdigit()]
-if nonnumeric:
-    fatal(f"meta count(s) not a number: {', '.join(nonnumeric)}")
-status = meta["analysis_status"]
+# A count is an integer here and not a string that looks like one. The STRICT
+# table refuses anything else on the way in; this is the same statement made
+# about the file, which is what this script exists to do.
+for k in ("schema_version",) + COUNTS:
+    check(isinstance(by[k], int), f"{k} is an INTEGER", f"got {by[k]!r}")
+status = by["analysis_status"]
 check(status in ("complete", "partial", "hierarchy_only"),
       "analysis_status is one of complete/partial/hierarchy_only",
       f"got {status!r}")
@@ -1072,26 +1076,16 @@ check(status in ("complete", "partial", "hierarchy_only"),
 # implication runs both ways: `complete` beside a non-zero count is a malformed
 # file, and a count that chose `partial` can be looked at rather than merely
 # inferred. `unresolved_count` is not among them by design -- a black box is
-# not an incompleteness of the export.
+# not an incompleteness of the export. `hierarchy_only` is decided before any
+# count is taken, so it claims nothing about them.
 PARTIAL_CAUSES = ("error_count", "empty_procedure_count",
                   "duplicate_path_count", "truncated_call_count",
                   "unanalysed_inst_count")
-explained = any(int(meta[k]) for k in PARTIAL_CAUSES)
+explained = any(by[k] for k in PARTIAL_CAUSES)
 check(not (status == "complete" and explained),
       "a complete status carries no count that would contradict it")
 check(not (status == "partial" and not explained),
       "a partial status names the count that caused it")
-
-info = con.execute("SELECT * FROM v_db_info").fetchone()
-info_cols = [d[0] for d in con.execute("SELECT * FROM v_db_info LIMIT 0").description]
-by = dict(zip(info_cols, info))
-check(str(by["schema_version"]) == meta["schema_version"]
-      and isinstance(by["schema_version"], int),
-      "v_db_info.schema_version agrees with meta and is INTEGER",
-      f"got {by['schema_version']!r}")
-for k in COUNTS:
-    check(by[k] == int(meta[k]) and isinstance(by[k], int),
-          f"v_db_info.{k} agrees with meta and is INTEGER", f"got {by[k]!r}")
 
 # --------------------------------------------------------- view contract
 # The fifteen stable views: existence, exact columns in exact order, and row
@@ -1631,8 +1625,8 @@ check(one("""
 
 # ------------------------------------------------------ mode-gated checks
 if mode:
-    check(meta.get("top") == MODES[mode], f"meta.top is {MODES[mode]}",
-          f"got {meta.get('top')!r}")
+    check(by["top"] == MODES[mode], f"db_info.top is {MODES[mode]}",
+          f"got {by['top']!r}")
 
 
 if mode == "constructs":
@@ -2193,11 +2187,11 @@ if mode == "params":
     # legally, because the parameter shrinks each level. The guard keys on
     # (module, parameters) and this file repeats the module at every level
     # and the pair at none, so nothing is cut and the tree is whole.
-    check(meta["analysis_status"] == "complete",
+    check(by["analysis_status"] == "complete",
           "a terminating parameterised recursion compiles clean",
-          f"got {meta['analysis_status']!r}")
-    check(int(meta["recursion_count"]) == 0,
-          "and nothing is cut", f"got {meta['recursion_count']}")
+          f"got {by['analysis_status']!r}")
+    check(by["recursion_count"] == 0,
+          "and nothing is cut", f"got {by['recursion_count']}")
     # 1 + 2 + 4 + 8. A guard keyed on the module alone would stop at the
     # first level and leave one.
     check(one("""
@@ -3917,7 +3911,7 @@ if mode == "incomplete":
                               FROM tree_node GROUP BY parent_node_id, name
                               HAVING c > 1)""") == 0,
           "and no two siblings share a name")
-    check(int(meta["duplicate_path_count"]) == 0,
+    check(by["duplicate_path_count"] == 0,
           "so the design reports no duplicate paths")
     # The names are synthesised, the diagnostics are not: an unnamed module
     # instantiation is still an elaboration error, and the export still says
@@ -3974,9 +3968,9 @@ if mode == "recursion":
     # Illegal RTL that slang rejects, so the database is hierarchy-only by
     # the same path any fatally-errored compilation takes. Asserted first:
     # everything below is about a tree built without dataflow.
-    check(meta["analysis_status"] == "hierarchy_only",
+    check(by["analysis_status"] == "hierarchy_only",
           "a recursive hierarchy is a fatally errored compilation",
-          f"got {meta['analysis_status']!r}")
+          f"got {by['analysis_status']!r}")
 
     # The contract the fix carries: an instance whose module AND parameters
     # are already those of one of its own ancestors is stamped, and stops
@@ -4006,8 +4000,8 @@ if mode == "recursion":
           "three instances re-enter a module of their own ancestry")
     # And the count is in the FILE, not only on stderr, so a consumer holding
     # a truncated database can tell it from a whole one.
-    check(int(meta["recursion_count"]) == 3,
-          "meta records all three", f"got {meta['recursion_count']}")
+    check(by["recursion_count"] == 3,
+          "db_info records all three", f"got {by['recursion_count']}")
     # No INSTANCE below a cut one, at any depth. Its generate scopes and its
     # primitives are stamped -- those come before the guard and are part of
     # the level the cut keeps -- so a check over children of every kind would

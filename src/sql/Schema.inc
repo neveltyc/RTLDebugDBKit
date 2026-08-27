@@ -38,9 +38,45 @@
 // conclusion the per-row check would, after the forward references have
 // landed.
 R"SQL(
--- value NOT NULL so v_db_info's MAX(CASE...) pivot keeps one meaning for
--- NULL: the key is missing, never "present but empty".
-CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- The seal: one row, one column per fact. Each of these is required, typed,
+-- and exactly one per database, and a key/value table could say none of that
+-- -- presence was the verifier's to check, the counts were TEXT a view had to
+-- CAST, and a mistyped key became a seventeenth fact instead of an error.
+--
+-- The CHECKs here carry no stripping markers: the marked ones are stripped
+-- because SQLite evaluates them per row, and this table has one.
+CREATE TABLE db_info(
+    id                    INTEGER PRIMARY KEY CHECK(id = 1),
+    schema_version        INTEGER NOT NULL,
+    tool                  TEXT NOT NULL,
+    tool_version          TEXT NOT NULL,
+    slang_version         TEXT NOT NULL,
+    producer_revision     TEXT NOT NULL,
+    -- The ELABORATED tops, space-separated; NULL when the design elaborated
+    -- none. Every other column is a fact about the run and always there.
+    top                   TEXT,
+    analysis_status       TEXT NOT NULL
+        CHECK(analysis_status IN ('complete','partial','hierarchy_only')),
+    error_count           INTEGER NOT NULL,
+    unresolved_count      INTEGER NOT NULL,
+    empty_procedure_count INTEGER NOT NULL,
+    duplicate_path_count  INTEGER NOT NULL,
+    recursion_count       INTEGER NOT NULL,
+    truncated_call_count  INTEGER NOT NULL,
+    checker_inst_count    INTEGER NOT NULL,
+    unanalysed_inst_count INTEGER NOT NULL,
+    config_digest         TEXT NOT NULL,
+    -- The status agrees with the counts beside it, which was prose in the
+    -- exporter and an assertion in the verifier and a rule the file itself
+    -- could not hold. `hierarchy_only` is exempt because it is decided before
+    -- any count is taken: the compilation was fatally errored, so there was
+    -- no dataflow to count gaps in.
+    CHECK(analysis_status = 'hierarchy_only'
+          OR (analysis_status = 'complete') =
+             (error_count = 0 AND empty_procedure_count = 0 AND
+              duplicate_path_count = 0 AND truncated_call_count = 0 AND
+              unanalysed_inst_count = 0))
+) STRICT;
 
 CREATE TABLE src_file(
     id      INTEGER PRIMARY KEY,

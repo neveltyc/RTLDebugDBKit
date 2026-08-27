@@ -5,7 +5,7 @@ reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
 column's meaning, value domain and NULL rules, each view's row granularity,
-the tables this document names, and the required `meta` set. Adding a column
+the tables this document names, and every column of `db_info`. Adding a column
 is included — the version integer is the only capability signal a consumer
 has, and a silent addition leaves the reader that wants it probing the file
 to find out. What does not bump: a new base table or index this document does
@@ -41,7 +41,7 @@ flowchart LR
     src_file[src_file]
     file[file]
     data_type[data_type]
-    meta[meta]
+    db_info[db_info]
   end
   subgraph hierarchy
     module[module]
@@ -128,7 +128,7 @@ does not apply to); solid edges are always present.
 
 | Group | Table | One row is | Foreign keys (`col → table`) |
 |---|---|---|---|
-| provenance | `meta` | one key/value of the seal | — |
+| provenance | `db_info` | the seal — exactly one row per database | — |
 | | `src_file` | one file slang read, with its SHA-256 | — |
 | | `file` | one path spelling rows carry | `src_file_id → src_file` |
 | | `data_type` | one interned type text | — |
@@ -661,7 +661,7 @@ asserts all of it on every export. Ground rules:
 * Explicit column lists, never `SELECT *`; no transitive closure — a
   fan-in cone is the consumer's recursive query, one step per row here.
 
-**`v_db_info`** — the meta seal as one row, counts CAST to INTEGER:
+**`v_db_info`** — the seal, one row, projected from `db_info`:
 `schema_version, tool, tool_version, slang_version, producer_revision, top,
 analysis_status, error_count, unresolved_count, empty_procedure_count,
 duplicate_path_count, recursion_count, truncated_call_count,
@@ -984,7 +984,7 @@ dictionary:
 | interface | `intf` | parameter | `param` | mapping | `map` |
 | database | `db` | column | `col` | | |
 
-Only identifiers are abbreviated: enum values and meta keys are data, mostly
+Only identifiers are abbreviated: enum values and column names are data, mostly
 the LRM's own words, so `'interface'` and `schema_version` stay spelled out.
 Role words stay whole (driver, load, signal, resolved, parent, scope, node).
 A word with no classic abbreviation is not given an invented one (operand,
@@ -1002,8 +1002,8 @@ ordinal, sequence, signature, width).
   outer net drives AND loads the inner one, so driver/load vocabulary
   belongs to `v_driver`/`v_load`, which derive it per port direction.
 * Kinds, directions and roles are their words. The words are a wire format
-  fixed by this schema, not slang's enum printer. Enum values and meta keys
-  are data, not identifiers: they stay full words.
+  fixed by this schema, not slang's enum printer. Enum values are data, not
+  identifiers: they stay full words.
 * Names are stored as SystemVerilog spells them: an escaped identifier
   keeps its backslash and its terminating space (`\g.1 `), and may contain
   `.` and `[`. A path is therefore assembled segment by segment from
@@ -1095,7 +1095,7 @@ consumer should not go looking for them in `vpi_user.h`:
 * `stmt_target`, `assign_operand`, `expr_ref` — positioned, classified
   references. The standard keeps expression trees; these are the flattened
   reference rows the trees are reduced to (see *What is not here*).
-* `meta`, `src_file`, `file` — the seal and the provenance. Nothing in the
+* `db_info`, `src_file`, `file` — the seal and the provenance. Nothing in the
   object model answers "which files did this come from, and have they
   changed since".
 * `stmt.stmt_kind`'s vocabulary is this schema's own words, not the
@@ -1113,10 +1113,12 @@ than an extractor counter, so its insert order is its id order, and the order
 slang hands the buffers back in is the order a thread pool finished reading
 them.
 `file` holds the spellings rows carry — as written in the filelist —
-joined to their src_file. `meta` is the seal; its required keys are the
-`v_db_info` columns except `top` — the space-separated names of the
-elaborated top instances — which is absent when the design elaborates
-none.
+joined to their src_file. `db_info` is the seal: one row, one column per
+fact, every column NOT NULL but `top` — the space-separated names of the
+elaborated top instances, NULL when the design elaborates none. It is a
+STRICT table, so a count is an integer rather than a string that reads like
+one, and `analysis_status`'s agreement with its counts is a CHECK rather
+than a rule stated in prose.
 `analysis_status` is `complete | partial | hierarchy_only`, and the exporter's
 exit code (0, 3, 4) is the same word: a caller can branch on it without
 opening the file. It agrees with the counts beside it, each of which is
@@ -1216,7 +1218,7 @@ no dataflow, not that the hierarchy stops early.
   which driver "wins" while a force is active — that is simulation, not
   structure.
 * Checkers are not modelled: a `checker` instantiation produces no rows —
-  no tree node, no nets, none of its assertions. `meta.checker_inst_count`
+  no tree node, no nets, none of its assertions. `db_info.checker_inst_count`
   says how many were passed over, so the absence is readable; it is not a
   cause of `partial`, since a construct this tool declines is not a walk
   that fell short.
@@ -1255,7 +1257,7 @@ no dataflow, not that the hierarchy stops early.
   walks contributes nothing. A body called from N sites is N sets of rows,
   bounded by a per-module expansion budget — a pathological call DAG that
   exceeds it reports the skipped sites rather than exhausting memory, and
-  `meta` says the export is `partial`.
+  `db_info` says the export is `partial`.
 * A subroutine's formals are one net per subroutine, not one per call site.
   The formal is shared, so a transitive cone that ignores call sites admits
   combinations no single call makes (`g1` with the second call's argument).
@@ -1271,7 +1273,7 @@ no dataflow, not that the hierarchy stops early.
   count over both double-counts that read. The detail path also stops at
   the function's return net, which has no arc onward to the target.
 * A macro-assembled reference spans two buffers and cannot be recovered as
-  one span; it is counted (`meta` external tally), not stored.
+  one span; it is counted (the seal's external tally), not stored.
 * Statements slang marks bad take their enclosing block out of the walk;
   `empty_procedure_count` says how often, and the diagnostics say why.
 

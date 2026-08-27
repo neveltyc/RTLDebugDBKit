@@ -36,38 +36,17 @@
 // which is what makes a stale view a caught error rather than a consumer's
 // surprise.
 R"SQL(
--- The meta table pivoted to one fixed row, so "which schema, which status" is
--- one SELECT with no key-value handling. Counts are CAST so a consumer gets
--- integers, not the TEXT the key-value table stores. The view only reshapes;
--- required-key enforcement stays in the verifier.
+-- The seal. `db_info` is already one typed row, so this is a projection: the
+-- contract publishes v_ names, and a consumer should not have to know the
+-- table is keyed on a constant id.
 CREATE VIEW v_db_info AS
 SELECT
-    CAST(MAX(CASE WHEN key = 'schema_version'
-                  THEN value END) AS INTEGER) AS schema_version,
-    MAX(CASE WHEN key = 'tool'                  THEN value END) AS tool,
-    MAX(CASE WHEN key = 'tool_version'          THEN value END) AS tool_version,
-    MAX(CASE WHEN key = 'slang_version'         THEN value END) AS slang_version,
-    MAX(CASE WHEN key = 'producer_revision'     THEN value END) AS producer_revision,
-    MAX(CASE WHEN key = 'top'                   THEN value END) AS top,
-    MAX(CASE WHEN key = 'analysis_status'       THEN value END) AS analysis_status,
-    CAST(MAX(CASE WHEN key = 'error_count'
-                  THEN value END) AS INTEGER) AS error_count,
-    CAST(MAX(CASE WHEN key = 'unresolved_count'
-                  THEN value END) AS INTEGER) AS unresolved_count,
-    CAST(MAX(CASE WHEN key = 'empty_procedure_count'
-                  THEN value END) AS INTEGER) AS empty_procedure_count,
-    CAST(MAX(CASE WHEN key = 'duplicate_path_count'
-                  THEN value END) AS INTEGER) AS duplicate_path_count,
-    CAST(MAX(CASE WHEN key = 'recursion_count'
-                  THEN value END) AS INTEGER) AS recursion_count,
-    CAST(MAX(CASE WHEN key = 'truncated_call_count'
-                  THEN value END) AS INTEGER) AS truncated_call_count,
-    CAST(MAX(CASE WHEN key = 'checker_inst_count'
-                  THEN value END) AS INTEGER) AS checker_inst_count,
-    CAST(MAX(CASE WHEN key = 'unanalysed_inst_count'
-                  THEN value END) AS INTEGER) AS unanalysed_inst_count,
-    MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest
-FROM meta;
+    schema_version, tool, tool_version, slang_version, producer_revision,
+    top, analysis_status, error_count, unresolved_count,
+    empty_procedure_count, duplicate_path_count, recursion_count,
+    truncated_call_count, checker_inst_count, unanalysed_inst_count,
+    config_digest
+FROM db_info;
 
 -- One row per tree_node. The subtype columns are NULL by node_kind, and that
 -- is the contract: root/instance/unresolved have inst_id (and module_id

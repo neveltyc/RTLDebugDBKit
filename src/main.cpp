@@ -809,22 +809,6 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
                               size_t numErrors, bool fatal) {
     designdb::Stats stats;
     designdb::Writer writer(tmpPath, opt.checkConstraints);
-    writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
-    writer.setMeta("tool", kToolName);
-    // The *elaborated* tops, not the --top argument: slang picks tops even
-    // when none is asked for, and a consumer mounting the database against
-    // a waveform needs the name either way. Space-separated when the design
-    // elaborates several -- the case that previously wrote nothing at all.
-    {
-        std::string tops;
-        for (auto inst : compilation.getRoot().topInstances) {
-            if (!tops.empty())
-                tops += ' ';
-            tops += inst->name;
-        }
-        if (!tops.empty())
-            writer.setMeta("top", tops);
-    }
     // Every buffer the source manager actually opened, not the list that
     // was asked for. That covers globs after expansion and, more to the
     // point, headers pulled in by `include -- a `define changed in one of
@@ -874,46 +858,56 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
 
     { Phase p("index+views", opt.timing); writer.finish(); }
 
-    // Status and versions are written after finish() so the data and
-    // indexes are complete before the meta seal lands.  setMeta()
-    // operates outside the batch transaction, so it works after
-    // finish(); and the atomic rename in the caller means the consumer
-    // never sees an intermediate state regardless -- this ordering is an
-    // extra defence so that a reader of the temp file can tell whether
-    // the export ran to completion.
-    writer.setMeta("analysis_status", analysisStatusOf(stats, numErrors, fatal));
-    writer.setMeta("error_count", std::to_string(numErrors));
-    writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
-    writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
-    writer.setMeta("duplicate_path_count", std::to_string(stats.duplicatePaths));
-    // Three counts that had no key, and one of them is the reason the other
-    // two got one: a recursive hierarchy is stamped one level deep and the
-    // rest of the tree is simply absent, which `hierarchy_only` does not say
-    // -- it says there is no dataflow, not that the tree is a PREFIX. Held
-    // only on stderr, `-q` silenced it, and two databases of one design, one
-    // cut and one whole, read alike to anyone holding the files.
-    //
-    // `truncated_call_count` and `unanalysed_inst_count` come with it because
-    // both choose `partial` above while every published count is zero, which
-    // leaves a consumer told the export is incomplete and given nothing to
+    // The seal is written after finish() so the data and the indexes are
+    // complete before the row that says the export ran to completion exists.
+    // It lands in ONE statement, outside the batch transaction: the atomic
+    // rename in the caller means a consumer never sees an intermediate state
+    // regardless, and this ordering is the extra defence that lets a reader
+    // of the temp file tell a finished export from an abandoned one.
+    designdb::DbInfoRow info;
+    info.schemaVersion = designdb::SchemaVersion;
+    info.tool = kToolName;
+    info.toolVersion = RTLDESIGNDB_VERSION;
+    info.slangVersion = RTLDESIGNDB_SLANG_TAG;
+    // Which build produced this, at commit granularity. `tool_version` alone
+    // cannot answer it: the edge dedup key and the seal both changed while
+    // the version string stayed 0.1.0, so two databases agreeing on
+    // tool_version, slang_version and config_digest could still have been
+    // written by exporters that disagree.
+    info.producerRevision = RTLDESIGNDB_PRODUCER_REVISION;
+    // The *elaborated* tops, not the --top argument: slang picks tops even
+    // when none is asked for, and a consumer mounting the database against a
+    // waveform needs the name either way. Space-separated when the design
+    // elaborates several; empty when it elaborates none, which the column
+    // holds as NULL.
+    for (auto inst : compilation.getRoot().topInstances) {
+        if (!info.top.empty())
+            info.top += ' ';
+        info.top += inst->name;
+    }
+    info.analysisStatus = analysisStatusOf(stats, numErrors, fatal);
+    info.errorCount = int64_t(numErrors);
+    info.unresolvedCount = stats.unresolved;
+    info.emptyProcedureCount = stats.emptyProcedures;
+    info.duplicatePathCount = stats.duplicatePaths;
+    // A recursive hierarchy is stamped one level deep and the rest of the
+    // tree is simply absent, which `hierarchy_only` does not say -- it says
+    // there is no dataflow, not that the tree is a PREFIX. On stderr alone
+    // `-q` silenced it, and two databases of one design, one cut and one
+    // whole, read alike to anyone holding the files.
+    info.recursionCount = stats.recursiveInstances;
+    // These two choose `partial` while every other count is zero, so without
+    // them a consumer is told the export is incomplete and given nothing to
     // look at. Since v5 the status has had to agree with the counts beside
-    // it; these are the counts that were missing from beside it.
-    writer.setMeta("recursion_count", std::to_string(stats.recursiveInstances));
-    writer.setMeta("truncated_call_count", std::to_string(stats.truncatedCalls));
-    writer.setMeta("unanalysed_inst_count", std::to_string(stats.unanalysedInsts));
-    // Not a cause of `partial`: a checker is a construct this tool does
-    // not model, not a walk that fell short. It is published so its
-    // absence can be read rather than guessed at.
-    writer.setMeta("checker_inst_count", std::to_string(stats.checkerInsts));
-    writer.setMeta("tool_version", RTLDESIGNDB_VERSION);
-    writer.setMeta("slang_version", RTLDESIGNDB_SLANG_TAG);
-    // Which build produced this, at commit granularity. `tool_version`
-    // alone cannot answer it: the edge dedup key and the meta seal both
-    // changed while the version string stayed 0.1.0, so two databases
-    // agreeing on tool_version, slang_version and config_digest could
-    // still have been written by exporters that disagree.
-    writer.setMeta("producer_revision", RTLDESIGNDB_PRODUCER_REVISION);
-    writer.setMeta("config_digest", configDigest(opt, compilation));
+    // it, and since v20 the schema holds that agreement.
+    info.truncatedCallCount = stats.truncatedCalls;
+    info.unanalysedInstCount = stats.unanalysedInsts;
+    // Not a cause of `partial`: a checker is a construct this tool does not
+    // model, not a walk that fell short. Published so its absence can be read
+    // rather than guessed at.
+    info.checkerInstCount = stats.checkerInsts;
+    info.configDigest = configDigest(opt, compilation);
+    writer.setDbInfo(info);
 
     return stats;
 }
