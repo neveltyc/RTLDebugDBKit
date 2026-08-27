@@ -642,7 +642,9 @@ CREATE TABLE hier_ref(
     branch_id        INTEGER REFERENCES branch(id),
     path             TEXT NOT NULL,
     access           TEXT NOT NULL /*!*/CHECK(access IN ('read','write','connect'))/*!*/,
-    resolved_inst_id INTEGER REFERENCES inst(id),
+    -- The instance is the net's (`net.inst_id`), not a column of its own: a
+    -- second spelling of one answer is a pair that can disagree, and twice
+    -- did. `v_hier_ref` still publishes it, off the net row it already joins.
     resolved_net_id  INTEGER REFERENCES net(id),
     lo               INTEGER,
     hi               INTEGER,

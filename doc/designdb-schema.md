@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 19. The version is the *consumption contract*, not the DDL: a
+Schema version 20. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
@@ -121,7 +121,8 @@ flowchart LR
 
 `net_dep` also carries the provenance columns `assign_operand_id`,
 `stmt_target_id` and `expr_ref_id` (the local reference each end came from);
-`hier_ref` carries `resolved_inst_id` beside `resolved_net_id`. Dashed
+`hier_ref` carries `resolved_net_id`, and the instance a resolved reference
+landed in is that net's (`net.inst_id`), published on `v_hier_ref`. Dashed
 edges are nullable references (the key is absent for rows the relationship
 does not apply to); solid edges are always present.
 
@@ -150,7 +151,7 @@ does not apply to); solid edges are always present.
 | | `expr_ref` | one non-operand read, classified by role | `stmt_id → stmt`, `net_id → net`, `branch_id → branch` |
 | | `proc_event` | one edge event triggered or waited on | `proc_id → proc`, `stmt_id → stmt`, `net_id → net` |
 | dataflow | `net_dep` | one net-to-net dependency occurrence | `src_net_id`/`tgt_net_id → net`, `stmt_id → stmt`, `prim_id → prim`, `call_site_id → call_site`, `assign_operand_id`, `stmt_target_id`, `expr_ref_id`, `src_hier_ref_id`/`tgt_hier_ref_id → hier_ref` |
-| boundary | `hier_ref` | one reference that leaves its instance | `inst_id`/`resolved_inst_id → inst`, `stmt_id → stmt`, `branch_id → branch`, `resolved_net_id → net` |
+| boundary | `hier_ref` | one reference that leaves its instance | `inst_id → inst`, `stmt_id → stmt`, `branch_id → branch`, `resolved_net_id → net` |
 
 The DDL in `src/sql/Schema.inc` carries the authoritative per-column comments;
 this file states the semantics a consumer builds on. The columns of each
@@ -526,8 +527,10 @@ The range is the one the RTL spells, not the one a dependency uses.
 while the two dependencies through it carry `[7:4]` and `[3:0]` in
 `net_dep` — where a range describes a particular dependency rather than
 the reference itself. Because an occurrence knows its place in the
-hierarchy, `resolved_inst_id` and `resolved_net_id` name the actual rows
-when the export can replay the reference —
+hierarchy, `resolved_net_id` names the actual net when the export can replay
+the reference — and the instance it landed in is that net's, which
+`v_hier_ref` publishes as `resolved_inst_id` so the question costs no join
+of the consumer's own —
 
 * downward (`u_cnt.cnt`): resolved, per occurrence;
 * absolute paths — anchored at `$root` — resolved from the design root, so
@@ -550,7 +553,7 @@ when the export can replay the reference —
   that is selected (`u_arr[2].x` seen from above) or that anchors on a
   generate block is not searched for, and stays NULL.
 
-NULL `resolved_*` means not resolved here. A dependency whose source went
+A NULL `resolved_net_id` means not resolved here. A dependency whose source went
 through an unresolved reference is still written and surfaces in `v_driver`
 as `'external'`, naming this row.
 
@@ -951,7 +954,8 @@ is_exact, file_path, src_path, src_line, src_col`. The target of the four
 this view spells three different things *path*: the reference, the file as
 the filelist wrote it, and the file slang read. `resolved_*` are NULL when
 the reference did not resolve here, never a fabricated object;
-`resolved_net_name` is non-NULL exactly when `resolved_net_id` is. A point
+`resolved_inst_id` and `resolved_net_name` are the resolved net's own
+instance and name, so all three are non-NULL exactly together. A point
 query by `resolved_net_id` seeks — "who names this net from outside" is an
 access path, not a scan.
 

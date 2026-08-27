@@ -1129,7 +1129,7 @@ SELECT
     h.stmt_id           AS stmt_id,
     h.path              AS ref_path,
     h.access            AS access,
-    h.resolved_inst_id  AS resolved_inst_id,
+    rn.inst_id          AS resolved_inst_id,
     h.resolved_net_id   AS resolved_net_id,
     rn.name             AS resolved_net_name,
     h.lo                AS lo,

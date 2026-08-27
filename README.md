@@ -123,7 +123,7 @@ granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v19:
+Release build, macOS arm64, against public designs, schema v20:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|

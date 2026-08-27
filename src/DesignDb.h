@@ -598,7 +598,18 @@ namespace designdb {
 /// carried no level at all. A statement-level event control inside a branch
 /// records its gating like every other statement kind; `if (en) @(posedge
 /// clk);` recorded nothing of en.
-inline constexpr int SchemaVersion = 19;
+///
+/// v20 removes what the schema was maintaining by checking rather than by
+/// construction. `hier_ref.resolved_inst_id` is the first of them: it held
+/// `net.inst_id` of the net beside it -- an equality the verifier has
+/// asserted since v10 -- so the pair could disagree, and twice did, once
+/// where a route reached an occurrence of a different module and left the
+/// instance named with no net, once where it named a generate level that has
+/// no `inst` row at all. A resolved reference now names a net, and the net
+/// names the instance. `v_hier_ref` publishes `resolved_inst_id` unchanged,
+/// off the net row it was already joining for `resolved_net_name`, so a
+/// consumer reading the view sees nothing move.
+inline constexpr int SchemaVersion = 20;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -903,7 +914,6 @@ struct HierRefRow {
     int64_t branchId = 0;         // set only on a branch condition; 0 = NULL
     std::string path;             // as written, normalised
     std::string access;           // Access's word
-    int64_t resolvedInstId = 0;   // 0 = not resolved to an object in this export
     int64_t resolvedNetId = 0;
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;

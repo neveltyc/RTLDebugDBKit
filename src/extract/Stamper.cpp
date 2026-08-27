@@ -810,8 +810,8 @@ private:
                     // Not a tree descent -- a package is not under a normal
                     // parent, and its path uses `::`. Look it up directly and
                     // resolve the member against its own net map; node stays
-                    // 0 so the generic block below is skipped, and the member
-                    // has to be there for either column to be written.
+                    // 0 so the generic block below is skipped, and the
+                    // member has to be there for the row to resolve at all.
                     if (ref.segs.empty())
                         break;
                     auto pit = packageByName.find(ref.segs.front());
@@ -820,7 +820,6 @@ private:
                     auto nit = pit->second.netByName.find(ref.netName);
                     if (nit == pit->second.netByName.end())
                         break;
-                    row.resolvedInstId = pit->second.nodeId;
                     row.resolvedNetId = nit->second;
                     resolvedNet.emplace(row.id, row.resolvedNetId);
                     break;
@@ -828,14 +827,12 @@ private:
                 default:
                     break;
             }
-            // A route answers with BOTH resolved columns or with neither.
-            // An instance without a net names where the reference landed and
-            // not what it landed on, which is a third state consumers written
-            // against "resolved or NULL" do not have -- and it is what a
-            // route reaching an occurrence of a DIFFERENT module leaves
-            // behind, since the net it wants is not among that module's.
+            // A route answers with the net it reached or with nothing. The
+            // instance is the net's own (`net.inst_id`), so a route that
+            // reaches an occurrence of a DIFFERENT module -- whose nets do
+            // not include the one wanted -- says nothing rather than naming
+            // where it landed without saying what it landed on.
             if (const int64_t net = netAt(node, ref.netName)) {
-                row.resolvedInstId = node;
                 row.resolvedNetId = net;
                 resolvedNet.emplace(row.id, net);
             }

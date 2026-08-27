@@ -121,11 +121,8 @@ report["deps_without_source"] = {
 # cross-hierarchy structure a consumer must resolve by hand.
 hrefs = report["rows"]["hier_ref"]
 resolved = scalar("SELECT count(*) FROM hier_ref WHERE resolved_net_id IS NOT NULL")
-inst_only = scalar("""SELECT count(*) FROM hier_ref
-                      WHERE resolved_inst_id IS NOT NULL AND resolved_net_id IS NULL""")
 report["hier_ref_resolution"] = {
-    "to_net": resolved, "to_instance_only": inst_only, "of": hrefs,
-    "pct_to_net": share(resolved, hrefs)}
+    "to_net": resolved, "of": hrefs, "pct_to_net": share(resolved, hrefs)}
 
 # Nets with no driver of any kind -- no dependency targets them, no
 # crossing feeds them, and they are not a design input. The boundary nets
@@ -204,7 +201,7 @@ pc = report["coarse_conn_mapping"]
 print(f"  at boundaries    {pc['n']:,} of {pc['of']:,} net ties ({pc['pct']}%)")
 h = report["hier_ref_resolution"]
 print(f"references out     {h['to_net']:,} of {h['of']:,} resolved to a net "
-      f"({h['pct_to_net']}%), {h['to_instance_only']:,} to an instance only")
+      f"({h['pct_to_net']}%)")
 u = report["undriven_nets"]
 print(f"undriven internal  {u['internal']:,} of {u['of']:,} nets "
       f"({u['pct_internal']}%)")

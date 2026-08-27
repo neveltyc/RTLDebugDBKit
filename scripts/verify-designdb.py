@@ -180,7 +180,7 @@ except sqlite3.Error as e:
     sys.exit(f"error: cannot read {db_path}: {e}")
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "19"
+SCHEMA_VERSION = "20"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
@@ -991,17 +991,6 @@ for tbl in ("term_map", "net_conn"):
 
 # -------------------------------------------------------------- hier_ref
 check(one("""
-    SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
-    WHERE h.resolved_inst_id IS NULL OR n.inst_id != h.resolved_inst_id""") == 0,
-      "a resolved net lies inside its resolved instance")
-# The two resolved columns answer together or not at all. An instance
-# without a net names where the reference landed and not what it landed on,
-# which is a third state for consumers written against "resolved or NULL".
-check(one("""
-    SELECT count(*) FROM hier_ref
-    WHERE (resolved_inst_id IS NULL) != (resolved_net_id IS NULL)""") == 0,
-      "a reference resolves to both halves or to neither")
-check(one("""
     SELECT count(*) FROM net_conn c JOIN hier_ref h ON h.id = c.outer_hier_ref_id
     WHERE h.access != 'connect'""") == 0,
       "a connection's outward tie is access='connect'")
@@ -1530,15 +1519,17 @@ check(one("""
     WHERE (resolved_net_name IS NOT NULL) != (resolved_net_id IS NOT NULL)""") == 0,
       "v_hier_ref names a resolved net exactly when there is one")
 # The rest is projection, and projection is where a pair of columns quietly
-# swaps. Nothing else in this file reads the view's own range columns or
-# resolved_inst_id, so without this they are pinned by name and position and
-# by nothing about their value.
+# swaps. Nothing else in this file reads the view's own range columns, so
+# without this they are pinned by name and position and by nothing about
+# their value -- and `resolved_inst_id` is no longer a column at all, so the
+# view's derivation of it is pinned here too.
 check(one("""
     SELECT count(*) FROM v_hier_ref v JOIN hier_ref h ON h.id = v.hier_ref_id
     WHERE v.inst_id IS NOT h.inst_id OR v.stmt_id IS NOT h.stmt_id
        OR v.ref_path IS NOT h.path OR v.access IS NOT h.access
-       OR v.resolved_inst_id IS NOT h.resolved_inst_id
        OR v.resolved_net_id IS NOT h.resolved_net_id
+       OR v.resolved_inst_id IS NOT (SELECT n.inst_id FROM net n
+                                     WHERE n.id = h.resolved_net_id)
        OR v.lo IS NOT h.lo OR v.hi IS NOT h.hi
        OR v.is_exact IS NOT h.is_exact
        OR v.src_line IS NOT h.line OR v.src_col IS NOT h.col""") == 0,
@@ -1763,7 +1754,7 @@ if mode == "constructs":
     check(one("""
         SELECT count(*) FROM hier_ref h
         JOIN net n ON n.id = h.resolved_net_id
-        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='u_cnt.cnt' AND n.name='cnt' AND t.name='u_cnt'""") >= 1,
           "the downward XMR resolves to the child's net")
     check(one("""
@@ -1885,8 +1876,9 @@ if mode == "modport":
     check(one("""
         SELECT count(*) FROM v_driver v JOIN net n ON n.id = v.signal_net_id
         WHERE n.name = 'data' AND v.driver_kind = 'constant'
-          AND v.signal_inst_id = (SELECT resolved_inst_id FROM hier_ref
-                                  WHERE path = 'p.d')""") == 1,
+          AND v.signal_inst_id = (SELECT n.inst_id FROM hier_ref h
+                                  JOIN net n ON n.id = h.resolved_net_id
+                                  WHERE h.path = 'p.d')""") == 1,
           "and the renamed net is driven through it")
     # The select form keeps the port's own geometry, which is not the
     # net's: it stays unresolved rather than claiming bits of `data` the
@@ -1911,8 +1903,8 @@ if mode == "interfaces":
                   ordinal, inst) == 1,
               f"the array port's segment {ordinal} binds {inst}")
     check(one("""
-        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
-        JOIN net n ON n.id = h.resolved_net_id
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path = 'bus_arr[0].vld' AND t.name = 'barr[0]'
           AND n.name = 'vld'""") == 1,
           "and a member reference through it lands on that element")
@@ -1958,8 +1950,8 @@ if mode == "interfaces":
                   ordinal, inst) == 1,
               f"the two-dimensional port's segment {ordinal} binds {inst}")
     check(one("""
-        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
-        JOIN net n ON n.id = h.resolved_net_id
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path = 'grid[1][0].data' AND t.name = 'bgrid[1][0]'
           AND n.name = 'data'""") == 1,
           "and a reference through it agrees with the connection side")
@@ -1973,7 +1965,7 @@ if mode == "interfaces":
         check(one("""
             SELECT count(*) FROM hier_ref h
             JOIN net n ON n.id = h.resolved_net_id
-            JOIN tree_node t ON t.id = h.resolved_inst_id
+            JOIN tree_node t ON t.id = n.inst_id
             WHERE h.path = ? AND h.access = ? AND n.name = ?
               AND t.name = 'bus3'""", path, access, net) == 1,
               f"the interface task's {path} resolves to the bound instance")
@@ -1988,9 +1980,8 @@ if mode == "interfaces":
     # instance it cannot name a net in.
     check(one("""
         SELECT count(*) FROM hier_ref
-        WHERE path = 'x' AND resolved_inst_id IS NULL
-          AND resolved_net_id IS NULL""") >= 1,
-          "while its formal resolves to neither half")
+        WHERE path = 'x' AND resolved_net_id IS NULL""") >= 1,
+          "while its formal does not resolve at all")
     # Two terminals of one module reaching one interface: the call does not
     # say which port it went through, and the occurrence that binds them
     # apart would take the write to the wrong instance. Unresolved from
@@ -1999,8 +1990,8 @@ if mode == "interfaces":
         SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
         JOIN module m ON m.id = i.module_id
         WHERE m.name = 'stamp_pair' AND h.path = 'data'
-          AND h.resolved_inst_id IS NOT NULL""") == 0,
-          "an ambiguous interface binding resolves to no instance at all")
+          AND h.resolved_net_id IS NOT NULL""") == 0,
+          "an ambiguous interface binding resolves to nothing at all")
     check(one("""
         SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
         JOIN module m ON m.id = i.module_id
@@ -3079,8 +3070,8 @@ if mode == "rootref":
           "one absolute path resolves to one net from every occurrence")
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='$root.rootref.u_leaf.q'
           AND t.name='u_leaf' AND n.name='q'""") == 3,
           "and it names u_leaf.q -- the write and both reads")
@@ -3088,8 +3079,8 @@ if mode == "rootref":
     # net of the root instance.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='$root.rootref.own' AND t.name='rootref'
           AND n.name='own'""") == 2,
           "a one-segment absolute path resolves to the root's own net")
@@ -3098,8 +3089,8 @@ if mode == "rootref":
     # readers answer with the one net the source names.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='rootref.u_leaf.q' AND t.name='u_leaf' AND n.name='q'
         """) == 2,
           "an upward path resolves from both occurrences")
@@ -3127,7 +3118,8 @@ if mode == "rootref":
     # does follow the occurrence, is the control.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node d ON d.id = n.inst_id
         JOIN tree_node p ON p.id = d.parent_node_id
         WHERE h.path='$root.rootref.u_below_a.deep.q'
           AND d.name='deep' AND p.name='u_below_a'""") == 2,
@@ -3135,7 +3127,8 @@ if mode == "rootref":
           "from both occurrences")
     check(one("""
         SELECT count(DISTINCT p.name) FROM hier_ref h
-        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node d ON d.id = n.inst_id
         JOIN tree_node p ON p.id = d.parent_node_id
         WHERE h.path='deep.q'""") == 2,
           "while the local path beside it follows the occurrence")
@@ -3565,18 +3558,18 @@ if mode == "external":
           "and both occurrences are gated by the one net the source names")
     # What the per-occurrence search finds need not be the KIND of thing the
     # analysed body found: `blk` is an instance above one occurrence and a
-    # generate block above the other. resolved_inst_id is a foreign key into
-    # inst, so the second has nothing to name -- and naming the generate node
-    # anyway is what the foreign_key_check above would have caught.
+    # generate block above the other. A generate level holds no nets, so the
+    # second resolves to nothing -- where a separate instance column could
+    # have named the level itself and broken its own foreign key.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='blk.sig' AND t.node_kind='instance' AND n.name='sig'""") == 1,
           "an upward anchor that finds an instance resolves")
     check(one("""
         SELECT count(*) FROM hier_ref
-        WHERE path='blk.sig' AND resolved_inst_id IS NULL""") == 1,
+        WHERE path='blk.sig' AND resolved_net_id IS NULL""") == 1,
           "and one that finds a generate block stays NULL")
     # A $unit object is what still leaves the model once packages and upward
     # names resolve: nothing stamps the compilation unit, so the dependency
@@ -3868,8 +3861,8 @@ if mode == "incomplete":
           "an upward name resolves where the surroundings hold the net")
     check(one("""
         SELECT count(*) FROM hier_ref
-        WHERE path='anchor.sig' AND resolved_inst_id IS NULL""") == 1,
-          "and answers with neither half where they do not")
+        WHERE path='anchor.sig' AND resolved_net_id IS NULL""") == 1,
+          "and does not resolve where they do not")
     check(one("""
         SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
         WHERE t.node_kind='unresolved' AND i.unresolved_def='ghost'""") == 1,

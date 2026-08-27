@@ -268,9 +268,9 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetDep]);
         prepare("INSERT INTO hier_ref(id, inst_id, stmt_id, branch_id, path,"
-                " access, resolved_inst_id, resolved_net_id, lo, hi, is_exact,"
+                " access, resolved_net_id, lo, hi, is_exact,"
                 " file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsHierRef]);
         begin();
     }
@@ -794,10 +794,9 @@ void Writer::addHierRef(const HierRefRow& r) {
                       SQLITE_STATIC);
     sqlite3_bind_text(s, 6, r.access.c_str(), static_cast<int>(r.access.size()),
                       SQLITE_STATIC);
-    bindOptId(s, 7, r.resolvedInstId);
-    bindOptId(s, 8, r.resolvedNetId);
-    bindRange(s, 9, r.bits, r.exact);
-    bindLoc(s, 12, r.fileId, r.line, r.column);
+    bindOptId(s, 7, r.resolvedNetId);
+    bindRange(s, 8, r.bits, r.exact);
+    bindLoc(s, 11, r.fileId, r.line, r.column);
     step(s);
     bumped();
 }
