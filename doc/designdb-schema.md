@@ -1064,12 +1064,13 @@ ordinal, sequence, signature, width).
   execution order inside a procedure. Neither is an identity.
 * Every id is issued by the exporter in one pass; 0 is never an id. The
   REFERENCES clauses are enforced by the verifier's `foreign_key_check`,
-  not per-insert — and the enum CHECK clauses are, by default, not in the
-  shipped file at all: a string IN-list evaluated per row costs more than
-  the rest of the insert, so the exporter writes them only under
-  `--check-constraints`, and the verifier re-derives every domain from the
-  finished file either way. The value domains are contract and are listed
-  in this document; their CHECK spelling in the file is not.
+  not per-insert, and the enum domains are enforced there too rather than
+  by a CHECK: a string IN-list evaluated per row costs more than the rest
+  of the insert, and the verifier covers the same domains plus the
+  NULL-required combinations a CHECK cannot express. The value domains are
+  contract and are listed in this document. `db_info` is the exception that
+  keeps its CHECKs — the per-row cost that rules them out elsewhere is one
+  row there.
 
 ## Against the standard object model
 

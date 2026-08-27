@@ -97,13 +97,6 @@ jobs:
         run: |
           ./build/rtl-designdb examples/basic/top.sv --top top -o design.db
           python3 scripts/verify-designdb.py design.db
-          # Every default export strips the CHECK clauses, so this is the one
-          # place the kept-CHECK DDL ever builds a table: without it a typo
-          # inside a CHECK expression ships and only a --check-constraints
-          # user finds it.
-          ./build/rtl-designdb examples/basic/top.sv --top top \
-            --check-constraints -o design-checked.db
-          python3 scripts/verify-designdb.py design-checked.db
           # 0, 3 and 4 all wrote a database -- complete, partial and
           # hierarchy only -- and two fixtures exist to produce the last two.
           for mode in $(python3 scripts/verify-designdb.py --list-modes); do
@@ -132,6 +125,42 @@ jobs:
             echo "the verifier accepted a database that is not there"; exit 1
           fi
           [ ! -e no-such.db ] || { echo "the verifier created it"; exit 1; }
+          # A log the caller NAMED is a contract: a pipeline step greps it
+          # next, and an absent file reads there as "no errors". So an
+          # unopenable --log stops the run before the export costs anything
+          # or replaces the database a previous run left, while the derived
+          # path only warns -- the database is the product.
+          ./build/rtl-designdb examples/basic/top.sv --top top -o keep.db
+          ./build/rtl-designdb examples/basic/top.sv --top top \
+            --log no-such-dir/x.log -o keep.db && rc=0 || rc=$?
+          [ "$rc" = 2 ] || { echo "an unopenable --log returned $rc, not 2"; exit 1; }
+          [ -s keep.db ] || { echo "it destroyed the previous export"; exit 1; }
+          # Naming a log and asking for none is a contradiction, whichever
+          # order a wrapper script appended them in.
+          for pair in "--log l.log --nolog" "--nolog --log l.log"; do
+            ./build/rtl-designdb examples/basic/top.sv --top top $pair \
+              -o both.db && rc=0 || rc=$?
+            [ "$rc" = 2 ] || { echo "--log with --nolog returned $rc, not 2"; exit 1; }
+            [ ! -e both.db ] || { echo "a refused option pair still exported"; exit 1; }
+          done
+          # An empty path is what an unset variable expands to, and it is
+          # the one value that would be indistinguishable from not passing
+          # --log at all: taken as absent it would quietly write the default
+          # log, and quietly write none alongside --nolog, reporting success
+          # both times.
+          for opts in '--log ""' '--log "" --nolog'; do
+            eval ./build/rtl-designdb examples/basic/top.sv --top top $opts \
+              -o empty.db && rc=0 || rc=$?
+            [ "$rc" = 2 ] || { echo "[$opts] returned $rc, not 2"; exit 1; }
+            [ ! -e empty.db ] || { echo "[$opts] still exported"; exit 1; }
+          done
+          # --log redirects; nothing is left at the default spelling.
+          rm -f rtldbgdb-elab.log
+          ./build/rtl-designdb examples/constructs/incomplete.sv \
+            --log named.log -o named.db || rc=$?
+          grep -q '^slang  *error:' named.log \
+            || { echo "--log wrote no diagnostics"; exit 1; }
+          [ ! -e rtldbgdb-elab.log ] || { echo "--log left a default log too"; exit 1; }
           # The CLI itself, which the constructs family never exercises: two
           # files sharing one compilation unit (so a macro defined in the first
           # reaches the second), a header found only through +incdir+, a define

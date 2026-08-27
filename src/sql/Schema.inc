@@ -18,8 +18,11 @@
 //     correspondence BETWEEN two ends, never either end's own range.
 //   * Kinds and directions are their words (`'input'`, `'constant'`,
 //     `'always_ff'`), never integer codes. Three values never deserved the
-//     decode table every consumer had to carry; CHECK constraints hold the
-//     closed sets.
+//     decode table every consumer had to carry. The closed sets are listed
+//     in `doc/designdb-schema.md` and enforced by verify-designdb.py's
+//     DOMAINS, not by a per-row CHECK: SQLite evaluates a string IN-list
+//     for every row, and the verifier covers the same domains plus the
+//     NULL-required combinations a CHECK cannot express.
 //   * `ordinal` is position in a declaration or extraction list; `sequence`
 //     is execution order inside a procedure. Neither is an identity.
 //
@@ -43,8 +46,8 @@ R"SQL(
 -- -- presence was the verifier's to check, the counts were TEXT a view had to
 -- CAST, and a mistyped key became a seventeenth fact instead of an error.
 --
--- The CHECKs here carry no stripping markers: the marked ones are stripped
--- because SQLite evaluates them per row, and this table has one.
+-- This table keeps its CHECKs where the enum columns elsewhere do not: the
+-- per-row cost that rules them out is one row here.
 CREATE TABLE db_info(
     id                    INTEGER PRIMARY KEY CHECK(id = 1),
     schema_version        INTEGER NOT NULL,
@@ -108,8 +111,7 @@ CREATE TABLE data_type(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
 CREATE TABLE module(
     id              INTEGER PRIMARY KEY,
     name            TEXT NOT NULL,
-    def_kind        TEXT NOT NULL
-        /*!*/CHECK(def_kind IN ('module','interface','program','package'))/*!*/,
+    def_kind        TEXT NOT NULL,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
     col             INTEGER,
@@ -138,8 +140,7 @@ CREATE TABLE tree_node(
     id             INTEGER PRIMARY KEY,
     parent_node_id INTEGER REFERENCES tree_node(id),
     name           TEXT NOT NULL,
-    node_kind      TEXT NOT NULL
-        /*!*/CHECK(node_kind IN ('root','instance','generate','primitive','unresolved','package'))/*!*/,
+    node_kind      TEXT NOT NULL,
     ordinal        INTEGER NOT NULL);
 
 -- One module instance occurrence. `id` IS the tree_node id -- one id space
@@ -185,7 +186,7 @@ CREATE TABLE inst_param(
 CREATE TABLE prim(
     id              INTEGER PRIMARY KEY REFERENCES tree_node(id),
     inst_id         INTEGER NOT NULL REFERENCES inst(id),
-    prim_kind       TEXT NOT NULL /*!*/CHECK(prim_kind IN ('gate','switch','udp'))/*!*/,
+    prim_kind       TEXT NOT NULL,
     def_name        TEXT NOT NULL,
     file_id         INTEGER REFERENCES file(id),
     line            INTEGER,
@@ -239,8 +240,8 @@ CREATE TABLE term(
     id            INTEGER PRIMARY KEY,
     inst_id       INTEGER NOT NULL REFERENCES inst(id),
     name          TEXT NOT NULL,
-    term_kind     TEXT NOT NULL /*!*/CHECK(term_kind IN ('signal','interface'))/*!*/,
-    direction     TEXT /*!*/CHECK(direction IN ('input','output','inout','ref'))/*!*/,
+    term_kind     TEXT NOT NULL,
+    direction     TEXT,
     data_type_id  INTEGER REFERENCES data_type(id),
     width         INTEGER,
     ordinal       INTEGER NOT NULL,
@@ -299,9 +300,7 @@ CREATE TABLE net_conn(
     outer_net_id       INTEGER REFERENCES net(id),
     term_id            INTEGER NOT NULL REFERENCES term(id),
     ordinal            INTEGER NOT NULL,
-    conn_kind          TEXT NOT NULL
-        /*!*/CHECK(conn_kind IN ('signal','constant','unconnected',
-                                  'expression_operand','interface','external_reference'))/*!*/,
+    conn_kind          TEXT NOT NULL,
     outer_lo           INTEGER,
     outer_hi           INTEGER,
     outer_exact        INTEGER CHECK(outer_exact IN (0,1)),
@@ -324,9 +323,7 @@ CREATE TABLE proc(
     id             INTEGER PRIMARY KEY,
     inst_id        INTEGER NOT NULL REFERENCES inst(id),
     scope_node_id  INTEGER NOT NULL REFERENCES tree_node(id),
-    proc_kind      TEXT NOT NULL
-        /*!*/CHECK(proc_kind IN ('always','always_ff','always_comb','always_latch',
-                                 'initial','final'))/*!*/,
+    proc_kind      TEXT NOT NULL,
     ordinal        INTEGER NOT NULL,
     file_id        INTEGER REFERENCES file(id),
     line           INTEGER,
@@ -432,15 +429,11 @@ CREATE TABLE branch(
     parent_branch_id INTEGER REFERENCES branch(id),
     depth            INTEGER NOT NULL,
     ordinal          INTEGER,
-    branch_kind      TEXT NOT NULL
-        /*!*/CHECK(branch_kind IN ('if','case','case_item','case_default',
-                                   'loop'))/*!*/,
-    sense            TEXT /*!*/CHECK(sense IN ('then','else'))/*!*/,
-    case_kind        TEXT
-        /*!*/CHECK(case_kind IN ('case','casez','casex','inside','matches'))/*!*/,
-    check_kind       TEXT
-        /*!*/CHECK(check_kind IN ('unique','unique0','priority'))/*!*/,
-    static_taken     INTEGER /*!*/CHECK(static_taken IN (0,1))/*!*/,
+    branch_kind      TEXT NOT NULL,
+    sense            TEXT,
+    case_kind        TEXT,
+    check_kind       TEXT,
+    static_taken     INTEGER,
     iter_net_id      INTEGER REFERENCES net(id),
     iter_first       INTEGER,
     iter_step        INTEGER,
@@ -541,13 +534,9 @@ CREATE TABLE stmt(
     proc_id               INTEGER REFERENCES proc(id),
     ordinal               INTEGER NOT NULL,
     sequence              INTEGER,
-    stmt_kind             TEXT NOT NULL
-        /*!*/CHECK(stmt_kind IN ('assignment','assertion','wait','call',
-                                 'system_task','event_control','alias',
-                                 'release','trigger','disable'))/*!*/,
+    stmt_kind             TEXT NOT NULL,
     construct             TEXT,
-    assign_kind           TEXT
-        /*!*/CHECK(assign_kind IN ('continuous','blocking','nonblocking'))/*!*/,
+    assign_kind           TEXT,
     delay                 TEXT,
     dropped_operand_count INTEGER NOT NULL,
     call_site_id          INTEGER REFERENCES call_site(id),
@@ -600,9 +589,7 @@ CREATE TABLE expr_ref(
     stmt_id   INTEGER NOT NULL REFERENCES stmt(id),
     ordinal   INTEGER NOT NULL,
     net_id    INTEGER NOT NULL REFERENCES net(id),
-    role      TEXT NOT NULL
-        /*!*/CHECK(role IN ('assertion','wait','event',
-                            'call_argument','system_task'))/*!*/,
+    role      TEXT NOT NULL,
     lo        INTEGER,
     hi        INTEGER,
     is_exact  INTEGER NOT NULL CHECK(is_exact IN (0,1)),
@@ -623,8 +610,8 @@ CREATE TABLE proc_event(
     proc_id      INTEGER NOT NULL REFERENCES proc(id),
     stmt_id      INTEGER REFERENCES stmt(id),
     net_id       INTEGER REFERENCES net(id),
-    event_kind   TEXT NOT NULL /*!*/CHECK(event_kind IN ('sensitivity','wait'))/*!*/,
-    edge_kind    TEXT /*!*/CHECK(edge_kind IN ('posedge','negedge','both'))/*!*/,
+    event_kind   TEXT NOT NULL,
+    edge_kind    TEXT,
     file_id      INTEGER REFERENCES file(id),
     line         INTEGER,
     col          INTEGER);
@@ -698,8 +685,7 @@ CREATE TABLE net_dep(
     prim_id            INTEGER REFERENCES prim(id),
     src_hier_ref_id    INTEGER REFERENCES hier_ref(id),
     tgt_hier_ref_id    INTEGER REFERENCES hier_ref(id),
-    dep_kind           TEXT NOT NULL
-        /*!*/CHECK(dep_kind IN ('data','control','primitive','procedure','alias'))/*!*/,
+    dep_kind           TEXT NOT NULL,
     src_lo             INTEGER,
     src_hi             INTEGER,
     src_exact          INTEGER CHECK(src_exact IN (0,1)),
@@ -729,7 +715,7 @@ CREATE TABLE hier_ref(
     stmt_id          INTEGER REFERENCES stmt(id),
     branch_id        INTEGER REFERENCES branch(id),
     path             TEXT NOT NULL,
-    access           TEXT NOT NULL /*!*/CHECK(access IN ('read','write','connect'))/*!*/,
+    access           TEXT NOT NULL,
     -- The instance is the net's (`net.inst_id`), not a column of its own: a
     -- second spelling of one answer is a pair that can disagree, and twice
     -- did. `v_hier_ref` still publishes it, off the net row it already joins.

@@ -53,23 +53,25 @@ struct Options {
     bool quiet = false;
     // 0 = off, -1 = every diagnostic, N > 0 = the first N. Unlimited is the
     // default for --diag: the counts above already say how many there are,
-    // and a cap meant "run with --diag to see them" showed a fraction of
-    // them -- on a large design, 15 errors out of 829.
+    // and a cap meant the summary sent a reader somewhere that showed a
+    // fraction of them -- on a large design, 15 errors out of 829.
     int showDiags = 0;
     bool singleUnit = false;
-    /// Write the elaboration log beside the database. On by default: a
-    /// database says what the design is, and nothing about what could not be
-    /// read to build it -- and the terminal that said so is gone by the time
-    /// anyone opens the file.
+    /// Write the elaboration log. On by default: a database says what the
+    /// design is, and nothing about what could not be read to build it --
+    /// and the terminal that said so is gone by the time anyone opens the
+    /// file.
     bool log = true;
+    /// Where to write it. Empty means beside the database, under kLogName.
+    /// An explicit path is a contract: a caller that named a file usually
+    /// greps it in the next step, so failing to open THAT is fatal where
+    /// failing to open the default one is not.
+    std::string logPath;
     /// Report how long each phase took. Which phase dominates is not
     /// guessable from the outside -- on a large design the export spends
     /// most of its time inside SQLite, not in the walk -- and knowing that
     /// is what tells an optimisation attempt where to go.
-    bool timing = false;
-    /// Keep the enum-domain CHECK clauses in the schema. Off by default:
-    /// see Writer's constructor for why.
-    bool checkConstraints = false;
+    bool timeReport = false;
 };
 
 /// Phase timer: prints on destruction so a phase is timed by scope.
@@ -91,7 +93,8 @@ struct Phase {
     }
 };
 
-/// The name every run's log is written under, beside the database.
+/// The name a run's log is written under beside the database, when --log
+/// does not name one of its own.
 constexpr const char* kLogName = "rtldbgdb-elab.log";
 
 /// The elaboration log: what the terminal said, kept.
@@ -118,9 +121,9 @@ constexpr const char* kLogName = "rtldbgdb-elab.log";
 /// what went wrong. The caret stays under the token slang put it under, the
 /// prefix being constant down the block.
 ///
-/// -q does not reach here. The terminal is a summary someone is watching; the
-/// log is the record they read afterwards, and the two are silenced by
-/// different things -- --nolog for this one.
+/// --quiet does not reach here. The terminal is a summary someone is
+/// watching; the log is the record they read afterwards, and the two are
+/// silenced by different things -- --nolog for this one.
 class ElabLog {
 public:
     ~ElabLog() {
@@ -128,20 +131,20 @@ public:
             std::fclose(file);
     }
 
-    /// Opens the log beside `output`. A log that cannot be opened is said
-    /// once and the run carries on: the database is the product, and losing
-    /// the record of an export is not a reason to lose the export.
-    void open(const std::string& output) {
-        const fs::path at = fs::path(output).parent_path() / kLogName;
-        file = std::fopen(at.string().c_str(), "w");
-        if (!file) {
-            std::fprintf(stderr, "warning: could not write %s; the export "
-                                 "continues without a log\n",
-                         at.string().c_str());
-        }
+    /// Opens the log at `path`, false when it could not be. Says nothing
+    /// either way: how bad that is depends on whether the caller named the
+    /// path or the tool derived it, and only the caller knows which.
+    bool open(const std::string& path) {
+        at = path;
+        file = std::fopen(path.c_str(), "w");
+        return file != nullptr;
     }
 
     bool active() const { return file != nullptr; }
+
+    /// Where it was opened, for a message that would otherwise name the
+    /// default spelling of a path `--log` may have moved.
+    const std::string& path() const { return at; }
 
     /// One item of one producer, however many lines it holds.
     void put(const char* producer, std::string_view severity,
@@ -186,6 +189,7 @@ private:
     }
 
     std::FILE* file = nullptr;
+    std::string at;
 };
 
 /// This tool's own producer name in the log, and the one in db_info.tool.
@@ -236,13 +240,22 @@ void finding(const Options& opt, ElabLog& log, const char* fmt, ...) {
     logged(log, !opt.quiet, text);
 }
 
-/// A failure: the run stops after it, so -q does not get to hide it.
+/// A failure: the run stops after it, so --quiet does not get to hide it.
 void failure(ElabLog& log, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     const std::string text = formatted(fmt, ap);
     va_end(ap);
     logged(log, true, text);
+}
+
+/// Where a message should send someone who wants the diagnostics themselves.
+///
+/// The log already holds every one of them, so naming it beats naming an
+/// option: `--diag` re-runs the whole export to print what the run just
+/// wrote. It is the answer only when there is no log to send them to.
+std::string diagnosticsAt(const ElabLog& log) {
+    return log.active() ? "see " + log.path() : std::string("run with --diag");
 }
 
 void usage() {
@@ -261,20 +274,22 @@ void usage() {
         "  --single-unit    compile the whole filelist as ONE compilation unit, so a\n"
         "                   leading defines file reaches every later file (VCS and\n"
         "                   Verilator behave this way; slang defaults to per-file units)\n"
-        "  -q               only report errors\n"
-        "  --timing         report how long each phase took\n"
-        "  --check-constraints  keep enum CHECK clauses in the schema (slower;\n"
-        "                   verify-designdb.py checks the same domains anyway)\n"
+        "  --quiet          only report errors\n"
+        "  --time-report    report how long each phase took\n"
         "  --diag [N]       print elaboration diagnostics (all of them; N caps it)\n"
+        "  --log <file>     write the elaboration log here instead of beside the\n"
+        "                   database (relative paths resolve against the cwd, as -o's do)\n"
         "  --nolog          do not write the elaboration log\n"
         "\n"
         "Bare paths are taken as source files.\n"
         "\n"
-        "Every run writes rtldbgdb-elab.log beside the database, one line per\n"
-        "producer and severity so it answers grep: slang's own diagnostics\n"
-        "under `slang`, this tool's findings under `rtl-designdb`, and a\n"
-        "multi-line item's continuations marked `|` where its first line has\n"
-        "`:`. -q quiets the terminal, not the log.\n"
+        "Every run writes an elaboration log — rtldbgdb-elab.log beside the\n"
+        "database unless --log names another path — one line per producer and\n"
+        "severity so it answers grep: slang's own diagnostics under `slang`,\n"
+        "this tool's findings under `rtl-designdb`, and a multi-line item's\n"
+        "continuations marked `|` where its first line has `:`. --quiet quiets\n"
+        "the terminal, not the log. A log named by --log that cannot be opened\n"
+        "stops the run; the default one only warns.\n"
         "\n"
         "exit: 0 complete, 3 partial, 4 hierarchy only (all three wrote a\n"
         "      database, and say what db_info.analysis_status says); 2 the input\n"
@@ -477,10 +492,9 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             return argv[++i];
         };
         if (a == "-h" || a == "--help") { usage(); std::exit(0); }
-        else if (a == "-q") opt.quiet = true;
+        else if (a == "--quiet") opt.quiet = true;
         else if (a == "--single-unit") opt.singleUnit = true;
-        else if (a == "--timing") opt.timing = true;
-        else if (a == "--check-constraints") opt.checkConstraints = true;
+        else if (a == "--time-report") opt.timeReport = true;
         else if (a == "--nolog") opt.log = false;
         else if (a == "--diag") {
             opt.showDiags = -1;
@@ -502,6 +516,20 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if (a == "-f" || a == "-file") { auto v = next(a.c_str()); if (!v) return false; opt.filelists.emplace_back(v); }
         else if (a == "-o")      { auto v = next("-o");      if (!v) return false; opt.output = v; }
         else if (a == "--top")   { auto v = next("--top");   if (!v) return false; opt.top = v; }
+        else if (a == "--log") {
+            auto v = next("--log");
+            if (!v)
+                return false;
+            // An empty path would be indistinguishable from not passing the
+            // option at all, so `--log "$UNSET"` would quietly write the
+            // default log and `--log "$UNSET" --nolog` would quietly write
+            // none, both reporting success.
+            if (!*v) {
+                std::fprintf(stderr, "error: --log needs a path\n");
+                return false;
+            }
+            opt.logPath = v;
+        }
         else if (a == "-I")      { auto v = next("-I");      if (!v) return false; opt.includeDirs.emplace_back(v); }
         else if (a.rfind("+define+", 0) == 0) {
             for (auto& d : splitPlus(a, "+define+")) opt.defines.push_back(d);
@@ -514,6 +542,14 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             return false;
         }
         else opt.files.push_back(a);
+    }
+    // Order-insensitive on purpose: a last-one-wins rule would make the
+    // meaning of a filelist-driven command line depend on where a wrapper
+    // script happened to append its own flag.
+    if (!opt.log && !opt.logPath.empty()) {
+        std::fprintf(stderr, "error: --log names a file and --nolog asks for "
+                             "none; pass one or the other\n");
+        return false;
     }
     return true;
 }
@@ -586,7 +622,7 @@ bool parseSources(const Options& opt, ElabLog& log, driver::SourceLoader& loader
             loader.addFiles(f);
     }
 
-    { Phase p("parse", opt.timing);
+    { Phase p("parse", opt.timeReport);
       trees = loader.loadAndParseSources(optionBag, &pool); }
 
     if (!loader.getErrors().empty()) {
@@ -651,15 +687,14 @@ DiagCounts reportDiagnostics(const Options& opt, ElabLog& log,
         // Worth saying even though warnings are usually noise: slang marks
         // the node bad for some of them, and a bad statement takes its
         // enclosing block out of the export.
-        finding(opt, log, "note: %zu elaboration warning(s); --diag shows them\n",
-                counts.warnings);
+        finding(opt, log, "note: %zu elaboration warning(s); %s\n",
+                counts.warnings, diagnosticsAt(log).c_str());
     }
     if (opt.showDiags)
         std::fputs(shown.c_str(), stderr);
     if (counts.errors) {
-        finding(opt, log,
-                "warning: %zu elaboration error(s); run with --diag to see them\n",
-                counts.errors);
+        finding(opt, log, "warning: %zu elaboration error(s); %s\n",
+                counts.errors, diagnosticsAt(log).c_str());
     }
     return counts;
 }
@@ -808,7 +843,7 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
                               SourceManager& sourceManager,
                               size_t numErrors, bool fatal) {
     designdb::Stats stats;
-    designdb::Writer writer(tmpPath, opt.checkConstraints);
+    designdb::Writer writer(tmpPath);
     // Every buffer the source manager actually opened, not the list that
     // was asked for. That covers globs after expansion and, more to the
     // point, headers pulled in by `include -- a `define changed in one of
@@ -853,10 +888,10 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
         writer.addSourceFile(path, digest);
     }
 
-    { Phase p("extract+write", opt.timing);
+    { Phase p("extract+write", opt.timeReport);
       stats = designdb::extract(compilation, analysis, writer); }
 
-    { Phase p("index+views", opt.timing); writer.finish(); }
+    { Phase p("index+views", opt.timeReport); writer.finish(); }
 
     // The seal is written after finish() so the data and the indexes are
     // complete before the row that says the export ran to completion exists.
@@ -966,8 +1001,8 @@ void reportStats(const Options& opt, ElabLog& log,
         finding(opt, log,
                 "warning: %lld procedure(s) drive a signal but yielded no "
                 "dataflow; a statement in them was rejected and its whole "
-                "block skipped -- run with --diag\n",
-                (long long)stats.emptyProcedures);
+                "block skipped -- %s\n",
+                (long long)stats.emptyProcedures, diagnosticsAt(log).c_str());
     }
     if (stats.unresolved) {
         finding(opt, log,
@@ -1009,9 +1044,9 @@ void reportStats(const Options& opt, ElabLog& log,
         finding(opt, log,
                 "warning: %lld instance(s) re-enter a module that is "
                 "already one of their own ancestors; the instantiation "
-                "is infinitely recursive, so the tree stops there -- run "
-                "with --diag\n",
-                (long long)stats.recursiveInstances);
+                "is infinitely recursive, so the tree stops there -- %s\n",
+                (long long)stats.recursiveInstances,
+                diagnosticsAt(log).c_str());
     }
     if (stats.unanalysedBodies && !stats.unanalysedInsts) {
         // Only worth saying when the templates are the whole of it. When
@@ -1040,12 +1075,31 @@ int main(int argc, char** argv) {
     Options opt;
     if (!parseArgs(argc, argv, opt))
         return ExitBadInput;
-    // Opened before anything can fail with something worth recording, and
-    // beside the database rather than beside the sources: the pair is what a
-    // consumer holds, and the log answers for the run that wrote that file.
+    // Opened before anything can fail with something worth recording, and by
+    // default beside the database rather than beside the sources: the pair is
+    // what a consumer holds, and the log answers for the run that wrote that
+    // file.
+    //
+    // A path the caller named is a contract -- a pipeline step that greps it
+    // next reads an empty result as "no errors" -- so failing to open it
+    // stops the run, here, before an export has cost anything or replaced
+    // the database a previous run left. The derived path is a convenience,
+    // and losing it is not a reason to lose the export.
     ElabLog log;
-    if (opt.log)
-        log.open(opt.output);
+    if (opt.log) {
+        const std::string at =
+            opt.logPath.empty()
+                ? (fs::path(opt.output).parent_path() / kLogName).string()
+                : opt.logPath;
+        if (!log.open(at)) {
+            if (!opt.logPath.empty()) {
+                failure(log, "error: cannot write the log %s\n", at.c_str());
+                return ExitBadInput;
+            }
+            std::fprintf(stderr, "warning: could not write %s; the export "
+                                 "continues without a log\n", at.c_str());
+        }
+    }
     for (auto& f : opt.filelists) {
         if (!readFilelist(f, opt, log))
             return finished(log, opt, ExitBadInput);
@@ -1086,7 +1140,7 @@ int main(int argc, char** argv) {
         // a syntax error is recovered from by the parser and its salvaged
         // fragments are exported, so without this a malformed source produced a
         // database indistinguishable from a correct one, silently.
-        Phase elab("elaborate", opt.timing);
+        Phase elab("elaborate", opt.timeReport);
         auto& diags = compilation.getAllDiagnostics();
         elab.stop();
         const DiagCounts counts = reportDiagnostics(opt, log, diags, sourceManager);
@@ -1105,8 +1159,9 @@ int main(int argc, char** argv) {
             finding(opt, log,
                     "warning: the compilation is fatally errored, so no dataflow "
                     "can be analysed; the database holds hierarchy only.\n"
-                    "         --diag says why (too many errors, instantiation "
-                    "deeper than 128, or a recursive hierarchy)\n");
+                    "         %s -- it says why (too many errors, instantiation "
+                    "deeper than 128, or a recursive hierarchy)\n",
+                    diagnosticsAt(log).c_str());
         }
 
         analysis::AnalysisManager analysis({}, pool);
@@ -1116,7 +1171,7 @@ int main(int argc, char** argv) {
         // Release build never noticed the missing half because the check is
         // an assert (AnalysisManager.cpp, "compilation.isFrozen()").
         compilation.freeze();
-        { Phase p("analyze", opt.timing); analysis.analyze(compilation); }
+        { Phase p("analyze", opt.timeReport); analysis.analyze(compilation); }
         compilation.unfreeze();
         // Informational only. What the analysis actually yielded per module
         // is not knowable here -- it is counted during extraction and

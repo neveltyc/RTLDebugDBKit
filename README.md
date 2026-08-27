@@ -42,21 +42,31 @@ whatever drives it.
 | `--single-unit` | Compile the whole list as one compilation unit, so a leading `` `define `` header reaches every later file. VCS and Verilator behave this way; slang defaults to per-file units. Designs that keep their configuration in a header need this. |
 | `-o <file.db>` | Output database. |
 | `--diag [N]` | Print elaboration diagnostics — all of them, or the first N. |
+| `--log <file>` | Write the elaboration log here instead of beside the database. Relative paths resolve against the cwd, as `-o`'s do. |
 | `--nolog` | Do not write the elaboration log (see *Log and exit code*). |
-| `--timing` | Report how long each phase took. |
-| `--check-constraints` | Keep the enum-domain `CHECK` clauses in the schema, so a bad value is refused as it is written. Off by default: a string `IN`-list is evaluated per row and costs more than the rest of the insert put together, while `verify-designdb.py` derives the same domains from the finished file. |
-| `-q` | Only report problems. |
+| `--time-report` | Report how long each phase took. |
+| `--quiet` | Only report problems. |
 
 Bare paths are taken as source files.
 
 ## Log and exit code
 
-Every run writes `rtldbgdb-elab.log` beside the database: slang's own
-diagnostics — all of them, whatever `--diag` shows on the terminal — and this
-tool's findings. `-q` quiets the terminal, not the log; `--nolog` turns the
-file off. The last line names the database the run wrote, or says it wrote
-none — a run that fails before publishing leaves the previous export in place
-and replaces its log, and that line is what tells the two apart.
+Every run writes an elaboration log — `rtldbgdb-elab.log` beside the database
+unless `--log` names another path: slang's own diagnostics — all of them,
+whatever `--diag` shows on the terminal — and this tool's findings. `--quiet`
+quiets the terminal, not the log; `--nolog` turns the file off, and asking for
+both a `--log` path and `--nolog` is refused. The last line names the database
+the run wrote, or says it wrote none — a run that fails before publishing
+leaves the previous export in place and replaces its log, and that line is
+what tells the two apart. That pairing is the default layout's; a log sent
+elsewhere with `--log` is the caller's to keep beside the right database.
+
+A log the caller named is treated as a contract, because the next step in a
+pipeline usually greps it and an absent file reads there as *no errors*: a
+`--log` path that cannot be opened stops the run with exit 2, before the
+export has cost anything or replaced an earlier database. The default path
+only warns and carries on — the database is the product, and a read-only
+directory is not a reason to lose it.
 
 Every line carries its producer and severity in fixed columns. A multi-line
 item marks exactly one line `:` — the one carrying the message — and the rest
@@ -140,7 +150,7 @@ with statements times fan-out. `scripts/export-real-designs.sh` reproduces
 this table against a local checkout of the designs.
 
 The shape holds well past these: a 320k-line design elaborating to 145k
-instances and 4.8M rows exports in about 4 seconds and 324 MB. `--timing`
+instances and 4.8M rows exports in about 4 seconds and 324 MB. `--time-report`
 breaks that down — roughly a quarter in slang, a sixth in the walk, and the
 rest inside SQLite writing rows and building indexes.
 
@@ -244,9 +254,9 @@ output when a `v*` tag is pushed.
 
 ## Testing RTL
 
-Every fixture passes `scripts/check-rtl.sh <file.sv> [top]`, which CI runs
-over `examples/` on every push and which anything used as a test case should
-pass first. It runs the file past Verilator and Icarus. They disagree in both
+Every fixture passes `scripts/check-rtl.sh <file.sv> [top]`, which anything
+used as a test case should pass first. It runs the file past Verilator and
+Icarus. They disagree in both
 directions — Verilator accepts a continuous assign with a variable index that
 Icarus correctly rejects, Icarus rejects an unpacked array slice that Verilator
 correctly accepts — so disagreement is a prompt to read the LRM, not a verdict.
