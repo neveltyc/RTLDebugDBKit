@@ -29,7 +29,7 @@ No database is upgraded in place: a version bump means re-exporting the RTL.
 
 ## Tables
 
-Twenty-four tables in six groups. Every relationship is a foreign key: a
+Twenty-six tables in six groups. Every relationship is a foreign key: a
 column named `<x>_id` holds the primary key of another table, and nowhere
 else does `_id` appear. The map (arrow points from the table that carries
 the key to the table it references; `╌╌` marks the two same-id subtype
@@ -147,7 +147,6 @@ does not apply to); solid edges are always present.
 | | `net_conn` | one segment of a terminal's outside | `term_id → term`, `outer_net_id → net`, `outer_intf_inst_id → inst`, `outer_hier_ref_id → hier_ref` |
 | statements | `proc` | one always/initial/final block | `inst_id → inst`, `scope_node_id → tree_node` |
 | | `call_site` | one subroutine-body expansion (a call) | `inst_id → inst`, `caller_stmt_id → stmt`, `parent_call_site_id → call_site` |
-| | `branch` | one level of the gating context | `inst_id → inst`, `parent_branch_id → branch`, `iter_net_id → net` |
 | | `branch` | one gating level | `inst_id → inst`, `parent_branch_id → branch`, `proc_id → proc`, `call_site_id → call_site`, `iter_net_id → net` |
 | | `branch_label` | one label of a case item, evaluated | `branch_id → branch` |
 | | `branch_ref` | one read of a level's condition | `branch_id → branch`, `net_id → net` |
