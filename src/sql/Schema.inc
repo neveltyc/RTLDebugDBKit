@@ -38,9 +38,45 @@
 // conclusion the per-row check would, after the forward references have
 // landed.
 R"SQL(
--- value NOT NULL so v_db_info's MAX(CASE...) pivot keeps one meaning for
--- NULL: the key is missing, never "present but empty".
-CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- The seal: one row, one column per fact. Each of these is required, typed,
+-- and exactly one per database, and a key/value table could say none of that
+-- -- presence was the verifier's to check, the counts were TEXT a view had to
+-- CAST, and a mistyped key became a seventeenth fact instead of an error.
+--
+-- The CHECKs here carry no stripping markers: the marked ones are stripped
+-- because SQLite evaluates them per row, and this table has one.
+CREATE TABLE db_info(
+    id                    INTEGER PRIMARY KEY CHECK(id = 1),
+    schema_version        INTEGER NOT NULL,
+    tool                  TEXT NOT NULL,
+    tool_version          TEXT NOT NULL,
+    slang_version         TEXT NOT NULL,
+    producer_revision     TEXT NOT NULL,
+    -- The ELABORATED tops, space-separated; NULL when the design elaborated
+    -- none. Every other column is a fact about the run and always there.
+    top                   TEXT,
+    analysis_status       TEXT NOT NULL
+        CHECK(analysis_status IN ('complete','partial','hierarchy_only')),
+    error_count           INTEGER NOT NULL,
+    unresolved_count      INTEGER NOT NULL,
+    empty_procedure_count INTEGER NOT NULL,
+    duplicate_path_count  INTEGER NOT NULL,
+    recursion_count       INTEGER NOT NULL,
+    truncated_call_count  INTEGER NOT NULL,
+    checker_inst_count    INTEGER NOT NULL,
+    unanalysed_inst_count INTEGER NOT NULL,
+    config_digest         TEXT NOT NULL,
+    -- The status agrees with the counts beside it, which was prose in the
+    -- exporter and an assertion in the verifier and a rule the file itself
+    -- could not hold. `hierarchy_only` is exempt because it is decided before
+    -- any count is taken: the compilation was fatally errored, so there was
+    -- no dataflow to count gaps in.
+    CHECK(analysis_status = 'hierarchy_only'
+          OR (analysis_status = 'complete') =
+             (error_count = 0 AND empty_procedure_count = 0 AND
+              duplicate_path_count = 0 AND truncated_call_count = 0 AND
+              unanalysed_inst_count = 0))
+) STRICT;
 
 CREATE TABLE src_file(
     id      INTEGER PRIMARY KEY,
@@ -409,6 +445,12 @@ CREATE TABLE branch(
     iter_first       INTEGER,
     iter_step        INTEGER,
     iter_count       INTEGER,
+    -- Where the level was walked, as `stmt.proc_id`/`stmt.call_site_id` are
+    -- for a statement: a subroutine body is walked once per call site, so
+    -- its levels are per expansion too -- and a level that gates nothing has
+    -- no statement to borrow either answer from.
+    proc_id          INTEGER REFERENCES proc(id),
+    call_site_id     INTEGER REFERENCES call_site(id),
     file_id          INTEGER REFERENCES file(id),
     line             INTEGER,
     col              INTEGER);
@@ -426,6 +468,44 @@ CREATE TABLE branch_label(
     value     TEXT,
     UNIQUE(branch_id, ordinal));
 
+-- One read of one level's condition. The level owns it: a condition is
+-- written once and evaluated once, however many statements sit under it, and
+-- a level that gates nothing at all still reads what it reads -- `if (c) ;`
+-- recorded c nowhere. Filing a copy per gated statement instead cost three
+-- to six times the rows on real designs and still could not say that.
+--
+-- What a statement gets is the DEPENDENCY, one per target, naming the level
+-- it came from (`net_dep.branch_id`). "Everything gating this statement" is
+-- the level chain from `stmt.branch_id` outward, which `branch_ancestor`
+-- makes one join.
+CREATE TABLE branch_ref(
+    id        INTEGER PRIMARY KEY,
+    branch_id INTEGER NOT NULL REFERENCES branch(id),
+    ordinal   INTEGER NOT NULL,
+    net_id    INTEGER NOT NULL REFERENCES net(id),
+    lo        INTEGER,
+    hi        INTEGER,
+    is_exact  INTEGER NOT NULL CHECK(is_exact IN (0,1)),
+    UNIQUE(branch_id, ordinal));
+
+-- The gating tree's transitive closure, the level itself included at
+-- distance 0. `branch.parent_branch_id` answers one step outward and makes
+-- every other question a recursive walk -- and a per-statement question
+-- asked through a view that recurses costs 2.4 ms against 3.2 us, because
+-- SQLite materialises the whole design's chains before filtering. This is
+-- that walk done once, per template, where a module's tree is a few dozen
+-- rows; stamping shifts it like every other id.
+--
+-- Both directions are indexed: fan-in ("what gates this level") on the
+-- primary key, fan-out ("what does this level control") on the index beside
+-- it, which is a full scan without.
+CREATE TABLE branch_ancestor(
+    branch_id          INTEGER NOT NULL REFERENCES branch(id),
+    ancestor_branch_id INTEGER NOT NULL REFERENCES branch(id),
+    distance           INTEGER NOT NULL,
+    PRIMARY KEY(branch_id, ancestor_branch_id)) WITHOUT ROWID;
+
+
 -- One statement, or one statement-level construct. The statement is the
 -- object; its targets, operands and other reads are child rows -- v9's
 -- `assignment` was one row per TARGET, so `{a,b} = {x,y}` was two rows
@@ -440,9 +520,10 @@ CREATE TABLE branch_label(
 -- pretended to evaluate; NULL when there is none.
 --
 -- branch_id is the gating context (`branch`), NULL outside every branch.
--- It is the complete answer to "what gates this statement": the level's own
--- reads are expr_ref rows with role='control', and a statement kind that
--- records no reads of its own -- an event control -- still names its level.
+-- It is the complete answer to "what gates this statement": the levels above
+-- it are `branch_ancestor` from here, their reads are `branch_ref` rows, and
+-- a statement kind that records no reads of its own -- an event control --
+-- still names its level.
 --
 -- What is deliberately NOT here, unchanged from v9: no branch-condition
 -- text, no clocked flag, no source text.
@@ -502,11 +583,11 @@ CREATE TABLE assign_operand(
     is_exact INTEGER NOT NULL CHECK(is_exact IN (0,1)),
     UNIQUE(stmt_id, ordinal));
 
--- One statement read that is not an assignment operand, classified by role:
+-- One statement read that is not an assignment operand, classified by role.
+-- A branch condition is not among them: it is read where it is written, so
+-- it belongs to its level (`branch_ref`) and not to each statement the level
+-- happens to gate.
 --
---   control        a branch condition the statement's targets sit under.
---                  branch_id names WHICH level of the gating contributed it
---                  -- always set for this role, always NULL for the others.
 --   assertion      read by an assert/assume/cover/expect
 --   wait           a wait statement's condition
 --   event          a sensitivity/event expression that is not a plain net
@@ -520,9 +601,8 @@ CREATE TABLE expr_ref(
     ordinal   INTEGER NOT NULL,
     net_id    INTEGER NOT NULL REFERENCES net(id),
     role      TEXT NOT NULL
-        /*!*/CHECK(role IN ('control','assertion','wait','event',
-                       'call_argument','system_task'))/*!*/,
-    branch_id INTEGER REFERENCES branch(id),
+        /*!*/CHECK(role IN ('assertion','wait','event',
+                            'call_argument','system_task'))/*!*/,
     lo        INTEGER,
     hi        INTEGER,
     is_exact  INTEGER NOT NULL CHECK(is_exact IN (0,1)),
@@ -569,9 +649,11 @@ CREATE TABLE proc_event(
 --              not resolve to a net row, the source range survives, and
 --              v_driver reports 'external'.
 --   control    it reaches the target through a branch condition: stmt_id,
---              the condition's expr_ref_id (role='control') or
---              src_hier_ref_id, and the target's reference as above.
---              map_exact is 0 -- a condition gates, it does not map.
+--              the level it came from in branch_id -- whose reads are
+--              branch_ref rows -- or src_hier_ref_id when the condition
+--              names something outside the instance, and the target's
+--              reference as above. map_exact is 0: a condition gates, it
+--              does not map.
 --   primitive  a gate/switch/UDP couples them: prim_id, per LRM
 --              (input, output) pairing.
 --   procedure  a call binds them: actual to formal by argument direction,
@@ -609,6 +691,10 @@ CREATE TABLE net_dep(
     assign_operand_id  INTEGER REFERENCES assign_operand(id),
     stmt_target_id   INTEGER REFERENCES stmt_target(id),
     expr_ref_id        INTEGER REFERENCES expr_ref(id),
+    -- Control: the level whose condition produced this row. The read itself
+    -- is that level's (`branch_ref`); this says which level, where the
+    -- columns above name a reference directly.
+    branch_id          INTEGER REFERENCES branch(id),
     prim_id            INTEGER REFERENCES prim(id),
     src_hier_ref_id    INTEGER REFERENCES hier_ref(id),
     tgt_hier_ref_id    INTEGER REFERENCES hier_ref(id),
@@ -624,17 +710,19 @@ CREATE TABLE net_dep(
     call_site_id       INTEGER REFERENCES call_site(id));
 
 -- One reference that leaves the instance: an XMR, an interface member, a
--- package item. The path is stored as written (normalised), AND -- new in
--- v10, because an occurrence knows its place in the hierarchy where a
--- folded row could not -- resolved to the target instance and net when
--- slang could resolve it and the target is in this export. NULL
--- resolved_* is "not resolved here", never a fabricated object.
+-- package item. The path is stored as written (normalised), AND -- because
+-- an occurrence knows its place in the hierarchy where a folded row could
+-- not -- resolved to the net it lands on when slang could resolve it and
+-- that net is in this export. A NULL resolved_net_id is "not resolved
+-- here", never a fabricated object; the instance is that net's own.
 --
 -- access: read | write | connect (a port connection tied outward; its
--- net_conn row points back here). branch_id is set on exactly the
--- references that are branch conditions -- `if (top.dbg_en) …` reads a name
--- outside the instance, so its control read lands here rather than in
--- expr_ref, and it names its level for the same reason those do.
+-- net_conn row points back here). A reference belongs to the statement it
+-- is written in (stmt_id) or, when it is a branch condition, to the level
+-- that reads it (branch_id) -- `if (top.dbg_en) …` reads a name outside the
+-- instance, so it lands here rather than in branch_ref, and is filed once
+-- per level exactly as those are. A connection reference has neither: it is
+-- reached through the net_conn row that names it.
 CREATE TABLE hier_ref(
     id               INTEGER PRIMARY KEY,
     inst_id          INTEGER NOT NULL REFERENCES inst(id),
@@ -642,7 +730,9 @@ CREATE TABLE hier_ref(
     branch_id        INTEGER REFERENCES branch(id),
     path             TEXT NOT NULL,
     access           TEXT NOT NULL /*!*/CHECK(access IN ('read','write','connect'))/*!*/,
-    resolved_inst_id INTEGER REFERENCES inst(id),
+    -- The instance is the net's (`net.inst_id`), not a column of its own: a
+    -- second spelling of one answer is a pair that can disagree, and twice
+    -- did. `v_hier_ref` still publishes it, off the net row it already joins.
     resolved_net_id  INTEGER REFERENCES net(id),
     lo               INTEGER,
     hi               INTEGER,

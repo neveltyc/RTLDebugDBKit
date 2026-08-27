@@ -84,12 +84,12 @@ grep 'fifo.sv' rtldbgdb-elab.log              # everything about one file
 
 The exit code says how complete the export is, so a caller does not have to
 open the database to find out. It is the same rule that writes
-`meta.analysis_status`, so the two can never disagree.
+`db_info.analysis_status`, so the two can never disagree.
 
 | | |
 |---|---|
 | `0` | Database written, `analysis_status = 'complete'`. |
-| `3` | Database written, `'partial'` — elaboration errors, or a gap one of the `meta` counts names. |
+| `3` | Database written, `'partial'` — elaboration errors, or a gap one of the seal's counts names. |
 | `4` | Database written, `'hierarchy_only'` — the compilation is fatally errored, so there is a tree and no dataflow. |
 | `2` | No database: the invocation or the sources were unusable (bad option, unreadable filelist, `--top` did not elaborate). |
 | `1` | No database: the export itself failed (the file could not be replaced, or an unexpected error). |
@@ -103,9 +103,10 @@ can read it.
 |---|---|
 | Hierarchy | `module` (the source definition), `tree_node` (the elaborated tree, one id space), `inst` (each module instance occurrence, with its parameter signature) + `inst_param` (that signature made queryable), `prim` (gates, switches, UDPs) |
 | Objects | `net` (every connectable object of every instance, implicit nets flagged), `term` + `term_map` (each instance's terminals and what they stand for inside) |
-| Dataflow | `net_dep` — net-to-net dependencies, one row per statement occurrence, each naming the operand, target, condition, call or primitive it came from; `proc`, `stmt`, `stmt_target`, `assign_operand`, `expr_ref`, `proc_event` — the statement layer those rows point into |
-| Boundaries | `net_conn` — what the parent wired to each terminal, segment by segment with bit windows; `hier_ref` — references that leave an instance, as written *and* resolved to the target instance and net where slang could |
-| Provenance | `src_file` (every file slang read, with its SHA-256), `meta` (schema version, tool, top) |
+| Dataflow | `net_dep` — net-to-net dependencies, one row per statement occurrence, each naming the operand, target, level, call or primitive it came from; `proc`, `stmt`, `stmt_target`, `assign_operand`, `expr_ref`, `proc_event` — the statement layer those rows point into |
+| Gating | `branch` — the level a statement sits under, as a tree; `branch_ref` (what the level's condition reads) + `branch_label` (a case arm's labels, evaluated) + `branch_ancestor` (the tree's closure, so "everything gating this" is one join) |
+| Boundaries | `net_conn` — what the parent wired to each terminal, segment by segment with bit windows; `hier_ref` — references that leave an instance, as written *and* resolved to the net where slang could |
+| Provenance | `src_file` (every file slang read, with its SHA-256), `db_info` (the seal: schema version, tool, top, status and counts — one typed row) |
 
 The model is **instance-level**: rows hang off the elaborated occurrence, so
 "who drives bit 3 of *this* instance's `q`" is one indexed lookup and a fan-in
@@ -123,7 +124,7 @@ granularity are the versioned contract.
 
 ## Measurements
 
-Release build, macOS arm64, against public designs, schema v19:
+Release build, macOS arm64, against public designs, schema v20:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|

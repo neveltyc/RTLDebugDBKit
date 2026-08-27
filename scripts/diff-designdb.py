@@ -38,10 +38,12 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# meta rows that legitimately differ between two builds of the tool. Nothing
-# else is excluded: schema_version, slang_version and config_digest must
-# match, so a phase that accidentally moves one fails here first.
-EXCLUDED_META_KEYS = ("producer_revision",)
+# The one seal column that legitimately differs between two builds of the
+# tool. Nothing else is excluded: schema_version, slang_version and
+# config_digest must match, so a phase that accidentally moves one fails here
+# first. Keyed by (table, column) because the seal is a row now: a row filter
+# would have to know which key it was dropping, and there are no keys.
+EXCLUDED_COLUMNS = {("db_info", "producer_revision")}
 
 # The timing note threshold. Informational, not a gate: the plan's +-10%
 # budget is judged by a human against the report.
@@ -133,18 +135,14 @@ def columns_of(cur, table):
 
 def rows_of(cur, table, cols, drop_ids=False):
     kept = [c for c in cols
-            if not (drop_ids and (c == "id" or c.endswith("_id")))]
+            if (table, c) not in EXCLUDED_COLUMNS
+            and not (drop_ids and (c == "id" or c.endswith("_id")))]
     if not kept:
         return []
     sel = ", ".join(f'"{c}"' for c in kept)
     order = ", ".join(f'"{c}"' for c in kept)
     q = f'SELECT {sel} FROM "{table}"'
-    if table == "meta":
-        marks = ", ".join("?" for _ in EXCLUDED_META_KEYS)
-        q += f" WHERE key NOT IN ({marks})"
-        cur.execute(q + f" ORDER BY {order}", EXCLUDED_META_KEYS)
-    else:
-        cur.execute(q + f" ORDER BY {order}")
+    cur.execute(q + f" ORDER BY {order}")
     return cur.fetchall()
 
 

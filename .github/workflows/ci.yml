@@ -91,7 +91,7 @@ jobs:
       # Export and read back: the basic example for the hollow check, then one
       # fixture per construct family. The mode list comes from the verifier, so
       # adding a fixture does not mean editing this loop. No --top for the
-      # family, so meta.top's slang-elected spelling is what gets asserted.
+      # family, so db_info.top's slang-elected spelling is what gets asserted.
       - name: Export and read back
         if: matrix.fixtures
         run: |
@@ -136,7 +136,7 @@ jobs:
           # files sharing one compilation unit (so a macro defined in the first
           # reaches the second), a header found only through +incdir+, a define
           # from the command line, and two uninstantiated tops -- the case that
-          # makes meta.top space-separated.
+          # makes db_info.top space-separated.
           (cd examples/options && ../../build/rtl-designdb -f opts.f --single-unit \
              +incdir+. +define+EXTRA_WIDTH=4 -o "$GITHUB_WORKSPACE/options.db")
           python3 scripts/verify-designdb.py options.db

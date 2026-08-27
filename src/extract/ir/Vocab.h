@@ -46,12 +46,14 @@ inline const char* word(Access a) {
     SLANG_UNREACHABLE;
 }
 
+/// What a non-operand read of a STATEMENT is. A branch condition is not
+/// among them: it belongs to its level (`branch_ref`), which is where it is
+/// written and where it is evaluated once for every statement under it.
 enum class RefRole : uint8_t {
-    Control, Assertion, Wait, Event, CallArgument, SystemTask
+    Assertion, Wait, Event, CallArgument, SystemTask
 };
 inline const char* word(RefRole r) {
     switch (r) {
-        case RefRole::Control:      return "control";
         case RefRole::Assertion:    return "assertion";
         case RefRole::Wait:         return "wait";
         case RefRole::Event:        return "event";

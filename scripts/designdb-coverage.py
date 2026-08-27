@@ -12,7 +12,7 @@
 #
 # Everything here is derived from what the exporter already records -- the
 # `*_exact` flags, `dropped_operand_count`, the resolved_* columns, and the
-# meta counts -- so it costs an export nothing and can be run against a
+# seal counts -- so it costs an export nothing and can be run against a
 # database produced weeks ago.
 #
 # There is no pass/fail. A design legitimately full of dynamic indexing will
@@ -40,8 +40,8 @@ def scalar(sql, default=0):
     return row[0] if row and row[0] is not None else default
 
 
-def meta(key):
-    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+def seal(column):
+    row = con.execute(f"SELECT {column} FROM v_db_info").fetchone()
     return row[0] if row else None
 
 
@@ -59,7 +59,7 @@ TABLES = ("module", "tree_node", "inst", "inst_param", "prim", "net", "term",
 report = {
     "database": os.path.basename(path),
     "bytes": os.path.getsize(path),
-    "meta": {k: meta(k) for k in (
+    "db_info": {k: seal(k) for k in (
         "schema_version", "analysis_status", "tool_version", "slang_version",
         "producer_revision", "config_digest", "top", "error_count",
         "unresolved_count", "empty_procedure_count",
@@ -121,11 +121,8 @@ report["deps_without_source"] = {
 # cross-hierarchy structure a consumer must resolve by hand.
 hrefs = report["rows"]["hier_ref"]
 resolved = scalar("SELECT count(*) FROM hier_ref WHERE resolved_net_id IS NOT NULL")
-inst_only = scalar("""SELECT count(*) FROM hier_ref
-                      WHERE resolved_inst_id IS NOT NULL AND resolved_net_id IS NULL""")
 report["hier_ref_resolution"] = {
-    "to_net": resolved, "to_instance_only": inst_only, "of": hrefs,
-    "pct_to_net": share(resolved, hrefs)}
+    "to_net": resolved, "of": hrefs, "pct_to_net": share(resolved, hrefs)}
 
 # Nets with no driver of any kind -- no dependency targets them, no
 # crossing feeds them, and they are not a design input. The boundary nets
@@ -175,7 +172,7 @@ if as_json:
     print(json.dumps(report, indent=2))
     sys.exit(0)
 
-m = report["meta"]
+m = report["db_info"]
 print(f"{report['database']}  ({report['bytes'] / 1e6:.1f} MB, schema {m['schema_version']})")
 print(f"  status     {m['analysis_status']}   "
       f"errors={m['error_count']} empty_proc={m['empty_procedure_count']} "
@@ -204,7 +201,7 @@ pc = report["coarse_conn_mapping"]
 print(f"  at boundaries    {pc['n']:,} of {pc['of']:,} net ties ({pc['pct']}%)")
 h = report["hier_ref_resolution"]
 print(f"references out     {h['to_net']:,} of {h['of']:,} resolved to a net "
-      f"({h['pct_to_net']}%), {h['to_instance_only']:,} to an instance only")
+      f"({h['pct_to_net']}%)")
 u = report["undriven_nets"]
 print(f"undriven internal  {u['internal']:,} of {u['of']:,} nets "
       f"({u['pct_internal']}%)")

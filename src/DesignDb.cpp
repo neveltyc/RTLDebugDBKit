@@ -229,12 +229,19 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
         prepare("INSERT INTO branch(id, inst_id, parent_branch_id, depth,"
                 " ordinal, branch_kind, sense, case_kind, check_kind,"
                 " static_taken, iter_net_id, iter_first, iter_step,"
-                " iter_count, file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " iter_count, proc_id, call_site_id, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsBranch]);
         prepare("INSERT INTO branch_label(id, branch_id, ordinal, value)"
                 " VALUES(?,?,?,?)",
                 &ins[InsBranchLabel]);
+        prepare("INSERT INTO branch_ref(id, branch_id, ordinal, net_id,"
+                " lo, hi, is_exact)"
+                " VALUES(?,?,?,?,?,?,?)",
+                &ins[InsBranchRef]);
+        prepare("INSERT INTO branch_ancestor(branch_id, ancestor_branch_id,"
+                " distance) VALUES(?,?,?)",
+                &ins[InsBranchAncestor]);
         prepare("INSERT INTO call_site(id, inst_id, caller_stmt_id,"
                 " parent_call_site_id, subroutine_name, depth)"
                 " VALUES(?,?,?,?,?,?)",
@@ -253,24 +260,24 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " VALUES(?,?,?,?,?,?,?)",
                 &ins[InsAssignOperand]);
         prepare("INSERT INTO expr_ref(id, stmt_id, ordinal, net_id, role,"
-                " branch_id, lo, hi, is_exact)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
+                " lo, hi, is_exact)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 &ins[InsExprRef]);
         prepare("INSERT INTO proc_event(id, proc_id, stmt_id, net_id, event_kind,"
                 " edge_kind, file_id, line, col)"
                 " VALUES(?,?,?,?,?,?,?,?,?)",
                 &ins[InsProcEvent]);
         prepare("INSERT INTO net_dep(id, src_net_id, tgt_net_id, stmt_id,"
-                " assign_operand_id, stmt_target_id, expr_ref_id, prim_id,"
-                " src_hier_ref_id, tgt_hier_ref_id, dep_kind,"
+                " assign_operand_id, stmt_target_id, expr_ref_id, branch_id,"
+                " prim_id, src_hier_ref_id, tgt_hier_ref_id, dep_kind,"
                 " src_lo, src_hi, src_exact, tgt_lo, tgt_hi, tgt_exact, map_exact,"
                 " call_site_id)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsNetDep]);
         prepare("INSERT INTO hier_ref(id, inst_id, stmt_id, branch_id, path,"
-                " access, resolved_inst_id, resolved_net_id, lo, hi, is_exact,"
+                " access, resolved_net_id, lo, hi, is_exact,"
                 " file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsHierRef]);
         begin();
     }
@@ -338,15 +345,44 @@ void Writer::bumped() {
     }
 }
 
-void Writer::setMeta(std::string_view key, std::string_view value) {
+void Writer::setDbInfo(const DbInfoRow& r) {
     sqlite3_stmt* s = nullptr;
-    prepare("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", &s);
-    sqlite3_bind_text(s, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT);
+    prepare("INSERT INTO db_info(id, schema_version, tool, tool_version,"
+            " slang_version, producer_revision, top, analysis_status,"
+            " error_count, unresolved_count, empty_procedure_count,"
+            " duplicate_path_count, recursion_count, truncated_call_count,"
+            " checker_inst_count, unanalysed_inst_count, config_digest)"
+            " VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", &s);
+    auto text = [&](int at, const std::string& v) {
+        sqlite3_bind_text(s, at, v.data(), static_cast<int>(v.size()), SQLITE_STATIC);
+    };
+    sqlite3_bind_int64(s, 1, r.schemaVersion);
+    text(2, r.tool);
+    text(3, r.toolVersion);
+    text(4, r.slangVersion);
+    text(5, r.producerRevision);
+    // The one nullable column: no top elaborated is a fact, and an empty
+    // string would be a top whose name is nothing.
+    if (r.top.empty())
+        sqlite3_bind_null(s, 6);
+    else
+        text(6, r.top);
+    text(7, r.analysisStatus);
+    sqlite3_bind_int64(s, 8, r.errorCount);
+    sqlite3_bind_int64(s, 9, r.unresolvedCount);
+    sqlite3_bind_int64(s, 10, r.emptyProcedureCount);
+    sqlite3_bind_int64(s, 11, r.duplicatePathCount);
+    sqlite3_bind_int64(s, 12, r.recursionCount);
+    sqlite3_bind_int64(s, 13, r.truncatedCallCount);
+    sqlite3_bind_int64(s, 14, r.checkerInstCount);
+    sqlite3_bind_int64(s, 15, r.unanalysedInstCount);
+    text(16, r.configDigest);
     int rc = sqlite3_step(s);
     sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        throw std::runtime_error(std::string("sqlite: writing meta: ") + sqlite3_errmsg(db));
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error(std::string("sqlite: writing db_info: ") +
+                                 sqlite3_errmsg(db));
+    }
 }
 
 void Writer::addSourceFile(const std::string& path, const std::string& digest) {
@@ -652,7 +688,9 @@ void Writer::addBranch(const BranchRow& r) {
         sqlite3_bind_null(s, 14);
     else
         sqlite3_bind_int64(s, 14, r.iterCount);
-    bindLoc(s, 15, r.fileId, r.line, r.column);
+    bindOptId(s, 15, r.procedureId);
+    bindOptId(s, 16, r.callSiteId);
+    bindLoc(s, 17, r.fileId, r.line, r.column);
     step(s);
     bumped();
 }
@@ -670,6 +708,28 @@ void Writer::addBranchLabel(const BranchLabelRow& r) {
                           static_cast<int>(r.value.size()), SQLITE_STATIC);
     else
         sqlite3_bind_null(s, 4);
+    step(s);
+    bumped();
+}
+
+void Writer::addBranchRef(const BranchRefRow& r) {
+    auto* s = ins[InsBranchRef];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.id);
+    sqlite3_bind_int64(s, 2, r.branchId);
+    sqlite3_bind_int64(s, 3, r.ordinal);
+    sqlite3_bind_int64(s, 4, r.netId);
+    bindRange(s, 5, r.bits, r.exact);
+    step(s);
+    bumped();
+}
+
+void Writer::addBranchAncestor(const BranchAncestorRow& r) {
+    auto* s = ins[InsBranchAncestor];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.branchId);
+    sqlite3_bind_int64(s, 2, r.ancestorBranchId);
+    sqlite3_bind_int64(s, 3, r.distance);
     step(s);
     bumped();
 }
@@ -721,8 +781,7 @@ void Writer::addExprRef(const ExprRefRow& r) {
     sqlite3_bind_int64(s, 4, r.netId);
     sqlite3_bind_text(s, 5, r.role.c_str(), static_cast<int>(r.role.size()),
                       SQLITE_STATIC);
-    bindOptId(s, 6, r.branchId);
-    bindRange(s, 7, r.bits, r.exact);
+    bindRange(s, 6, r.bits, r.exact);
     step(s);
     bumped();
 }
@@ -752,10 +811,11 @@ void Writer::addNetDep(const NetDepRow& r) {
     bindOptId(s, 5, r.assignOperandId);
     bindOptId(s, 6, r.stmtTargetId);
     bindOptId(s, 7, r.exprRefId);
-    bindOptId(s, 8, r.primitiveId);
-    bindOptId(s, 9, r.sourceHierRefId);
-    bindOptId(s, 10, r.targetHierRefId);
-    sqlite3_bind_text(s, 11, r.dependencyKind.c_str(), static_cast<int>(r.dependencyKind.size()),
+    bindOptId(s, 8, r.branchId);
+    bindOptId(s, 9, r.primitiveId);
+    bindOptId(s, 10, r.sourceHierRefId);
+    bindOptId(s, 11, r.targetHierRefId);
+    sqlite3_bind_text(s, 12, r.dependencyKind.c_str(), static_cast<int>(r.dependencyKind.size()),
                       SQLITE_STATIC);
     // A row with no source END has no source range to describe, so every
     // column describing one is NULL -- enforced here rather than in every
@@ -765,20 +825,20 @@ void Writer::addNetDep(const NetDepRow& r) {
     // 'external' reference) keeps its range: the range describes the
     // referenced object's bits, which are real even when unnamed here.
     if (r.sourceNetId == 0 && r.sourceHierRefId == 0) {
-        bindRangeTri(s, 12, std::nullopt, -1);
-        bindRange(s, 15, r.targetBits, r.targetExact);
-        sqlite3_bind_null(s, 18);
+        bindRangeTri(s, 13, std::nullopt, -1);
+        bindRange(s, 16, r.targetBits, r.targetExact);
+        sqlite3_bind_null(s, 19);
     }
     else {
-        bindRangeTri(s, 12, r.sourceBits, r.sourceExact);
-        bindRange(s, 15, r.targetBits, r.targetExact);
-        bindTri(s, 18, r.mappingExact);
+        bindRangeTri(s, 13, r.sourceBits, r.sourceExact);
+        bindRange(s, 16, r.targetBits, r.targetExact);
+        bindTri(s, 19, r.mappingExact);
     }
     // A call site tags a statement's dataflow, so a row with no statement
     // carries none -- the argument bindings of a call in a control
     // expression (`if (f(x))`) have stmt_id NULL and get call_site_id NULL
     // with it, rather than a tag pointing into a call that owns no statement.
-    bindOptId(s, 19, r.stmtId ? r.callSiteId : 0);
+    bindOptId(s, 20, r.stmtId ? r.callSiteId : 0);
     step(s);
     bumped();
 }
@@ -794,10 +854,9 @@ void Writer::addHierRef(const HierRefRow& r) {
                       SQLITE_STATIC);
     sqlite3_bind_text(s, 6, r.access.c_str(), static_cast<int>(r.access.size()),
                       SQLITE_STATIC);
-    bindOptId(s, 7, r.resolvedInstId);
-    bindOptId(s, 8, r.resolvedNetId);
-    bindRange(s, 9, r.bits, r.exact);
-    bindLoc(s, 12, r.fileId, r.line, r.column);
+    bindOptId(s, 7, r.resolvedNetId);
+    bindRange(s, 8, r.bits, r.exact);
+    bindLoc(s, 11, r.fileId, r.line, r.column);
     step(s);
     bumped();
 }

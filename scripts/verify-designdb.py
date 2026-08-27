@@ -28,7 +28,7 @@ import re
 import sqlite3
 import sys
 
-# mode -> the meta.top that fixture must elect. CI takes its loop from this
+# mode -> the db_info.top that fixture must elect. CI takes its loop from this
 # table (--list-modes), so the fixture set is named in one place.
 MODES = {
     "constructs": "constructs",
@@ -79,7 +79,7 @@ DOMAINS = (
       "alias", "release", "trigger", "disable"), False),
     ("stmt", "assign_kind", ("continuous", "blocking", "nonblocking"), True),
     ("expr_ref", "role",
-     ("control", "assertion", "wait", "event", "call_argument", "system_task"), False),
+     ("assertion", "wait", "event", "call_argument", "system_task"), False),
     ("branch", "branch_kind",
      ("if", "case", "case_item", "case_default", "loop"), False),
     ("branch", "sense", ("then", "else"), True),
@@ -102,8 +102,8 @@ VIEW_DOMAINS = (
       "connection_expression", "constant", "terminal", "system_task", "alias",
       "external", "trigger")),
     ("v_load", "load_kind",
-     ("dataflow", "connection", "sensitivity", "wait", "statement", "terminal",
-      "alias")),
+     ("dataflow", "connection", "sensitivity", "wait", "statement", "condition",
+      "terminal", "alias")),
     ("v_net_attachment", "attachment_kind",
      ("terminal_inside", "actual_outside", "written_by", "release_target",
       "alias_binding", "read_by", "condition", "statement_read", "event",
@@ -180,11 +180,11 @@ except sqlite3.Error as e:
     sys.exit(f"error: cannot read {db_path}: {e}")
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "19"
+SCHEMA_VERSION = "20"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
-# cannot run without -- a missing view, a meta key later code indexes -- stops
+# cannot run without -- a missing view, a seal later code indexes -- stops
 # it early, through fatal().
 failures = []
 checked = 0
@@ -434,7 +434,7 @@ check(one("""
     SELECT COALESCE(SUM(n - 1), 0) FROM (
         SELECT count(*) AS n FROM tree_node
         GROUP BY parent_node_id, name HAVING count(*) > 1)""") ==
-      int(one("SELECT value FROM meta WHERE key='duplicate_path_count'")),
+      one("SELECT duplicate_path_count FROM v_db_info"),
       "sibling name collisions match duplicate_path_count")
 
 # ------------------------------------------------- parameter round-trip
@@ -632,14 +632,43 @@ check(one("""
     SELECT count(*) FROM stmt s JOIN branch b ON b.id = s.branch_id
     WHERE s.inst_id != b.inst_id""") == 0,
       "a statement's gating level is in its own instance")
+# A condition's reads belong to the level, wherever they land: a net of this
+# instance is a branch_ref row, a name outside it a hier_ref keyed on the
+# level instead of on a statement. Neither is a statement's read.
 check(one("""
-    SELECT count(*) FROM expr_ref
-    WHERE (role = 'control') != (branch_id IS NOT NULL)""") == 0,
-      "branch_id is set on exactly the control reads")
+    SELECT count(*) FROM branch_ref r JOIN branch b ON b.id = r.branch_id
+    JOIN net n ON n.id = r.net_id
+    WHERE n.inst_id != b.inst_id""") == 0,
+      "a level reads nets of its own instance")
 check(one("""
-    SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
-    WHERE e.role = 'control' AND s.branch_id IS NULL""") == 0,
-      "a statement with a control read names the level it sits in")
+    SELECT count(*) FROM hier_ref h
+    WHERE h.branch_id IS NOT NULL AND h.stmt_id IS NOT NULL""") == 0,
+      "an outward condition belongs to its level and to no statement")
+check(one("""
+    SELECT count(*) FROM hier_ref h
+    WHERE h.branch_id IS NOT NULL AND h.access != 'read'""") == 0,
+      "only a read leaves the instance as a branch condition")
+check(one("""
+    SELECT count(*) FROM net_dep
+    WHERE (dep_kind = 'control') != (branch_id IS NOT NULL)""") == 0,
+      "a dependency names a level exactly when a condition made it")
+# A control dependency's source is a net the level it names actually reads,
+# or the outward reference that level holds. Without this the two halves --
+# the read on the level, the dependency on the statement -- could describe
+# two different gatings, and v_load's condition arm suppresses a read that
+# has a dependency on exactly this pairing.
+check(one("""
+    SELECT count(*) FROM net_dep d WHERE d.dep_kind = 'control'
+      AND NOT EXISTS (SELECT 1 FROM branch_ref r
+                      WHERE r.branch_id = d.branch_id
+                        AND r.net_id IS d.src_net_id)
+      AND NOT EXISTS (SELECT 1 FROM hier_ref h
+                      WHERE h.id = d.src_hier_ref_id
+                        AND h.branch_id = d.branch_id)""") == 0,
+      "a control dependency's source is one of the level's own reads")
+# The level a control dependency names is one its statement actually sits
+# under, which is what makes the two halves -- the read on the level, the
+# dependency on the statement -- describe one gating and not two.
 check(one("""
     WITH RECURSIVE chain(stmt_id, branch_id) AS (
         SELECT id, branch_id FROM stmt WHERE branch_id IS NOT NULL
@@ -647,20 +676,38 @@ check(one("""
         SELECT c.stmt_id, b.parent_branch_id
         FROM chain c JOIN branch b ON b.id = c.branch_id
         WHERE b.parent_branch_id IS NOT NULL)
-    SELECT count(*) FROM expr_ref e
-    WHERE e.role = 'control'
+    SELECT count(*) FROM net_dep d
+    WHERE d.dep_kind = 'control' AND d.stmt_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM chain c
-                      WHERE c.stmt_id = e.stmt_id
-                        AND c.branch_id = e.branch_id)""") == 0,
-      "a control read's level is on its statement's own chain")
-check(one("""
-    SELECT count(*) FROM hier_ref h
-    WHERE h.branch_id IS NOT NULL AND h.access != 'read'""") == 0,
-      "only a read leaves the instance as a branch condition")
+                      WHERE c.stmt_id = d.stmt_id
+                        AND c.branch_id = d.branch_id)""") == 0,
+      "a control dependency's level is on its statement's own chain")
 check(one("""
     SELECT count(*) FROM hier_ref h JOIN branch b ON b.id = h.branch_id
     WHERE h.inst_id != b.inst_id""") == 0,
       "an outward condition's level is in its own instance")
+# The closure is derived, so it is checked against what it derives FROM in
+# one statement: the same pairs the parent chain gives, the level itself
+# included, at the distance the walk takes.
+check(one("""
+    WITH RECURSIVE up(branch_id, ancestor_branch_id, distance) AS (
+        SELECT id, id, 0 FROM branch
+      UNION ALL
+        SELECT u.branch_id, b.parent_branch_id, u.distance + 1
+        FROM up u JOIN branch b ON b.id = u.ancestor_branch_id
+        WHERE b.parent_branch_id IS NOT NULL)
+    SELECT (SELECT count(*) FROM up) + (SELECT count(*) FROM branch_ancestor)
+         - 2 * (SELECT count(*) FROM branch_ancestor a JOIN up u
+                ON u.branch_id = a.branch_id
+               AND u.ancestor_branch_id = a.ancestor_branch_id
+               AND u.distance = a.distance)""") == 0,
+      "branch_ancestor is the parent chain's closure, distances included")
+check(one("""
+    SELECT count(*) FROM branch_ancestor a
+    LEFT JOIN branch b ON b.id = a.branch_id
+    LEFT JOIN branch p ON p.id = a.ancestor_branch_id
+    WHERE b.id IS NULL OR p.id IS NULL OR b.inst_id != p.inst_id""") == 0,
+      "and both of its ends are levels of one instance")
 # A loop index sources no dataflow: that is what the iteration space
 # replaced. A `procedure` arc survives -- `t(i)` really does feed the formal,
 # and dropping it would leave the formal with no driver at all.
@@ -681,9 +728,9 @@ check(one("""
     WHERE (branch_kind IN ('case_item', 'case_default'))
        != (ordinal IS NOT NULL)""") == 0,
       "ordinal is set on exactly the case arms")
-# Ordinal is the arm's WRITTEN position, so it is unique and increasing
-# under one point but not contiguous: an arm whose body gates nothing has no
-# row, and closing the gap would misstate which arms precede which.
+# Ordinal is the arm's WRITTEN position under one point, which is the
+# priority a plain `case` has. Every written arm has a row, so it is also
+# contiguous -- but written position is what it means, not row order.
 check(one("""SELECT count(*) FROM branch WHERE ordinal < 0""") == 0,
       "an arm ordinal is never negative")
 check(one("""
@@ -754,9 +801,6 @@ check(one("""
 check(one("""
     SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
     WHERE CASE e.role
-        -- A condition gates whatever statement it encloses, including one
-        -- that writes nothing this instance names.
-        WHEN 'control'     THEN 0
         WHEN 'assertion'   THEN s.stmt_kind != 'assertion'
         WHEN 'wait'        THEN s.stmt_kind NOT IN ('wait', 'event_control')
         WHEN 'event'       THEN s.stmt_kind != 'event_control'
@@ -792,7 +836,7 @@ check(one("""
              -- ('external'), but it must exist as a row of one of the two.
              OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
              OR d.assign_operand_id IS NOT NULL OR d.prim_id IS NOT NULL
-             OR (d.expr_ref_id IS NULL) = (d.src_hier_ref_id IS NULL)
+             OR d.expr_ref_id IS NOT NULL
              OR (d.stmt_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
              -- NULL-safe: `NULL != 0` is NULL, so the plain comparison read
              -- as "0 or NULL" and let an unset mapping through.
@@ -893,7 +937,6 @@ check(one("""
     SELECT count(*) FROM net_dep d JOIN expr_ref e ON e.id = d.expr_ref_id
     WHERE e.net_id != d.src_net_id
        OR (d.stmt_id IS NOT NULL AND e.stmt_id != d.stmt_id)
-       OR (d.dep_kind = 'control' AND e.role != 'control')
        OR (d.dep_kind = 'procedure' AND e.role != 'call_argument')""") == 0,
       "net_dep's expression reference agrees with the expr_ref row")
 # Locality holds exactly where no end went through a hierarchical
@@ -991,17 +1034,6 @@ for tbl in ("term_map", "net_conn"):
 
 # -------------------------------------------------------------- hier_ref
 check(one("""
-    SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
-    WHERE h.resolved_inst_id IS NULL OR n.inst_id != h.resolved_inst_id""") == 0,
-      "a resolved net lies inside its resolved instance")
-# The two resolved columns answer together or not at all. An instance
-# without a net names where the reference landed and not what it landed on,
-# which is a third state for consumers written against "resolved or NULL".
-check(one("""
-    SELECT count(*) FROM hier_ref
-    WHERE (resolved_inst_id IS NULL) != (resolved_net_id IS NULL)""") == 0,
-      "a reference resolves to both halves or to neither")
-check(one("""
     SELECT count(*) FROM net_conn c JOIN hier_ref h ON h.id = c.outer_hier_ref_id
     WHERE h.access != 'connect'""") == 0,
       "a connection's outward tie is access='connect'")
@@ -1035,21 +1067,27 @@ check(one("""
         ELSE 1 END""") == 0,
       "connection columns match conn_kind")
 
-# ------------------------------------------------------------------ meta
-# The doc states the required set as a rule -- the v_db_info columns minus
-# `top` -- so it is derived here rather than hand-copied: a column added to
-# the view then demands its meta key without this list needing to know.
-required = [r[1] for r in con.execute("PRAGMA table_info(v_db_info)")
-            if r[1] != "top"]
-if not required:
-    fatal("v_db_info is missing")
-meta = dict(con.execute("SELECT key, value FROM meta"))
-# Fatal rather than collected: every check below indexes these keys.
-missing = [k for k in required if k not in meta or meta[k] is None]
-if missing:
-    fatal(f"meta lacks required key(s): {', '.join(missing)}")
-check(meta["schema_version"] == SCHEMA_VERSION,
-      f"schema_version is {SCHEMA_VERSION}", f"got {meta['schema_version']}")
+# --------------------------------------------------------------- db_info
+# One row, typed, every column required but `top`. The schema says all of
+# that now -- NOT NULL, INTEGER, and the CHECK that ties the status to its
+# counts -- so what is left here is what the schema cannot say: that the row
+# is there at all, and that this file's contract is the one this script
+# knows.
+try:
+    info_cols = [d[0] for d in
+                 con.execute("SELECT * FROM v_db_info LIMIT 0").description]
+    info = con.execute("SELECT * FROM v_db_info").fetchone()
+except sqlite3.OperationalError as e:
+    fatal(f"v_db_info is missing or unreadable: {e}")
+# Fatal rather than collected: every check below reads these.
+if info is None:
+    fatal("db_info holds no row -- the export did not seal")
+by = dict(zip(info_cols, info))
+unset = [k for k, v in by.items() if v is None and k != "top"]
+if unset:
+    fatal(f"db_info leaves required column(s) NULL: {', '.join(unset)}")
+check(str(by["schema_version"]) == SCHEMA_VERSION,
+      f"schema_version is {SCHEMA_VERSION}", f"got {by['schema_version']}")
 
 # The version is stated in four independent places -- this constant, the
 # exporter's SchemaVersion, the field reference's opening line and the
@@ -1072,10 +1110,12 @@ for _rel, _pattern in (("src/DesignDb.h", r"SchemaVersion\s*=\s*(\d+)"),
 COUNTS = ("error_count", "unresolved_count", "empty_procedure_count",
           "duplicate_path_count", "recursion_count", "truncated_call_count",
           "checker_inst_count", "unanalysed_inst_count")
-nonnumeric = [k for k in COUNTS if not meta[k].isdigit()]
-if nonnumeric:
-    fatal(f"meta count(s) not a number: {', '.join(nonnumeric)}")
-status = meta["analysis_status"]
+# A count is an integer here and not a string that looks like one. The STRICT
+# table refuses anything else on the way in; this is the same statement made
+# about the file, which is what this script exists to do.
+for k in ("schema_version",) + COUNTS:
+    check(isinstance(by[k], int), f"{k} is an INTEGER", f"got {by[k]!r}")
+status = by["analysis_status"]
 check(status in ("complete", "partial", "hierarchy_only"),
       "analysis_status is one of complete/partial/hierarchy_only",
       f"got {status!r}")
@@ -1083,26 +1123,16 @@ check(status in ("complete", "partial", "hierarchy_only"),
 # implication runs both ways: `complete` beside a non-zero count is a malformed
 # file, and a count that chose `partial` can be looked at rather than merely
 # inferred. `unresolved_count` is not among them by design -- a black box is
-# not an incompleteness of the export.
+# not an incompleteness of the export. `hierarchy_only` is decided before any
+# count is taken, so it claims nothing about them.
 PARTIAL_CAUSES = ("error_count", "empty_procedure_count",
                   "duplicate_path_count", "truncated_call_count",
                   "unanalysed_inst_count")
-explained = any(int(meta[k]) for k in PARTIAL_CAUSES)
+explained = any(by[k] for k in PARTIAL_CAUSES)
 check(not (status == "complete" and explained),
       "a complete status carries no count that would contradict it")
 check(not (status == "partial" and not explained),
       "a partial status names the count that caused it")
-
-info = con.execute("SELECT * FROM v_db_info").fetchone()
-info_cols = [d[0] for d in con.execute("SELECT * FROM v_db_info LIMIT 0").description]
-by = dict(zip(info_cols, info))
-check(str(by["schema_version"]) == meta["schema_version"]
-      and isinstance(by["schema_version"], int),
-      "v_db_info.schema_version agrees with meta and is INTEGER",
-      f"got {by['schema_version']!r}")
-for k in COUNTS:
-    check(by[k] == int(meta[k]) and isinstance(by[k], int),
-          f"v_db_info.{k} agrees with meta and is INTEGER", f"got {by[k]!r}")
 
 # --------------------------------------------------------- view contract
 # The fifteen stable views: existence, exact columns in exact order, and row
@@ -1148,7 +1178,7 @@ VIEW_COLUMNS = {
         "src_lo", "src_hi", "src_exact", "tgt_net_id",
         "tgt_inst_id", "tgt_name", "tgt_lo", "tgt_hi",
         "tgt_exact", "stmt_id", "assign_operand_id",
-        "stmt_target_id", "expr_ref_id", "prim_id",
+        "stmt_target_id", "expr_ref_id", "branch_id", "prim_id",
         "src_hier_ref_id", "tgt_hier_ref_id",
         "dep_kind", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
@@ -1166,8 +1196,8 @@ VIEW_COLUMNS = {
         "load_net_id", "load_inst_id",
         "load_name", "load_ref", "load_lo", "load_hi", "load_exact",
         "load_kind", "dep_id", "conn_id", "stmt_id", "proc_id",
-        "term_id", "map_exact", "call_site_id", "file_path", "src_path",
-        "src_line", "src_col"],
+        "term_id", "map_exact", "call_site_id", "branch_id",
+        "file_path", "src_path", "src_line", "src_col"],
     "v_stmt": [
         "stmt_id", "inst_id", "module_id", "module_name",
         "scope_node_id", "proc_id", "ordinal", "sequence",
@@ -1184,7 +1214,8 @@ VIEW_COLUMNS = {
         "net_id", "inst_id", "net_name", "attachment_kind",
         "lo", "hi", "is_exact", "stmt_id",
         "term_map_id", "conn_id", "stmt_target_id", "assign_operand_id",
-        "expr_ref_id", "proc_event_id", "dep_id", "hier_ref_id"],
+        "expr_ref_id", "proc_event_id", "dep_id", "hier_ref_id",
+        "branch_ref_id"],
     "v_node_path": ["node_id", "node_path"],
     "v_proc_event": [
         "proc_event_id", "proc_id", "inst_id", "proc_kind", "stmt_id",
@@ -1195,14 +1226,15 @@ VIEW_COLUMNS = {
         "parent_branch_id", "depth", "ordinal", "branch_kind", "sense",
         "case_kind",
         "check_kind", "static_taken", "iter_net_id", "iter_name",
-        "iter_first", "iter_step", "iter_count", "labels",
-        "file_path", "src_path", "src_line", "src_col"],
+        "iter_first", "iter_step", "iter_count", "proc_id", "call_site_id",
+        "labels", "file_path", "src_path", "src_line", "src_col"],
     "v_call_site": [
         "call_site_id", "inst_id", "module_id", "module_name",
         "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
     "v_hier_ref": [
         "hier_ref_id", "inst_id", "module_id", "module_name", "stmt_id",
-        "ref_path", "access", "resolved_inst_id", "resolved_net_id",
+        "branch_id", "ref_path", "access", "resolved_inst_id",
+        "resolved_net_id",
         "resolved_net_name", "lo", "hi", "is_exact",
         "file_path", "src_path", "src_line", "src_col"],
 }
@@ -1295,7 +1327,11 @@ want = (one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
                                    WHERE d.expr_ref_id = e.id)""")
         + one("""SELECT count(*) FROM assign_operand o
                  WHERE NOT EXISTS (SELECT 1 FROM net_dep d
-                                   WHERE d.assign_operand_id = o.id)"""))
+                                   WHERE d.assign_operand_id = o.id)""")
+        + one("""SELECT count(*) FROM branch_ref r
+                 WHERE NOT EXISTS (SELECT 1 FROM net_dep d
+                                   WHERE d.branch_id = r.branch_id
+                                     AND d.src_net_id = r.net_id)"""))
 check(n_load == want, "v_load reconciles with its branch formula",
       f"{n_load} rows, branch sum says {want}")
 
@@ -1308,6 +1344,7 @@ want = (one("SELECT count(*) FROM term_map")
         + one("SELECT count(*) FROM stmt_target")
         + one("SELECT count(*) FROM assign_operand")
         + one("SELECT count(*) FROM expr_ref")
+        + one("SELECT count(*) FROM branch_ref")
         + one("SELECT count(*) FROM proc_event WHERE net_id IS NOT NULL")
         + one("SELECT count(*) FROM net_dep")
         + one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
@@ -1385,7 +1422,16 @@ for view in ("v_driver", "v_load", "v_net_dep"):
                           WHERE c.id = v.call_site_id
                             AND c.caller_stmt_id = v.stmt_id)""") == 0,
           f"{view}.call_site_id is its statement's, or the call it opens")
-# Exclusive arc, like net_dep: exactly one of the seven typed id columns is
+# A condition row has no statement to take it from -- the read is the
+# level's -- so it takes the level's, which is stamped per expansion exactly
+# as a statement is. The join above cannot see these rows at all.
+check(one("""
+    SELECT count(*) FROM v_load v JOIN branch b ON b.id = v.branch_id
+    WHERE v.load_kind = 'condition'
+      AND (v.call_site_id IS NOT b.call_site_id
+           OR v.proc_id IS NOT b.proc_id)""") == 0,
+      "a condition load is tagged with its level's procedure and expansion")
+# Exclusive arc, like net_dep: exactly one of the typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
 # an id into a slot its kind does not own.
@@ -1395,7 +1441,7 @@ check(one("""
         + (stmt_target_id IS NOT NULL)
         + (assign_operand_id IS NOT NULL) + (expr_ref_id IS NOT NULL)
         + (proc_event_id IS NOT NULL) + (dep_id IS NOT NULL)
-        + (hier_ref_id IS NOT NULL) != 1""") == 0,
+        + (hier_ref_id IS NOT NULL) + (branch_ref_id IS NOT NULL) != 1""") == 0,
       "every attachment names exactly one typed id")
 check(one("""
     SELECT count(*) FROM v_net_attachment WHERE CASE attachment_kind
@@ -1405,7 +1451,7 @@ check(one("""
         WHEN 'release_target'     THEN stmt_target_id IS NULL
         WHEN 'alias_binding'      THEN stmt_target_id IS NULL
         WHEN 'read_by'            THEN assign_operand_id IS NULL
-        WHEN 'condition'          THEN expr_ref_id IS NULL
+        WHEN 'condition'          THEN branch_ref_id IS NULL
         WHEN 'statement_read'     THEN expr_ref_id IS NULL
         WHEN 'event'              THEN proc_event_id IS NULL
         WHEN 'dep_in'             THEN dep_id IS NULL
@@ -1530,15 +1576,17 @@ check(one("""
     WHERE (resolved_net_name IS NOT NULL) != (resolved_net_id IS NOT NULL)""") == 0,
       "v_hier_ref names a resolved net exactly when there is one")
 # The rest is projection, and projection is where a pair of columns quietly
-# swaps. Nothing else in this file reads the view's own range columns or
-# resolved_inst_id, so without this they are pinned by name and position and
-# by nothing about their value.
+# swaps. Nothing else in this file reads the view's own range columns, so
+# without this they are pinned by name and position and by nothing about
+# their value -- and `resolved_inst_id` is no longer a column at all, so the
+# view's derivation of it is pinned here too.
 check(one("""
     SELECT count(*) FROM v_hier_ref v JOIN hier_ref h ON h.id = v.hier_ref_id
     WHERE v.inst_id IS NOT h.inst_id OR v.stmt_id IS NOT h.stmt_id
        OR v.ref_path IS NOT h.path OR v.access IS NOT h.access
-       OR v.resolved_inst_id IS NOT h.resolved_inst_id
        OR v.resolved_net_id IS NOT h.resolved_net_id
+       OR v.resolved_inst_id IS NOT (SELECT n.inst_id FROM net n
+                                     WHERE n.id = h.resolved_net_id)
        OR v.lo IS NOT h.lo OR v.hi IS NOT h.hi
        OR v.is_exact IS NOT h.is_exact
        OR v.src_line IS NOT h.line OR v.src_col IS NOT h.col""") == 0,
@@ -1566,9 +1614,11 @@ check(one("""
       "terminal drivers are exactly the rows naming a terminal")
 check(one("""
     SELECT count(*) FROM v_load
-    WHERE (load_kind IN ('sensitivity','wait','statement','terminal'))
+    WHERE (load_kind IN ('sensitivity','wait','statement','condition',
+                         'terminal'))
           != (load_net_id IS NULL)""") == 0,
-      "target-less loads are exactly sensitivity/wait/statement/terminal")
+      "target-less loads are exactly sensitivity/wait/statement/condition/"
+      "terminal")
 check(one("""
     SELECT count(*) FROM v_load
     WHERE (load_kind = 'terminal') != (term_id IS NOT NULL)""") == 0,
@@ -1583,7 +1633,7 @@ check(one("""
 check(one("""
     SELECT count(*) FROM v_load
     WHERE load_kind NOT IN ('dataflow','connection','sensitivity','wait',
-                            'statement','terminal','alias')""") == 0,
+                            'statement','condition','terminal','alias')""") == 0,
       "load_kind stays in its vocabulary")
 
 # ------------------------------------------------- query plan discipline
@@ -1640,8 +1690,8 @@ check(one("""
 
 # ------------------------------------------------------ mode-gated checks
 if mode:
-    check(meta.get("top") == MODES[mode], f"meta.top is {MODES[mode]}",
-          f"got {meta.get('top')!r}")
+    check(by["top"] == MODES[mode], f"db_info.top is {MODES[mode]}",
+          f"got {by['top']!r}")
 
 
 if mode == "constructs":
@@ -1763,7 +1813,7 @@ if mode == "constructs":
     check(one("""
         SELECT count(*) FROM hier_ref h
         JOIN net n ON n.id = h.resolved_net_id
-        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='u_cnt.cnt' AND n.name='cnt' AND t.name='u_cnt'""") >= 1,
           "the downward XMR resolves to the child's net")
     check(one("""
@@ -1885,8 +1935,9 @@ if mode == "modport":
     check(one("""
         SELECT count(*) FROM v_driver v JOIN net n ON n.id = v.signal_net_id
         WHERE n.name = 'data' AND v.driver_kind = 'constant'
-          AND v.signal_inst_id = (SELECT resolved_inst_id FROM hier_ref
-                                  WHERE path = 'p.d')""") == 1,
+          AND v.signal_inst_id = (SELECT n.inst_id FROM hier_ref h
+                                  JOIN net n ON n.id = h.resolved_net_id
+                                  WHERE h.path = 'p.d')""") == 1,
           "and the renamed net is driven through it")
     # The select form keeps the port's own geometry, which is not the
     # net's: it stays unresolved rather than claiming bits of `data` the
@@ -1911,8 +1962,8 @@ if mode == "interfaces":
                   ordinal, inst) == 1,
               f"the array port's segment {ordinal} binds {inst}")
     check(one("""
-        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
-        JOIN net n ON n.id = h.resolved_net_id
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path = 'bus_arr[0].vld' AND t.name = 'barr[0]'
           AND n.name = 'vld'""") == 1,
           "and a member reference through it lands on that element")
@@ -1958,8 +2009,8 @@ if mode == "interfaces":
                   ordinal, inst) == 1,
               f"the two-dimensional port's segment {ordinal} binds {inst}")
     check(one("""
-        SELECT count(*) FROM hier_ref h JOIN tree_node t ON t.id = h.resolved_inst_id
-        JOIN net n ON n.id = h.resolved_net_id
+        SELECT count(*) FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path = 'grid[1][0].data' AND t.name = 'bgrid[1][0]'
           AND n.name = 'data'""") == 1,
           "and a reference through it agrees with the connection side")
@@ -1973,7 +2024,7 @@ if mode == "interfaces":
         check(one("""
             SELECT count(*) FROM hier_ref h
             JOIN net n ON n.id = h.resolved_net_id
-            JOIN tree_node t ON t.id = h.resolved_inst_id
+            JOIN tree_node t ON t.id = n.inst_id
             WHERE h.path = ? AND h.access = ? AND n.name = ?
               AND t.name = 'bus3'""", path, access, net) == 1,
               f"the interface task's {path} resolves to the bound instance")
@@ -1988,9 +2039,8 @@ if mode == "interfaces":
     # instance it cannot name a net in.
     check(one("""
         SELECT count(*) FROM hier_ref
-        WHERE path = 'x' AND resolved_inst_id IS NULL
-          AND resolved_net_id IS NULL""") >= 1,
-          "while its formal resolves to neither half")
+        WHERE path = 'x' AND resolved_net_id IS NULL""") >= 1,
+          "while its formal does not resolve at all")
     # Two terminals of one module reaching one interface: the call does not
     # say which port it went through, and the occurrence that binds them
     # apart would take the write to the wrong instance. Unresolved from
@@ -1999,8 +2049,8 @@ if mode == "interfaces":
         SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
         JOIN module m ON m.id = i.module_id
         WHERE m.name = 'stamp_pair' AND h.path = 'data'
-          AND h.resolved_inst_id IS NOT NULL""") == 0,
-          "an ambiguous interface binding resolves to no instance at all")
+          AND h.resolved_net_id IS NOT NULL""") == 0,
+          "an ambiguous interface binding resolves to nothing at all")
     check(one("""
         SELECT count(*) FROM hier_ref h JOIN inst i ON i.id = h.inst_id
         JOIN module m ON m.id = i.module_id
@@ -2202,11 +2252,11 @@ if mode == "params":
     # legally, because the parameter shrinks each level. The guard keys on
     # (module, parameters) and this file repeats the module at every level
     # and the pair at none, so nothing is cut and the tree is whole.
-    check(meta["analysis_status"] == "complete",
+    check(by["analysis_status"] == "complete",
           "a terminating parameterised recursion compiles clean",
-          f"got {meta['analysis_status']!r}")
-    check(int(meta["recursion_count"]) == 0,
-          "and nothing is cut", f"got {meta['recursion_count']}")
+          f"got {by['analysis_status']!r}")
+    check(by["recursion_count"] == 0,
+          "and nothing is cut", f"got {by['recursion_count']}")
     # 1 + 2 + 4 + 8. A guard keyed on the module alone would stop at the
     # first level and leave one.
     check(one("""
@@ -2250,15 +2300,16 @@ if mode == "procedural":
         SELECT count(*) FROM v_load
         WHERE signal_name = 'fired' AND load_kind = 'sensitivity'""") == 1,
           "and the procedure waiting on it is still its load")
-    # Both statements exist so their gating has somewhere to land: the
-    # condition reaching them is a read, and it had nowhere else to go.
+    # Both statements exist so their gating has somewhere to land -- and it
+    # lands on the LEVEL they sit in, which is where the condition is
+    # written and evaluated.
     for kind in ("trigger", "disable"):
         check(one("""
-            SELECT count(*) FROM expr_ref e JOIN stmt s ON s.id = e.stmt_id
-            JOIN net n ON n.id = e.net_id
-            WHERE s.stmt_kind = ? AND e.role = 'control' AND n.name = 'en'""",
-                  kind) == 1,
-              f"a gated {kind} records the condition it was reached under")
+            SELECT count(*) FROM stmt s
+            JOIN branch_ref r ON r.branch_id = s.branch_id
+            JOIN net n ON n.id = r.net_id
+            WHERE s.stmt_kind = ? AND n.name = 'en'""", kind) == 1,
+              f"a gated {kind} sits in a level that reads its condition")
     check(one("""
         SELECT count(*) FROM stmt WHERE stmt_kind = 'disable'
           AND NOT EXISTS (SELECT 1 FROM stmt_target t WHERE t.stmt_id = stmt.id)
@@ -2331,6 +2382,46 @@ if mode == "procedural":
         WHERE module_name='stmtgaps' AND branch_kind='loop' AND iter_name='i'
           AND iter_first=0 AND iter_step=1 AND iter_count=4""") == 1,
           "the loop level carries the space it runs -- i = 0,1,2,3")
+    # A level is a fact about the source, not about what landed under it.
+    # `if (en) ;` has an arm and an empty loop body has a level, exactly as
+    # an empty case arm has always had a row -- otherwise a reader counting
+    # senses gets a level the design does not have and misses one it does.
+    check(sorted(r[0] for r in con.execute("""
+        SELECT sense FROM v_branch
+        WHERE module_name='emptylevel' AND branch_kind='if'""")) ==
+          ["else", "else", "then", "then"],
+          "an if arm that gates nothing is still an arm, on both senses")
+    check(one("""
+        SELECT count(*) FROM v_branch
+        WHERE module_name='emptylevel' AND branch_kind='loop'
+          AND iter_count=2""") == 1,
+          "and a loop with an empty body still carries its iteration space")
+    # `if (gate) ; else ;` gates nothing at all, so there is no statement
+    # anywhere to hang the condition on -- and the design still reads gate.
+    # The level reads it, once per arm, which is what the source says.
+    check(one("""
+        SELECT count(*) FROM branch_ref r
+        JOIN branch b ON b.id = r.branch_id
+        JOIN net n ON n.id = r.net_id
+        JOIN inst i ON i.id = b.inst_id JOIN module m ON m.id = i.module_id
+        WHERE m.name='emptylevel' AND n.name='gate'""") == 2,
+          "a level that gates nothing still reads its condition")
+    check(one("""
+        SELECT count(*) FROM v_load
+        WHERE signal_name='gate' AND load_kind='condition'""") == 2,
+          "and the signal reads back as loaded, which it was not before")
+    # The closure is a template fact shifted per occurrence, and a generate
+    # level is where a shift goes wrong if it can: the two occurrences of one
+    # body must carry the same shape and share no row of it.
+    gen = [r[1] for r in con.execute("""
+        SELECT b.inst_id, group_concat(a.distance ORDER BY a.distance)
+        FROM branch_ancestor a
+        JOIN branch b ON b.id = a.branch_id
+        JOIN inst i ON i.id = b.inst_id JOIN module m ON m.id = i.module_id
+        WHERE m.name='genlevel' GROUP BY b.inst_id""")]
+    check(len(gen) == 2 and gen[0] == gen[1] and "1" in gen[0],
+          "a generate-nested closure is stamped alike for both occurrences",
+          f"got {gen}")
     check(one("""
         SELECT count(*) FROM v_stmt s
         JOIN v_branch b ON b.branch_id = s.branch_id
@@ -2388,14 +2479,14 @@ if mode == "procedural":
     # the level is the only thing that can tell the arms apart.
     check(one("""
         SELECT count(DISTINCT reads) FROM (
-            SELECT s.stmt_id AS sid,
-                   group_concat(e.net_id) AS reads
+            SELECT s.branch_id AS bid,
+                   group_concat(r.net_id) AS reads
             FROM v_stmt s
             JOIN v_stmt_target t ON t.stmt_id = s.stmt_id
-            JOIN expr_ref e ON e.stmt_id = s.stmt_id AND e.role='control'
+            JOIN branch_ref r ON r.branch_id = s.branch_id
             WHERE s.module_name='gating' AND t.net_name='q'
               AND s.src_line IN (189, 190)
-            GROUP BY s.stmt_id)""") == 1,
+            GROUP BY s.branch_id)""") == 1,
           "while the two innermost arms still read exactly the same nets")
     # LRM 12.5 -- the qualifier and the matching semantics belong to the case
     # POINT; the labels belong to the item, one row each, and no item sees
@@ -2433,15 +2524,14 @@ if mode == "procedural":
     # reference on the release statement itself.
     check(one("""
         SELECT count(*) FROM v_stmt s
-        JOIN expr_ref e ON e.stmt_id = s.stmt_id
-        JOIN net n ON n.id = e.net_id
-        WHERE s.stmt_kind='release' AND e.role='control'
-          AND n.name='g'""") == 1,
-          "a release records the condition that ends the hijack")
+        JOIN branch_ref r ON r.branch_id = s.branch_id
+        JOIN net n ON n.id = r.net_id
+        WHERE s.stmt_kind='release' AND n.name='g'""") == 1,
+          "a release sits in the level that ends the hijack")
     check(one("""
         SELECT count(*) FROM v_load
-        WHERE signal_name='g' AND load_kind='statement'""") == 1,
-          "and that condition reads g as a statement-kind load")
+        WHERE signal_name='g' AND load_kind='condition'""") == 1,
+          "and that condition reads g as a condition-kind load")
     # ---- LRM 9.2.2.3 / 9.4.2: the procedure kind and edge kind that have
     # ---- no posedge/negedge spelling to be mistaken for
     check(one("""
@@ -3065,8 +3155,8 @@ if mode == "rootref":
           "one absolute path resolves to one net from every occurrence")
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='$root.rootref.u_leaf.q'
           AND t.name='u_leaf' AND n.name='q'""") == 3,
           "and it names u_leaf.q -- the write and both reads")
@@ -3074,8 +3164,8 @@ if mode == "rootref":
     # net of the root instance.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='$root.rootref.own' AND t.name='rootref'
           AND n.name='own'""") == 2,
           "a one-segment absolute path resolves to the root's own net")
@@ -3084,8 +3174,8 @@ if mode == "rootref":
     # readers answer with the one net the source names.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='rootref.u_leaf.q' AND t.name='u_leaf' AND n.name='q'
         """) == 2,
           "an upward path resolves from both occurrences")
@@ -3113,7 +3203,8 @@ if mode == "rootref":
     # does follow the occurrence, is the control.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node d ON d.id = n.inst_id
         JOIN tree_node p ON p.id = d.parent_node_id
         WHERE h.path='$root.rootref.u_below_a.deep.q'
           AND d.name='deep' AND p.name='u_below_a'""") == 2,
@@ -3121,7 +3212,8 @@ if mode == "rootref":
           "from both occurrences")
     check(one("""
         SELECT count(DISTINCT p.name) FROM hier_ref h
-        JOIN tree_node d ON d.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node d ON d.id = n.inst_id
         JOIN tree_node p ON p.id = d.parent_node_id
         WHERE h.path='deep.q'""") == 2,
           "while the local path beside it follows the occurrence")
@@ -3373,15 +3465,16 @@ if mode == "xmr":
           AND t.term_name='p' AND tn.node_name='u_sink'""") == 1,
           "the resolved external tie shows g feeding u_sink.p as an attachment")
     # A condition gating a statement that writes nothing this instance
-    # names is still a read of that signal.
+    # names is still a read of that signal -- and it is the LEVEL's read, so
+    # it survives however little the statements under it turn out to be.
     check(one("""
         SELECT count(*) FROM v_load
-        WHERE signal_name='quiet_gate' AND load_kind='statement'""") == 1,
+        WHERE signal_name='quiet_gate' AND load_kind='condition'""") == 1,
           "a condition gating a targetless statement is still a load")
     check(one("""
-        SELECT count(*) FROM expr_ref e JOIN net n ON n.id = e.net_id
-        WHERE n.name='quiet_gate' AND e.role='control'""") == 1,
-          "and it is recorded as the control reference it is")
+        SELECT count(*) FROM branch_ref r JOIN net n ON n.id = r.net_id
+        WHERE n.name='quiet_gate'""") == 1,
+          "and it is recorded once, on the level that reads it")
     # One reference split across two targets: the row names the whole of
     # what the RTL wrote, the dependencies take their own halves.
     check(one("""
@@ -3551,18 +3644,18 @@ if mode == "external":
           "and both occurrences are gated by the one net the source names")
     # What the per-occurrence search finds need not be the KIND of thing the
     # analysed body found: `blk` is an instance above one occurrence and a
-    # generate block above the other. resolved_inst_id is a foreign key into
-    # inst, so the second has nothing to name -- and naming the generate node
-    # anyway is what the foreign_key_check above would have caught.
+    # generate block above the other. A generate level holds no nets, so the
+    # second resolves to nothing -- where a separate instance column could
+    # have named the level itself and broken its own foreign key.
     check(one("""
         SELECT count(*) FROM hier_ref h
-        JOIN tree_node t ON t.id = h.resolved_inst_id
         JOIN net n ON n.id = h.resolved_net_id
+        JOIN tree_node t ON t.id = n.inst_id
         WHERE h.path='blk.sig' AND t.node_kind='instance' AND n.name='sig'""") == 1,
           "an upward anchor that finds an instance resolves")
     check(one("""
         SELECT count(*) FROM hier_ref
-        WHERE path='blk.sig' AND resolved_inst_id IS NULL""") == 1,
+        WHERE path='blk.sig' AND resolved_net_id IS NULL""") == 1,
           "and one that finds a generate block stays NULL")
     # A $unit object is what still leaves the model once packages and upward
     # names resolve: nothing stamps the compilation unit, so the dependency
@@ -3854,8 +3947,8 @@ if mode == "incomplete":
           "an upward name resolves where the surroundings hold the net")
     check(one("""
         SELECT count(*) FROM hier_ref
-        WHERE path='anchor.sig' AND resolved_inst_id IS NULL""") == 1,
-          "and answers with neither half where they do not")
+        WHERE path='anchor.sig' AND resolved_net_id IS NULL""") == 1,
+          "and does not resolve where they do not")
     check(one("""
         SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
         WHERE t.node_kind='unresolved' AND i.unresolved_def='ghost'""") == 1,
@@ -3910,7 +4003,7 @@ if mode == "incomplete":
                               FROM tree_node GROUP BY parent_node_id, name
                               HAVING c > 1)""") == 0,
           "and no two siblings share a name")
-    check(int(meta["duplicate_path_count"]) == 0,
+    check(by["duplicate_path_count"] == 0,
           "so the design reports no duplicate paths")
     # The names are synthesised, the diagnostics are not: an unnamed module
     # instantiation is still an elaboration error, and the export still says
@@ -3967,9 +4060,9 @@ if mode == "recursion":
     # Illegal RTL that slang rejects, so the database is hierarchy-only by
     # the same path any fatally-errored compilation takes. Asserted first:
     # everything below is about a tree built without dataflow.
-    check(meta["analysis_status"] == "hierarchy_only",
+    check(by["analysis_status"] == "hierarchy_only",
           "a recursive hierarchy is a fatally errored compilation",
-          f"got {meta['analysis_status']!r}")
+          f"got {by['analysis_status']!r}")
 
     # The contract the fix carries: an instance whose module AND parameters
     # are already those of one of its own ancestors is stamped, and stops
@@ -3999,8 +4092,8 @@ if mode == "recursion":
           "three instances re-enter a module of their own ancestry")
     # And the count is in the FILE, not only on stderr, so a consumer holding
     # a truncated database can tell it from a whole one.
-    check(int(meta["recursion_count"]) == 3,
-          "meta records all three", f"got {meta['recursion_count']}")
+    check(by["recursion_count"] == 3,
+          "db_info records all three", f"got {by['recursion_count']}")
     # No INSTANCE below a cut one, at any depth. Its generate scopes and its
     # primitives are stamped -- those come before the guard and are part of
     # the level the cut keeps -- so a check over children of every kind would

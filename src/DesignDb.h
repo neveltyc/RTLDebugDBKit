@@ -598,7 +598,55 @@ namespace designdb {
 /// carried no level at all. A statement-level event control inside a branch
 /// records its gating like every other statement kind; `if (en) @(posedge
 /// clk);` recorded nothing of en.
-inline constexpr int SchemaVersion = 19;
+///
+/// v20 removes what the schema was maintaining by checking rather than by
+/// construction. `hier_ref.resolved_inst_id` is the first of them: it held
+/// `net.inst_id` of the net beside it -- an equality the verifier has
+/// asserted since v10 -- so the pair could disagree, and twice did, once
+/// where a route reached an occurrence of a different module and left the
+/// instance named with no net, once where it named a generate level that has
+/// no `inst` row at all. A resolved reference now names a net, and the net
+/// names the instance. `v_hier_ref` publishes `resolved_inst_id` unchanged,
+/// off the net row it was already joining for `resolved_net_name`, so a
+/// consumer reading the view sees nothing move.
+///
+/// The seal is the second: `meta(key, value)` becomes `db_info`, one STRICT
+/// row of typed columns. Sixteen facts that are neither optional nor
+/// open-ended were stored as text pairs, so presence was the verifier's to
+/// check, the counts were TEXT a view had to CAST, and a mistyped key would
+/// have become a seventeenth fact rather than an error. Now every column is
+/// NOT NULL but `top` (NULL when the design elaborated none), a count is an
+/// integer, and the rule that `analysis_status` agrees with the counts
+/// beside it is a CHECK rather than prose in the exporter and an assertion
+/// in the verifier. `v_db_info` keeps its sixteen columns in their order, so
+/// again a consumer reading the view sees nothing move; one reading `meta`
+/// reads `db_info` instead, by column rather than by key.
+///
+/// The third is the gating. A branch condition was filed as a read of every
+/// statement it gated, which is three to six times the rows on real designs
+/// -- VeeRwolf 10 849 control reads for 3 563 distinct ones, one pair
+/// repeated eighty times -- and could not record the case where there is no
+/// statement at all: `if (gate) ; else ;` produced no row of any kind, so a
+/// signal the design reads appeared nowhere in the database. A condition is
+/// written once and evaluated once, so it belongs to its level:
+/// `branch_ref` is that read set, `expr_ref` keeps the reads that really are
+/// a statement's and loses the `control` role and its `branch_id`, and a
+/// gated statement gets the DEPENDENCY, one per target, naming the level in
+/// `net_dep.branch_id`. An outward condition follows the same rule: a
+/// `hier_ref` keyed on the level, `stmt_id` NULL, published on `v_hier_ref`
+/// beside a new `branch_id`. `v_load` gains `condition` for a level that
+/// reads a net and gates nothing this instance names -- `statement` was the
+/// old spelling and it needed a statement.
+///
+/// `branch_ancestor` is what keeps that affordable. Everything gating one
+/// statement was a single indexed lookup and would have become a walk up
+/// `parent_branch_id`: 62.8 us per statement as a recursive CTE against
+/// v19's 3.50 us, and 2 361 us through a view, since SQLite materialises
+/// every chain in the design before it filters. The closure is computed once
+/// per module template, where a tree is a few dozen rows, and shifted per
+/// occurrence like every other id; the query is back to 3.83 us, and both
+/// directions are indexed because both are asked.
+inline constexpr int SchemaVersion = 20;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -800,6 +848,8 @@ struct BranchRow {
     int64_t fileId = 0;
     uint32_t line = 0;
     uint32_t column = 0;
+    int64_t procedureId = 0;      // the procedure it is inside; 0 = NULL
+    int64_t callSiteId = 0;       // the expansion it was walked for; 0 = NULL
 };
 
 /// One label of a case item, evaluated.
@@ -809,6 +859,23 @@ struct BranchLabelRow {
     int64_t ordinal = 0;
     std::string value;
     bool hasValue = false;        // false = NULL: not constant-evaluable
+};
+
+/// One (level, ancestor) pair of the gating tree, the level itself included.
+struct BranchAncestorRow {
+    int64_t branchId = 0;
+    int64_t ancestorBranchId = 0;
+    int64_t distance = 0;
+};
+
+/// One read of one level's condition.
+struct BranchRefRow {
+    int64_t id = 0;
+    int64_t branchId = 0;
+    int64_t ordinal = 0;
+    int64_t netId = 0;
+    std::optional<std::pair<uint64_t, uint64_t>> bits;
+    bool exact = true;
 };
 
 /// One subroutine-body expansion: a body walked once per call site.
@@ -849,7 +916,6 @@ struct ExprRefRow {
     int64_t ordinal = 0;
     int64_t netId = 0;
     std::string role;             // RefRole's word
-    int64_t branchId = 0;         // which gating level; 0 = NULL (role != control)
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
 };
@@ -882,6 +948,7 @@ struct NetDepRow {
     int64_t assignOperandId = 0;
     int64_t stmtTargetId = 0;
     int64_t exprRefId = 0;
+    int64_t branchId = 0;
     int64_t primitiveId = 0;
     int64_t sourceHierRefId = 0;
     int64_t targetHierRefId = 0;
@@ -894,6 +961,31 @@ struct NetDepRow {
     int64_t callSiteId = 0;       // the call-site expansion this belongs to; 0 = NULL
 };
 
+/// The seal: the whole of `db_info`, written once.
+///
+/// Every field is required, which is why they are values and not options --
+/// a writer that forgets one no longer produces a database missing a fact,
+/// it fails to compile. `top` is the exception the schema names: NULL when
+/// the design elaborated no top at all.
+struct DbInfoRow {
+    int schemaVersion = 0;
+    std::string tool;
+    std::string toolVersion;
+    std::string slangVersion;
+    std::string producerRevision;
+    std::string top;              // empty = no top elaborated, written NULL
+    std::string analysisStatus;
+    int64_t errorCount = 0;
+    int64_t unresolvedCount = 0;
+    int64_t emptyProcedureCount = 0;
+    int64_t duplicatePathCount = 0;
+    int64_t recursionCount = 0;
+    int64_t truncatedCallCount = 0;
+    int64_t checkerInstCount = 0;
+    int64_t unanalysedInstCount = 0;
+    std::string configDigest;
+};
+
 /// One reference that leaves the instance, as written and, when slang could
 /// resolve it, as the object it lands on.
 struct HierRefRow {
@@ -903,7 +995,6 @@ struct HierRefRow {
     int64_t branchId = 0;         // set only on a branch condition; 0 = NULL
     std::string path;             // as written, normalised
     std::string access;           // Access's word
-    int64_t resolvedInstId = 0;   // 0 = not resolved to an object in this export
     int64_t resolvedNetId = 0;
     std::optional<std::pair<uint64_t, uint64_t>> bits;
     bool exact = true;
@@ -930,7 +1021,10 @@ public:
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;
 
-    void setMeta(std::string_view key, std::string_view value);
+    /// The seal, in one statement. Called after finish(), for the reason the
+    /// caller gives: the data and the indexes are complete before the row
+    /// that says the export ran to completion exists at all.
+    void setDbInfo(const DbInfoRow& r);
 
     /// Records a source file and its SHA-256, so a consumer can tell that the
     /// database and the RTL have diverged instead of answering from stale data.
@@ -964,6 +1058,8 @@ public:
     void addProcedure(const ProcedureRow& r);
     void addBranch(const BranchRow& r);
     void addBranchLabel(const BranchLabelRow& r);
+    void addBranchRef(const BranchRefRow& r);
+    void addBranchAncestor(const BranchAncestorRow& r);
     void addCallSite(const CallSiteRow& r);
     void addStmt(const StmtRow& r);
     void addStmtTarget(const StmtTargetRow& r);
@@ -989,7 +1085,9 @@ private:
     enum Ins {
         InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
         InsTerm, InsTermMap, InsNetConn, InsProcedure, InsBranch,
-        InsBranchLabel, InsCallSite, InsStmt,
+        InsBranchLabel,
+        InsBranchRef,
+        InsBranchAncestor, InsCallSite, InsStmt,
         InsStmtTarget, InsAssignOperand, InsExprRef, InsProcEvent,
         InsNetDep, InsHierRef,
         InsCount

@@ -16,7 +16,7 @@
 
 // A CHECKER, which this tool does not model at all: its instance is not an
 // InstanceSymbol, so the walk never reaches it and its ports, assertions and
-// scope produce no rows. Counted in `meta.checker_inst_count` so the absence
+// scope produce no rows. Counted in `db_info.checker_inst_count` so the absence
 // is a fact a consumer can read rather than one indistinguishable from a
 // design that instantiates none.
 checker never_unknown(logic clk, logic sig);

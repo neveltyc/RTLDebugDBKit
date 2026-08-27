@@ -76,12 +76,20 @@ struct BranchFrame {
     /// reads are in `refs` like any other.
     std::vector<std::optional<std::string>> labels;
     slang::SourceRange where;
+    /// The call-site expansion this level was walked for, or -1 at module
+    /// level. A subroutine body is walked once per call site, so its levels
+    /// are per expansion exactly as its statements are -- and a level that
+    /// gates nothing has no statement to borrow the answer from.
+    int32_t callSite = -1;
 };
 
 /// One control read together with the level that contributed it.
 struct GateRef {
     Ref ref;
     BranchId branch = -1;
+    /// Where the LEVEL is written, not the statement it gates: the condition
+    /// is read once where it stands, however many statements sit under it.
+    SourceRange where;
 };
 
 /// The branch levels of one procedure walk, as a tree. Levels are only ever
@@ -107,7 +115,7 @@ public:
         std::vector<GateRef> out;
         for (auto it = levels.rbegin(); it != levels.rend(); ++it)
             for (auto& r : frames_[size_t(*it)].refs)
-                out.push_back(GateRef{r, *it});
+                out.push_back(GateRef{r, *it, frames_[size_t(*it)].where});
         return out;
     }
 

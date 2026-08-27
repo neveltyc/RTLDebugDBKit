@@ -70,7 +70,7 @@ private:
     struct Bases {
         int64_t net = 0, term = 0, termMap = 0, proc = 0, stmt = 0, target = 0,
                 operand = 0, exprRef = 0, procEvent = 0, dep = 0, hierRef = 0,
-                callSite = 0, branch = 0, branchLabel = 0;
+                callSite = 0, branch = 0, branchLabel = 0, branchRef = 0;
     };
 
     struct ReplayJob {
@@ -185,6 +185,8 @@ private:
         base.branch = branchCounter; branchCounter += int64_t(t.branches.size());
         base.branchLabel = branchLabelCounter;
         branchLabelCounter += int64_t(t.branchLabels.size());
+        base.branchRef = branchRefCounter;
+        branchRefCounter += int64_t(t.branchRefs.size());
 
         // Primitives are tree nodes; their ids come from the node counter.
         std::vector<int64_t> primNode(t.prims.size(), 0);
@@ -294,6 +296,8 @@ private:
             row.checkKind = word(br.check);
             row.staticTaken = br.staticTaken;
             row.iterNetId = stampId(base.net, br.iterNet);
+            row.procedureId = stampId(base.proc, br.proc);
+            row.callSiteId = stampId(base.callSite, br.callSite);
             row.iterCount = br.iterCount;
             row.iterFirst = br.iterFirst;
             row.iterStep = br.iterStep;
@@ -312,6 +316,27 @@ private:
             row.value = lb.value;
             row.hasValue = lb.hasValue;
             writer.addBranchLabel(row);
+        }
+        for (size_t i = 0; i < t.branchRefs.size(); i++) {
+            auto& r = t.branchRefs[i];
+            BranchRefRow row;
+            row.id = base.branchRef + int64_t(i) + 1;
+            row.branchId = base.branch + r.branch + 1;
+            row.ordinal = r.ordinal;
+            row.netId = base.net + r.net + 1;
+            row.bits = r.r.bits;
+            row.exact = r.r.exact;
+            writer.addBranchRef(row);
+        }
+        // The gating tree's closure, shifted like everything else: it is a
+        // fact about the template's own levels, so it is computed once there
+        // and moved here, not recomputed per occurrence.
+        for (auto& a : t.branchAncestors) {
+            BranchAncestorRow row;
+            row.branchId = base.branch + a.branch + 1;
+            row.ancestorBranchId = base.branch + a.ancestor + 1;
+            row.distance = a.distance;
+            writer.addBranchAncestor(row);
         }
 
         // Call sites first: a stmt row names the site it belongs to, so the
@@ -383,7 +408,6 @@ private:
             row.ordinal = r.ordinal;
             row.netId = base.net + r.net + 1;
             row.role = word(r.role);
-            row.branchId = stampId(base.branch, r.branch);
             row.bits = r.r.bits;
             row.exact = r.r.exact;
             writer.addExprRef(row);
@@ -417,6 +441,7 @@ private:
             row.assignOperandId = stampId(base.operand, d.operandRef);
             row.stmtTargetId = stampId(base.target, d.targetRef);
             row.exprRefId = stampId(base.exprRef, d.exprRef);
+            row.branchId = stampId(base.branch, d.branch);
             row.primitiveId = d.prim < 0 ? 0 : primNode[size_t(d.prim)];
             row.dependencyKind = word(d.kind);
             row.sourceBits = d.srcR.bits;
@@ -810,8 +835,8 @@ private:
                     // Not a tree descent -- a package is not under a normal
                     // parent, and its path uses `::`. Look it up directly and
                     // resolve the member against its own net map; node stays
-                    // 0 so the generic block below is skipped, and the member
-                    // has to be there for either column to be written.
+                    // 0 so the generic block below is skipped, and the
+                    // member has to be there for the row to resolve at all.
                     if (ref.segs.empty())
                         break;
                     auto pit = packageByName.find(ref.segs.front());
@@ -820,7 +845,6 @@ private:
                     auto nit = pit->second.netByName.find(ref.netName);
                     if (nit == pit->second.netByName.end())
                         break;
-                    row.resolvedInstId = pit->second.nodeId;
                     row.resolvedNetId = nit->second;
                     resolvedNet.emplace(row.id, row.resolvedNetId);
                     break;
@@ -828,14 +852,12 @@ private:
                 default:
                     break;
             }
-            // A route answers with BOTH resolved columns or with neither.
-            // An instance without a net names where the reference landed and
-            // not what it landed on, which is a third state consumers written
-            // against "resolved or NULL" do not have -- and it is what a
-            // route reaching an occurrence of a DIFFERENT module leaves
-            // behind, since the net it wants is not among that module's.
+            // A route answers with the net it reached or with nothing. The
+            // instance is the net's own (`net.inst_id`), so a route that
+            // reaches an occurrence of a DIFFERENT module -- whose nets do
+            // not include the one wanted -- says nothing rather than naming
+            // where it landed without saying what it landed on.
             if (const int64_t net = netAt(node, ref.netName)) {
-                row.resolvedInstId = node;
                 row.resolvedNetId = net;
                 resolvedNet.emplace(row.id, net);
             }
@@ -886,6 +908,7 @@ private:
             row.stmtTargetId =
                 stampId(job.base.target, d.targetRef);
             row.exprRefId = stampId(job.base.exprRef, d.exprRef);
+            row.branchId = stampId(job.base.branch, d.branch);
             row.dependencyKind = word(d.kind);
             row.sourceBits = d.srcR.bits;
             row.sourceExact = d.srcR.exact ? 1 : 0;
@@ -1003,6 +1026,7 @@ private:
     int64_t callSiteCounter = 0;
     int64_t branchCounter = 0;
     int64_t branchLabelCounter = 0;
+    int64_t branchRefCounter = 0;
     int64_t rootOrdinal = 0;
 
     /// The templates on the branch of the tree `stampBody` is currently

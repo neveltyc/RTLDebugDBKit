@@ -36,38 +36,17 @@
 // which is what makes a stale view a caught error rather than a consumer's
 // surprise.
 R"SQL(
--- The meta table pivoted to one fixed row, so "which schema, which status" is
--- one SELECT with no key-value handling. Counts are CAST so a consumer gets
--- integers, not the TEXT the key-value table stores. The view only reshapes;
--- required-key enforcement stays in the verifier.
+-- The seal. `db_info` is already one typed row, so this is a projection: the
+-- contract publishes v_ names, and a consumer should not have to know the
+-- table is keyed on a constant id.
 CREATE VIEW v_db_info AS
 SELECT
-    CAST(MAX(CASE WHEN key = 'schema_version'
-                  THEN value END) AS INTEGER) AS schema_version,
-    MAX(CASE WHEN key = 'tool'                  THEN value END) AS tool,
-    MAX(CASE WHEN key = 'tool_version'          THEN value END) AS tool_version,
-    MAX(CASE WHEN key = 'slang_version'         THEN value END) AS slang_version,
-    MAX(CASE WHEN key = 'producer_revision'     THEN value END) AS producer_revision,
-    MAX(CASE WHEN key = 'top'                   THEN value END) AS top,
-    MAX(CASE WHEN key = 'analysis_status'       THEN value END) AS analysis_status,
-    CAST(MAX(CASE WHEN key = 'error_count'
-                  THEN value END) AS INTEGER) AS error_count,
-    CAST(MAX(CASE WHEN key = 'unresolved_count'
-                  THEN value END) AS INTEGER) AS unresolved_count,
-    CAST(MAX(CASE WHEN key = 'empty_procedure_count'
-                  THEN value END) AS INTEGER) AS empty_procedure_count,
-    CAST(MAX(CASE WHEN key = 'duplicate_path_count'
-                  THEN value END) AS INTEGER) AS duplicate_path_count,
-    CAST(MAX(CASE WHEN key = 'recursion_count'
-                  THEN value END) AS INTEGER) AS recursion_count,
-    CAST(MAX(CASE WHEN key = 'truncated_call_count'
-                  THEN value END) AS INTEGER) AS truncated_call_count,
-    CAST(MAX(CASE WHEN key = 'checker_inst_count'
-                  THEN value END) AS INTEGER) AS checker_inst_count,
-    CAST(MAX(CASE WHEN key = 'unanalysed_inst_count'
-                  THEN value END) AS INTEGER) AS unanalysed_inst_count,
-    MAX(CASE WHEN key = 'config_digest'         THEN value END) AS config_digest
-FROM meta;
+    schema_version, tool, tool_version, slang_version, producer_revision,
+    top, analysis_status, error_count, unresolved_count,
+    empty_procedure_count, duplicate_path_count, recursion_count,
+    truncated_call_count, checker_inst_count, unanalysed_inst_count,
+    config_digest
+FROM db_info;
 
 -- One row per tree_node. The subtype columns are NULL by node_kind, and that
 -- is the contract: root/instance/unresolved have inst_id (and module_id
@@ -259,6 +238,7 @@ SELECT
     d.assign_operand_id      AS assign_operand_id,
     d.stmt_target_id       AS stmt_target_id,
     d.expr_ref_id            AS expr_ref_id,
+    d.branch_id              AS branch_id,
     d.prim_id                AS prim_id,
     d.src_hier_ref_id        AS src_hier_ref_id,
     d.tgt_hier_ref_id        AS tgt_hier_ref_id,
@@ -625,9 +605,13 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 --                 with role='event' when the expression was not plain).
 --   wait          a procedure suspends on it (proc_event, or role='wait').
 --   statement     a statement reads it and writes nothing this instance
---                 names: an assertion, a $display, a call argument or
---                 branch condition whose statement has no local target.
+--                 names: an assertion, a $display or a call argument whose
+--                 statement has no local target.
 --                 load_* are all NULL -- a real reader, no nameable target.
+--   condition     a level reads it and gates nothing this instance names.
+--                 The read belongs to the level, so stmt_id is NULL and
+--                 branch_id names it -- `if (c) ;` is the whole of this
+--                 case, and it used to be no row at all.
 --   terminal      the design boundary: a root output/inout/ref terminal
 --                 reads the net it stands for. load_* are NULL and
 --                 term_id names the pin, so "unused" and "reaches the
@@ -681,6 +665,7 @@ SELECT
     NULL                     AS term_id,
     d.map_exact              AS map_exact,
     d.call_site_id           AS call_site_id,
+    d.branch_id              AS branch_id,
     f.path                   AS file_path,
     sf.path                  AS src_path,
     COALESCE(s.line, p.line) AS src_line,
@@ -703,6 +688,7 @@ SELECT
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
     a.map_exact, NULL,
+    NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net outnet          ON outnet.id = a.outer_net_id
@@ -719,6 +705,7 @@ SELECT
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
     a.map_exact, NULL,
+    NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
@@ -734,6 +721,7 @@ SELECT
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
     NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
     f.path, sf.path, pe.line, pe.col
 FROM proc_event pe
 JOIN net n               ON n.id = pe.net_id
@@ -749,6 +737,7 @@ SELECT
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
     NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
     f.path, sf.path, s.line, s.col
 FROM expr_ref e
 JOIN net n               ON n.id = e.net_id
@@ -758,12 +747,33 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE e.role IN ('assertion', 'wait', 'event', 'system_task')
    OR NOT EXISTS (SELECT 1 FROM net_dep d WHERE d.expr_ref_id = e.id)
 UNION ALL
+-- A condition that gates nothing this instance names. The dependency rows
+-- carry the rest into 'dataflow', so the guard is the same one the reads
+-- above use: a level's read of a net is repeated here only when no
+-- dependency came out of that pair.
+SELECT
+    r.net_id, n.inst_id, n.name, NULL,
+    r.lo, r.hi, r.is_exact,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    'condition',
+    NULL, NULL, NULL, b.proc_id, NULL, NULL, b.call_site_id,
+    r.branch_id,
+    f.path, sf.path, b.line, b.col
+FROM branch_ref r
+JOIN net n               ON n.id = r.net_id
+JOIN branch b            ON b.id = r.branch_id
+LEFT JOIN file f         ON f.id = b.file_id
+LEFT JOIN src_file sf ON sf.id = f.src_file_id
+WHERE NOT EXISTS (SELECT 1 FROM net_dep d
+                  WHERE d.branch_id = r.branch_id AND d.src_net_id = r.net_id)
+UNION ALL
 SELECT
     o.net_id, n.inst_id, n.name, NULL,
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
     NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
     f.path, sf.path, s.line, s.col
 FROM assign_operand o
 JOIN net n               ON n.id = o.net_id
@@ -778,6 +788,7 @@ SELECT
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id, NULL, NULL,
+    NULL,
     f.path, sf.path, t.line, t.col
 FROM term_map m
 JOIN term t              ON t.id = m.term_id
@@ -918,7 +929,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- Everything touching one net, one row per attachment: the structural
 -- adjacency that v_driver/v_load answer directionally, answered flatly --
 -- "what hangs off this net". attachment_kind names the relation, and
--- exactly ONE of the seven typed id columns points at that relation's own
+-- exactly ONE of the typed id columns points at that relation's own
 -- row -- the same exclusive-arc shape net_dep uses, rather than one
 -- polymorphic id whose meaning a consumer had to reconstruct from the
 -- kind. The typed column each kind fills:
@@ -942,8 +953,11 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 --                                    a separate kind so "what writes this
 --                                    net" excludes it, as no net_dep does.
 --   read_by             assign_operand_id
---   condition           expr_ref_id  expr_ref with role='control'.
---   statement_read      expr_ref_id  every other expr_ref role.
+--   condition           branch_ref_id  a level's own read of its
+--                                    condition. stmt_id is NULL: the read
+--                                    belongs to the level, not to the
+--                                    statements under it.
+--   statement_read      expr_ref_id  an expr_ref, whatever its role.
 --   event               proc_event_id  proc_event: a procedure triggers
 --                                    or waits on it. One procedure takes
 --                                    several events on one net, so the
@@ -964,12 +978,12 @@ SELECT m.inner_net_id AS net_id, n.inst_id AS inst_id, n.name AS net_name,
        m.id AS term_map_id, NULL AS conn_id, NULL AS stmt_target_id,
        NULL AS assign_operand_id,
        NULL AS expr_ref_id, NULL AS proc_event_id, NULL AS dep_id,
-       NULL AS hier_ref_id
+       NULL AS hier_ref_id, NULL AS branch_ref_id
 FROM term_map m JOIN net n ON n.id = m.inner_net_id
 UNION ALL
 SELECT c.outer_net_id, n.inst_id, n.name, 'actual_outside',
        c.outer_lo, c.outer_hi, c.outer_exact, NULL,
-       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL
+       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 FROM net_conn c JOIN net n ON n.id = c.outer_net_id
 WHERE c.outer_net_id IS NOT NULL
 UNION ALL
@@ -980,7 +994,7 @@ UNION ALL
 -- this net feed" answered nothing for exactly the ties v12 taught to arc.
 SELECT h.resolved_net_id, n.inst_id, n.name, 'actual_outside',
        h.lo, h.hi, h.is_exact, NULL,
-       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL
+       NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 FROM net_conn c
 JOIN hier_ref h ON h.id = c.outer_hier_ref_id
 JOIN net n ON n.id = h.resolved_net_id
@@ -998,42 +1012,45 @@ SELECT a.net_id, n.inst_id, n.name,
             WHEN s.stmt_kind = 'alias'   THEN 'alias_binding'
             ELSE 'written_by' END,
        a.lo, a.hi, a.is_exact, a.stmt_id,
-       NULL, NULL, a.id, NULL, NULL, NULL, NULL, NULL
+       NULL, NULL, a.id, NULL, NULL, NULL, NULL, NULL, NULL
 FROM stmt_target a JOIN net n ON n.id = a.net_id
 JOIN stmt s ON s.id = a.stmt_id
 UNION ALL
 SELECT o.net_id, n.inst_id, n.name, 'read_by',
        o.lo, o.hi, o.is_exact, o.stmt_id,
-       NULL, NULL, NULL, o.id, NULL, NULL, NULL, NULL
+       NULL, NULL, NULL, o.id, NULL, NULL, NULL, NULL, NULL
 FROM assign_operand o JOIN net n ON n.id = o.net_id
 UNION ALL
-SELECT e.net_id, n.inst_id, n.name,
-       CASE WHEN e.role = 'control' THEN 'condition'
-            ELSE 'statement_read' END,
+SELECT e.net_id, n.inst_id, n.name, 'statement_read',
        e.lo, e.hi, e.is_exact, e.stmt_id,
-       NULL, NULL, NULL, NULL, e.id, NULL, NULL, NULL
+       NULL, NULL, NULL, NULL, e.id, NULL, NULL, NULL, NULL
 FROM expr_ref e JOIN net n ON n.id = e.net_id
+UNION ALL
+SELECT r.net_id, n.inst_id, n.name, 'condition',
+       r.lo, r.hi, r.is_exact, NULL,
+       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, r.id
+FROM branch_ref r JOIN net n ON n.id = r.net_id
 UNION ALL
 SELECT pe.net_id, n.inst_id, n.name, 'event',
        NULL, NULL, 1, pe.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, pe.id, NULL, NULL
+       NULL, NULL, NULL, NULL, NULL, pe.id, NULL, NULL, NULL
 FROM proc_event pe JOIN net n ON n.id = pe.net_id
 WHERE pe.net_id IS NOT NULL
 UNION ALL
 SELECT d.tgt_net_id, n.inst_id, n.name, 'dep_in',
        d.tgt_lo, d.tgt_hi, d.tgt_exact, d.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL
+       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL, NULL
 FROM net_dep d JOIN net n ON n.id = d.tgt_net_id
 UNION ALL
 SELECT d.src_net_id, n.inst_id, n.name, 'dep_out',
        d.src_lo, d.src_hi, d.src_exact, d.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL
+       NULL, NULL, NULL, NULL, NULL, NULL, d.id, NULL, NULL
 FROM net_dep d JOIN net n ON n.id = d.src_net_id
 WHERE d.src_net_id IS NOT NULL
 UNION ALL
 SELECT h.resolved_net_id, n.inst_id, n.name, 'named_from_outside',
        h.lo, h.hi, h.is_exact, h.stmt_id,
-       NULL, NULL, NULL, NULL, NULL, NULL, NULL, h.id
+       NULL, NULL, NULL, NULL, NULL, NULL, NULL, h.id, NULL
 FROM hier_ref h JOIN net n ON n.id = h.resolved_net_id
 WHERE h.resolved_net_id IS NOT NULL;
 
@@ -1065,6 +1082,8 @@ SELECT
     b.iter_first       AS iter_first,
     b.iter_step        AS iter_step,
     b.iter_count       AS iter_count,
+    b.proc_id          AS proc_id,
+    b.call_site_id     AS call_site_id,
     (SELECT group_concat(v, ',') FROM
         (SELECT l.value AS v FROM branch_label l
           WHERE l.branch_id = b.id ORDER BY l.ordinal)) AS labels,
@@ -1127,9 +1146,10 @@ SELECT
     i.module_id         AS module_id,
     m.name              AS module_name,
     h.stmt_id           AS stmt_id,
+    h.branch_id         AS branch_id,
     h.path              AS ref_path,
     h.access            AS access,
-    h.resolved_inst_id  AS resolved_inst_id,
+    rn.inst_id          AS resolved_inst_id,
     h.resolved_net_id   AS resolved_net_id,
     rn.name             AS resolved_net_name,
     h.lo                AS lo,

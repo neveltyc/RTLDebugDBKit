@@ -36,9 +36,9 @@ endmodule
 // occurrence, and what it finds there need not be the KIND of thing the
 // analysed body found: `blk` is an instance above one occurrence of shadow_rd
 // and a generate block above the other. The first resolves. The second is
-// where the lookup stopped and there is no instance to record for it --
-// resolved_inst_id is a foreign key into inst -- so it stays NULL rather than
-// naming a node with no inst row or searching on for some other `blk`.
+// where the lookup stopped, and a generate level holds no nets -- so the
+// reference resolves to nothing rather than searching on for some other
+// `blk` under a level the source did not name.
 module shadow_leaf;
     logic [7:0] sig;
 endmodule

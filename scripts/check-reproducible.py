@@ -62,6 +62,18 @@ def schema(con):
     ).fetchall()
 
 
+def row_order(con, table):
+    """What to order a table's rows by: its rowid, or its key when it has none."""
+    try:
+        con.execute(f'SELECT rowid FROM "{table}" LIMIT 1').fetchall()
+        return "rowid"
+    except sqlite3.OperationalError:
+        key = [r[1] for r in
+               sorted((r for r in con.execute(f'PRAGMA table_info("{table}")')
+                       if r[5]), key=lambda r: r[5])]
+        return ", ".join(f'"{c}"' for c in key)
+
+
 def compare(ref_db, new_db, run):
     """Report every way `new_db` differs from `ref_db`, as a list of strings."""
     a, b = sqlite3.connect(ref_db), sqlite3.connect(new_db)
@@ -86,16 +98,22 @@ def compare(ref_db, new_db, run):
         # under test. Two databases holding one set of rows in two orders is
         # exactly the failure this script was written for, and ordering the
         # rows by their own contents would hide it.
-        ca = a.execute(f'SELECT rowid, * FROM "{t}" ORDER BY rowid')
-        cb = b.execute(f'SELECT rowid, * FROM "{t}" ORDER BY rowid')
+        #
+        # A WITHOUT ROWID table has no insertion order to disagree about --
+        # it is stored in primary key order -- and no rowid to ask for, so it
+        # is compared in the order it is kept in.
+        order = row_order(a, t)
+        ca = a.execute(f'SELECT {order}, * FROM "{t}" ORDER BY {order}')
+        cb = b.execute(f'SELECT {order}, * FROM "{t}" ORDER BY {order}')
         differing = 0
         for ra, rb in zip(ca, cb):
             compared += 1
             if ra != rb:
                 differing += 1
                 if differing <= 3:
-                    problems.append(f"run {run}: {t} rowid {ra[0]}: "
-                                    f"{ra[1:]} != {rb[1:]}")
+                    key = ra[:len(order.split(", "))]
+                    problems.append(f"run {run}: {t} row {key}: "
+                                    f"{ra[len(key):]} != {rb[len(key):]}")
         # zip() stops at the shorter side, so a length difference has to be
         # asked about separately or a truncated table reads as a clean match.
         na = a.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
