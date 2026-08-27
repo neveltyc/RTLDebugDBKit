@@ -38,18 +38,39 @@ jobs:
           sha256sum rtl-designdb-* > sha256sums.txt
           cat sha256sums.txt
 
+      # The release notes are the CHANGELOG entry for this tag, not a generated
+      # commit list: the changelog is written for a reader deciding whether to
+      # upgrade, and the commit list is not. A tag whose version has no entry
+      # stops the release here rather than publishing an empty body.
+      - name: Take the release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/         { exit }
+            found                      { print }
+          ' CHANGELOG.md | sed '1{/^$/d;}' > release-notes.md
+          [ -s release-notes.md ] || {
+            echo "CHANGELOG.md has no section for $version"; exit 1; }
+          cat release-notes.md
+
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: release-notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
+          # third-party-licenses.md rides along because the binaries are
+          # statically linked: a downloaded asset carries no repository around
+          # it, and the MIT and BSL-1.0 components inside require their notices
+          # to travel with a binary redistribution.
           files: |
             dist/rtl-designdb-linux-amd64
             dist/rtl-designdb-linux-arm64
             dist/rtl-designdb-windows-amd64.exe
             dist/rtl-designdb-macos-arm64
             dist/sha256sums.txt
+            third-party-licenses.md
