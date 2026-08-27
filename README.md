@@ -8,6 +8,7 @@
 </p>
 
 <p align="center">
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.0-3366cc?style=flat-square">
   <img alt="schema" src="https://img.shields.io/badge/schema-v20-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
@@ -273,14 +274,13 @@ Release 构建，macOS arm64，公开设计，schema v20：
 
 | 设计 | 定义 | 实例 | 网 | 语句 | 依赖 | 耗时 | 数据库 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 225 | 744 | 3,385 | 0.02 s | 0.98 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.03 s | 1.53 MB |
-| VeeRwolf (`veerwolf_core`) | 91 | 1,925 | 17,808 | 11,083 | 36,414 | 0.22 s | 11.4 MB |
+| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0.03 s | 0.89 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 0.03 s | 1.38 MB |
+| VeeRwolf (`veerwolf_core`) | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 0.24 s | 11.0 MB |
 
-要看的是实例级展开这一列：VeeRwolf 的 1,925 个实例是从 164 个参数化模块体盖出来
-的（10 倍复制），而数据库落在折叠版 v9 文件的大约 **2 倍**，不是 10 倍——类型文本保持
-interned，最大的几张表随语句数增长，不是随语句数乘扇出。
-`scripts/export-real-designs.sh` 用本地的这几个设计复现这张表。
+要看的是实例级展开这一列：VeeRwolf 的 1,925 个实例是从 **169 个参数化模块体**盖出来的，
+约 11 倍复制，而数据库只有 11 MB——类型文本保持 interned，最大的几张表随语句数增长，
+不是随语句数乘扇出。`scripts/export-real-designs.sh` 用本地的这几个设计复现这张表。
 
 更大的也守得住：一个 32 万行、精化出 14.5 万个实例、480 万行的设计，大约 4 秒、324 MB。
 `--time-report` 能拆开看——大致四分之一在 slang，六分之一在遍历，其余在 SQLite 写行和建
@@ -378,6 +378,11 @@ sqlite3 -box design.db "SELECT * FROM v_db_info"
 2. **只查 `v_` 视图**。列、NULL 规则、行粒度是带版本的契约；基表不是。
 3. **诊断在日志里**，`grep '^slang  *error:' rtldbgdb-elab.log` 一条一行，各自点名文件
    和错因。不需要为了看错误重跑导出。
+
+## 变更记录
+
+每个版本的变更记在 [CHANGELOG.md](CHANGELOG.md)。工具版本用语义化版本，数据库契约另有
+一个整数 `db_info.schema_version`，两者独立推进。
 
 ## 许可证
 

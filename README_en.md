@@ -8,6 +8,7 @@
 </p>
 
 <p align="center">
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.0-3366cc?style=flat-square">
   <img alt="schema" src="https://img.shields.io/badge/schema-v20-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
@@ -297,14 +298,14 @@ Release build, macOS arm64, against public designs, schema v20:
 
 | design | definitions | instances | nets | statements | dependencies | time | database |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| picorv32 | 1 | 1 | 225 | 744 | 3,385 | 0.02 s | 0.98 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,355 | 0.03 s | 1.53 MB |
-| VeeRwolf (`veerwolf_core`) | 91 | 1,925 | 17,808 | 11,083 | 36,414 | 0.22 s | 11.4 MB |
+| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0.03 s | 0.89 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 0.03 s | 1.38 MB |
+| VeeRwolf (`veerwolf_core`) | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 0.24 s | 11.0 MB |
 
 The instance-level expansion is the column to watch: VeeRwolf's 1,925 instances
-stamp out from 164 parameterised bodies (10× replication), and the database lands
-at roughly **2× the folded v9 file** rather than 10× — type text stays interned,
-and the biggest tables scale with statements, not with statements times fan-out.
+stamp out from **169 parameterised bodies**, roughly 11× replication, and the
+database still lands at 11 MB — type text stays interned, and the biggest tables
+scale with statements, not with statements times fan-out.
 `scripts/export-real-designs.sh` reproduces this table against a local checkout
 of the designs.
 
@@ -425,6 +426,12 @@ Three things matter for an agent:
 3. **Diagnostics are in the log.** `grep '^slang  *error:' rtldbgdb-elab.log`
    gives one line per error, each naming its file and what went wrong. There is
    no need to re-run the export to see them.
+
+## Changelog
+
+Each release is recorded in [CHANGELOG.md](CHANGELOG.md). The tool uses semantic
+versioning; the database contract carries its own integer,
+`db_info.schema_version`, and the two move independently.
 
 ## Licence
 
