@@ -452,8 +452,8 @@ FROM arc;
 --   constant            a tie-off or a constant RHS: driver_net_id NULL,
 --                       and every driver_* column NULL with it.
 --   external            the source is a reference this export has no net
---                       row for -- a package variable, an upward name from
---                       a shared body. The signal IS driven; driver_net_id
+--                       row for -- a `$unit` item, an upward name whose
+--                       search declined. The signal IS driven; driver_net_id
 --                       is NULL because the driver has no row, not because
 --                       it does not exist, and src_hier_ref_id on the
 --                       dependency names the reference (path, location,

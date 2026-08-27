@@ -3,14 +3,14 @@
 // A path anchored at $root is ABSOLUTE: it names one object, and every
 // occurrence of the body that spells it means that same object. An upward
 // name is the opposite -- it means whatever the surroundings of THIS
-// occurrence hold, which is why one analysed body cannot answer for it and
-// the export leaves it NULL.
+// occurrence hold, so it is searched for again per occurrence rather than
+// replayed from the one body that was analysed.
 //
 // slang's HierarchicalReference::isUpward() answers true for both (it is
 // `upwardCount > 0 || path[0] is Root`), so a single test against it dropped
 // the absolute ones with the upward ones and no $root reference ever
 // resolved. The two spellings of one target below are the point: they name
-// the same net and only one of them can be replayed per occurrence.
+// the same net and they get there by different routes.
 
 module rootref_leaf;
     logic [7:0] q;
@@ -38,9 +38,11 @@ module rootref_reader(input logic clk, output logic [7:0] abs_o,
     // downward replay would have done and what makes r1 the case that tells
     // the two apart.
     always_ff @(posedge clk) abs_o <= $root.rootref.u_leaf.q;
-    // The same net, spelled upward. It resolves for r0 and r1 alike here,
-    // but the body cannot know that: another instantiation of this module
-    // would find a different `rootref` above it, or none. Stays NULL.
+    // The same net, spelled upward. Which level answers `rootref` belongs to
+    // the occurrence -- another instantiation of this module would find a
+    // different one above it, or none -- so the search runs from r0 and from
+    // r1 separately. Here both find the top, and both land on the net the
+    // absolute spelling names.
     always_ff @(posedge clk) up_o <= rootref.u_leaf.q;
     // An absolute path whose target is a net of the TOP instance: one tree
     // segment, so the descent from the root node has to consume exactly it

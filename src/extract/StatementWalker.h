@@ -1317,7 +1317,14 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
         Ref dst;
         dst.sym = curSub->returnValVar;
-        dst.origin = stmt.expr;
+        // No origin: the result variable is not written as an expression
+        // anywhere. Handing it the RETURNED one made every consumer of the
+        // field answer about the value instead of the target -- a reference
+        // outside the instance was filed under the returned expression's own
+        // text (`iy_inc==4'h0?ix_seq_num:...` as a written name), and
+        // `return u.x;` resolved that write onto u.x, which the function
+        // reads and never drives.
+        //
         // A return writes all of the implicit result variable; whole and
         // exact is the genuine answer here, not a parity default.
         dst.cover = BitInterval::whole();

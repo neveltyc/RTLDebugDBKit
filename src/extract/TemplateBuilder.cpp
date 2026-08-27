@@ -48,6 +48,7 @@ TemplateSet TemplateBuilder::run() {
     for (auto& [key, group] : groups) {
         auto& t = templates[key];
         t.moduleId = moduleIds[&group.body->getDefinition()];
+        t.defName = std::string(group.body->getDefinition().name);
         t.params = group.params;
         t.paramPairs = group.paramPairs;
         buildTemplate(t, *group.body);
@@ -344,9 +345,8 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
     /// targets replay inside the occurrence's own subtree; absolute ones
     /// replay from the root; a reference through one of this template's own
     /// interface terminals replays from whatever instance the terminal is
-    /// bound to in that occurrence. Upward references (upwardCount > 0) stay
-    /// unresolved -- the one analysed body speaks for occurrences whose
-    /// upward surroundings may differ, and a guess is worse than a NULL.
+    /// bound to in that occurrence; an upward one is searched for above each
+    /// occurrence, per fillUpward.
 void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // The reference expression may be wrapped in selects and
     // conversions; the resolved reference lives on the base value node.
@@ -431,21 +431,14 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
         row.resolve = TplHierRef::Failed;
         return;
     }
-    // slang's isUpward() is true for two unrelated shapes, and only one of
-    // them is unresolvable here: a name that climbed OUT of this body
-    // (upwardCount > 0), and a name anchored at $root. The first is a
-    // genuine unknown -- the one analysed body speaks for occurrences whose
-    // upward surroundings may differ, and a guess is worse than a NULL. The
-    // second is the opposite: an absolute path names the same object seen
-    // from every occurrence, which is exactly what TplHierRef::Absolute is
-    // for. Asking isUpward() alone dropped `$root.a.b.c` with the upward
-    // ones and left Absolute unreachable.
+    // slang's isUpward() is true for two unrelated shapes: a name that
+    // climbed OUT of this body (upwardCount > 0), and a name anchored at
+    // $root. They replay differently -- the first is searched for above each
+    // occurrence, the second descends from the root -- so Absolute is told
+    // apart here rather than left unreachable behind isUpward().
     const bool fromRoot = !hv->ref.path.empty() && hv->ref.path.front().symbol &&
                           hv->ref.path.front().symbol->kind == SymbolKind::Root;
-    if (!fromRoot && hv->ref.isUpward()) {
-        row.resolve = TplHierRef::Upward;
-        return;
-    }
+    const bool upward = !fromRoot && hv->ref.isUpward();
     // A modport port stands for the net behind it: the reference
     // resolves to that net, not to the modport's own symbol -- whose
     // path carries the modport level (`bus.src.vld`) that the stamped
@@ -476,6 +469,10 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
             return;
         }
         target = inner;
+    }
+    if (upward) {
+        fillUpward(row, *hv, *target);
+        return;
     }
     std::string full = target->getHierarchicalPath();
     // The interface-port case: the reference entered through one of this
@@ -542,6 +539,58 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // which is what Stamper's descend(0, segs) consumes.
     row.resolve = TplHierRef::Absolute;
     if (!segsFromAncestry(nullptr, nullptr, *target, row))
+        row.resolve = TplHierRef::Failed;
+}
+
+/// The first name component of a written path, or empty when a search cannot
+/// key on it: an escaped identifier and a selected component (`u_arr[2].x`
+/// seen from above) are spelled one way in the source and another in the
+/// tree, so neither spelling is the key.
+static std::string firstSegment(const std::string& path) {
+    const size_t dot = path.find('.');
+    if (dot == 0 || dot == std::string::npos)
+        return {};
+    std::string first = path.substr(0, dot);
+    if (first.find_first_of("\\[:") != std::string::npos)
+        return {};
+    return first;
+}
+
+    /// The replay route for a name that climbed out of the analysed body:
+    /// the name it is anchored at, and the segments below that anchor.
+    ///
+    /// Which level the anchor sits at is deliberately not recorded. LRM 23.8
+    /// resolves the first component by searching the enclosing hierarchy for
+    /// it, and the level that answers belongs to the occurrence rather than
+    /// to the one body that was analysed -- `tb_top.dut.x` may name an
+    /// instance two levels above one occurrence, four above the next, and
+    /// nothing at all above a third. The stamper repeats the search per
+    /// occurrence, which is what makes the answer that occurrence's own
+    /// instead of this body's guessed onto it.
+void TemplateBuilder::fillUpward(TplHierRef& row, const HierarchicalValueExpression& hv,
+                                 const Symbol& target) {
+    if (hv.ref.path.empty())
+        return;
+    auto& head = hv.ref.path.front();
+    const Symbol* anchor = head.symbol;
+    // Only an instance anchors a route: a generate block is a level
+    // segsFromAncestry has no stop for, and a selected head is not the name
+    // the search would carry.
+    if (anchor->kind != SymbolKind::Instance ||
+        !std::get_if<std::string_view>(&head.selector))
+        return;
+    std::string first = firstSegment(row.path);
+    if (first.empty())
+        return;
+    // The key has to be a name the stamper can recognise the anchor by: the
+    // instance's own name, or -- the other half of the upward rule -- the
+    // definition name of a module the reference stands inside.
+    if (anchor->name != first &&
+        anchor->as<InstanceSymbol>().getDefinition().name != first)
+        return;
+    row.anchor = std::move(first);
+    row.resolve = TplHierRef::Upward;
+    if (!segsFromAncestry(nullptr, anchor, target, row))
         row.resolve = TplHierRef::Failed;
 }
 

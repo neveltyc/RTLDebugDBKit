@@ -322,13 +322,16 @@ private:
     /// targets replay inside the occurrence's own subtree; absolute ones --
     /// the $root-anchored names -- replay from the design root; a reference
     /// through one of this template's own interface terminals replays from
-    /// whatever instance the terminal is bound to in that occurrence.
-    /// Upward references (upwardCount > 0) stay unresolved -- the one
-    /// analysed body speaks for occurrences whose upward surroundings may
-    /// differ, and a guess is worse than a NULL. That reasoning covers only
-    /// the upward ones, so $root is exempt from it: an absolute path names
-    /// one object no matter which occurrence reads it.
+    /// whatever instance the terminal is bound to in that occurrence; an
+    /// upward one is searched for above each occurrence, per fillUpward.
     void fillResolution(Build& b, TplHierRef& row, const Ref& r);
+
+    /// The route for a name that climbed out of the analysed body: the name
+    /// it is anchored at, plus the segments below that anchor. The anchor is
+    /// searched for again per occurrence, so no level from this body's
+    /// surroundings is baked into the row.
+    void fillUpward(TplHierRef& row, const HierarchicalValueExpression& hv,
+                    const Symbol& target);
 
     static bool splitBelow(const std::string& full, const std::string& prefix,
                            std::string& rel);
