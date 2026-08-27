@@ -120,7 +120,10 @@ try:
         # the only thing that says why, so it is printed then and not before.
         proc = subprocess.run([exporter, *exporter_args, "-o", db],
                               capture_output=True, text=True)
-        if proc.returncode != 0:
+        # 0, 3 and 4 all wrote a database -- complete, partial and hierarchy
+        # only. An incomplete export is still reproducible, and its two runs
+        # must agree row for row like any other's.
+        if proc.returncode not in (0, 3, 4):
             sys.stderr.write(proc.stdout + proc.stderr)
             sys.exit(f"export run {run} failed with status {proc.returncode}")
         if not os.path.exists(db):

@@ -42,11 +42,54 @@ whatever drives it.
 | `--single-unit` | Compile the whole list as one compilation unit, so a leading `` `define `` header reaches every later file. VCS and Verilator behave this way; slang defaults to per-file units. Designs that keep their configuration in a header need this. |
 | `-o <file.db>` | Output database. |
 | `--diag [N]` | Print elaboration diagnostics — all of them, or the first N. |
+| `--nolog` | Do not write the elaboration log (see *Log and exit code*). |
 | `--timing` | Report how long each phase took. |
 | `--check-constraints` | Keep the enum-domain `CHECK` clauses in the schema, so a bad value is refused as it is written. Off by default: a string `IN`-list is evaluated per row and costs more than the rest of the insert put together, while `verify-designdb.py` derives the same domains from the finished file. |
 | `-q` | Only report problems. |
 
 Bare paths are taken as source files.
+
+## Log and exit code
+
+Every run writes `rtldbgdb-elab.log` beside the database: slang's own
+diagnostics — all of them, whatever `--diag` shows on the terminal — and this
+tool's findings. `-q` quiets the terminal, not the log; `--nolog` turns the
+file off.
+
+Every line carries its producer and severity in fixed columns. A multi-line
+item marks exactly one line `:` — the one carrying the message — and the rest
+`|`, so a `:` line always names a file and what went wrong. slang prints its
+instance path *before* the diagnostic, so that context arrives as a `|` line
+above its own `:` line:
+
+```
+slang        error|   in instance: soc.u_core
+slang        error: rtl/fifo.sv:39:5: error: unknown module 'ghost'
+slang        error|     ghost #(.MODE(2)) u_g (.clk(clk), .req(req));
+slang        error|     ^~~~~
+rtl-designdb note: 2 instantiation(s) name a module that could not be resolved
+```
+
+So the file answers questions rather than being scrolled:
+
+```sh
+grep -c '^slang  *error:' rtldbgdb-elab.log   # how many errors (items, not lines)
+grep '^slang  *error' rtldbgdb-elab.log       # each one with its source snippet
+grep '^rtl-designdb' rtldbgdb-elab.log        # what the exporter itself found
+grep 'fifo.sv' rtldbgdb-elab.log              # everything about one file
+```
+
+The exit code says how complete the export is, so a caller does not have to
+open the database to find out. It is the same rule that writes
+`meta.analysis_status`, so the two can never disagree.
+
+| | |
+|---|---|
+| `0` | Database written, `analysis_status = 'complete'`. |
+| `3` | Database written, `'partial'` — elaboration errors, or a gap one of the `meta` counts names. |
+| `4` | Database written, `'hierarchy_only'` — the compilation is fatally errored, so there is a tree and no dataflow. |
+| `2` | No database: the invocation or the sources were unusable (bad option, unreadable filelist, `--top` did not elaborate). |
+| `1` | No database: the export itself failed (the file could not be replaced, or an unexpected error). |
 
 ## Output
 

@@ -44,8 +44,13 @@ run() {
     db="$out/$name.db"
     echo "=== $name ==="
     start=$(date +%s%N 2>/dev/null || date +%s)
-    if ! (cd "$dir" && "$bin" "$@" -o "$db"); then
-        echo "FAIL: export $name" >&2
+    # 0, 3 and 4 all wrote a database -- complete, partial and hierarchy
+    # only. A third-party tree that does not fully elaborate is still worth
+    # exporting and checking; only "no database" is a failure here.
+    (cd "$dir" && "$bin" "$@" -o "$db")
+    rc=$?
+    if [ "$rc" != 0 ] && [ "$rc" != 3 ] && [ "$rc" != 4 ]; then
+        echo "FAIL: export $name (exit $rc)" >&2
         fail=1
         return
     fi
