@@ -92,8 +92,11 @@ jobs:
         run: |
           ${{ matrix.bin }} examples/basic/top.sv --top top -o design.db
           ${{ matrix.python }} scripts/verify-designdb.py design.db
+          # 0, 3 and 4 all wrote a database -- complete, partial and
+          # hierarchy only -- and two fixtures exist to produce the last two.
           for mode in $(${{ matrix.python }} scripts/verify-designdb.py --list-modes); do
-            ${{ matrix.bin }} "examples/constructs/$mode.sv" -o "$mode.db"
+            ${{ matrix.bin }} "examples/constructs/$mode.sv" -o "$mode.db" \
+              || { rc=$?; [ "$rc" = 3 ] || [ "$rc" = 4 ] || exit "$rc"; }
             ${{ matrix.python }} scripts/verify-designdb.py "$mode.db" "$mode"
           done
 

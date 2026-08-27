@@ -104,9 +104,20 @@ jobs:
           ./build/rtl-designdb examples/basic/top.sv --top top \
             --check-constraints -o design-checked.db
           python3 scripts/verify-designdb.py design-checked.db
+          # 0, 3 and 4 all wrote a database -- complete, partial and
+          # hierarchy only -- and two fixtures exist to produce the last two.
           for mode in $(python3 scripts/verify-designdb.py --list-modes); do
-            ./build/rtl-designdb "examples/constructs/$mode.sv" -o "$mode.db"
+            ./build/rtl-designdb "examples/constructs/$mode.sv" -o "$mode.db" \
+              || { rc=$?; [ "$rc" = 3 ] || [ "$rc" = 4 ] || exit "$rc"; }
             python3 scripts/verify-designdb.py "$mode.db" "$mode"
+          done
+          # The exit code is the contract an agent branches on without opening
+          # the database, so it is asserted rather than merely tolerated.
+          for pair in "incomplete 3" "recursion 4"; do
+            set -- $pair
+            ./build/rtl-designdb "examples/constructs/$1.sv" -o "code-$1.db" \
+              && rc=0 || rc=$?
+            [ "$rc" = "$2" ] || { echo "expected exit $2 from $1, got $rc"; exit 1; }
           done
           # The CLI itself, which the constructs family never exercises: two
           # files sharing one compilation unit (so a macro defined in the first
