@@ -2331,6 +2331,20 @@ if mode == "procedural":
         WHERE module_name='stmtgaps' AND branch_kind='loop' AND iter_name='i'
           AND iter_first=0 AND iter_step=1 AND iter_count=4""") == 1,
           "the loop level carries the space it runs -- i = 0,1,2,3")
+    # A level is a fact about the source, not about what landed under it.
+    # `if (en) ;` has an arm and an empty loop body has a level, exactly as
+    # an empty case arm has always had a row -- otherwise a reader counting
+    # senses gets a level the design does not have and misses one it does.
+    check(sorted(r[0] for r in con.execute("""
+        SELECT sense FROM v_branch
+        WHERE module_name='emptylevel' AND branch_kind='if'""")) ==
+          ["else", "then"],
+          "an if arm that gates nothing is still an arm, on both senses")
+    check(one("""
+        SELECT count(*) FROM v_branch
+        WHERE module_name='emptylevel' AND branch_kind='loop'
+          AND iter_count=2""") == 1,
+          "and a loop with an empty body still carries its iteration space")
     check(one("""
         SELECT count(*) FROM v_stmt s
         JOIN v_branch b ON b.branch_id = s.branch_id

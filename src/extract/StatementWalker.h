@@ -106,9 +106,12 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// The level the statement being walked sits in, materialising the
     /// pending chain down to it.
     ///
-    /// On demand, so an `if` arm or a loop that gates nothing leaves no row
-    /// behind. A case arm is materialised by its handler regardless: the
-    /// arms under a point are the whole case.
+    /// Every handler that pushes a level calls this before walking the body,
+    /// so a level exists because the source spells it and not because
+    /// something under it happened to land a row. An arm that gates nothing
+    /// is still an arm: without it, `which arm is this, and what did the
+    /// other one do` has no answer, and for a case, which values fall
+    /// through to the default has none either.
     BranchId currentBranch() {
         BranchId parent = -1;
         for (size_t i = 0; i < levels.size(); i++) {
@@ -562,6 +565,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             t.sense = BranchSense::Then;
             t.staticTaken = taken;
             Level level(*this, std::move(t));
+            currentBranch();
             stmt.ifTrue.visit(*this);
         }
         if (stmt.ifFalse) {
@@ -569,6 +573,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             e.sense = BranchSense::Else;
             e.staticTaken = taken < 0 ? -1 : 1 - taken;
             Level level(*this, std::move(e));
+            currentBranch();
             stmt.ifFalse->visit(*this);
         }
     }
@@ -928,6 +933,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         describeIterationSpace(stmt, mine, f);
         {
             Level level(*this, std::move(f));
+            currentBranch();
             stmt.body.visit(*this);
         }
         for (auto& idx : mine)
@@ -965,6 +971,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
         {
             Level level(*this, std::move(f));
+            currentBranch();
             visitDefault(stmt);
         }
         for (auto* v : mine)
@@ -980,6 +987,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         f.kind = BranchKind::Loop;
         f.where = stmt.sourceRange;
         Level level(*this, std::move(f));
+        currentBranch();
         stmt.body.visit(*this);
     }
 
@@ -992,6 +1000,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             stmt.cond.visit(*this);
         });
         Level level(*this, std::move(f));
+        currentBranch();
         stmt.body.visit(*this);
     }
 
@@ -1009,6 +1018,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             stmt.cond.visit(*this);
         });
         Level level(*this, std::move(f));
+        currentBranch();
         stmt.body.visit(*this);
     }
 
@@ -1029,6 +1039,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 f.iterCount = *v;
         }
         Level level(*this, std::move(f));
+        currentBranch();
         stmt.body.visit(*this);
     }
 

@@ -278,6 +278,22 @@ module loopspace (input logic [7:0] d, din,
     end
 endmodule
 
+// A level exists because the source spells it, not because something under
+// it landed a row. A `case` arm has always been materialised for that reason
+// -- one arm missing makes "which values fall through to default"
+// unanswerable -- while an `if` arm and a loop body were materialised on
+// demand: this pair recorded ONE arm where the source has two, and no loop
+// level at all, so a reader counting senses got a level the design does not
+// have and missed one it does.
+module emptylevel (input logic clk, input logic en, input logic [7:0] a,
+                   output logic [7:0] q);
+    always_ff @(posedge clk) begin
+        if (en) ;                             // an arm that gates nothing
+        else    q <= a;
+        for (int i = 0; i < 2; i = i + 1) ;   // a body that does nothing
+    end
+endmodule
+
 module procedural (input logic clk, input logic [7:0] x, k,
                    input logic [3:0] sel, input logic b, g, en, ev,
                    output logic [7:0] explicit_self, compound_self,
@@ -290,7 +306,8 @@ module procedural (input logic clk, input logic [7:0] x, k,
                    input  logic rst_n,
                    output logic [7:0] gated_q, gated_y, gated_z, gated_w,
                    output logic [7:0] gated_v,
-                   output logic [7:0] summed, carried, mirrored, dead);
+                   output logic [7:0] summed, carried, mirrored, dead,
+                   output logic [7:0] empty_arm_q);
     compound u_cmp (.clk(clk), .x(x), .explicit_self(explicit_self),
                     .compound_self(compound_self), .shift_self(shift_self),
                     .masked(masked));
@@ -306,4 +323,5 @@ module procedural (input logic clk, input logic [7:0] x, k,
                     .w(gated_w), .v(gated_v));
     loopspace u_lsp (.d(x), .din(k), .summed(summed), .carried(carried),
                      .mirrored(mirrored), .dead(dead));
+    emptylevel u_emp (.clk(clk), .en(en), .a(x), .q(empty_arm_q));
 endmodule
