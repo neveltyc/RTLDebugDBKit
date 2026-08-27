@@ -54,7 +54,9 @@ Bare paths are taken as source files.
 Every run writes `rtldbgdb-elab.log` beside the database: slang's own
 diagnostics — all of them, whatever `--diag` shows on the terminal — and this
 tool's findings. `-q` quiets the terminal, not the log; `--nolog` turns the
-file off.
+file off. The last line names the database the run wrote, or says it wrote
+none — a run that fails before publishing leaves the previous export in place
+and replaces its log, and that line is what tells the two apart.
 
 Every line carries its producer and severity in fixed columns. A multi-line
 item marks exactly one line `:` — the one carrying the message — and the rest
@@ -68,6 +70,7 @@ slang        error: rtl/fifo.sv:39:5: error: unknown module 'ghost'
 slang        error|     ghost #(.MODE(2)) u_g (.clk(clk), .req(req));
 slang        error|     ^~~~~
 rtl-designdb note: 2 instantiation(s) name a module that could not be resolved
+rtl-designdb note: wrote design.db (partial)
 ```
 
 So the file answers questions rather than being scrolled:

@@ -119,6 +119,19 @@ jobs:
               && rc=0 || rc=$?
             [ "$rc" = "$2" ] || { echo "expected exit $2 from $1, got $rc"; exit 1; }
           done
+          # A filelist whose last option never got its argument is a truncated
+          # input. It has to be refused: exporting it wrote a database that
+          # called itself complete over a design missing whole files.
+          printf '%s\n-f\n' examples/basic/top.sv > trailing.f
+          ./build/rtl-designdb -f trailing.f --top top -o trailing.db \
+            && rc=0 || rc=$?
+          [ "$rc" = 2 ] || { echo "a truncated filelist returned $rc, not 2"; exit 1; }
+          [ ! -e trailing.db ] || { echo "a refused filelist still exported"; exit 1; }
+          # The verifier reads; it must not create what it was asked to read.
+          if python3 scripts/verify-designdb.py no-such.db; then
+            echo "the verifier accepted a database that is not there"; exit 1
+          fi
+          [ ! -e no-such.db ] || { echo "the verifier created it"; exit 1; }
           # The CLI itself, which the constructs family never exercises: two
           # files sharing one compilation unit (so a macro defined in the first
           # reaches the second), a header found only through +incdir+, a define

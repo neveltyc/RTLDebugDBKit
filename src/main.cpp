@@ -449,6 +449,20 @@ bool readFilelist(const fs::path& path, Options& opt, ElabLog& log, int depth = 
             }
         }
     }
+    // The wrap tracking above carries an option across a line ending; the end
+    // of the FILE is where it has to be settled. A list ending in a bare `-f`
+    // names a nested list nobody read, and taking that for a complete input
+    // exported a database that reports analysis_status='complete' over a
+    // truncated design -- worse than refusing the input, because nothing in
+    // the file says a source is missing.
+    if (pending != Pending::None) {
+        const char* option = pending == Pending::Filelist ? "-f"
+                             : pending == Pending::LibFile ? "-v"
+                                                           : "-y";
+        failure(log, "error: %s ends with %s and no argument for it\n",
+                path.string().c_str(), option);
+        return false;
+    }
     return true;
 }
 
@@ -760,6 +774,22 @@ enum ExitCode {
     ExitHierarchyOnly = 4,
 };
 
+/// The run's last word, to the log and not to the terminal: which database
+/// it left behind, or that it left none.
+///
+/// A log is read beside a database, and the two can disagree -- a run that
+/// fails before publishing keeps the PREVIOUS export while replacing its log
+/// -- so the log ends by saying which of the two it is talking about.
+int finished(ElabLog& log, const Options& opt, int code,
+             const char* status = nullptr) {
+    if (status)
+        log.put(kToolName, "note", "wrote " + opt.output + " (" + status + ")");
+    else
+        log.put(kToolName, "note",
+                "no database was written (exit " + std::to_string(code) + ")");
+    return code;
+}
+
 int exitCodeFor(std::string_view analysisStatus) {
     if (analysisStatus == "hierarchy_only")
         return ExitHierarchyOnly;
@@ -1024,11 +1054,11 @@ int main(int argc, char** argv) {
         log.open(opt.output);
     for (auto& f : opt.filelists) {
         if (!readFilelist(f, opt, log))
-            return ExitBadInput;
+            return finished(log, opt, ExitBadInput);
     }
     if (opt.files.empty()) {
         failure(log, "error: no source files (pass -f <filelist> or paths)\n");
-        return ExitBadInput;
+        return finished(log, opt, ExitBadInput);
     }
 
     try {
@@ -1045,7 +1075,7 @@ int main(int argc, char** argv) {
         driver::SourceLoader loader(sourceManager);
         std::vector<std::shared_ptr<syntax::SyntaxTree>> trees;
         if (!parseSources(opt, log, loader, optionBag, *pool, trees))
-            return ExitBadInput;
+            return finished(log, opt, ExitBadInput);
 
         ast::Compilation compilation(optionBag);
         for (auto& tree : trees)
@@ -1068,7 +1098,7 @@ int main(int argc, char** argv) {
         const DiagCounts counts = reportDiagnostics(opt, log, diags, sourceManager);
 
         if (!checkTopElaborated(opt, log, compilation))
-            return ExitBadInput;
+            return finished(log, opt, ExitBadInput);
 
         // Checked before analysing, not inferred afterwards. slang sets this on
         // three conditions -- the error limit exceeded, instantiation deeper
@@ -1113,14 +1143,15 @@ int main(int argc, char** argv) {
         // The writer is destroyed with writeDatabase's frame, so the database
         // file is closed and complete before this runs.
         if (!publish(log, tmpPath, opt.output))
-            return ExitFailed;
+            return finished(log, opt, ExitFailed);
         tempGuard.armed = false;
 
         reportStats(opt, log, stats);
-        return exitCodeFor(analysisStatusOf(stats, counts.errors, fatal));
+        const char* status = analysisStatusOf(stats, counts.errors, fatal);
+        return finished(log, opt, exitCodeFor(status), status);
     }
     catch (const std::exception& e) {
         failure(log, "error: %s\n", e.what());
-        return ExitFailed;
+        return finished(log, opt, ExitFailed);
     }
 }
