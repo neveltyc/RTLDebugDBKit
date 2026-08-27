@@ -5,8 +5,9 @@ cmake-build-*/
 compile_commands.json
 .cache/
 
-# Exported databases and local RTL drops
+# Exported databases, the log written beside them, and local RTL drops
 *.db
+rtldbgdb-elab.log
 /rtl/
 /scratch/
 

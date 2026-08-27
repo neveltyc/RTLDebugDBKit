@@ -9,6 +9,7 @@
 // to whatever drives it, and this binary does the one job that has to be fast.
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -56,6 +57,11 @@ struct Options {
     // them -- on a large design, 15 errors out of 829.
     int showDiags = 0;
     bool singleUnit = false;
+    /// Write the elaboration log beside the database. On by default: a
+    /// database says what the design is, and nothing about what could not be
+    /// read to build it -- and the terminal that said so is gone by the time
+    /// anyone opens the file.
+    bool log = true;
     /// Report how long each phase took. Which phase dominates is not
     /// guessable from the outside -- on a large design the export spends
     /// most of its time inside SQLite, not in the walk -- and knowing that
@@ -85,6 +91,160 @@ struct Phase {
     }
 };
 
+/// The name every run's log is written under, beside the database.
+constexpr const char* kLogName = "rtldbgdb-elab.log";
+
+/// The elaboration log: what the terminal said, kept.
+///
+/// Every line leads with its producer and severity, so the file answers grep
+/// rather than an eye scrolling it:
+///
+///     slang        error: fifo.sv:39:5: error: unknown module 'ghost'
+///     slang        error|     ghost #(.MODE(2)) u_g (.clk(clk));
+///     slang        error|     ^~~~~
+///     rtl-designdb note: 2 instantiation(s) name a module that could not ...
+///
+/// Three things decide that shape. The producers are apart because slang's
+/// diagnostics are about the SOURCE and this tool's findings are about the
+/// EXPORT -- the same line number means different things in each. The
+/// severity is a column rather than a word somewhere in the sentence, so
+/// `^slang  *error:` asks about severity and not about whichever message
+/// happens to contain the word (slang's own text is kept verbatim, its
+/// severity word included; only this tool's is lifted out). And a multi-line
+/// item marks exactly one line `:` -- the one carrying the message, which is
+/// not always the first (see headLine) -- and the rest `|`, so
+/// `^slang  *error` returns each diagnostic WITH its source snippet while
+/// `^slang  *error:` is one line per diagnostic, each naming its file and
+/// what went wrong. The caret stays under the token slang put it under, the
+/// prefix being constant down the block.
+///
+/// -q does not reach here. The terminal is a summary someone is watching; the
+/// log is the record they read afterwards, and the two are silenced by
+/// different things -- --nolog for this one.
+class ElabLog {
+public:
+    ~ElabLog() {
+        if (file)
+            std::fclose(file);
+    }
+
+    /// Opens the log beside `output`. A log that cannot be opened is said
+    /// once and the run carries on: the database is the product, and losing
+    /// the record of an export is not a reason to lose the export.
+    void open(const std::string& output) {
+        const fs::path at = fs::path(output).parent_path() / kLogName;
+        file = std::fopen(at.string().c_str(), "w");
+        if (!file) {
+            std::fprintf(stderr, "warning: could not write %s; the export "
+                                 "continues without a log\n",
+                         at.string().c_str());
+        }
+    }
+
+    bool active() const { return file != nullptr; }
+
+    /// One item of one producer, however many lines it holds.
+    void put(const char* producer, std::string_view severity,
+             std::string_view text) {
+        if (!file)
+            return;
+        const size_t head = headLine(text);
+        for (size_t index = 0; !text.empty(); index++) {
+            const size_t nl = text.find('\n');
+            const std::string_view line = text.substr(0, nl);
+            std::fprintf(file, "%-12s %.*s%c %.*s\n", producer,
+                         int(severity.size()), severity.data(),
+                         index == head ? ':' : '|', int(line.size()),
+                         line.data());
+            if (nl == std::string_view::npos)
+                break;
+            text.remove_prefix(nl + 1);
+        }
+    }
+
+private:
+    /// Which line of an item carries what a reader came for.
+    ///
+    /// Not always the first: slang puts the include stack and the instance
+    /// path BEFORE the diagnostic, so heading on line zero made the one-line
+    /// view of a recursive design read `in instance: recursion.u_chain` and
+    /// name neither the file nor the error. Those two prefixes are the only
+    /// ones it writes ahead of the message (TextDiagnosticClient::report), and
+    /// a spelling this does not know falls back to the first line.
+    static size_t headLine(std::string_view text) {
+        for (size_t index = 0; !text.empty(); index++) {
+            const size_t nl = text.find('\n');
+            const std::string_view line = text.substr(0, nl);
+            if (!line.starts_with("in file included from ") &&
+                !line.starts_with("  in "))
+                return index;
+            if (nl == std::string_view::npos)
+                break;
+            text.remove_prefix(nl + 1);
+        }
+        return 0;
+    }
+
+    std::FILE* file = nullptr;
+};
+
+/// This tool's own producer name in the log, and the one in meta.tool.
+constexpr const char* kToolName = "rtl-designdb";
+
+std::string formatted(const char* fmt, va_list ap) {
+    va_list copy;
+    va_copy(copy, ap);
+    const int n = std::vsnprintf(nullptr, 0, fmt, copy);
+    va_end(copy);
+    if (n <= 0)
+        return {};
+    std::string out(size_t(n), '\0');
+    std::vsnprintf(out.data(), size_t(n) + 1, fmt, ap);
+    return out;
+}
+
+/// This tool's messages lead with their severity, which the terminal wants in
+/// the sentence and the log wants in a column. Split there: the word, and the
+/// message without it.
+std::pair<std::string_view, std::string_view> splitSeverity(std::string_view text) {
+    for (std::string_view word : {"error", "warning", "note"}) {
+        if (text.size() > word.size() + 2 &&
+            text.compare(0, word.size(), word) == 0 &&
+            text.compare(word.size(), 2, ": ") == 0) {
+            return {word, text.substr(word.size() + 2)};
+        }
+    }
+    return {"note", text};
+}
+
+/// One of this tool's own findings: to the log always, to the terminal when
+/// nothing silenced it.
+void logged(ElabLog& log, bool terminal, const std::string& text) {
+    const auto [severity, rest] = splitSeverity(text);
+    log.put(kToolName, severity, rest);
+    if (terminal)
+        std::fputs(text.c_str(), stderr);
+}
+
+/// A finding: something the run went on past, so -q may keep it off the
+/// terminal.
+void finding(const Options& opt, ElabLog& log, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    const std::string text = formatted(fmt, ap);
+    va_end(ap);
+    logged(log, !opt.quiet, text);
+}
+
+/// A failure: the run stops after it, so -q does not get to hide it.
+void failure(ElabLog& log, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    const std::string text = formatted(fmt, ap);
+    va_end(ap);
+    logged(log, true, text);
+}
+
 void usage() {
     std::puts(
         "rtl-designdb — export an elaborated SystemVerilog design to SQLite\n"
@@ -106,8 +266,20 @@ void usage() {
         "  --check-constraints  keep enum CHECK clauses in the schema (slower;\n"
         "                   verify-designdb.py checks the same domains anyway)\n"
         "  --diag [N]       print elaboration diagnostics (all of them; N caps it)\n"
+        "  --nolog          do not write the elaboration log\n"
         "\n"
-        "Bare paths are taken as source files.");
+        "Bare paths are taken as source files.\n"
+        "\n"
+        "Every run writes rtldbgdb-elab.log beside the database, one line per\n"
+        "producer and severity so it answers grep: slang's own diagnostics\n"
+        "under `slang`, this tool's findings under `rtl-designdb`, and a\n"
+        "multi-line item's continuations marked `|` where its first line has\n"
+        "`:`. -q quiets the terminal, not the log.\n"
+        "\n"
+        "exit: 0 complete, 3 partial, 4 hierarchy only (all three wrote a\n"
+        "      database, and say what meta.analysis_status says); 2 the input\n"
+        "      or the options were unusable, 1 the export itself failed --\n"
+        "      neither wrote one.");
 }
 
 /// Expand `$VAR` and `${VAR}` from the environment.
@@ -168,15 +340,15 @@ std::vector<std::string> splitPlus(std::string_view tok, std::string_view prefix
 /// comments, `+define+`, `+incdir+`, a nested `-f`, and bare paths. Relative
 /// paths resolve against the filelist's own directory, which is what makes a
 /// checked-in `.f` portable.
-bool readFilelist(const fs::path& path, Options& opt, int depth = 0) {
+bool readFilelist(const fs::path& path, Options& opt, ElabLog& log, int depth = 0) {
     if (depth > 16) {
-        std::fprintf(stderr, "error: filelist nesting too deep at %s\n",
-                     path.string().c_str());
+        failure(log, "error: filelist nesting too deep at %s\n",
+                path.string().c_str());
         return false;
     }
     std::ifstream in(path);
     if (!in) {
-        std::fprintf(stderr, "error: cannot read filelist %s\n", path.string().c_str());
+        failure(log, "error: cannot read filelist %s\n", path.string().c_str());
         return false;
     }
     const fs::path base = path.parent_path();
@@ -223,7 +395,7 @@ bool readFilelist(const fs::path& path, Options& opt, int depth = 0) {
                 const auto what = pending;
                 pending = Pending::None;
                 if (what == Pending::Filelist) {
-                    if (!readFilelist(resolve(tok), opt, depth + 1))
+                    if (!readFilelist(resolve(tok), opt, log, depth + 1))
                         return false;
                 }
                 else if (what == Pending::LibFile) {
@@ -241,7 +413,7 @@ bool readFilelist(const fs::path& path, Options& opt, int depth = 0) {
             }
             else if (tok == "-f" || tok == "-file") {
                 if (t + 1 < toks.size()) {
-                    if (!readFilelist(resolve(toks[++t]), opt, depth + 1))
+                    if (!readFilelist(resolve(toks[++t]), opt, log, depth + 1))
                         return false;
                 }
                 else {
@@ -253,7 +425,7 @@ bool readFilelist(const fs::path& path, Options& opt, int depth = 0) {
             }
             else if (tok == "-y" && t + 1 >= toks.size()) {
                 pending = Pending::LibDir;
-                std::fprintf(stderr, "note: -y library directories are not searched\n");
+                finding(opt, log, "note: -y library directories are not searched\n");
             }
             else if (tok == "-v" && t + 1 < toks.size()) {
                 // A VCS library file: module definitions compiled on demand.
@@ -265,12 +437,12 @@ bool readFilelist(const fs::path& path, Options& opt, int depth = 0) {
             }
             else if (tok == "-y" && t + 1 < toks.size()) {
                 t++;    // library *directory*: needs a name-to-file rule; unused here
-                std::fprintf(stderr, "note: -y library directories are not searched\n");
+                finding(opt, log, "note: -y library directories are not searched\n");
             }
             else if (tok[0] == '+' || tok[0] == '-') {
                 // An option this tool does not model. Skipping silently would
                 // change what gets compiled without saying so.
-                std::fprintf(stderr, "note: ignoring filelist option %s\n", tok.c_str());
+                finding(opt, log, "note: ignoring filelist option %s\n", tok.c_str());
             }
             else {
                 opt.files.push_back(resolve(tok).string());
@@ -295,6 +467,7 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if (a == "--single-unit") opt.singleUnit = true;
         else if (a == "--timing") opt.timing = true;
         else if (a == "--check-constraints") opt.checkConstraints = true;
+        else if (a == "--nolog") opt.log = false;
         else if (a == "--diag") {
             opt.showDiags = -1;
             // The WHOLE token has to be a number, not just its first
@@ -379,7 +552,7 @@ Bag buildOptionBag(const Options& opt) {
 /// (addFiles passes none, and addSeparateUnit's empty library name resolves to
 /// none), which is the only reason a loader scoped to this call would not
 /// already be a use-after-free.
-bool parseSources(const Options& opt, driver::SourceLoader& loader,
+bool parseSources(const Options& opt, ElabLog& log, driver::SourceLoader& loader,
                   const Bag& optionBag, slang::ThreadPool& pool,
                   std::vector<std::shared_ptr<syntax::SyntaxTree>>& trees) {
     for (auto& inc : opt.includeDirs)
@@ -404,7 +577,7 @@ bool parseSources(const Options& opt, driver::SourceLoader& loader,
 
     if (!loader.getErrors().empty()) {
         for (auto& err : loader.getErrors())
-            std::fprintf(stderr, "error: %s\n", err.c_str());
+            failure(log, "error: %s\n", err.c_str());
         return false;
     }
     return true;
@@ -429,7 +602,8 @@ struct DiagCounts {
 /// one that says something went wrong. So they are reported, `--diag` shows
 /// them, and only the *limit* is lifted -- what must never happen is the silent
 /// whole-design bail that hitting the limit would otherwise cause.
-DiagCounts reportDiagnostics(const Options& opt, const Diagnostics& diags,
+DiagCounts reportDiagnostics(const Options& opt, ElabLog& log,
+                             const Diagnostics& diags,
                              SourceManager& sourceManager) {
     DiagCounts counts;
     for (auto& d : diags) {
@@ -439,45 +613,56 @@ DiagCounts reportDiagnostics(const Options& opt, const Diagnostics& diags,
             counts.warnings++;
     }
 
-    if (counts.warnings && !opt.quiet && opt.showDiags == 0) {
-        // Worth saying even though warnings are usually noise: slang marks
-        // the node bad for some of them, and a bad statement takes its
-        // enclosing block out of the export.
-        std::fprintf(stderr, "note: %zu elaboration warning(s); --diag shows them\n",
-                     counts.warnings);
-    }
-    if (opt.showDiags) {
+    // slang's own text, rendered one diagnostic at a time so each enters the
+    // log as its own item under its own severity. The log takes every one of
+    // them whatever the terminal is showing -- that is the whole point of
+    // having a log -- and nothing is rendered when neither reader exists.
+    std::string shown;
+    if (log.active() || opt.showDiags) {
         slang::DiagnosticEngine engine(sourceManager);
         auto client = std::make_shared<slang::TextDiagnosticClient>();
         engine.addClient(client);
-        int shown = 0;
+        int rendered = 0;
         for (auto& d : diags) {
-            if (opt.showDiags > 0 && shown++ >= opt.showDiags)
-                break;
+            client->clear();
             engine.issue(d);   // warnings included: one can delete a block
+            const std::string text = client->getString();
+            log.put("slang", d.isError() ? "error" : "warning", text);
+            if (opt.showDiags < 0 || rendered++ < opt.showDiags)
+                shown += text;
         }
-        std::fputs(client->getString().c_str(), stderr);
     }
-    if (counts.errors && !opt.quiet) {
-        std::fprintf(stderr,
-                     "warning: %zu elaboration error(s); run with --diag to see them\n",
-                     counts.errors);
+
+    if (counts.warnings && opt.showDiags == 0) {
+        // Worth saying even though warnings are usually noise: slang marks
+        // the node bad for some of them, and a bad statement takes its
+        // enclosing block out of the export.
+        finding(opt, log, "note: %zu elaboration warning(s); --diag shows them\n",
+                counts.warnings);
+    }
+    if (opt.showDiags)
+        std::fputs(shown.c_str(), stderr);
+    if (counts.errors) {
+        finding(opt, log,
+                "warning: %zu elaboration error(s); run with --diag to see them\n",
+                counts.errors);
     }
     return counts;
 }
 
 /// False when --top named something that did not elaborate as a top module.
-bool checkTopElaborated(const Options& opt, ast::Compilation& compilation) {
+bool checkTopElaborated(const Options& opt, ElabLog& log,
+                        ast::Compilation& compilation) {
     if (opt.top.empty())
         return true;
     for (auto inst : compilation.getRoot().topInstances) {
         if (inst->name == opt.top)
             return true;
     }
-    std::fprintf(stderr,
-                 "error: --top '%s' did not elaborate as a top module; "
-                 "check the name and that its source is in the filelist\n",
-                 opt.top.c_str());
+    failure(log,
+            "error: --top '%s' did not elaborate as a top module; "
+            "check the name and that its source is in the filelist\n",
+            opt.top.c_str());
     return false;
 }
 
@@ -511,6 +696,78 @@ std::string configDigest(const Options& opt, ast::Compilation& compilation) {
     return designdb::digest(cfg);
 }
 
+/// How complete the export is, in one word.
+///
+/// The meta value and the process's exit code are this one call, so a caller
+/// branching on the return value and a caller reading `v_db_info` cannot
+/// disagree about the same run.
+///
+/// A duplicated hierarchical path makes `partial` for the same reason a
+/// skipped procedure does: the database is missing something it would
+/// otherwise hold. It is not a dataflow gap but a *naming* one -- two
+/// instances answer to one path, so a path lookup can resolve to the
+/// wrong subtree. Only the terminal warning said so, and `-q` silenced
+/// even that, which left the condition invisible to anyone holding the
+/// file.
+///
+/// `unresolved` deliberately does not: an unresolved instantiation is a
+/// black box, and a design that instantiates a vendor macro it has no
+/// source for is complete as far as this tool can be. The count is
+/// recorded so a consumer can decide for itself.
+///
+/// `hierarchy_only` has one cause, and this is it. It used to read
+/// `fatal || numScopes == 0`, which said there were two --
+/// AnalysisManager::analyze() returns early only on hasFatalErrors(),
+/// and otherwise it enters every compilation unit before it reaches an
+/// instance, with Stats::numScopes counting those units too. A file of
+/// nothing but a comment reports 1 scope, a file holding one package
+/// reports 2, and main() has already refused an empty file list, so
+/// numScopes == 0 could only mean the `fatal` beside it. The second
+/// disjunct never chose anything, and the condition it was standing in
+/// for -- the analysis ran and some module got no dataflow out of it --
+/// had no test anywhere, nor a counter to build one from.
+///
+/// stats.unanalysedInsts is that counter, and it enters here as
+/// `partial` rather than `hierarchy_only` because the condition is per
+/// module and the rest of the design is unaffected. It is a guard, not a
+/// branch this design takes: while slang's analysis descends what the
+/// template walk descends, an occurrence is stamped from an unanalysed
+/// body only when the compilation is fatally errored, and `fatal` above
+/// has already answered for that. See designdb::Stats for the two places
+/// the descents differ and why neither is reachable in the pinned slang.
+const char* analysisStatusOf(const designdb::Stats& stats, size_t numErrors,
+                             bool fatal) {
+    if (fatal)
+        return "hierarchy_only";
+    if (numErrors || stats.emptyProcedures || stats.duplicatePaths ||
+        stats.truncatedCalls || stats.unanalysedInsts)
+        return "partial";
+    return "complete";
+}
+
+/// What the process returns.
+///
+/// `complete`, `partial` and `hierarchy_only` all wrote a database and are
+/// worth telling apart without opening it -- a caller that wants dataflow can
+/// stop at 4, one that only wants the tree cannot. The two that wrote nothing
+/// are apart for the same reason: 2 is answered by fixing the invocation or
+/// the sources, 1 by looking at this tool or the filesystem under it.
+enum ExitCode {
+    ExitComplete = 0,
+    ExitFailed = 1,
+    ExitBadInput = 2,
+    ExitPartial = 3,
+    ExitHierarchyOnly = 4,
+};
+
+int exitCodeFor(std::string_view analysisStatus) {
+    if (analysisStatus == "hierarchy_only")
+        return ExitHierarchyOnly;
+    if (analysisStatus == "partial")
+        return ExitPartial;
+    return ExitComplete;
+}
+
 /// Writes the whole database to `tmpPath` and returns what went into it.
 ///
 /// The writer is scoped to this function: when it returns, the file is closed
@@ -523,7 +780,7 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     designdb::Stats stats;
     designdb::Writer writer(tmpPath, opt.checkConstraints);
     writer.setMeta("schema_version", std::to_string(designdb::SchemaVersion));
-    writer.setMeta("tool", "rtl-designdb");
+    writer.setMeta("tool", kToolName);
     // The *elaborated* tops, not the --top argument: slang picks tops even
     // when none is asked for, and a consumer mounting the database against
     // a waveform needs the name either way. Space-separated when the design
@@ -594,49 +851,7 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     // never sees an intermediate state regardless -- this ordering is an
     // extra defence so that a reader of the temp file can tell whether
     // the export ran to completion.
-    //
-    // A duplicated hierarchical path makes `partial` for the same reason a
-    // skipped procedure does: the database is missing something it would
-    // otherwise hold. It is not a dataflow gap but a *naming* one -- two
-    // instances answer to one path, so a path lookup can resolve to the
-    // wrong subtree. Only the terminal warning said so, and `-q` silenced
-    // even that, which left the condition invisible to anyone holding the
-    // file.
-    //
-    // `unresolved` deliberately does not: an unresolved instantiation is a
-    // black box, and a design that instantiates a vendor macro it has no
-    // source for is complete as far as this tool can be. The count is
-    // recorded so a consumer can decide for itself.
-    //
-    // `hierarchy_only` has one cause, and this is it. It used to read
-    // `fatal || numScopes == 0`, which said there were two --
-    // AnalysisManager::analyze() returns early only on hasFatalErrors(),
-    // and otherwise it enters every compilation unit before it reaches an
-    // instance, with Stats::numScopes counting those units too. A file of
-    // nothing but a comment reports 1 scope, a file holding one package
-    // reports 2, and main() has already refused an empty file list, so
-    // numScopes == 0 could only mean the `fatal` beside it. The second
-    // disjunct never chose anything, and the condition it was standing in
-    // for -- the analysis ran and some module got no dataflow out of it --
-    // had no test anywhere, nor a counter to build one from.
-    //
-    // stats.unanalysedInsts is that counter, and it enters here as
-    // `partial` rather than `hierarchy_only` because the condition is per
-    // module and the rest of the design is unaffected. It is a guard, not a
-    // branch this design takes: while slang's analysis descends what the
-    // template walk descends, an occurrence is stamped from an unanalysed
-    // body only when the compilation is fatally errored, and `fatal` above
-    // has already answered for that. See designdb::Stats for the two places
-    // the descents differ and why neither is reachable in the pinned slang.
-    const char* analysisStatus;
-    if (fatal)
-        analysisStatus = "hierarchy_only";
-    else if (numErrors || stats.emptyProcedures || stats.duplicatePaths ||
-             stats.truncatedCalls || stats.unanalysedInsts)
-        analysisStatus = "partial";
-    else
-        analysisStatus = "complete";
-    writer.setMeta("analysis_status", analysisStatus);
+    writer.setMeta("analysis_status", analysisStatusOf(stats, numErrors, fatal));
     writer.setMeta("error_count", std::to_string(numErrors));
     writer.setMeta("unresolved_count", std::to_string(stats.unresolved));
     writer.setMeta("empty_procedure_count", std::to_string(stats.emptyProcedures));
@@ -698,99 +913,100 @@ struct TempGuard {
 /// refuses. That is a real failure a user meets by leaving the database open in
 /// a viewer, so it is reported rather than thrown -- the message has to say
 /// which file and why, and a filesystem_error's what() does not.
-bool publish(const std::string& tmpPath, const std::string& output) {
+bool publish(ElabLog& log, const std::string& tmpPath, const std::string& output) {
     std::error_code ec;
     std::filesystem::rename(tmpPath, output, ec);
     if (ec) {
-        std::fprintf(stderr,
-                     "error: could not replace '%s' with the finished export: %s\n"
-                     "       the previous database is untouched; if it is open in "
-                     "another program, close it and retry\n",
-                     output.c_str(), ec.message().c_str());
+        failure(log,
+                "error: could not replace '%s' with the finished export: %s\n"
+                "       the previous database is untouched; if it is open in "
+                "another program, close it and retry\n",
+                output.c_str(), ec.message().c_str());
         return false;
     }
     return true;
 }
 
 /// What the run found, and what it could not.
-void reportStats(const Options& opt, const designdb::Stats& stats) {
-    if (opt.quiet)
-        return;
-    std::printf("%s: %lld modules, %lld instances, %lld nets, %lld terminals, "
-                "%lld connections, %lld statements, %lld dependencies\n",
-                opt.output.c_str(), (long long)stats.modules,
-                (long long)stats.instances, (long long)stats.nets,
-                (long long)stats.terms, (long long)stats.conns,
-                (long long)stats.stmts, (long long)stats.deps);
+void reportStats(const Options& opt, ElabLog& log,
+                 const designdb::Stats& stats) {
+    if (!opt.quiet) {
+        std::printf("%s: %lld modules, %lld instances, %lld nets, %lld terminals, "
+                    "%lld connections, %lld statements, %lld dependencies\n",
+                    opt.output.c_str(), (long long)stats.modules,
+                    (long long)stats.instances, (long long)stats.nets,
+                    (long long)stats.terms, (long long)stats.conns,
+                    (long long)stats.stmts, (long long)stats.deps);
+    }
     if (stats.emptyProcedures) {
-        std::fprintf(stderr,
-                     "warning: %lld procedure(s) drive a signal but yielded no "
-                     "dataflow; a statement in them was rejected and its whole "
-                     "block skipped -- run with --diag\n",
-                     (long long)stats.emptyProcedures);
+        finding(opt, log,
+                "warning: %lld procedure(s) drive a signal but yielded no "
+                "dataflow; a statement in them was rejected and its whole "
+                "block skipped -- run with --diag\n",
+                (long long)stats.emptyProcedures);
     }
     if (stats.unresolved) {
-        std::fprintf(stderr,
-                     "note: %lld instantiation(s) name a module that could not "
-                     "be resolved; recorded as unresolved tree nodes\n",
-                     (long long)stats.unresolved);
+        finding(opt, log,
+                "note: %lld instantiation(s) name a module that could not "
+                "be resolved; recorded as unresolved tree nodes\n",
+                (long long)stats.unresolved);
     }
     if (stats.anonymous) {
-        std::fprintf(stderr,
-                     "note: %lld instantiation(s) carry no instance name; "
-                     "each holds a synthesised $def$n path segment rather "
-                     "than its parent's name. A module instantiation must be "
-                     "named, so a macro may not have expanded\n",
-                     (long long)stats.anonymous);
+        finding(opt, log,
+                "note: %lld instantiation(s) carry no instance name; "
+                "each holds a synthesised $def$n path segment rather "
+                "than its parent's name. A module instantiation must be "
+                "named, so a macro may not have expanded\n",
+                (long long)stats.anonymous);
     }
     if (stats.external) {
-        std::fprintf(stderr,
-                     "note: %lld reference(s) to symbols outside their own "
-                     "module (hierarchical, interface or package items); "
-                     "those written as a path are recorded in hier_ref\n",
-                     (long long)stats.external);
+        finding(opt, log,
+                "note: %lld reference(s) to symbols outside their own "
+                "module (hierarchical, interface or package items); "
+                "those written as a path are recorded in hier_ref\n",
+                (long long)stats.external);
     }
     if (stats.truncatedCalls) {
-        std::fprintf(stderr,
-                     "warning: %lld call site(s) exceeded the "
-                     "subroutine expansion budget; their bodies were "
-                     "not walked, so dataflow through them is "
-                     "incomplete\n",
-                     (long long)stats.truncatedCalls);
+        finding(opt, log,
+                "warning: %lld call site(s) exceeded the "
+                "subroutine expansion budget; their bodies were "
+                "not walked, so dataflow through them is "
+                "incomplete\n",
+                (long long)stats.truncatedCalls);
     }
     if (stats.duplicatePaths) {
-        std::fprintf(stderr,
-                     "warning: %lld instances share a hierarchical path with "
-                     "another; the design did not fully elaborate, so a path "
-                     "lookup may be ambiguous\n",
-                     (long long)stats.duplicatePaths);
+        finding(opt, log,
+                "warning: %lld instances share a hierarchical path with "
+                "another; the design did not fully elaborate, so a path "
+                "lookup may be ambiguous\n",
+                (long long)stats.duplicatePaths);
     }
     if (stats.recursiveInstances) {
-        std::fprintf(stderr,
-                     "warning: %lld instance(s) re-enter a module that is "
-                     "already one of their own ancestors; the instantiation "
-                     "is infinitely recursive, so the tree stops there -- run "
-                     "with --diag\n",
-                     (long long)stats.recursiveInstances);
+        finding(opt, log,
+                "warning: %lld instance(s) re-enter a module that is "
+                "already one of their own ancestors; the instantiation "
+                "is infinitely recursive, so the tree stops there -- run "
+                "with --diag\n",
+                (long long)stats.recursiveInstances);
     }
     if (stats.unanalysedBodies && !stats.unanalysedInsts) {
         // Only worth saying when the templates are the whole of it. When
         // occurrences inherited the gap the warning below says so, and the
         // fatally-errored run that produces it has already been reported.
-        std::fprintf(stderr,
-                     "note: %lld module body group(s) had no analysed body, "
-                     "so the templates built from them hold no procedure; "
-                     "nothing is stamped from them, and no row is missing\n",
-                     (long long)stats.unanalysedBodies);
+        finding(opt, log,
+                "note: %lld module body group(s) had no analysed body, "
+                "so the templates built from them hold no procedure; "
+                "nothing is stamped from them, and no row is missing\n",
+                (long long)stats.unanalysedBodies);
     }
     if (stats.unanalysedInsts) {
-        std::fprintf(stderr,
-                     "warning: %lld of %lld instance(s) were stamped from a "
-                     "module body the analysis never reached; their procedures "
-                     "are absent, so they carry hierarchy and connections and "
-                     "no procedural dataflow\n",
-                     (long long)stats.unanalysedInsts,
-                     (long long)stats.stampedBodies);
+        finding(opt, log,
+                "warning: %lld of %lld instance(s) were stamped from a "
+                "module body the analysis never reached; their procedures "
+                "are absent, so they carry hierarchy and connections and "
+                "no procedural dataflow\n",
+                (long long)stats.unanalysedInsts,
+                (long long)stats.stampedBodies);
     }
 }
 
@@ -799,14 +1015,20 @@ void reportStats(const Options& opt, const designdb::Stats& stats) {
 int main(int argc, char** argv) {
     Options opt;
     if (!parseArgs(argc, argv, opt))
-        return 2;
+        return ExitBadInput;
+    // Opened before anything can fail with something worth recording, and
+    // beside the database rather than beside the sources: the pair is what a
+    // consumer holds, and the log answers for the run that wrote that file.
+    ElabLog log;
+    if (opt.log)
+        log.open(opt.output);
     for (auto& f : opt.filelists) {
-        if (!readFilelist(f, opt))
-            return 2;
+        if (!readFilelist(f, opt, log))
+            return ExitBadInput;
     }
     if (opt.files.empty()) {
-        std::fprintf(stderr, "error: no source files (pass -f <filelist> or paths)\n");
-        return 2;
+        failure(log, "error: no source files (pass -f <filelist> or paths)\n");
+        return ExitBadInput;
     }
 
     try {
@@ -822,8 +1044,8 @@ int main(int argc, char** argv) {
         // Outlives the compilation on purpose -- see parseSources.
         driver::SourceLoader loader(sourceManager);
         std::vector<std::shared_ptr<syntax::SyntaxTree>> trees;
-        if (!parseSources(opt, loader, optionBag, *pool, trees))
-            return 2;
+        if (!parseSources(opt, log, loader, optionBag, *pool, trees))
+            return ExitBadInput;
 
         ast::Compilation compilation(optionBag);
         for (auto& tree : trees)
@@ -843,10 +1065,10 @@ int main(int argc, char** argv) {
         Phase elab("elaborate", opt.timing);
         auto& diags = compilation.getAllDiagnostics();
         elab.stop();
-        const DiagCounts counts = reportDiagnostics(opt, diags, sourceManager);
+        const DiagCounts counts = reportDiagnostics(opt, log, diags, sourceManager);
 
-        if (!checkTopElaborated(opt, compilation))
-            return 2;
+        if (!checkTopElaborated(opt, log, compilation))
+            return ExitBadInput;
 
         // Checked before analysing, not inferred afterwards. slang sets this on
         // three conditions -- the error limit exceeded, instantiation deeper
@@ -856,11 +1078,11 @@ int main(int argc, char** argv) {
         // missing and guessing from an empty result.
         const bool fatal = compilation.hasFatalErrors();
         if (fatal) {
-            std::fprintf(stderr,
-                         "warning: the compilation is fatally errored, so no dataflow "
-                         "can be analysed; the database holds hierarchy only.\n"
-                         "         --diag says why (too many errors, instantiation "
-                         "deeper than 128, or a recursive hierarchy)\n");
+            finding(opt, log,
+                    "warning: the compilation is fatally errored, so no dataflow "
+                    "can be analysed; the database holds hierarchy only.\n"
+                    "         --diag says why (too many errors, instantiation "
+                    "deeper than 128, or a recursive hierarchy)\n");
         }
 
         analysis::AnalysisManager analysis({}, pool);
@@ -890,15 +1112,15 @@ int main(int argc, char** argv) {
                           counts.errors, fatal);
         // The writer is destroyed with writeDatabase's frame, so the database
         // file is closed and complete before this runs.
-        if (!publish(tmpPath, opt.output))
-            return 1;
+        if (!publish(log, tmpPath, opt.output))
+            return ExitFailed;
         tempGuard.armed = false;
 
-        reportStats(opt, stats);
-        return 0;
+        reportStats(opt, log, stats);
+        return exitCodeFor(analysisStatusOf(stats, counts.errors, fatal));
     }
     catch (const std::exception& e) {
-        std::fprintf(stderr, "error: %s\n", e.what());
-        return 1;
+        failure(log, "error: %s\n", e.what());
+        return ExitFailed;
     }
 }

@@ -287,7 +287,7 @@ which outer column is set — the kind first, then its pointer:
 | `unconnected` | — | recorded, not omitted: absence would also mean "the exporter did not get this far". Claimed only for a pin the parent left empty — a connection whose shape this schema cannot spell (a sequence expression against a black box) records the nets it reaches as `expression_operand` instead |
 | `expression_operand` | `outer_net_id` or `outer_hier_ref_id` | the actual is an expression; this row is one net it reads. `.en(state == RUN)` samples `state` but does not alias it to `en`; `map_exact` is 0 by construction |
 | `interface` | `outer_intf_inst_id` | the bound interface instance, through pass-through chains: a grandchild handed the parent's own interface port resolves to the instance the parent was handed. An interface ARRAY port binds one element per segment, in declaration order — the leaves, for a multi-dimensional one — as a concatenated actual does on an ordinary port. It resolves through a pass-through chain like a scalar, including where the port is fed by a slice of a wider array, in which case the segment a row reads is not the one it occupies. NULL where the segment has no per-occurrence object at all. No dataflow arc pretends to cross an interface binding |
-| `external_reference` | `outer_hier_ref_id` | tied to something with no name in the parent (`.p(u.g[7:4])`); the reference says what, with `access='connect'`. It crosses like any other connection once the reference resolves — with a `map_exact` of its own, so the arc is traceable bit by bit — while an upward tie (`.a(tb.glob)`) stays a recorded connection with no arc |
+| `external_reference` | `outer_hier_ref_id` | tied to something with no name in the parent (`.p(u.g[7:4])`); the reference says what, with `access='connect'`. It crosses like any other connection once the reference resolves — with a `map_exact` of its own, so the arc is traceable bit by bit — while a tie to something with no row of its own (`.a(cu_glob)`, a `$unit` item) stays a recorded connection with no arc |
 
 Width degradation: when the connection expression's width and the declared
 terminal width disagree (an output narrower than the net it drives arrives
@@ -541,9 +541,14 @@ when the export can replay the reference —
   (`bus_arr[0].vld`): resolved to the element that occurrence's terminal
   binds in that segment, however many levels the array was forwarded
   through;
-* upward references: NULL. The one analysed body speaks for occurrences
-  whose surroundings may differ, so the target is not resolved per
-  occurrence.
+* upward references (`tb_top.glob`, a name that climbs out of the
+  instance): searched for again per occurrence. LRM 23.8 resolves the first
+  component by looking outward from where the reference stands, so the level
+  that answers it belongs to the occurrence — two occurrences of one body can
+  sit at different depths, under different surroundings, or under none that
+  answers. Each is resolved on its own tree, or left NULL. A first component
+  that is selected (`u_arr[2].x` seen from above) or that anchors on a
+  generate block is not searched for, and stays NULL.
 
 NULL `resolved_*` means not resolved here. A dependency whose source went
 through an unresolved reference is still written and surfaces in `v_driver`
@@ -774,7 +779,7 @@ rest of the reference is `v_hier_ref`. `driver_kind`:
   row here as everywhere. A call written inside a CONDITION has no
   statement row to anchor to and records neither.
 * `external` — the source is a reference this export has no net row for:
-  an upward name from a shared body, a `$unit` item.
+  a `$unit` item, an upward name the search declined.
   `driver_net_id` is NULL and `driver_ref` carries the reference as
   written, so the row still answers what it reads; `src_hier_ref_id` on the
   dependency points at the rest of it (`v_hier_ref`: location, resolution
@@ -1108,8 +1113,10 @@ joined to their src_file. `meta` is the seal; its required keys are the
 `v_db_info` columns except `top` — the space-separated names of the
 elaborated top instances — which is absent when the design elaborates
 none.
-`analysis_status` is `complete | partial | hierarchy_only` and agrees with
-the counts beside it, each of which is published: `error_count`,
+`analysis_status` is `complete | partial | hierarchy_only`, and the exporter's
+exit code (0, 3, 4) is the same word: a caller can branch on it without
+opening the file. It agrees with the counts beside it, each of which is
+published: `error_count`,
 `empty_procedure_count` (skipped procedures), `duplicate_path_count` (two
 siblings sharing one (parent, name) pair, so a path lookup stops resolving
 uniquely), `truncated_call_count` and `unanalysed_inst_count` — an
@@ -1214,13 +1221,13 @@ no dataflow, not that the hierarchy stops early.
 
 ## Known limits
 
-* Upward hierarchical references keep `resolved_*` NULL — the one analysed
-  body speaks for occurrences whose surroundings may differ, so
-  `$root`-relative climbs from a shared body cannot be pinned per
-  occurrence. Their dataflow is not silent (`driver_kind='external'`), but
-  the far object has no row: a trace ends at the reference text. `$unit`
-  compilation-unit items are the same. (Package variables do resolve — see
-  *Packages*.)
+* `$unit` compilation-unit items keep `resolved_*` NULL: nothing stamps the
+  compilation unit, so there is no object to resolve onto. Their dataflow is
+  not silent (`driver_kind='external'`), but the far object has no row: a
+  trace ends at the reference text. So do the two upward shapes the search
+  declines — a selected first component and one anchored on a generate
+  block. (Package variables and ordinary upward names do resolve — see
+  *Packages* and *Hierarchical references*.)
 
 * A built-in method's effect on the object it is called on is not
   modelled. `q.push_back(x)` records the call (`stmt_kind='call'`,

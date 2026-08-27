@@ -111,8 +111,12 @@ def export(binary, name, cwd, args, outdir):
     r = subprocess.run([binary] + args + ["-q", "-o", db],
                        cwd=cwd, capture_output=True, text=True)
     elapsed = time.monotonic() - start
-    if r.returncode != 0:
-        fail(f"export {name} with {binary} failed:\n{r.stdout}{r.stderr}")
+    # 0, 3 and 4 all wrote a database -- complete, partial and hierarchy
+    # only. Two fixtures and some third-party trees are deliberately not
+    # complete, and their rows have to be compared like any other's.
+    if r.returncode not in (0, 3, 4):
+        fail(f"export {name} with {binary} failed (exit {r.returncode}):"
+             f"\n{r.stdout}{r.stderr}")
     return db, elapsed
 
 

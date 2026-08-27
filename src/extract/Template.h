@@ -254,15 +254,15 @@ struct TplHierRef {
     TplRange r;
     TplLoc loc;
     /// How the reference resolves per occurrence -- or why it does not.
-    /// The first three all stamp NULL resolved ids, and are spelled apart
-    /// because "nothing to resolve", "tried and could not" and "must not
-    /// guess" are different facts about the same NULL.
+    /// The first two both stamp NULL resolved ids, and are spelled apart
+    /// because "nothing to resolve" and "tried and could not" are different
+    /// facts about the same NULL.
     enum ResolveKind {
         NotHierarchical,     // a bare or package-free name; nothing to walk
         Failed,              // a target existed and no replay could be built
-        Upward,              // climbs out of the analysed body; a guess is
-                             // worse than a NULL, so deliberately unresolved
         Downward,            // segs descend from the occurrence's own node
+        Upward,              // `anchor` is searched for above the occurrence,
+                             // then segs descend from where it was found
         Absolute,            // segs descend from the design root
         ViaIfaceTerm,        // segs descend from the interface bound to term
         Package              // segs[0] names a package; netName its member
@@ -272,6 +272,11 @@ struct TplHierRef {
     /// ARRAY port. One terminal binds one element per segment, so the
     /// terminal alone does not say which instance the reference meant.
     int32_t ifaceElem = 0;
+    /// Upward: the first name component, as the source spells it. The
+    /// enclosing hierarchy is searched for it per occurrence -- which level
+    /// answers is the occurrence's own business, so nothing about the level
+    /// the analysed body found is kept here.
+    std::string anchor;
     std::vector<std::string> segs;   // tree segments to descend
     std::string netName;     // scope-relative net name at the target instance
 
@@ -311,6 +316,10 @@ struct TplChild {
 
 struct Template {
     int64_t moduleId = 0;
+    /// The definition this body is an instance of. An upward reference may
+    /// name the module it stands in rather than any instance name (LRM 23.8),
+    /// so the replay matches occurrences against it.
+    std::string defName;
     std::string params;
     std::vector<std::pair<std::string, std::string>> paramPairs;
     std::vector<TplScope> scopes;
