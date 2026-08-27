@@ -80,8 +80,34 @@ module anonymous(input logic a, input logic b, output logic [4:0] y);
     assign y[4] = g0 & g1;
 endmodule
 
+// An upward name that resolves for one occurrence of a shared body and not
+// for the other: both surroundings hold an `anchor`, but they are anchors of
+// different modules and only one of them has the net. The occurrence that
+// misses it must resolve to NEITHER half -- an instance without a net says
+// where the reference landed and not what it landed on, and a consumer
+// written against "resolved or NULL" has no third state to read that as.
+module has_sig;  logic sig;   endmodule
+module no_sig;   logic other; endmodule
+
+module up_reader(output logic o);
+    assign o = anchor.sig;
+endmodule
+
+module up_here(output logic o);
+    has_sig anchor();
+    up_reader r(.o(o));
+endmodule
+
+module up_missing(output logic o);
+    no_sig anchor();          // same name, and no `sig` under it
+    up_reader r(.o(o));
+endmodule
+
 module incomplete(input logic clk, input logic [3:0] req, input logic a,
-                  input logic b, output logic [3:0] gnt, output logic [4:0] y);
+                  input logic b, output logic [3:0] gnt, output logic [4:0] y,
+                  output logic up_ok, output logic up_gone);
     unresolved u_unres (.clk(clk), .req(req), .gnt(gnt));
     anonymous  u_anon  (.a(a), .b(b), .y(y));
+    up_here    u_up_ok   (.o(up_ok));
+    up_missing u_up_gone (.o(up_gone));
 endmodule

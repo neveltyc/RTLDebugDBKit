@@ -790,7 +790,8 @@ private:
                     node = descend(job.instNode, ref.segs);
                     break;
                 case TplHierRef::Upward:
-                    node = searchUpward(job.instNode, ref.anchor, ref.segs);
+                    node = searchUpward(job.instNode, ref.anchor, ref.segs,
+                                        ref.netName);
                     break;
                 case TplHierRef::Absolute:
                     node = descend(0, ref.segs);
@@ -809,43 +810,34 @@ private:
                     // Not a tree descent -- a package is not under a normal
                     // parent, and its path uses `::`. Look it up directly and
                     // resolve the member against its own net map; node stays
-                    // 0 so the generic net-index block below is skipped.
+                    // 0 so the generic block below is skipped, and the member
+                    // has to be there for either column to be written.
                     if (ref.segs.empty())
                         break;
                     auto pit = packageByName.find(ref.segs.front());
                     if (pit == packageByName.end())
                         break;
-                    row.resolvedInstId = pit->second.nodeId;
                     auto nit = pit->second.netByName.find(ref.netName);
-                    if (nit != pit->second.netByName.end()) {
-                        row.resolvedNetId = nit->second;
-                        resolvedNet.emplace(row.id, row.resolvedNetId);
-                    }
+                    if (nit == pit->second.netByName.end())
+                        break;
+                    row.resolvedInstId = pit->second.nodeId;
+                    row.resolvedNetId = nit->second;
+                    resolvedNet.emplace(row.id, row.resolvedNetId);
                     break;
                 }
                 default:
                     break;
             }
-            // A route answers only where it lands on a stamped occurrence.
-            // resolved_inst_id names an INSTANCE -- the schema says so with a
-            // foreign key -- and a name search can end on a level that is not
-            // one: a generate block or a primitive may carry, in one
-            // occurrence's surroundings, the name an instance carried in the
-            // analysed body. That is where the lookup stopped, so searching
-            // on would answer with a different object; the NULL says what is
-            // true. The same find then names the net.
-            auto tplIt = node == 0 ? nodeTemplate.end() : nodeTemplate.find(node);
-            if (tplIt != nodeTemplate.end()) {
+            // A route answers with BOTH resolved columns or with neither.
+            // An instance without a net names where the reference landed and
+            // not what it landed on, which is a third state consumers written
+            // against "resolved or NULL" do not have -- and it is what a
+            // route reaching an occurrence of a DIFFERENT module leaves
+            // behind, since the net it wants is not among that module's.
+            if (const int64_t net = netAt(node, ref.netName)) {
                 row.resolvedInstId = node;
-                if (!ref.netName.empty()) {
-                    auto& tt = *tplIt->second.first;
-                    auto nIt = tt.netIndex.find(ref.netName);
-                    if (nIt != tt.netIndex.end()) {
-                        row.resolvedNetId =
-                            tplIt->second.second + nIt->second + 1;
-                        resolvedNet.emplace(row.id, row.resolvedNetId);
-                    }
-                }
+                row.resolvedNetId = net;
+                resolvedNet.emplace(row.id, net);
             }
             writer.addHierRef(row);
         }
@@ -907,16 +899,41 @@ private:
         }
     }
 
+    /// The net `name` names inside a stamped occurrence, or 0 when the node
+    /// is not one -- a generate level, a primitive -- or holds no such net.
+    /// Every route ends here, which is what keeps the two resolved columns
+    /// moving together.
+    int64_t netAt(int64_t node, const std::string& name) const {
+        if (node == 0 || name.empty())
+            return 0;
+        auto tplIt = nodeTemplate.find(node);
+        if (tplIt == nodeTemplate.end())
+            return 0;
+        auto& index = tplIt->second.first->netIndex;
+        auto nIt = index.find(name);
+        if (nIt == index.end())
+            return 0;
+        return tplIt->second.second + nIt->second + 1;
+    }
+
     /// The upward lookup of LRM 23.8, repeated against the stamped tree:
     /// from the occurrence outward, each level is asked for a child named
     /// `anchor` and each instance level for the definition it is an instance
-    /// of, and the first level that also carries the rest of the path
-    /// answers. Searching rather than climbing a recorded number of levels is
-    /// the point -- the level that answers is a fact about the occurrence,
-    /// and two occurrences of one body can sit at different depths, under
-    /// different surroundings, or under none that answers at all.
+    /// of, and the first level that carries the WHOLE of the rest -- the
+    /// segments and the net at the end of them -- answers. Searching rather
+    /// than climbing a recorded number of levels is the point: the level that
+    /// answers is a fact about the occurrence, and two occurrences of one
+    /// body can sit at different depths, under different surroundings, or
+    /// under none that answers at all.
+    ///
+    /// A level whose name matches but whose subtree does not carry the rest
+    /// is passed over rather than answered with, which is what the elaborator
+    /// does (Lookup.cpp, lookupUpward: a downward walk that finds nothing is
+    /// not a failure, it is a reason to keep climbing). Answering with it
+    /// would leave an instance and no net.
     int64_t searchUpward(int64_t from, const std::string& anchor,
-                         const std::vector<std::string>& segs) {
+                         const std::vector<std::string>& segs,
+                         const std::string& netName) {
         if (anchor.empty())
             return 0;
         for (int64_t level = from;;) {
@@ -924,14 +941,16 @@ private:
             if (pIt != childByName.end()) {
                 auto cIt = pIt->second.find(anchor);
                 if (cIt != pIt->second.end()) {
-                    if (const int64_t node = descend(cIt->second, segs))
+                    const int64_t node = descend(cIt->second, segs);
+                    if (netAt(node, netName))
                         return node;
                 }
             }
             auto tIt = nodeTemplate.find(level);
             if (tIt != nodeTemplate.end() &&
                 tIt->second.first->defName == anchor) {
-                if (const int64_t node = descend(level, segs))
+                const int64_t node = descend(level, segs);
+                if (netAt(node, netName))
                     return node;
             }
             if (level == 0)

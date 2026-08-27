@@ -23,6 +23,7 @@
 #                                           fail unless the corpus together
 #                                           produces every published value
 import os
+import pathlib
 import re
 import sqlite3
 import sys
@@ -164,7 +165,19 @@ if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in MOD
     sys.exit(f"usage: {sys.argv[0]} <design.db> [{'|'.join(MODES)}]\n"
              f"       {sys.argv[0]} --list-modes")
 
-con = sqlite3.connect(sys.argv[1])
+# Read-only, and only a file that is already there. A plain connect() CREATES
+# the path it is handed, so verifying a mistyped name left a 0-byte database
+# behind and then failed on `no such table: module` -- a traceback where the
+# answer is "that file does not exist", and a file where a read-only tool
+# should leave none.
+db_path = sys.argv[1]
+if not os.path.isfile(db_path):
+    sys.exit(f"error: no such database: {db_path}")
+try:
+    con = sqlite3.connect(
+        f"{pathlib.Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+except sqlite3.Error as e:
+    sys.exit(f"error: cannot read {db_path}: {e}")
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
 SCHEMA_VERSION = "19"
@@ -3827,6 +3840,22 @@ if mode == "incomplete":
     # ---- a definition that is missing
     check(status == "partial",
           "a missing definition leaves the export partial")
+    # ---- an upward name that answers for one occurrence and not the other
+    # Both surroundings hold an `anchor`; only one of them holds the net. The
+    # occurrence that misses it resolves to NEITHER half -- the generic check
+    # above rules out the third state, and this pins which of the two rows is
+    # which, so a route that stops half way is caught here rather than by a
+    # consumer.
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node t ON t.id = h.inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='anchor.sig' AND n.name='sig'""") == 1,
+          "an upward name resolves where the surroundings hold the net")
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path='anchor.sig' AND resolved_inst_id IS NULL""") == 1,
+          "and answers with neither half where they do not")
     check(one("""
         SELECT count(*) FROM tree_node t JOIN inst i ON i.id = t.id
         WHERE t.node_kind='unresolved' AND i.unresolved_def='ghost'""") == 1,
