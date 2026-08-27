@@ -89,12 +89,12 @@ run() {
     echo "ok: $name  ${size} bytes  ${ms} ms"
 }
 
-run picorv32  "$rwa/picorv32"  "$rwa/picorv32/picorv32.v" --top picorv32 -q
-run tinyriscv "$rwa/tinyriscv" -f tiny.f --top tinyriscv_soc_top -q
+run picorv32  "$rwa/picorv32"  "$rwa/picorv32/picorv32.v" --top picorv32 --quiet
+run tinyriscv "$rwa/tinyriscv" -f tiny.f --top tinyriscv_soc_top --quiet
 
 veer="$rwa/veerwolf_run/build/veerwolf_0.7.5/sim-verilator"
 if [ -d "$veer" ] && [ -f "$veer/designdb_real.f" ]; then
-    run veerwolf "$veer" -f designdb_real.f --top veerwolf_core -q
+    run veerwolf "$veer" -f designdb_real.f --top veerwolf_core --quiet
 else
     echo "skip: veerwolf (no fusesoc work root at $veer)"
 fi

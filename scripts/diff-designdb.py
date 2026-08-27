@@ -110,7 +110,12 @@ def export(binary, name, cwd, args, outdir):
     if os.path.exists(db):
         os.remove(db)
     start = time.monotonic()
-    r = subprocess.run([binary] + args + ["-q", "-o", db],
+    # `-o` is the only option this adds, because the two binaries straddle a
+    # change and need not agree on any other spelling: a quiet flag was here
+    # once and made the gate unusable across the release that renamed it,
+    # while buying nothing -- the output is captured either way, and only a
+    # failing export ever prints it.
+    r = subprocess.run([binary] + args + ["-o", db],
                        cwd=cwd, capture_output=True, text=True)
     elapsed = time.monotonic() - start
     # 0, 3 and 4 all wrote a database -- complete, partial and hierarchy

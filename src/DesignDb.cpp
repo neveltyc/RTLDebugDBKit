@@ -130,7 +130,7 @@ void bindOptWidth(sqlite3_stmt* s, int i, int64_t width) {
 
 } // namespace
 
-Writer::Writer(const std::string& path, bool checkConstraints) {
+Writer::Writer(const std::string& path) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
     if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
@@ -161,29 +161,7 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
         exec("PRAGMA cache_size=-262144");   // 256 MiB, not pages
         exec("PRAGMA temp_store=MEMORY");
         exec("PRAGMA locking_mode=EXCLUSIVE");
-        // The enum CHECK clauses are marked in kSchema so they can be left
-        // out. They are the single most expensive thing in the write path
-        // -- SQLite evaluates a string IN-list for every row -- and the
-        // verifier re-derives the same domains from the finished file, so
-        // the default is to spend that time on the export instead.
-        if (checkConstraints) {
-            std::string ddl(kSchema);
-            size_t at = 0;
-            while ((at = ddl.find("/*!*/", at)) != std::string::npos)
-                ddl.erase(at, 5);
-            exec(ddl.c_str());
-        }
-        else {
-            std::string ddl(kSchema);
-            size_t open = 0;
-            while ((open = ddl.find("/*!*/", open)) != std::string::npos) {
-                size_t close = ddl.find("/*!*/", open + 5);
-                if (close == std::string::npos)
-                    break;
-                ddl.erase(open, close + 5 - open);
-            }
-            exec(ddl.c_str());
-        }
+        exec(kSchema);
 
         // Column lists are spelled out so a schema reorder or mid-table
         // insertion surfaces as a prepare error, never a silent transposition

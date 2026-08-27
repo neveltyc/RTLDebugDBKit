@@ -277,9 +277,10 @@ check(not fk_errs, "foreign_key_check passes",
                              f"table={fk_errs[0][0]} rowid={fk_errs[0][1]}")
 
 # ---------------------------------------------------------- value domains
-# The DDL carries CHECK constraints for the closed enums; re-checking here
-# catches a database written by a producer that dropped them, and covers the
-# NULL-required combinations CHECK cannot express. DOMAINS is also what
+# This is where the closed enums are enforced. The DDL carries no CHECK for
+# them -- SQLite evaluates a string IN-list per row, which costs more than the
+# rest of the insert -- and a check here is the stronger one anyway: it covers
+# the NULL-required combinations CHECK cannot express. DOMAINS is also what
 # --domain-coverage reads, so the set a fixture must reach and the set a row
 # may hold are one table.
 for tbl, col, values, nullable in DOMAINS:
