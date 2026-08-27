@@ -16,6 +16,7 @@ module leaf;
     logic [7:0] split;
     logic [7:0] far_mem [0:3];
     logic [7:0] tied;
+    logic [7:0] fetch_src;
 endmodule
 
 module sink(input logic [7:0] p, output logic [7:0] seen);
@@ -26,7 +27,7 @@ endmodule
 // into ITSELF. The symbol it lands on belongs to the analysed body, so a
 // locality test that asks only about the symbol calls it a local read -- and
 // then each occurrence reads its OWN net, which is the one thing the path
-// does not say. Both occurrences must answer with the reference.
+// does not say. Both occurrences must answer with u_tw1's.
 module twice(output logic [7:0] mine, output logic [7:0] named);
     assign mine = 8'hA5;
     assign named = xmr_top.u_tw1.mine;
@@ -37,7 +38,8 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
            input logic quiet_gate,
            output logic q, output logic [3:0] slice_o, output logic tick,
            output logic [3:0] sp_hi, output logic [3:0] sp_lo,
-           output logic seen, output logic far_o);
+           output logic seen, output logic far_o,
+           output logic [7:0] fetched_o);
     leaf u();
 
     // Read across the boundary: u.x drives q.
@@ -156,6 +158,18 @@ module xmr(input logic clk, input logic a, input logic [7:0] d,
     // one direction never reaches.
     sink u_sink2 (.p(8'h00), .seen(u.split));
 
+    // A function whose RESULT is a downward read. `return e` writes the
+    // subroutine's implicit result variable, and nothing else: filing that
+    // write under the returned expression instead made the far net its own
+    // driver -- a driver the design does not have, on the very object the
+    // function only reads.
+    logic [7:0] fetched;
+    function automatic logic [7:0] fetch();
+        return u.fetch_src;
+    endfunction
+    assign fetched = fetch();
+    assign fetched_o = fetched;
+
     // A select spelled through the genvar: one spelling in the source, a
     // different element each iteration. The stored path carries the constant
     // each iteration resolved to, or two references share one key and a
@@ -173,11 +187,12 @@ module xmr_top(input logic clk, input logic a, input logic [7:0] d,
                output logic q, output logic [3:0] slice_o, output logic tick,
                output logic [3:0] sp_hi, output logic [3:0] sp_lo,
                output logic seen, output logic far_o,
+               output logic [7:0] fetched_o,
                output logic [7:0] m1_named, output logic [7:0] m2_named);
     xmr u_xmr (.clk(clk), .a(a), .d(d), .g1(g1), .g2(g2),
                .sens_only(sens_only), .quiet_gate(quiet_gate), .q(q),
                .slice_o(slice_o), .tick(tick), .sp_hi(sp_hi), .sp_lo(sp_lo),
-               .seen(seen), .far_o(far_o));
+               .seen(seen), .far_o(far_o), .fetched_o(fetched_o));
     logic [7:0] mine1, mine2;
     twice u_tw1 (.mine(mine1), .named(m1_named));
     twice u_tw2 (.mine(mine2), .named(m2_named));

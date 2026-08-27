@@ -680,6 +680,7 @@ private:
     /// path lookup in it is then ambiguous. The second node keeps its rows;
     /// only the by-name map keeps the first.
     void noteChild(int64_t parent, const std::string& name, int64_t id) {
+        parentOf[id] = parent;
         if (!childByName[parent].emplace(name, id).second)
             stats.duplicatePaths++;
     }
@@ -788,6 +789,9 @@ private:
                 case TplHierRef::Downward:
                     node = descend(job.instNode, ref.segs);
                     break;
+                case TplHierRef::Upward:
+                    node = searchUpward(job.instNode, ref.anchor, ref.segs);
+                    break;
                 case TplHierRef::Absolute:
                     node = descend(0, ref.segs);
                     break;
@@ -822,18 +826,24 @@ private:
                 default:
                     break;
             }
-            if (node != 0) {
+            // A route answers only where it lands on a stamped occurrence.
+            // resolved_inst_id names an INSTANCE -- the schema says so with a
+            // foreign key -- and a name search can end on a level that is not
+            // one: a generate block or a primitive may carry, in one
+            // occurrence's surroundings, the name an instance carried in the
+            // analysed body. That is where the lookup stopped, so searching
+            // on would answer with a different object; the NULL says what is
+            // true. The same find then names the net.
+            auto tplIt = node == 0 ? nodeTemplate.end() : nodeTemplate.find(node);
+            if (tplIt != nodeTemplate.end()) {
                 row.resolvedInstId = node;
                 if (!ref.netName.empty()) {
-                    auto tplIt = nodeTemplate.find(node);
-                    if (tplIt != nodeTemplate.end()) {
-                        auto& tt = *tplIt->second.first;
-                        auto nIt = tt.netIndex.find(ref.netName);
-                        if (nIt != tt.netIndex.end()) {
-                            row.resolvedNetId =
-                                tplIt->second.second + nIt->second + 1;
-                            resolvedNet.emplace(row.id, row.resolvedNetId);
-                        }
+                    auto& tt = *tplIt->second.first;
+                    auto nIt = tt.netIndex.find(ref.netName);
+                    if (nIt != tt.netIndex.end()) {
+                        row.resolvedNetId =
+                            tplIt->second.second + nIt->second + 1;
+                        resolvedNet.emplace(row.id, row.resolvedNetId);
                     }
                 }
             }
@@ -843,12 +853,11 @@ private:
         // The cross-instance dependencies. An endpoint is a local net (base
         // plus index) or a reference's resolution. The TARGET must resolve:
         // target_net_id is NOT NULL, and guessing a written object would be
-        // a wrong fact. The SOURCE may not: a package variable or an upward
-        // name is a real driver this export has no net row for, and v10/v11
-        // dropping the whole row made "driven through an unresolvable name"
-        // indistinguishable from "undriven". The row is now written with a
-        // NULL source net and the reference on the source end; v_driver
-        // reports it as 'external'.
+        // a wrong fact. The SOURCE may not: a `$unit` item is a real driver
+        // this export has no net row for, and v10/v11 dropping the whole row
+        // made "driven through an unresolvable name" indistinguishable from
+        // "undriven". The row is now written with a NULL source net and the
+        // reference on the source end; v_driver reports it as 'external'.
         for (auto& job : crossJobs) {
             const TplDep& d = job.t->deps[job.idx];
             NetDepRow row;
@@ -895,6 +904,40 @@ private:
                 stampId(job.base.callSite, d.callSite);
             writer.addNetDep(row);
             stats.deps++;
+        }
+    }
+
+    /// The upward lookup of LRM 23.8, repeated against the stamped tree:
+    /// from the occurrence outward, each level is asked for a child named
+    /// `anchor` and each instance level for the definition it is an instance
+    /// of, and the first level that also carries the rest of the path
+    /// answers. Searching rather than climbing a recorded number of levels is
+    /// the point -- the level that answers is a fact about the occurrence,
+    /// and two occurrences of one body can sit at different depths, under
+    /// different surroundings, or under none that answers at all.
+    int64_t searchUpward(int64_t from, const std::string& anchor,
+                         const std::vector<std::string>& segs) {
+        if (anchor.empty())
+            return 0;
+        for (int64_t level = from;;) {
+            auto pIt = childByName.find(level);
+            if (pIt != childByName.end()) {
+                auto cIt = pIt->second.find(anchor);
+                if (cIt != pIt->second.end()) {
+                    if (const int64_t node = descend(cIt->second, segs))
+                        return node;
+                }
+            }
+            auto tIt = nodeTemplate.find(level);
+            if (tIt != nodeTemplate.end() &&
+                tIt->second.first->defName == anchor) {
+                if (const int64_t node = descend(level, segs))
+                    return node;
+            }
+            if (level == 0)
+                return 0;
+            auto up = parentOf.find(level);
+            level = up == parentOf.end() ? 0 : up->second;
         }
     }
 
@@ -949,6 +992,10 @@ private:
     std::unordered_set<const Template*> onPath;
 
     std::unordered_map<int64_t, std::unordered_map<std::string, int64_t>> childByName;
+    /// Every stamped node's parent, for the outward half of an upward
+    /// reference's search. The tree rows carry it too, but they are written
+    /// out, not kept.
+    std::unordered_map<int64_t, int64_t> parentOf;
     std::vector<ReplayJob> replayJobs;
     std::vector<CrossJob> crossJobs;
     /// node id -> (template, net id base) for net-name resolution at replay.

@@ -2780,6 +2780,19 @@ if mode == "patterncase":
 
 
 if mode == "outward":
+    # A package function's `return` writes the subroutine's own result
+    # variable, and the row names that variable. It used to be filed under
+    # the RETURNED expression's text, which put `|a` in the database as the
+    # name of a written object -- and a consumer reading a written name off
+    # this row got an expression where a signal belongs.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE access='write' AND path='outward_pkg::chk.chk'""") == 1,
+          "a package function's return writes its own result variable")
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE access='write' AND path LIKE '%|%'""") == 0,
+          "and no written name is an expression")
     # A built-in method registers as a system call in slang, but nothing
     # leaves the language: the row says `call`, with the method's own word.
     check(one("""
@@ -3053,14 +3066,20 @@ if mode == "rootref":
         WHERE h.path='$root.rootref.own' AND t.name='rootref'
           AND n.name='own'""") == 2,
           "a one-segment absolute path resolves to the root's own net")
-    # The upward spelling of the same net stays unresolved: one analysed
-    # body cannot answer for surroundings it does not know.
+    # The upward spelling of the same net resolves per occurrence: the
+    # search runs against the tree the occurrence actually sits in, so both
+    # readers answer with the one net the source names.
     check(one("""
-        SELECT count(*) FROM hier_ref
-        WHERE path='rootref.u_leaf.q'
-          AND (resolved_inst_id IS NOT NULL OR resolved_net_id IS NOT NULL)
-        """) == 0,
-          "an upward path to the same net stays unresolved")
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='rootref.u_leaf.q' AND t.name='u_leaf' AND n.name='q'
+        """) == 2,
+          "an upward path resolves from both occurrences")
+    check(one("""
+        SELECT count(DISTINCT resolved_net_id) FROM hier_ref
+        WHERE path IN ('rootref.u_leaf.q', '$root.rootref.u_leaf.q')""") == 1,
+          "and lands on the net its absolute spelling names")
     # What the resolution is for: the write becomes a driver instead of a
     # dependency that could not be materialised, and the read becomes a load.
     check(one("""
@@ -3132,15 +3151,30 @@ if mode == "xmr":
         WHERE signal_name='a' AND load_name='x' AND load_ref='u.x'""") == 1,
           "and the load view mirrors it")
     # A path that climbs out of a twice-instantiated body and back into it
-    # lands on a symbol of that body, and is still not the occurrence's own
-    # net: both occurrences answer with the reference, neither with itself.
-    check(one("""SELECT count(*) FROM v_driver d JOIN net n ON n.id=d.signal_net_id
-                 WHERE n.name='named' AND d.driver_kind='external'""") == 2,
-          "a path back into the analysed body stays a reference")
+    # names ONE object from both occurrences -- never the occurrence's own
+    # net, which is the one thing the path does not say.
+    check(one("""SELECT count(DISTINCT d.driver_net_id) FROM v_driver d
+                 JOIN net n ON n.id=d.signal_net_id
+                 WHERE n.name='named'""") == 1,
+          "a path back into the analysed body names one net from both")
     check(one("""SELECT count(*) FROM v_driver d JOIN net n ON n.id=d.signal_net_id
                  JOIN net s ON s.id=d.driver_net_id
-                 WHERE n.name='named' AND s.name='mine'""") == 0,
-          "and never resolves to the occurrence's own net")
+                 JOIN tree_node t ON t.id = s.inst_id
+                 WHERE n.name='named' AND s.name='mine'
+                   AND t.name='u_tw1'""") == 2,
+          "and it is u_tw1's, read from u_tw2 as well as from u_tw1")
+
+    # `return e` writes the subroutine's implicit result variable and
+    # nothing else. Filing that write under the RETURNED expression made the
+    # far net a driver of itself -- a driver the design does not have, on an
+    # object the function only reads.
+    check(one("""SELECT count(*) FROM v_driver WHERE signal_name='fetch_src'""") == 0,
+          "a return of a downward read leaves what it reads undriven")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE signal_name='fetched' AND driver_kind='data'
+          AND driver_name='fetch_src' AND driver_ref='u.fetch_src'""") == 1,
+          "while the value it returns still reaches the caller")
 
     # A downward read is a real dependency naming the reference it went
     # through -- not a hier_ref row beside a fabricated constant driver.
@@ -3472,25 +3506,67 @@ if mode == "aliascat":
 
 
 if mode == "external":
-    # LRM 23.8 -- an upward hierarchical reference from a shared body, which
-    # is what still leaves the model once packages resolve. `tb_top.glob`
-    # climbs out of up_leaf, and the one analysed body cannot say where each
-    # of its two occurrences sits. The dependency carries a NULL source net
-    # and the reference on the source end; v_driver says 'external' -- not
-    # undriven.
+    # LRM 23.8 -- an upward reference from a shared body. The level that
+    # answers `tb_top.glob` is the occurrence's own, so both occurrences
+    # resolve, and onto the one net the source names.
+    check(one("""
+        SELECT count(DISTINCT h.resolved_net_id) FROM hier_ref h
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='tb_top.glob' AND n.name='glob'""") == 1,
+          "an upward reference from a shared body resolves to one net")
+    check(one("""
+        SELECT count(*) FROM v_driver
+        WHERE driver_kind='data' AND signal_name='up_o'
+          AND driver_name='glob' AND driver_ref='tb_top.glob'""") == 2,
+          "and drives both occurrences' outputs, naming its spelling")
+    # The same climb from a CONDITION -- the half that carries a branch. It
+    # resolves like the read beside it, so the gating is a control dependency
+    # with a real source rather than one with none.
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path='tb_top.gmode' AND branch_id IS NOT NULL
+          AND resolved_net_id IS NOT NULL""") == 4,
+          "an upward condition resolves and keeps its branch")
+    check(one("""
+        SELECT count(*) FROM v_net_dep
+        WHERE dep_kind='control' AND src_name='gmode' AND tgt_name='ug'
+          AND src_net_id IS NOT NULL""") == 4,
+          "and gates as a control dependency with a source net")
+    check(one("""
+        SELECT count(DISTINCT src_net_id) FROM v_net_dep
+        WHERE dep_kind='control' AND src_name='gmode'""") == 1,
+          "and both occurrences are gated by the one net the source names")
+    # What the per-occurrence search finds need not be the KIND of thing the
+    # analysed body found: `blk` is an instance above one occurrence and a
+    # generate block above the other. resolved_inst_id is a foreign key into
+    # inst, so the second has nothing to name -- and naming the generate node
+    # anyway is what the foreign_key_check above would have caught.
+    check(one("""
+        SELECT count(*) FROM hier_ref h
+        JOIN tree_node t ON t.id = h.resolved_inst_id
+        JOIN net n ON n.id = h.resolved_net_id
+        WHERE h.path='blk.sig' AND t.node_kind='instance' AND n.name='sig'""") == 1,
+          "an upward anchor that finds an instance resolves")
+    check(one("""
+        SELECT count(*) FROM hier_ref
+        WHERE path='blk.sig' AND resolved_inst_id IS NULL""") == 1,
+          "and one that finds a generate block stays NULL")
+    # A $unit object is what still leaves the model once packages and upward
+    # names resolve: nothing stamps the compilation unit, so the dependency
+    # carries a NULL source net and the reference on the source end.
     check(one("""
         SELECT count(*) FROM v_driver
         WHERE driver_kind='external' AND signal_name='o'""") >= 1,
-          "an output driven by an upward reference is external")
+          "an output driven by a $unit object is external")
     # The window and the name, both off the v_driver row itself, so reading
     # them costs no dep_id -> net_dep -> hier_ref walk: two more queries per
     # external row, the second against a base table rather than a view.
     check(one("""
         SELECT count(*) FROM v_driver
         WHERE driver_kind='external' AND signal_name='nib'
-          AND driver_ref='tb_top.glob'
+          AND driver_ref='cu_glob'
           AND driver_lo=0 AND driver_hi=3 AND driver_exact=1""") >= 1,
-          "the windowed upward read keeps its window and names what it reads")
+          "the windowed external read keeps its window and names what it reads")
     check(one("""
         SELECT count(*) FROM v_driver
         WHERE driver_kind='external' AND driver_ref IS NULL""") == 0,
@@ -3509,18 +3585,18 @@ if mode == "external":
         SELECT count(*) FROM net_dep
         WHERE src_net_id IS NULL AND src_hier_ref_id IS NOT NULL
           AND dep_kind='control'""") >= 1,
-          "an upward condition gates as a control dependency with no source")
+          "an external condition gates as a control dependency with no source")
     check(one("""
         SELECT count(*) FROM v_driver
         WHERE driver_kind='external' AND signal_name='g'""") >= 1,
-          "so the upward-gated target shows its external control")
-    # o and nib are pure upward reads -- no constant hides among their
+          "so the externally gated target shows its external control")
+    # o and nib are pure external reads -- no constant hides among their
     # drivers. (g legitimately also has constant drivers: the 8'hFF/8'h00 it
-    # assigns under the upward condition.)
+    # assigns under the external condition.)
     check(one("""
         SELECT count(*) FROM v_driver
         WHERE signal_name IN ('o','nib') AND driver_kind='constant'""") == 0,
-          "and no upward source is misreported as a constant")
+          "and no external source is misreported as a constant")
 
 if mode == "callsite":
     # A constant actual ties the formal off, the same fact `.p(8'h5A)`
