@@ -175,6 +175,16 @@ struct TplBranchRef {
     TplRange r;
 };
 
+/// One (level, ancestor) pair of the gating tree, the level itself included
+/// at distance 0. The parent link alone answers "one step outward" and makes
+/// every other question a recursive walk; this is that walk done once, per
+/// template, where the tree is a few dozen rows rather than per occurrence.
+struct TplBranchAncestor {
+    int32_t branch = -1;
+    int32_t ancestor = -1;
+    int32_t distance = 0;
+};
+
 struct TplBranchLabel {
     int32_t branch = 0;
     int64_t ordinal = 0;
@@ -347,6 +357,7 @@ struct Template {
     std::vector<TplBranch> branches;
     std::vector<TplBranchLabel> branchLabels;
     std::vector<TplBranchRef> branchRefs;
+    std::vector<TplBranchAncestor> branchAncestors;
     std::vector<TplStmtRef> targets;
     std::vector<TplStmtRef> operands;
     std::vector<TplExprRef> exprRefs;

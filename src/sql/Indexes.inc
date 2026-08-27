@@ -66,6 +66,13 @@ CREATE INDEX expr_ref_by_net        ON expr_ref(net_id);
 -- A level's read set: what this condition reads, one seek. The
 -- (branch_id, ordinal) UNIQUE covers the other direction.
 CREATE INDEX branch_ref_by_net      ON branch_ref(net_id);
+
+-- The closure's fan-out direction: "everything this level controls,
+-- transitively". The table's primary key serves the fan-in direction, and on
+-- a clustered key the other end is a full scan -- 283 us against 13 us per
+-- level on VeeRwolf, for a covering index over two integers.
+CREATE INDEX branch_ancestor_by_ancestor
+    ON branch_ancestor(ancestor_branch_id, branch_id);
 CREATE INDEX proc_event_by_proc ON proc_event(proc_id);
 CREATE INDEX proc_event_by_net      ON proc_event(net_id)
     WHERE net_id IS NOT NULL;

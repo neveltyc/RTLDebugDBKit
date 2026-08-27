@@ -239,6 +239,9 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
                 " lo, hi, is_exact)"
                 " VALUES(?,?,?,?,?,?,?)",
                 &ins[InsBranchRef]);
+        prepare("INSERT INTO branch_ancestor(branch_id, ancestor_branch_id,"
+                " distance) VALUES(?,?,?)",
+                &ins[InsBranchAncestor]);
         prepare("INSERT INTO call_site(id, inst_id, caller_stmt_id,"
                 " parent_call_site_id, subroutine_name, depth)"
                 " VALUES(?,?,?,?,?,?)",
@@ -715,6 +718,16 @@ void Writer::addBranchRef(const BranchRefRow& r) {
     sqlite3_bind_int64(s, 3, r.ordinal);
     sqlite3_bind_int64(s, 4, r.netId);
     bindRange(s, 5, r.bits, r.exact);
+    step(s);
+    bumped();
+}
+
+void Writer::addBranchAncestor(const BranchAncestorRow& r) {
+    auto* s = ins[InsBranchAncestor];
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, r.branchId);
+    sqlite3_bind_int64(s, 2, r.ancestorBranchId);
+    sqlite3_bind_int64(s, 3, r.distance);
     step(s);
     bumped();
 }

@@ -326,6 +326,16 @@ private:
             row.exact = r.r.exact;
             writer.addBranchRef(row);
         }
+        // The gating tree's closure, shifted like everything else: it is a
+        // fact about the template's own levels, so it is computed once there
+        // and moved here, not recomputed per occurrence.
+        for (auto& a : t.branchAncestors) {
+            BranchAncestorRow row;
+            row.branchId = base.branch + a.branch + 1;
+            row.ancestorBranchId = base.branch + a.ancestor + 1;
+            row.distance = a.distance;
+            writer.addBranchAncestor(row);
+        }
 
         // Call sites first: a stmt row names the site it belongs to, so the
         // site ids must be issued before the statements reference them.

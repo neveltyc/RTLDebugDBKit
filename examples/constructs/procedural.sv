@@ -298,6 +298,19 @@ module emptylevel (input logic clk, input logic en, input logic gate,
     end
 endmodule
 
+// A level inside a generate block, in a body stamped twice. The gating
+// tree's closure is computed once per template and shifted per occurrence,
+// so an ancestor id that leaked would name a level of the OTHER occurrence:
+// the two here must carry the same shape and share no row of it.
+module genlevel (input logic clk, input logic en, input logic [7:0] a,
+                 output logic [7:0] q);
+    for (genvar g = 0; g < 2; g = g + 1) begin : gl
+        always_ff @(posedge clk)
+            if (en)
+                q[g*4 +: 4] <= a[g*4 +: 4];
+    end
+endmodule
+
 module procedural (input logic clk, input logic [7:0] x, k,
                    input logic [3:0] sel, input logic b, g, en, ev,
                    output logic [7:0] explicit_self, compound_self,
@@ -311,7 +324,8 @@ module procedural (input logic clk, input logic [7:0] x, k,
                    output logic [7:0] gated_q, gated_y, gated_z, gated_w,
                    output logic [7:0] gated_v,
                    output logic [7:0] summed, carried, mirrored, dead,
-                   output logic [7:0] empty_arm_q);
+                   output logic [7:0] empty_arm_q,
+                   output logic [7:0] gen_q1, output logic [7:0] gen_q2);
     compound u_cmp (.clk(clk), .x(x), .explicit_self(explicit_self),
                     .compound_self(compound_self), .shift_self(shift_self),
                     .masked(masked));
@@ -329,4 +343,6 @@ module procedural (input logic clk, input logic [7:0] x, k,
                      .mirrored(mirrored), .dead(dead));
     emptylevel u_emp (.clk(clk), .en(en), .gate(g), .a(x),
                       .q(empty_arm_q));
+    genlevel u_gl1 (.clk(clk), .en(en), .a(x), .q(gen_q1));
+    genlevel u_gl2 (.clk(clk), .en(en), .a(k), .q(gen_q2));
 endmodule

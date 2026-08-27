@@ -62,6 +62,7 @@ flowchart LR
     branch[branch]
     branch_label[branch_label]
     branch_ref[branch_ref]
+    branch_ancestor[branch_ancestor]
     stmt[stmt]
     stmt_target[stmt_target]
     assign_operand[assign_operand]
@@ -100,6 +101,7 @@ flowchart LR
   branch -.->|iter_net_id| net
   branch_label --> branch
   branch_ref --> branch
+  branch_ancestor --> branch
   branch_ref -->|net_id| net
   call_site -->|inst_id| inst
   call_site -.->|caller_stmt_id| stmt
@@ -148,6 +150,7 @@ does not apply to); solid edges are always present.
 | | `branch` | one level of the gating context | `inst_id → inst`, `parent_branch_id → branch`, `iter_net_id → net` |
 | | `branch_label` | one label of a case item, evaluated | `branch_id → branch` |
 | | `branch_ref` | one read of a level's condition | `branch_id → branch`, `net_id → net` |
+| | `branch_ancestor` | one (level, ancestor) pair, the level included | `branch_id`/`ancestor_branch_id → branch` |
 | | `stmt` | one statement or statement-level construct | `inst_id → inst`, `scope_node_id → tree_node`, `proc_id → proc`, `call_site_id → call_site`, `branch_id → branch` |
 | | `stmt_target` | one statement's target reference (LHS, release, system write) | `stmt_id → stmt`, `net_id → net` |
 | | `assign_operand` | one assignment right-hand-side reference | `stmt_id → stmt`, `net_id → net` |
@@ -457,6 +460,36 @@ here and nowhere else. What each gated statement gets is the *dependency*,
 one per target, naming the level in `net_dep.branch_id`. A condition that
 names something outside the instance is a `hier_ref` keyed the same way:
 `branch_id` set, `stmt_id` NULL.
+
+**`branch_ancestor`** — the gating tree's transitive closure,
+`(branch_id, ancestor_branch_id, distance)`, the level itself included at
+distance 0. `branch.parent_branch_id` answers one step outward and leaves
+every other question a recursive walk, and asking a per-statement question
+through a view that recurses costs 2.4 ms where a join costs 3.8 µs — SQLite
+materialises the whole design's chains before it filters. So the walk is done
+once, per module template, and shifted per occurrence.
+
+Everything gating one statement, its conditions included:
+
+```sql
+SELECT r.net_id, r.lo, r.hi, r.is_exact
+FROM stmt s
+JOIN branch_ancestor a ON a.branch_id = s.branch_id
+JOIN branch_ref r      ON r.branch_id = a.ancestor_branch_id
+WHERE s.id = ?
+```
+
+Everything one level controls, transitively — the other direction, indexed
+the same way:
+
+```sql
+SELECT s.id FROM branch_ancestor a
+JOIN stmt s ON s.branch_id = a.branch_id
+WHERE a.ancestor_branch_id = ?
+```
+
+An outward condition is a `hier_ref` rather than a `branch_ref`, so a query
+that must not miss an XMR gating reads both against the same closure.
 
 **`expr_ref`** — every read of a STATEMENT that is not an assignment operand,
 classified: `assertion`, `wait` (a wait's condition), `event` (a sensitivity

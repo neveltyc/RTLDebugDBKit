@@ -1102,6 +1102,13 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
         // addHierRef keys those on the level, so asking again finds the same
         // row rather than making a second. A level that gated nothing has
         // filed nothing, and this is where its condition stops being lost.
+        // The level and everything above it, walked once here because the
+        // parent chain of this procedure's levels is closed: `row.parent` is
+        // always a level this loop has already pushed.
+        for (int32_t up = idx, d = 0; up >= 0;
+             up = b.t->branches[size_t(up)].parent, d++) {
+            b.t->branchAncestors.push_back(TplBranchAncestor{idx, up, d});
+        }
         const TplLoc where = locator.locate(f.where.start(), procAt);
         int64_t ordinal = 0;
         for (auto& r : f.refs) {

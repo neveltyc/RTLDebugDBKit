@@ -834,6 +834,13 @@ struct BranchLabelRow {
     bool hasValue = false;        // false = NULL: not constant-evaluable
 };
 
+/// One (level, ancestor) pair of the gating tree, the level itself included.
+struct BranchAncestorRow {
+    int64_t branchId = 0;
+    int64_t ancestorBranchId = 0;
+    int64_t distance = 0;
+};
+
 /// One read of one level's condition.
 struct BranchRefRow {
     int64_t id = 0;
@@ -1025,6 +1032,7 @@ public:
     void addBranch(const BranchRow& r);
     void addBranchLabel(const BranchLabelRow& r);
     void addBranchRef(const BranchRefRow& r);
+    void addBranchAncestor(const BranchAncestorRow& r);
     void addCallSite(const CallSiteRow& r);
     void addStmt(const StmtRow& r);
     void addStmtTarget(const StmtTargetRow& r);
@@ -1051,7 +1059,8 @@ private:
         InsModule, InsTreeNode, InsInst, InsInstParam, InsPrimitive, InsNet,
         InsTerm, InsTermMap, InsNetConn, InsProcedure, InsBranch,
         InsBranchLabel,
-        InsBranchRef, InsCallSite, InsStmt,
+        InsBranchRef,
+        InsBranchAncestor, InsCallSite, InsStmt,
         InsStmtTarget, InsAssignOperand, InsExprRef, InsProcEvent,
         InsNetDep, InsHierRef,
         InsCount

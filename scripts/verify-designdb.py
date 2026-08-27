@@ -672,6 +672,28 @@ check(one("""
     SELECT count(*) FROM hier_ref h JOIN branch b ON b.id = h.branch_id
     WHERE h.inst_id != b.inst_id""") == 0,
       "an outward condition's level is in its own instance")
+# The closure is derived, so it is checked against what it derives FROM in
+# one statement: the same pairs the parent chain gives, the level itself
+# included, at the distance the walk takes.
+check(one("""
+    WITH RECURSIVE up(branch_id, ancestor_branch_id, distance) AS (
+        SELECT id, id, 0 FROM branch
+      UNION ALL
+        SELECT u.branch_id, b.parent_branch_id, u.distance + 1
+        FROM up u JOIN branch b ON b.id = u.ancestor_branch_id
+        WHERE b.parent_branch_id IS NOT NULL)
+    SELECT (SELECT count(*) FROM up)
+         - (SELECT count(*) FROM branch_ancestor a JOIN up u
+            ON u.branch_id = a.branch_id
+           AND u.ancestor_branch_id = a.ancestor_branch_id
+           AND u.distance = a.distance)""") == 0,
+      "branch_ancestor is the parent chain's closure, distances included")
+check(one("""
+    SELECT count(*) FROM branch_ancestor a
+    LEFT JOIN branch b ON b.id = a.branch_id
+    LEFT JOIN branch p ON p.id = a.ancestor_branch_id
+    WHERE b.id IS NULL OR p.id IS NULL OR b.inst_id != p.inst_id""") == 0,
+      "and both of its ends are levels of one instance")
 # A loop index sources no dataflow: that is what the iteration space
 # replaced. A `procedure` arc survives -- `t(i)` really does feed the formal,
 # and dropping it would leave the formal with no driver at all.
@@ -2364,6 +2386,24 @@ if mode == "procedural":
         SELECT count(*) FROM v_load
         WHERE signal_name='gate' AND load_kind='condition'""") == 2,
           "and the signal reads back as loaded, which it was not before")
+    # The closure is a template fact shifted per occurrence, and a generate
+    # level is where a shift goes wrong if it can: the two occurrences of one
+    # body must carry the same shape and share no row of it.
+    gen = list(con.execute("""
+        SELECT b.inst_id, count(*) FROM branch_ancestor a
+        JOIN branch b ON b.id = a.branch_id
+        JOIN inst i ON i.id = b.inst_id JOIN module m ON m.id = i.module_id
+        WHERE m.name='genlevel' GROUP BY b.inst_id"""))
+    check(len(gen) == 2 and gen[0][1] == gen[1][1] and gen[0][1] > 0,
+          "a generate-nested closure is stamped alike for both occurrences",
+          f"got {gen}")
+    check(one("""
+        SELECT count(*) FROM branch_ancestor a
+        JOIN branch b ON b.id = a.branch_id
+        JOIN branch p ON p.id = a.ancestor_branch_id
+        JOIN inst i ON i.id = b.inst_id JOIN module m ON m.id = i.module_id
+        WHERE m.name='genlevel' AND p.inst_id != b.inst_id""") == 0,
+          "and neither occurrence names a level of the other")
     check(one("""
         SELECT count(*) FROM v_stmt s
         JOIN v_branch b ON b.branch_id = s.branch_id

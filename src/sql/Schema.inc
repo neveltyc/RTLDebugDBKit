@@ -475,6 +475,23 @@ CREATE TABLE branch_ref(
     is_exact  INTEGER NOT NULL CHECK(is_exact IN (0,1)),
     UNIQUE(branch_id, ordinal));
 
+-- The gating tree's transitive closure, the level itself included at
+-- distance 0. `branch.parent_branch_id` answers one step outward and makes
+-- every other question a recursive walk -- and a per-statement question
+-- asked through a view that recurses costs 2.4 ms against 3.2 us, because
+-- SQLite materialises the whole design's chains before filtering. This is
+-- that walk done once, per template, where a module's tree is a few dozen
+-- rows; stamping shifts it like every other id.
+--
+-- Both directions are indexed: fan-in ("what gates this level") on the
+-- primary key, fan-out ("what does this level control") on the index beside
+-- it, which is a full scan without.
+CREATE TABLE branch_ancestor(
+    branch_id          INTEGER NOT NULL REFERENCES branch(id),
+    ancestor_branch_id INTEGER NOT NULL REFERENCES branch(id),
+    distance           INTEGER NOT NULL,
+    PRIMARY KEY(branch_id, ancestor_branch_id)) WITHOUT ROWID;
+
 CREATE TABLE branch_label(
     id        INTEGER PRIMARY KEY,
     branch_id INTEGER NOT NULL REFERENCES branch(id),
