@@ -1093,6 +1093,8 @@ void TemplateBuilder::buildProcedure(Build& b, const AnalyzedProcedure& proc) {
         row.iterFirst = f.iterFirst;
         row.iterStep = f.iterStep;
         row.hasProgression = f.hasProgression;
+        row.proc = b.curProc;
+        row.callSite = f.callSite;
         row.loc = locator.locate(f.where.start(), procAt);
         const int32_t idx = int32_t(b.t->branches.size());
         b.t->branches.push_back(std::move(row));
@@ -1317,6 +1319,24 @@ void TemplateBuilder::fileAssignment(Build& b, const std::vector<TargetRecord>& 
         c.src = g.ref;
         c.level = b.branchBase + g.branch;
         c.net = netOfRef(*b.decl, g.ref);
+        // One level reading one net over one window gates a target once,
+        // however many times the condition spells it: `if (x == 1 || x == 2)`
+        // is two reads of x -- two branch_ref rows, which is what the source
+        // says -- and one gating. The dependency names the level, not the
+        // read, so a second row here would be identical to the first in every
+        // column but its id.
+        const TplRange window = rangeOf(g.ref);
+        bool seen = false;
+        for (auto& prev : controls) {
+            seen = prev.level == c.level && prev.net == c.net &&
+                   rangeOf(prev.src).bits == window.bits &&
+                   rangeOf(prev.src).exact == window.exact &&
+                   (c.net >= 0 || prev.src.origin == g.ref.origin);
+            if (seen)
+                break;
+        }
+        if (seen)
+            continue;
         // The read itself belongs to the level and is filed once, with the
         // level's own rows -- a condition is written once and evaluated once
         // however many statements sit under it. What the statement gets is

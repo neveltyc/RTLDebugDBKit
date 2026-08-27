@@ -229,8 +229,8 @@ Writer::Writer(const std::string& path, bool checkConstraints) {
         prepare("INSERT INTO branch(id, inst_id, parent_branch_id, depth,"
                 " ordinal, branch_kind, sense, case_kind, check_kind,"
                 " static_taken, iter_net_id, iter_first, iter_step,"
-                " iter_count, file_id, line, col)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " iter_count, proc_id, call_site_id, file_id, line, col)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 &ins[InsBranch]);
         prepare("INSERT INTO branch_label(id, branch_id, ordinal, value)"
                 " VALUES(?,?,?,?)",
@@ -688,7 +688,9 @@ void Writer::addBranch(const BranchRow& r) {
         sqlite3_bind_null(s, 14);
     else
         sqlite3_bind_int64(s, 14, r.iterCount);
-    bindLoc(s, 15, r.fileId, r.line, r.column);
+    bindOptId(s, 15, r.procedureId);
+    bindOptId(s, 16, r.callSiteId);
+    bindLoc(s, 17, r.fileId, r.line, r.column);
     step(s);
     bumped();
 }

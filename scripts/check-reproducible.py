@@ -111,8 +111,9 @@ def compare(ref_db, new_db, run):
             if ra != rb:
                 differing += 1
                 if differing <= 3:
-                    problems.append(f"run {run}: {t} row {ra[0]}: "
-                                    f"{ra[1:]} != {rb[1:]}")
+                    key = ra[:len(order.split(", "))]
+                    problems.append(f"run {run}: {t} row {key}: "
+                                    f"{ra[len(key):]} != {rb[len(key):]}")
         # zip() stops at the shorter side, so a length difference has to be
         # asked about separately or a truncated table reads as a clean match.
         na = a.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]

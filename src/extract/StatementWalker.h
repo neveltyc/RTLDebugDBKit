@@ -119,6 +119,7 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
             if (p.id < 0) {
                 p.frame.parent = parent;
                 p.frame.depth = int32_t(i) + 1;
+                p.frame.callSite = callSiteSlot ? *callSiteSlot : -1;
                 p.id = branches.add(std::move(p.frame));
             }
             parent = p.id;
@@ -578,27 +579,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
         }
     }
 
-    /// Whether a body can gate anything at all: `2'b01: ;` and `2'b01: begin
-    /// end` cannot. Their arm makes no level on demand, so the labels' reads
-    /// would have no statement anywhere to land on, and a signal the case
-    /// reads would end with no load row in the database at all.
-    static bool gatesNothing(const Statement& body) {
-        switch (body.kind) {
-            case StatementKind::Empty:
-                return true;
-            case StatementKind::List:
-                for (auto* child : body.as<StatementList>().list) {
-                    if (!child || !gatesNothing(*child))
-                        return false;
-                }
-                return true;
-            case StatementKind::Block:
-                return gatesNothing(body.as<BlockStatement>().body);
-            default:
-                return false;
-        }
-    }
-
     /// One label, evaluated. nullopt is a label constant evaluation does not
     /// reach -- an `inside` range over a variable -- whose reads stay on the
     /// item's level like any other control read.
@@ -645,14 +625,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                     collectGating(*label, arm.refs);
                     label->visit(*this);
                     arm.labels.push_back(labelValue(*label));
-                }
-                // An arm that gates nothing hands its labels' reads to the
-                // point, where the matching reads them anyway. Left on the
-                // arm they would reach no statement and vanish.
-                if (gatesNothing(*item.stmt)) {
-                    point.refs.insert(point.refs.end(), arm.refs.begin(),
-                                      arm.refs.end());
-                    arm.refs.clear();
                 }
                 arms.push_back(std::move(arm));
             }
@@ -1287,11 +1259,6 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
                 if (item.filter) {
                     collectGating(*item.filter, arm.refs);
                     item.filter->visit(*this);
-                    if (gatesNothing(*item.stmt)) {
-                        point.refs.insert(point.refs.end(), arm.refs.begin(),
-                                          arm.refs.end());
-                        arm.refs.clear();
-                    }
                 }
                 arms.push_back(std::move(arm));
             }

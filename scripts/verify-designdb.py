@@ -652,6 +652,20 @@ check(one("""
     SELECT count(*) FROM net_dep
     WHERE (dep_kind = 'control') != (branch_id IS NOT NULL)""") == 0,
       "a dependency names a level exactly when a condition made it")
+# A control dependency's source is a net the level it names actually reads,
+# or the outward reference that level holds. Without this the two halves --
+# the read on the level, the dependency on the statement -- could describe
+# two different gatings, and v_load's condition arm suppresses a read that
+# has a dependency on exactly this pairing.
+check(one("""
+    SELECT count(*) FROM net_dep d WHERE d.dep_kind = 'control'
+      AND NOT EXISTS (SELECT 1 FROM branch_ref r
+                      WHERE r.branch_id = d.branch_id
+                        AND r.net_id IS d.src_net_id)
+      AND NOT EXISTS (SELECT 1 FROM hier_ref h
+                      WHERE h.id = d.src_hier_ref_id
+                        AND h.branch_id = d.branch_id)""") == 0,
+      "a control dependency's source is one of the level's own reads")
 # The level a control dependency names is one its statement actually sits
 # under, which is what makes the two halves -- the read on the level, the
 # dependency on the statement -- describe one gating and not two.
@@ -682,11 +696,11 @@ check(one("""
         SELECT u.branch_id, b.parent_branch_id, u.distance + 1
         FROM up u JOIN branch b ON b.id = u.ancestor_branch_id
         WHERE b.parent_branch_id IS NOT NULL)
-    SELECT (SELECT count(*) FROM up)
-         - (SELECT count(*) FROM branch_ancestor a JOIN up u
-            ON u.branch_id = a.branch_id
-           AND u.ancestor_branch_id = a.ancestor_branch_id
-           AND u.distance = a.distance)""") == 0,
+    SELECT (SELECT count(*) FROM up) + (SELECT count(*) FROM branch_ancestor)
+         - 2 * (SELECT count(*) FROM branch_ancestor a JOIN up u
+                ON u.branch_id = a.branch_id
+               AND u.ancestor_branch_id = a.ancestor_branch_id
+               AND u.distance = a.distance)""") == 0,
       "branch_ancestor is the parent chain's closure, distances included")
 check(one("""
     SELECT count(*) FROM branch_ancestor a
@@ -823,9 +837,6 @@ check(one("""
              OR (d.src_net_id IS NULL AND d.src_hier_ref_id IS NULL)
              OR d.assign_operand_id IS NOT NULL OR d.prim_id IS NOT NULL
              OR d.expr_ref_id IS NOT NULL
-             -- The read is the level's; a source net comes with the level
-             -- that read it, an outward one with the reference instead.
-             OR d.branch_id IS NULL
              OR (d.stmt_target_id IS NULL) = (d.tgt_hier_ref_id IS NULL)
              -- NULL-safe: `NULL != 0` is NULL, so the plain comparison read
              -- as "0 or NULL" and let an unset mapping through.
@@ -1062,8 +1073,12 @@ check(one("""
 # counts -- so what is left here is what the schema cannot say: that the row
 # is there at all, and that this file's contract is the one this script
 # knows.
-info_cols = [d[0] for d in con.execute("SELECT * FROM v_db_info LIMIT 0").description]
-info = con.execute("SELECT * FROM v_db_info").fetchone()
+try:
+    info_cols = [d[0] for d in
+                 con.execute("SELECT * FROM v_db_info LIMIT 0").description]
+    info = con.execute("SELECT * FROM v_db_info").fetchone()
+except sqlite3.OperationalError as e:
+    fatal(f"v_db_info is missing or unreadable: {e}")
 # Fatal rather than collected: every check below reads these.
 if info is None:
     fatal("db_info holds no row -- the export did not seal")
@@ -1181,8 +1196,8 @@ VIEW_COLUMNS = {
         "load_net_id", "load_inst_id",
         "load_name", "load_ref", "load_lo", "load_hi", "load_exact",
         "load_kind", "dep_id", "conn_id", "stmt_id", "proc_id",
-        "term_id", "map_exact", "call_site_id", "file_path", "src_path",
-        "src_line", "src_col"],
+        "term_id", "map_exact", "call_site_id", "branch_id",
+        "file_path", "src_path", "src_line", "src_col"],
     "v_stmt": [
         "stmt_id", "inst_id", "module_id", "module_name",
         "scope_node_id", "proc_id", "ordinal", "sequence",
@@ -1211,8 +1226,8 @@ VIEW_COLUMNS = {
         "parent_branch_id", "depth", "ordinal", "branch_kind", "sense",
         "case_kind",
         "check_kind", "static_taken", "iter_net_id", "iter_name",
-        "iter_first", "iter_step", "iter_count", "labels",
-        "file_path", "src_path", "src_line", "src_col"],
+        "iter_first", "iter_step", "iter_count", "proc_id", "call_site_id",
+        "labels", "file_path", "src_path", "src_line", "src_col"],
     "v_call_site": [
         "call_site_id", "inst_id", "module_id", "module_name",
         "caller_stmt_id", "parent_call_site_id", "subroutine_name", "depth"],
@@ -1407,6 +1422,15 @@ for view in ("v_driver", "v_load", "v_net_dep"):
                           WHERE c.id = v.call_site_id
                             AND c.caller_stmt_id = v.stmt_id)""") == 0,
           f"{view}.call_site_id is its statement's, or the call it opens")
+# A condition row has no statement to take it from -- the read is the
+# level's -- so it takes the level's, which is stamped per expansion exactly
+# as a statement is. The join above cannot see these rows at all.
+check(one("""
+    SELECT count(*) FROM v_load v JOIN branch b ON b.id = v.branch_id
+    WHERE v.load_kind = 'condition'
+      AND (v.call_site_id IS NOT b.call_site_id
+           OR v.proc_id IS NOT b.proc_id)""") == 0,
+      "a condition load is tagged with its level's procedure and expansion")
 # Exclusive arc, like net_dep: exactly one of the typed id columns is
 # non-null per row, and it is the one attachment_kind names -- so a consumer
 # joins the right base table without decoding the kind, and no row smuggles
@@ -2389,21 +2413,15 @@ if mode == "procedural":
     # The closure is a template fact shifted per occurrence, and a generate
     # level is where a shift goes wrong if it can: the two occurrences of one
     # body must carry the same shape and share no row of it.
-    gen = list(con.execute("""
-        SELECT b.inst_id, count(*) FROM branch_ancestor a
+    gen = [r[1] for r in con.execute("""
+        SELECT b.inst_id, group_concat(a.distance ORDER BY a.distance)
+        FROM branch_ancestor a
         JOIN branch b ON b.id = a.branch_id
         JOIN inst i ON i.id = b.inst_id JOIN module m ON m.id = i.module_id
-        WHERE m.name='genlevel' GROUP BY b.inst_id"""))
-    check(len(gen) == 2 and gen[0][1] == gen[1][1] and gen[0][1] > 0,
+        WHERE m.name='genlevel' GROUP BY b.inst_id""")]
+    check(len(gen) == 2 and gen[0] == gen[1] and "1" in gen[0],
           "a generate-nested closure is stamped alike for both occurrences",
           f"got {gen}")
-    check(one("""
-        SELECT count(*) FROM branch_ancestor a
-        JOIN branch b ON b.id = a.branch_id
-        JOIN branch p ON p.id = a.ancestor_branch_id
-        JOIN inst i ON i.id = b.inst_id JOIN module m ON m.id = i.module_id
-        WHERE m.name='genlevel' AND p.inst_id != b.inst_id""") == 0,
-          "and neither occurrence names a level of the other")
     check(one("""
         SELECT count(*) FROM v_stmt s
         JOIN v_branch b ON b.branch_id = s.branch_id

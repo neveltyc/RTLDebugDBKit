@@ -665,6 +665,7 @@ SELECT
     NULL                     AS term_id,
     d.map_exact              AS map_exact,
     d.call_site_id           AS call_site_id,
+    d.branch_id              AS branch_id,
     f.path                   AS file_path,
     sf.path                  AS src_path,
     COALESCE(s.line, p.line) AS src_line,
@@ -687,6 +688,7 @@ SELECT
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
     a.map_exact, NULL,
+    NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net outnet          ON outnet.id = a.outer_net_id
@@ -703,6 +705,7 @@ SELECT
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
     a.map_exact, NULL,
+    NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
@@ -718,6 +721,7 @@ SELECT
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
     NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
     f.path, sf.path, pe.line, pe.col
 FROM proc_event pe
 JOIN net n               ON n.id = pe.net_id
@@ -733,6 +737,7 @@ SELECT
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
     NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
     f.path, sf.path, s.line, s.col
 FROM expr_ref e
 JOIN net n               ON n.id = e.net_id
@@ -751,7 +756,8 @@ SELECT
     r.lo, r.hi, r.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'condition',
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, b.proc_id, NULL, NULL, b.call_site_id,
+    r.branch_id,
     f.path, sf.path, b.line, b.col
 FROM branch_ref r
 JOIN net n               ON n.id = r.net_id
@@ -767,6 +773,7 @@ SELECT
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
     NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
     f.path, sf.path, s.line, s.col
 FROM assign_operand o
 JOIN net n               ON n.id = o.net_id
@@ -781,6 +788,7 @@ SELECT
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id, NULL, NULL,
+    NULL,
     f.path, sf.path, t.line, t.col
 FROM term_map m
 JOIN term t              ON t.id = m.term_id
@@ -921,7 +929,7 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- Everything touching one net, one row per attachment: the structural
 -- adjacency that v_driver/v_load answer directionally, answered flatly --
 -- "what hangs off this net". attachment_kind names the relation, and
--- exactly ONE of the seven typed id columns points at that relation's own
+-- exactly ONE of the typed id columns points at that relation's own
 -- row -- the same exclusive-arc shape net_dep uses, rather than one
 -- polymorphic id whose meaning a consumer had to reconstruct from the
 -- kind. The typed column each kind fills:
@@ -1074,6 +1082,8 @@ SELECT
     b.iter_first       AS iter_first,
     b.iter_step        AS iter_step,
     b.iter_count       AS iter_count,
+    b.proc_id          AS proc_id,
+    b.call_site_id     AS call_site_id,
     (SELECT group_concat(v, ',') FROM
         (SELECT l.value AS v FROM branch_label l
           WHERE l.branch_id = b.id ORDER BY l.ordinal)) AS labels,

@@ -188,7 +188,7 @@ private:
     std::FILE* file = nullptr;
 };
 
-/// This tool's own producer name in the log, and the one in meta.tool.
+/// This tool's own producer name in the log, and the one in db_info.tool.
 constexpr const char* kToolName = "rtl-designdb";
 
 std::string formatted(const char* fmt, va_list ap) {
@@ -277,7 +277,7 @@ void usage() {
         "`:`. -q quiets the terminal, not the log.\n"
         "\n"
         "exit: 0 complete, 3 partial, 4 hierarchy only (all three wrote a\n"
-        "      database, and say what meta.analysis_status says); 2 the input\n"
+        "      database, and say what db_info.analysis_status says); 2 the input\n"
         "      or the options were unusable, 1 the export itself failed --\n"
         "      neither wrote one.");
 }
@@ -712,7 +712,7 @@ std::string configDigest(const Options& opt, ast::Compilation& compilation) {
 
 /// How complete the export is, in one word.
 ///
-/// The meta value and the process's exit code are this one call, so a caller
+/// The seal's value and the process's exit code are this one call, so a caller
 /// branching on the return value and a caller reading `v_db_info` cannot
 /// disagree about the same run.
 ///

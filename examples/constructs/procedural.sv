@@ -306,8 +306,9 @@ module genlevel (input logic clk, input logic en, input logic [7:0] a,
                  output logic [7:0] q);
     for (genvar g = 0; g < 2; g = g + 1) begin : gl
         always_ff @(posedge clk)
-            if (en)
-                q[g*4 +: 4] <= a[g*4 +: 4];
+            if (en)                       // nested, so the closure has depth
+                if (a[g*4])               // to get wrong in the first place
+                    q[g*4 +: 4] <= a[g*4 +: 4];
     end
 endmodule
 

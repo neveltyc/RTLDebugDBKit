@@ -848,6 +848,8 @@ struct BranchRow {
     int64_t fileId = 0;
     uint32_t line = 0;
     uint32_t column = 0;
+    int64_t procedureId = 0;      // the procedure it is inside; 0 = NULL
+    int64_t callSiteId = 0;       // the expansion it was walked for; 0 = NULL
 };
 
 /// One label of a case item, evaluated.
@@ -873,7 +875,7 @@ struct BranchRefRow {
     int64_t ordinal = 0;
     int64_t netId = 0;
     std::optional<std::pair<uint64_t, uint64_t>> bits;
-    int exact = 0;
+    bool exact = true;
 };
 
 /// One subroutine-body expansion: a body walked once per call site.

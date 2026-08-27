@@ -76,6 +76,11 @@ struct BranchFrame {
     /// reads are in `refs` like any other.
     std::vector<std::optional<std::string>> labels;
     slang::SourceRange where;
+    /// The call-site expansion this level was walked for, or -1 at module
+    /// level. A subroutine body is walked once per call site, so its levels
+    /// are per expansion exactly as its statements are -- and a level that
+    /// gates nothing has no statement to borrow the answer from.
+    int32_t callSite = -1;
 };
 
 /// One control read together with the level that contributed it.

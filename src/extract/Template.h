@@ -161,10 +161,19 @@ struct TplBranch {
     int64_t iterStep = 0;
     bool hasProgression = false;
     TplLoc loc;
+    int32_t proc = -1;
+    int32_t callSite = -1;
 };
 
 /// One label of a case item, evaluated. `hasValue` false is a label constant
 /// evaluation does not reach.
+struct TplBranchLabel {
+    int32_t branch = 0;
+    int64_t ordinal = 0;
+    std::string value;
+    bool hasValue = false;
+};
+
 /// One read of one level's condition. Owned by the level and not by the
 /// statements under it: the condition is written once and evaluated once,
 /// and a level that gates nothing at all still reads what it reads.
@@ -185,12 +194,6 @@ struct TplBranchAncestor {
     int32_t distance = 0;
 };
 
-struct TplBranchLabel {
-    int32_t branch = 0;
-    int64_t ordinal = 0;
-    std::string value;
-    bool hasValue = false;
-};
 
 struct TplStmtRef {          // stmt_target and assign_operand share the shape
     int32_t stmt = 0;

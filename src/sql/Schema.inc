@@ -445,6 +445,12 @@ CREATE TABLE branch(
     iter_first       INTEGER,
     iter_step        INTEGER,
     iter_count       INTEGER,
+    -- Where the level was walked, as `stmt.proc_id`/`stmt.call_site_id` are
+    -- for a statement: a subroutine body is walked once per call site, so
+    -- its levels are per expansion too -- and a level that gates nothing has
+    -- no statement to borrow either answer from.
+    proc_id          INTEGER REFERENCES proc(id),
+    call_site_id     INTEGER REFERENCES call_site(id),
     file_id          INTEGER REFERENCES file(id),
     line             INTEGER,
     col              INTEGER);
@@ -455,6 +461,13 @@ CREATE TABLE branch(
 -- -- and NULL where constant evaluation does not reach the label, as for an
 -- `inside` range over a variable. Such a label's reads are still control
 -- reads on the item's level.
+CREATE TABLE branch_label(
+    id        INTEGER PRIMARY KEY,
+    branch_id INTEGER NOT NULL REFERENCES branch(id),
+    ordinal   INTEGER NOT NULL,
+    value     TEXT,
+    UNIQUE(branch_id, ordinal));
+
 -- One read of one level's condition. The level owns it: a condition is
 -- written once and evaluated once, however many statements sit under it, and
 -- a level that gates nothing at all still reads what it reads -- `if (c) ;`
@@ -492,12 +505,6 @@ CREATE TABLE branch_ancestor(
     distance           INTEGER NOT NULL,
     PRIMARY KEY(branch_id, ancestor_branch_id)) WITHOUT ROWID;
 
-CREATE TABLE branch_label(
-    id        INTEGER PRIMARY KEY,
-    branch_id INTEGER NOT NULL REFERENCES branch(id),
-    ordinal   INTEGER NOT NULL,
-    value     TEXT,
-    UNIQUE(branch_id, ordinal));
 
 -- One statement, or one statement-level construct. The statement is the
 -- object; its targets, operands and other reads are child rows -- v9's
@@ -513,9 +520,10 @@ CREATE TABLE branch_label(
 -- pretended to evaluate; NULL when there is none.
 --
 -- branch_id is the gating context (`branch`), NULL outside every branch.
--- It is the complete answer to "what gates this statement": the level's own
--- reads are expr_ref rows with role='control', and a statement kind that
--- records no reads of its own -- an event control -- still names its level.
+-- It is the complete answer to "what gates this statement": the levels above
+-- it are `branch_ancestor` from here, their reads are `branch_ref` rows, and
+-- a statement kind that records no reads of its own -- an event control --
+-- still names its level.
 --
 -- What is deliberately NOT here, unchanged from v9: no branch-condition
 -- text, no clocked flag, no source text.
@@ -702,17 +710,19 @@ CREATE TABLE net_dep(
     call_site_id       INTEGER REFERENCES call_site(id));
 
 -- One reference that leaves the instance: an XMR, an interface member, a
--- package item. The path is stored as written (normalised), AND -- new in
--- v10, because an occurrence knows its place in the hierarchy where a
--- folded row could not -- resolved to the target instance and net when
--- slang could resolve it and the target is in this export. NULL
--- resolved_* is "not resolved here", never a fabricated object.
+-- package item. The path is stored as written (normalised), AND -- because
+-- an occurrence knows its place in the hierarchy where a folded row could
+-- not -- resolved to the net it lands on when slang could resolve it and
+-- that net is in this export. A NULL resolved_net_id is "not resolved
+-- here", never a fabricated object; the instance is that net's own.
 --
 -- access: read | write | connect (a port connection tied outward; its
--- net_conn row points back here). branch_id is set on exactly the
--- references that are branch conditions -- `if (top.dbg_en) …` reads a name
--- outside the instance, so its control read lands here rather than in
--- expr_ref, and it names its level for the same reason those do.
+-- net_conn row points back here). A reference belongs to the statement it
+-- is written in (stmt_id) or, when it is a branch condition, to the level
+-- that reads it (branch_id) -- `if (top.dbg_en) …` reads a name outside the
+-- instance, so it lands here rather than in branch_ref, and is filed once
+-- per level exactly as those are. A connection reference has neither: it is
+-- reached through the net_conn row that names it.
 CREATE TABLE hier_ref(
     id               INTEGER PRIMARY KEY,
     inst_id          INTEGER NOT NULL REFERENCES inst(id),

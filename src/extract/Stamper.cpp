@@ -296,6 +296,8 @@ private:
             row.checkKind = word(br.check);
             row.staticTaken = br.staticTaken;
             row.iterNetId = stampId(base.net, br.iterNet);
+            row.procedureId = stampId(base.proc, br.proc);
+            row.callSiteId = stampId(base.callSite, br.callSite);
             row.iterCount = br.iterCount;
             row.iterFirst = br.iterFirst;
             row.iterStep = br.iterStep;

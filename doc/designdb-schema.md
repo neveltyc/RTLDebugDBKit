@@ -148,6 +148,7 @@ does not apply to); solid edges are always present.
 | statements | `proc` | one always/initial/final block | `inst_id → inst`, `scope_node_id → tree_node` |
 | | `call_site` | one subroutine-body expansion (a call) | `inst_id → inst`, `caller_stmt_id → stmt`, `parent_call_site_id → call_site` |
 | | `branch` | one level of the gating context | `inst_id → inst`, `parent_branch_id → branch`, `iter_net_id → net` |
+| | `branch` | one gating level | `inst_id → inst`, `parent_branch_id → branch`, `proc_id → proc`, `call_site_id → call_site`, `iter_net_id → net` |
 | | `branch_label` | one label of a case item, evaluated | `branch_id → branch` |
 | | `branch_ref` | one read of a level's condition | `branch_id → branch`, `net_id → net` |
 | | `branch_ancestor` | one (level, ancestor) pair, the level included | `branch_id`/`ancestor_branch_id → branch` |
@@ -856,8 +857,11 @@ An unconnected terminal contributes no row.
 signal_hi,
 signal_exact, load_net_id, load_inst_id, load_name, load_ref, load_lo,
 load_hi, load_exact, load_kind, dep_id, conn_id, stmt_id,
-proc_id, term_id, map_exact, call_site_id, file_path, src_path,
-src_line, src_col`.
+proc_id, term_id, map_exact, call_site_id, branch_id, file_path, src_path,
+src_line, src_col`. `branch_id` is set on the `condition` rows, whose read
+belongs to a level rather than to a statement — with the level's own
+`proc_id` and `call_site_id` beside it, since a level is walked per
+expansion exactly as a statement is.
 
 `load_ref` is `v_driver`'s `driver_ref` with the ends exchanged: how the
 **load** end was spelled when it was reached by a hierarchical name, NULL
@@ -915,7 +919,7 @@ attachment: `net_id, inst_id, net_name, attachment_kind, lo, hi, is_exact,
 stmt_id, term_map_id, conn_id, stmt_target_id, assign_operand_id,
 expr_ref_id, proc_event_id, dep_id, hier_ref_id, branch_ref_id`. The structural adjacency the
 directional views cannot ask flatly — "what hangs off this net" — with
-`attachment_kind` naming the relation and exactly ONE of the eight typed
+`attachment_kind` naming the relation and exactly ONE of the typed
 id columns pointing at that relation's own row (the exclusive-arc shape
 `net_dep` uses, not one polymorphic id): `terminal_inside` →
 `term_map_id`; `actual_outside` → `conn_id`; `written_by` /
@@ -957,30 +961,29 @@ expression is not a plain net. A point query by `net_id` seeks.
 index named and its labels gathered: `branch_id, inst_id, module_id,
 module_name, parent_branch_id, depth, ordinal, branch_kind, sense, case_kind,
 check_kind, static_taken, iter_net_id, iter_name, iter_first, iter_step,
-iter_count, labels, file_path, src_path, src_line, src_col`. `labels` is the
-item's evaluated label values comma-separated, for the common read;
-`branch_label` is the row-per-label form and the only one that tells a NULL
-value from an absent label. The chain outward is `parent_branch_id`, one
-step per row; the transitive walk is the consumer's recursive query, as it
-is for `net_dep` and `call_site`:
+iter_count, proc_id, call_site_id, labels, file_path, src_path, src_line,
+src_col`. `labels` is the item's evaluated label values comma-separated, for
+the common read; `branch_label` is the row-per-label form and the only one
+that tells a NULL value from an absent label. `proc_id` and `call_site_id`
+say where the level was walked, as they do for a statement. The chain
+outward is `parent_branch_id`, one step per row, and `branch_ancestor` is
+that walk already done:
 
 ```sql
-WITH RECURSIVE chain(stmt_id, branch_id) AS (
-    SELECT id, branch_id FROM stmt WHERE id = ?
-  UNION ALL
-    SELECT c.stmt_id, b.parent_branch_id
-    FROM chain c JOIN branch b ON b.id = c.branch_id
-    WHERE b.parent_branch_id IS NOT NULL)
 SELECT v.depth, v.branch_kind, v.sense, v.case_kind, v.check_kind,
        v.static_taken, v.labels, v.src_line,
        (SELECT group_concat(n.net_name)
-          FROM expr_ref e JOIN v_net n ON n.net_id = e.net_id
-         WHERE e.branch_id = v.branch_id AND e.stmt_id = c.stmt_id) AS reads
-FROM chain c JOIN v_branch v ON v.branch_id = c.branch_id
+          FROM branch_ref r JOIN v_net n ON n.net_id = r.net_id
+         WHERE r.branch_id = v.branch_id) AS reads
+FROM stmt s
+JOIN branch_ancestor a ON a.branch_id = s.branch_id
+JOIN v_branch v        ON v.branch_id = a.ancestor_branch_id
+WHERE s.id = ?
 ORDER BY v.depth;
 ```
 
-Point queries by `branch_id` and by `parent_branch_id` both seek.
+Point queries by `branch_id` and by `parent_branch_id` both seek, and so do
+both ends of `branch_ancestor`.
 
 **`v_call_site`** — one row per subroutine-body expansion: `call_site_id,
 inst_id, module_id, module_name, caller_stmt_id, parent_call_site_id,
@@ -992,9 +995,11 @@ string. See *Tracing across calls*.
 **`v_hier_ref`** — one row per reference that leaves its instance:
 `hier_ref_id, inst_id, module_id, module_name, stmt_id, branch_id, ref_path,
 access, resolved_inst_id, resolved_net_id, resolved_net_name, lo, hi,
-is_exact, file_path, src_path, src_line, src_col`. Exactly one of `stmt_id`
+is_exact, file_path, src_path, src_line, src_col`. At most one of `stmt_id`
 and `branch_id` is set: a statement's reference belongs to the statement, a
-condition's to the level that reads it. The target of the four
+condition's to the level that reads it, and a connection reference
+(`access='connect'`) to neither — it is reached through the `net_conn` row
+that names it. The target of the four
 `hier_ref` ids the other views publish — `v_net_dep`'s
 `src_hier_ref_id`/`tgt_hier_ref_id`, `v_net_conn`'s `outer_hier_ref_id`,
 `v_net_attachment`'s `hier_ref_id`. `ref_path` rather than `path` because
@@ -1206,18 +1211,17 @@ no dataflow, not that the hierarchy stops early.
   reader's.
 * No branch-condition truth tables on statements. Which assignment "was in
   effect" is not evaluable from a waveform by SQL. The conditions are
-  recorded — their structure in `branch`, their reads as `control`
-  dependencies with their expression references — and the evaluation is the
-  reader's. `branch.static_taken` is not an evaluation: it reports what the
+  recorded — their structure in `branch`, their reads in `branch_ref` — and
+  the evaluation is the reader's. `branch.static_taken` is not an evaluation: it reports what the
   elaboration settled.
 * No `stmt` rows for control-flow constructs. `if`, `case`, loops and blocks
   are not statements here and `stmt` has no parent-statement column; a
   procedure's shape is `sequence` order plus each statement's `branch_id`.
-  "What gates this statement" is that level and the chain above it; the
-  *reads* of those levels are its `expr_ref` rows with `role='control'` —
-  flatly, `v_net_attachment` rows with `attachment_kind='condition'` and
-  this `stmt_id` — not its `control` dependencies: a gated statement that
-  drives nothing (a `release`) has gating and no dependencies at all.
+  "What gates this statement" is that level and the chain above it, which
+  `branch_ancestor` gives in one join; the *reads* of those levels are their
+  `branch_ref` rows, not the statement's `control` dependencies — a gated
+  statement that drives nothing (a `release`) has gating and no dependencies
+  at all.
 * No unrolled loop bodies. A constant-bounded loop is one statement with the
   iteration space on its `branch` row, not one statement per iteration. Bit
   precision inside the body is what that costs: `din[7-j] → rev[j]` is a
