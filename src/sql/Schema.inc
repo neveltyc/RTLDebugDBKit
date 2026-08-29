@@ -361,8 +361,7 @@ CREATE TABLE call_site(
 --   if            sense says which arm ('then'/'else'); check_kind carries a
 --                 `priority if`/`unique if` qualifier. The level's control
 --                 reads ARE the condition, so both arms name the same nets
---                 and `sense` is what tells the two apart -- v18 gave them
---                 one gate and a consumer could not.
+--                 and `sense` is what tells the two apart.
 --   case          the branch POINT, one per case statement: case_kind is the
 --                 matching semantics in the LRM's word, check_kind the
 --                 unique/priority qualifier, and the level's control reads
@@ -518,8 +517,8 @@ CREATE TABLE branch_ancestor(
 -- a statement kind that records no reads of its own -- an event control --
 -- still names its level.
 --
--- What is deliberately NOT here, unchanged from v9: no branch-condition
--- text, no clocked flag, no source text.
+-- What is deliberately NOT here: no branch-condition text, no clocked flag,
+-- no source text.
 --
 -- `force` records as a blocking assignment whose construct says 'force'
 -- (a procedural `assign` says 'proc_assign') -- the dataflow is a
@@ -560,8 +559,8 @@ CREATE TABLE stmt_target(
 
 -- One operand reference of an assignment's RHS. Operands belong to the
 -- STATEMENT, not to a target: which operand feeds which target is
--- `net_dep`'s answer, and pairing them here is exactly the cross product
--- v7 removed. A read occurring twice is two rows.
+-- `net_dep`'s answer, and pairing them here would be a cross product. A read
+-- occurring twice is two rows.
 CREATE TABLE assign_operand(
     id       INTEGER PRIMARY KEY,
     stmt_id  INTEGER NOT NULL REFERENCES stmt(id),
@@ -660,7 +659,7 @@ CREATE TABLE proc_event(
 -- an operand/target row. The pairing is made where the statement was
 -- walked, one row per (source element, target element) that share bits --
 -- never by joining hier_ref to operands on stmt_id afterwards, which would
--- resurrect the cross product v7 removed. An unresolved TARGET reference
+-- be the cross product this pairing avoids. An unresolved TARGET reference
 -- produces no dependency: tgt_net_id is NOT NULL, and a guessed written
 -- object would be a wrong fact. An unresolved SOURCE reference keeps its
 -- row -- src_net_id NULL, src_hier_ref_id set -- because dropping it made

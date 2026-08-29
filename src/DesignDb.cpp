@@ -15,9 +15,9 @@ namespace designdb {
 
 namespace {
 
-// The DDL lives in src/sql/, one file per phase, because it is 1,370 lines of
-// SQL against 750 lines of C++ -- reading the writer meant scrolling past the
-// whole schema and every view to reach it. Each file holds one raw string
+// The DDL lives in src/sql/, one file per phase, so the schema and its views
+// do not bury the writer that streams rows: the writer reads without scrolling
+// past the whole schema. Each file holds one raw string
 // literal, so the `#include` has to sit OUTSIDE the literal: the preprocessor
 // does not run inside R"SQL(...)SQL", and a directive written in there would be
 // stored as SQL text and handed to SQLite verbatim.

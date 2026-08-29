@@ -775,17 +775,15 @@ std::string configDigest(const Options& opt, ast::Compilation& compilation) {
 /// source for is complete as far as this tool can be. The count is
 /// recorded so a consumer can decide for itself.
 ///
-/// `hierarchy_only` has one cause, and this is it. It used to read
-/// `fatal || numScopes == 0`, which said there were two --
-/// AnalysisManager::analyze() returns early only on hasFatalErrors(),
-/// and otherwise it enters every compilation unit before it reaches an
-/// instance, with Stats::numScopes counting those units too. A file of
-/// nothing but a comment reports 1 scope, a file holding one package
+/// `hierarchy_only` has one cause, and this is it: `hasFatalErrors()`. It is
+/// NOT `numScopes == 0` -- AnalysisManager::analyze() returns early only on
+/// hasFatalErrors(), and otherwise it enters every compilation unit before it
+/// reaches an instance, with Stats::numScopes counting those units too. A file
+/// of nothing but a comment reports 1 scope, a file holding one package
 /// reports 2, and main() has already refused an empty file list, so
-/// numScopes == 0 could only mean the `fatal` beside it. The second
-/// disjunct never chose anything, and the condition it was standing in
-/// for -- the analysis ran and some module got no dataflow out of it --
-/// had no test anywhere, nor a counter to build one from.
+/// numScopes == 0 could only mean the `fatal` beside it, no cause of its own.
+/// A separate condition -- the analysis ran and some module got no dataflow
+/// out of it -- needs a counter of its own.
 ///
 /// stats.unanalysedInsts is that counter, and it enters here as
 /// `partial` rather than `hierarchy_only` because the condition is per
@@ -944,8 +942,8 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     info.recursionCount = stats.recursiveInstances;
     // These two choose `partial` while every other count is zero, so without
     // them a consumer is told the export is incomplete and given nothing to
-    // look at. Since v5 the status has had to agree with the counts beside
-    // it, and since v20 the schema holds that agreement.
+    // look at. The status must agree with the counts beside it, an agreement
+    // the schema's CHECK holds.
     info.truncatedCallCount = stats.truncatedCalls;
     info.unanalysedInstCount = stats.unanalysedInsts;
     // Not a cause of `partial`: a checker is a construct this tool does not

@@ -198,9 +198,8 @@ private:
         /// The canonical body's port-slot map (termSlots[t]).
         const TermSlotMap* termOf = nullptr;
         const InstanceBodySymbol* body = nullptr;
-        /// The declaration index for this body. Owns what used to be
-        /// netOf/scopeOf, and is the only thing here that hands out net
-        /// and scope indices.
+        /// The declaration index for this body, and the only thing here that
+        /// hands out net and scope indices.
         DeclIndex* decl = nullptr;
         std::unordered_map<const SubroutineSymbol*, int32_t> procOf;
         /// (reference expression, is-write, statement) -> hierRefs index.
@@ -247,7 +246,7 @@ private:
     };
 
     /// One net a connection expression attaches, with its window in the
-    /// formal -- the boundary twin of Slot. Ported from v9.
+    /// formal -- the boundary twin of Slot.
     struct ConnRef {
         Ref ref;
         bool expression = false;

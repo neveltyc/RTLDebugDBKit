@@ -670,11 +670,11 @@ asserts all of it on every export. Ground rules:
   and location are already in `v_tree_node` (`node_kind='primitive'`).
   `inst_param` and `module` likewise have no views — parameter and
   definition queries read the base tables. The published views are the
-  stable surface, not the whole answerable surface. `hier_ref` was in that set
-  and is no longer: four views point
-  at it (`v_net_dep`'s two `*_hier_ref_id`, `v_net_conn`'s
-  `outer_hier_ref_id`, `v_net_attachment`'s `hier_ref_id`) and it is the one
-  a trace meets on its ordinary path rather than when reaching for detail.
+  stable surface, not the whole answerable surface. `hier_ref` is the
+  exception with a view of its own, `v_hier_ref`, because a trace meets it on
+  its ordinary path rather than when reaching for detail: four views publish a
+  `*_hier_ref_id` into it (`v_net_dep`'s two, `v_net_conn`'s
+  `outer_hier_ref_id`, `v_net_attachment`'s `hier_ref_id`).
 * `v_driver`, `v_load` and `v_net_attachment` are COMPOSITE: UNION ALL
   branches discriminated by their kind column, each branch's row count
   reconcilable by a formula the verifier evaluates. The dependency, event,

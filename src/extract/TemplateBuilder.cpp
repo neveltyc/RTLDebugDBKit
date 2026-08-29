@@ -316,14 +316,13 @@ int32_t TemplateBuilder::addHierRef(Build& b, bool isWrite, const Ref& r,
     // `q <= tb_top.glob` was recorded.
     if (text.empty() && r.sym)
         text = r.sym->getHierarchicalPath();
-    // Empty is the only reason left to drop one. There used to be a second --
-    // a path had to contain a '.' or a '::' -- which discarded every reference
-    // to a $unit-scope object, whose name is bare. Dropping it here produced no
-    // hier_ref, so the dependency became a net_dep with a null source AND a
-    // null reference: the exact shape v_driver classifies as a CONSTANT. The
-    // database then said a signal fed by an outward name was tied off, and the
-    // gating went with it, since a control dependency needs one of the two
-    // indices to survive.
+    // Empty is the only reason to drop one. A $unit-scope object has a bare
+    // name -- no '.' or '::' -- and must not be dropped for it: dropping it
+    // produces no hier_ref, so the dependency becomes a net_dep with a null
+    // source AND a null reference, the exact shape v_driver classifies as a
+    // CONSTANT. The database would then say a signal fed by an outward name is
+    // tied off, and the gating would go with it, since a control dependency
+    // needs one of the two indices to survive.
     if (text.empty()) {
         stats.external++;
         b.hierSeen.emplace(key, -1);
@@ -1582,15 +1581,13 @@ void TemplateBuilder::fileBinding(Build& b, const BindNode& n, const TplLoc& at,
         if (reads && stmt >= 0)
             addExprRef(b, stmt, actual, RefRole::CallArgument, actualIdx);
         if (writes) {
-            // The target row AND a source-less `procedure` dependency, which
-            // is the shape v_driver has documented since v14: "`procedure`
-            // with a NULL driver_net_id is a call into a subroutine declared
-            // outside this instance, whose formal is no net here". The view
-            // learned to label the row; nothing emitted one, so the two
-            // contracted views answered "what writes this net" differently --
-            // v_net_attachment and v_stmt_target said this statement did,
-            // v_driver said nothing did. A package task that plainly writes
-            // its output actual read as undriven.
+            // The target row AND a source-less `procedure` dependency, the
+            // shape v_driver documents: "`procedure` with a NULL driver_net_id
+            // is a call into a subroutine declared outside this instance, whose
+            // formal is no net here". Without the dependency, v_net_attachment
+            // and v_stmt_target would say this statement writes the net and
+            // v_driver would say nothing does -- a package task that plainly
+            // writes its output actual reading as undriven.
             //
             // The formal cannot be named as the source: at a call site it
             // is a symbol with no expression of its own, so there is no

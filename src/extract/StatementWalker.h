@@ -44,10 +44,10 @@ using namespace slang::ast;
 
 // ------------------------------------------------------- statement walking
 //
-// Walks a procedure statement by statement. Ported from v9 with the callback
-// layer reshaped: a target arrives with its paired operands and the gating
-// stack in one call, because the template needs the pairing (net_dep names
-// the operand and target rows) rather than a stream of independent edges.
+// Walks a procedure statement by statement. The callback layer hands a target
+// to the template with its paired operands and the gating stack in one call,
+// because the template needs the pairing (net_dep names the operand and target
+// rows) rather than a stream of independent edges.
 
 struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood> {
     /// The walk's one output: a stream of self-contained nodes

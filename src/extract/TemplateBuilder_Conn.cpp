@@ -254,8 +254,8 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
         // By symbol, never by name. slang's expandMultiPortConn hands back
         // one PortConnection per MEMBER of a MultiPort, so `.p({hi, lo})`
         // arrives as `hi` and `lo` -- names no terminal answers to; and two
-        // unnamed ports share the one synthesized name. Both cases used to
-        // miss here and the connection was dropped without a row.
+        // unnamed ports share the one synthesized name. A by-name match would
+        // miss both and drop the connection without a row.
         auto slotIt = childSlots.find(&conn->port);
         if (slotIt == childSlots.end())
             continue;
@@ -439,10 +439,8 @@ void TemplateBuilder::buildInstanceConns(Build& b, const InstanceSymbol& child, 
                 tc.hierRef = href;
                 // An external tie has a formal to measure against like
                 // any other connection to a resolved child, so it
-                // states its mapping by the same rule -- v11 left it
-                // NULL and the crossing arc reported 0 even where both
-                // windows were exact, which is what kept those ties
-                // untraceable bit by bit.
+                // states its mapping by the same rule, so the crossing arc
+                // stays traceable bit by bit wherever both windows are exact.
                 if (!cn.expression)
                     tc.mappingExact = cn.positional && !inArray &&
                                               !widthMismatch

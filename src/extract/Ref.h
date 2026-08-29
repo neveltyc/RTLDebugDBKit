@@ -136,8 +136,9 @@ inline std::optional<Ref> refOf(const ValuePath& path) {
     return r;
 }
 
-/// Constants filtered per statement; see the v9 note on why accumulated
-/// across the three collection passes of one assignment.
+/// Constants filtered out of the operands, accumulated across the three
+/// collection passes of one assignment so the count is reported once per
+/// statement.
 inline thread_local int64_t filteredConstants = 0;
 
 inline void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Ref>& out,
@@ -157,8 +158,9 @@ inline void collectRefs(const Expression& expr, EvalContext& ctx, std::vector<Re
         skipSelectors);
 }
 
-/// A reference together with the bits of the *assignment* it occupies -- what
-/// makes `{a, b} = {x, y}` answerable without the v7 cross product.
+/// A reference together with the bits of the *assignment* it occupies, so
+/// `{a, b} = {x, y}` pairs its targets and operands by overlapping bits
+/// rather than as a cross product.
 struct Slot {
     Ref ref;
     /// The window of the enclosing assignment this reference sits in, or
@@ -184,17 +186,16 @@ struct Slot {
 /// The number is set from measurement, not taste: of the designs exported
 /// here, the heaviest user of calls is picorv32 with 13 call statements,
 /// and tinyriscv and VeeRwolf have none. Four thousand is two orders of
-/// magnitude above that, so real RTL -- and any testbench short of a
-/// deliberately exponential one -- never reaches it. What it stops is
-/// counted and reported, never silently dropped.
+/// magnitude above that, so the regression corpus stays far below it. What
+/// it stops is counted and reported, never silently dropped.
 constexpr int64_t kCallExpansionBudget = 4000;
 
 /// How many iterations a loop's description will enumerate before giving up
 /// on saying how many there are. The enumeration is a constant-fold per
 /// iteration and runs ONCE per written loop -- the body is still walked once,
-/// so nested loops do not multiply it -- and real RTL loops are a few dozen
-/// iterations. Past this the branch row keeps its index and publishes no
-/// count, which is the honest answer rather than a slow one.
+/// so nested loops do not multiply it. Past this the branch row keeps its
+/// index and publishes no count, which is the honest answer rather than a
+/// slow one.
 constexpr size_t kLoopDescribeSteps = 65536;
 
 inline uint64_t exprWidthOf(const Expression& e) {

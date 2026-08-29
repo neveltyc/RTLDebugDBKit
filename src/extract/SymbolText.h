@@ -461,9 +461,9 @@ inline std::string parameterText(const InstanceBodySymbol& body) {
     return out;
 }
 
-/// One reference to a signal, with the bits it touches. Encoding unchanged
-/// from v7: `whole` spans the object, `exact=false` means the range is an
-/// upper bound (a dynamic selector).
+/// One reference to a signal, with the bits it touches. Encoding: `whole`
+/// spans the object, `exact=false` means the range is an upper bound (a
+/// dynamic selector).
 
 
 /// The path segment slang gives a generate block: the genvar's *value* for a

@@ -7,7 +7,7 @@
 // computed does not.
 // verify-designdb.py asserts all of it on every export.
 //
-// Ground rules, revised from v8 for the instance-level model:
+// Ground rules for the instance-level model:
 //
 //   * A FACT view's row is one base-table row -- v_tree_node, v_net,
 //     v_term, v_term_map, v_net_conn, v_net_dep,
@@ -18,9 +18,8 @@
 //   * v_driver and v_load are COMPOSITE: UNION ALL branches discriminated by
 //     driver_kind/load_kind, each branch's row count reconcilable against
 //     its base tables by a formula the verifier evaluates. They are the one
-//     place the hierarchy crossing is composed (net_conn against term_map);
-//     v9 left that composition to the consumer, and every consumer wrote it
-//     differently or wrongly.
+//     place the hierarchy crossing is composed (net_conn against term_map),
+//     so a consumer never reconstructs it.
 //   * v_conn_arc is scaffolding for that composition, NOT part of the
 //     contract: consumers must not query it, and it may change or vanish
 //     without a version bump. It exists because the same composition feeds
@@ -82,8 +81,8 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
 -- One row per tree node: the dotted path from its root down to it. The
 -- tree stores one segment per node and no path strings, so this is the
--- assembly rule published once rather than rewritten per consumer -- three
--- of whose spellings are wrong. It anchors on the node's OWN root, so a
+-- assembly rule published once rather than rewritten per consumer, where the
+-- obvious hand-assemblies get it wrong. It anchors on the node's OWN root, so a
 -- package (parentless, like a root, but not one) contributes its own name
 -- and nothing else; the elaborated-tree paths are the rows whose node is
 -- not a package.
@@ -507,7 +506,7 @@ SELECT
     -- `pullup` has no input terminal and a call into a subroutine this
     -- template cannot name has no nameable driver, and reporting either as a
     -- tie-off inflates every multiple-driver count with a conflict that is
-    -- not one. The ELSE used to swallow them.
+    -- not one.
     CASE WHEN d.src_net_id IS NOT NULL THEN d.dep_kind
          WHEN d.src_hier_ref_id IS NOT NULL THEN 'external'
          WHEN s.stmt_kind = 'system_task' THEN 'system_task'
@@ -591,8 +590,8 @@ LEFT JOIN file f         ON f.id = t.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE t.direction IN ('input', 'inout', 'ref');
 
--- Every recorded read of signal_net, one row each -- v9's generalised load
--- semantics carried to the instance level, plus the crossing. load_kind:
+-- Every recorded read of signal_net, one row each -- in-module reads and
+-- the boundary crossing alike. load_kind:
 --
 --   dataflow      a net_dep row: the signal feeds a target (data, control,
 --                 primitive or procedure -- join net_dep on dep_id
@@ -611,7 +610,7 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 --   condition     a level reads it and gates nothing this instance names.
 --                 The read belongs to the level, so stmt_id is NULL and
 --                 branch_id names it -- `if (c) ;` is the whole of this
---                 case, and it used to be no row at all.
+--                 case.
 --   terminal      the design boundary: a root output/inout/ref terminal
 --                 reads the net it stands for. load_* are NULL and
 --                 term_id names the pin, so "unused" and "reaches the
@@ -623,11 +622,10 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 --
 -- call_site_id is the body expansion the read was walked for, on every arm
 -- that has a statement to take it from -- dataflow, sensitivity, wait and
--- statement alike. The three arms that read a base table directly used to
--- write a literal NULL there while their own statement carried a tag, so a
+-- statement alike, including the arms that read a base table directly. A
 -- consumer filtering `call_site_id = ? OR call_site_id IS NULL` -- the
--- documented recipe -- admitted one call's sensitivity into every call's
--- cone, which is the mixing the tag exists to prevent. The crossing and
+-- documented recipe -- would otherwise admit one call's sensitivity into
+-- every call's cone, the mixing the tag exists to prevent. The crossing and
 -- terminal arms keep NULL: neither has a statement, so neither belongs to a
 -- call.
 --
@@ -803,10 +801,9 @@ WHERE t.direction IN ('output', 'inout', 'ref');
 -- one statement is ONE row here no matter how many targets it writes.
 --
 -- call_site_id is the body expansion this statement was walked for, the
--- same tag v_net_dep and the two directional views carry. It was on the
--- base table from v13 and missing here, which left the documented
+-- same tag v_net_dep and the two directional views carry, so the documented
 -- context-sensitive recipe -- "follow only the rows of one call's site" --
--- unexecutable for a walk that starts at a statement rather than at a
+-- is executable for a walk that starts at a statement rather than at a
 -- dependency.
 CREATE VIEW v_stmt AS
 SELECT
@@ -990,8 +987,8 @@ UNION ALL
 -- The far side of a resolved external tie: the same wiring fact as a plain
 -- signal connection, but the net lives in another instance and the window
 -- lives on the hier_ref. Without this branch the crossing a `.p(u.g[7:4])`
--- makes showed up only as named_from_outside, and "which child pin does
--- this net feed" answered nothing for exactly the ties v12 taught to arc.
+-- makes would show up only as named_from_outside, and "which child pin does
+-- this net feed" would answer nothing for a resolved external tie.
 SELECT h.resolved_net_id, n.inst_id, n.name, 'actual_outside',
        h.lo, h.hi, h.is_exact, NULL,
        NULL, c.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL

@@ -13,7 +13,7 @@ First release.
 to one SQLite file — hierarchy, declarations, and net-to-net dataflow — with no
 simulator involved and no runtime in the output.
 
-Ships schema v20: 26 tables, and a stable interface of 19 `v_` views whose
+Ships schema v20: 26 tables, and a stable interface of 18 `v_` views whose
 columns, NULL rules and row granularity are the versioned contract. Rows hang off
 the elaborated instance rather than a folded module. Gating levels form a tree
 with a precomputed transitive closure. Every database carries a typed `db_info`
