@@ -282,6 +282,8 @@ SELECT depth, count(*) FROM c GROUP BY depth ORDER BY depth;
 
 </details>
 
+配套的下游消费者仓库：[neveltyc/RTLTracer](https://github.com/neveltyc/RTLTracer)。单文件版本（数据库查询工具）位于 `dist-bundle` 分支的 `rtltracer-v<schema_version>.py`。
+
 ---
 
 ## Schema 契约

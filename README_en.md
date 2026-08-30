@@ -293,6 +293,8 @@ SELECT depth, count(*) FROM c GROUP BY depth ORDER BY depth;
 
 </details>
 
+Downstream consumer repository: [neveltyc/RTLTracer](https://github.com/neveltyc/RTLTracer). The single-file build (a database query tool) is at `rtltracer-v<schema_version>.py` on the `dist-bundle` branch.
+
 ---
 
 ## Schema contract
