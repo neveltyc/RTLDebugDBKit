@@ -7,6 +7,8 @@ carries its own integer, `db_info.schema_version`, which moves independently.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-30
+
 ### Added
 
 * Schema v21 materializes directed `conn_arc` rows from effective

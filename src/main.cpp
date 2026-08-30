@@ -914,8 +914,8 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     info.toolVersion = RTLDESIGNDB_VERSION;
     info.slangVersion = RTLDESIGNDB_SLANG_TAG;
     // Which build produced this, at commit granularity. `tool_version` alone
-    // cannot answer it: the edge dedup key and the seal both changed while
-    // the version string stayed 0.1.0, so two databases agreeing on
+    // cannot answer it: the edge dedup key and the seal have changed between
+    // builds that shared one version string, so two databases agreeing on
     // tool_version, slang_version and config_digest could still have been
     // written by exporters that disagree.
     info.producerRevision = RTLDESIGNDB_PRODUCER_REVISION;
