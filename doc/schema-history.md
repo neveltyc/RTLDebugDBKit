@@ -16,6 +16,30 @@ the folded model -- rows hung off a module rather than an instance -- whose
 tables (`edge`, `assignment`, `symbol`, `port`, `child`) v10 replaced with the
 instance-level object model the field reference documents.
 
+## v21
+
+v21 adds a normalized one-hop graph above the existing fact layer. `conn_arc`
+materializes each traversable direction of a `(net_conn, term_map)` overlap and
+keeps both source ids, so crossing a terminal no longer requires a query-time
+geometry join. Input-like terminals point from the outside net to the inside
+net, output-like terminals point the other way, and `inout`/`ref` produce both
+directions. Constants, unconnected terminals, interface bindings and unresolved
+references have no pair of net endpoints and therefore no graph arc. Indexes on
+both net ends make either direction a point seek.
+
+`v_trace_edge` is the unified graph contract over `net_dep UNION ALL conn_arc`.
+It separates `edge_kind` (`data`, `control`, `primitive`, `procedure`, `alias`,
+`connection`, `connection_expression`) from `map_kind` (`exact`, `inexact`). An
+exact edge always publishes concrete, equal-width source and destination
+ranges; whole exact fact-layer ends are expanded to `[0, width-1]`. An inexact
+edge retains any conservative range available for disjoint pruning. Dependency
+and connection provenance remain traceable through `dep_id` or `conn_arc_id`;
+source location and the statement-level provenance columns are projected on the
+same row.
+
+`net_dep`, `net_conn`, `term_map`, `v_driver` and `v_load` remain in the
+contract. No transitive closure or physical copy of `net_dep` is added.
+
 ## v20
 
 v20 removes what the schema was maintaining by checking rather than by

@@ -26,7 +26,7 @@ namespace designdb {
 /// read it as though the layout held; no database is upgraded in place, so a
 /// bump means re-exporting the RTL. What each past bump changed is in
 /// doc/schema-history.md.
-inline constexpr int SchemaVersion = 20;
+inline constexpr int SchemaVersion = 21;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row
@@ -443,9 +443,9 @@ public:
     void addNetDep(const NetDepRow& r);
     void addHierRef(const HierRefRow& r);
 
-    /// Commits, then builds the indexes and creates the views. Indexes come
-    /// after the data: filling a table that already carries them costs far
-    /// more than one build at the end.
+    /// Commits, composes connection arcs, then builds the indexes. Views are
+    /// definitions only and are installed before the composition that reuses
+    /// v_conn_arc's overlap semantics.
     void finish();
 
 private:

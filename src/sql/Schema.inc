@@ -2,8 +2,8 @@
 // occurrence, not off a folded module variant. Thirty-two copies of one core
 // are thirty-two sets of rows, and in exchange every net, terminal and
 // statement is one row with one id -- "who drives bit 3 of THIS instance's
-// q" is an indexed lookup, and a fan-in cone is a recursive CTE over
-// `net_dep` rather than an application-side walk that re-folds the hierarchy
+// q" is an indexed lookup, and a fan-in cone walks `v_trace_edge` rather than
+// using an application-side traversal that re-folds the hierarchy
 // at every boundary. The fold was v9's trade; this is the other side of it,
 // taken deliberately (see doc/designdb-schema.md for the accounting).
 //
@@ -14,7 +14,7 @@
 //     nowhere else -- an attribute is never dressed as a key.
 //   * A bit range is prefixed with the end it describes (`src_lo`,
 //     `tgt_hi`, `term_exact`); a single-range table spells its own range
-//     bare (`lo`/`hi`/`is_exact`). `map_exact` always describes the
+//     bare (`lo`/`hi`/`is_exact`). `map_exact` and `map_kind` describe the
 //     correspondence BETWEEN two ends, never either end's own range.
 //   * Kinds and directions are their words (`'input'`, `'constant'`,
 //     `'always_ff'`), never integer codes. Three values never deserved the
@@ -314,6 +314,25 @@ CREATE TABLE net_conn(
     line               INTEGER,
     col                INTEGER,
     UNIQUE(term_id, ordinal));
+
+-- One directed, traversable crossing between nets on opposite sides of a
+-- terminal. The net_conn and term_map segments are composed after extraction;
+-- constants, unconnected terminals and unresolved references have no two net
+-- endpoints and therefore no graph arc. Ranges are flattened, inclusive
+-- bounds. map_kind says only whether equal-offset correspondence is safe;
+-- an inexact row can still carry conservative ranges for disjoint pruning.
+CREATE TABLE conn_arc(
+    id            INTEGER PRIMARY KEY,
+    src_net_id    INTEGER NOT NULL REFERENCES net(id),
+    dst_net_id    INTEGER NOT NULL REFERENCES net(id),
+    src_lo        INTEGER,
+    src_hi        INTEGER,
+    dst_lo        INTEGER,
+    dst_hi        INTEGER,
+    map_kind      TEXT NOT NULL,
+    conn_id       INTEGER NOT NULL REFERENCES net_conn(id),
+    term_map_id   INTEGER NOT NULL REFERENCES term_map(id),
+    UNIQUE(conn_id, term_map_id, src_net_id, dst_net_id));
 
 -- One procedure: an always/initial/final block. Task and function bodies
 -- get no row; their statements belong to the calling procedure. v9 named

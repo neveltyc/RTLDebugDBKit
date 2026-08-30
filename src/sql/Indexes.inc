@@ -25,6 +25,8 @@ CREATE INDEX term_by_inst           ON term(inst_id, ordinal);
 CREATE INDEX term_by_inst_name      ON term(inst_id, name);
 CREATE INDEX term_map_by_net        ON term_map(inner_net_id);
 CREATE INDEX net_conn_by_net        ON net_conn(outer_net_id);
+CREATE INDEX conn_arc_by_src        ON conn_arc(src_net_id);
+CREATE INDEX conn_arc_by_dst        ON conn_arc(dst_net_id);
 -- The reverse of hier_ref's advertised back-pointer. Without it, "what does
 -- this net drive across the boundary" is an indexed seek for a locally
 -- named connection and a full net_conn scan for an outward tie -- the one

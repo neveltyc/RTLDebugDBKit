@@ -5,7 +5,7 @@
 <p>
   <img alt="Release" src="https://img.shields.io/github/v/release/neveltyc/RTLDebugDBKit?sort=semver&style=flat-square&color=3366cc">
   <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/neveltyc/RTLDebugDBKit/ci.yml?branch=main&style=flat-square&label=CI">
-  <img alt="schema" src="https://img.shields.io/badge/schema-v20-3366cc?style=flat-square">
+  <img alt="schema" src="https://img.shields.io/badge/schema-v21-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
 </p>
@@ -100,7 +100,7 @@ sqlite3 -box design.db "SELECT * FROM v_db_info;"
 
 ## The database
 
-Current schema version: **20**
+Current schema version: **21**
 
 RTLDebugDBKit stores an **instance-level design**.
 
@@ -131,6 +131,7 @@ Drivers, loads, statements and dependencies all hang off a concrete instance.
 | Object | `v_term` | terminal |
 | Object | `v_term_map` | terminal to inside-instance object mapping |
 | Connection | `v_net_conn` | instance-boundary connection |
+| Trace graph | `v_trace_edge` | normalized one-hop net → net dependencies |
 | Dataflow | `v_driver` | direct driver of a net |
 | Dataflow | `v_load` | direct load of a net |
 | Dataflow | `v_net_dep` / `net_dep` | net → net static dependency |
@@ -160,6 +161,8 @@ Full definitions are in [`doc/designdb-schema.md`](doc/designdb-schema.md).
 | `width` | Bit width |
 | `*_kind` | Object or relation type |
 | `*_exact` | Whether the range / mapping is exact |
+| `edge_kind` | RTL semantics of a one-hop dependency |
+| `map_kind` | `exact` or `inexact` bit correspondence across an edge |
 
 > [!TIP]
 > The precise semantics of bit ranges, NULL, row granularity and exactness
@@ -201,7 +204,7 @@ outside net ── terminal ── inside net
 ```
 
 Main query entries:
-`v_net_conn` · `v_term_map` · `v_driver` · `v_load`
+`v_trace_edge` · `v_net_conn` · `v_term_map` · `v_driver` · `v_load`
 
 ### Hierarchical reference
 
@@ -219,7 +222,7 @@ resolution status.
 
 A common trace path:
 
-> **path → net → driver/load → statement → branch → fan-in**
+> **path → net → trace edge → statement → branch → fan-in**
 
 | To find | Query entry |
 | --- | --- |
@@ -229,7 +232,7 @@ A common trace path:
 | RTL location | `v_stmt` |
 | Enclosing control conditions | `v_branch` + `branch_ancestor` |
 | Nets a branch uses | `branch_ref` |
-| Fan-in, going up | `net_dep` |
+| One hop upstream/downstream | `v_trace_edge` |
 
 <details>
 <summary><strong>Handy SQL</strong></summary>
@@ -275,9 +278,9 @@ ORDER BY b.depth;
 WITH RECURSIVE c(net_id, depth) AS (
   SELECT :net_id, 0
   UNION
-  SELECT d.src_net_id, c.depth + 1
-  FROM net_dep d JOIN c ON d.tgt_net_id = c.net_id
-  WHERE d.src_net_id IS NOT NULL AND c.depth < 4
+  SELECT e.src_net_id, c.depth + 1
+  FROM v_trace_edge e JOIN c ON e.dst_net_id = c.net_id
+  WHERE e.src_net_id IS NOT NULL AND c.depth < 4
 )
 SELECT depth, count(*) FROM c GROUP BY depth ORDER BY depth;
 ```
@@ -294,18 +297,19 @@ The schema version:
 db_info.schema_version
 ```
 
-Schema v20 publishes **18 public `v_*` views**.
+Schema v21 publishes **19 public `v_*` views**.
 
 Prefer a view for ordinary queries. A few relations are exposed directly as
 public base tables:
-`net_dep` · `branch_ref` · `branch_ancestor` · `module` · `inst_param` · `expr_ref` · `prim`
+`net_dep` · `conn_arc` · `branch_ref` · `branch_ancestor` · `module` · `inst_param` · `expr_ref` · `prim`
 
 > [!WARNING]
 > `v_conn_arc` is an internal view and is not part of the public query
 > interface.
 
 Consumers should treat [`doc/designdb-schema.md`](doc/designdb-schema.md) as
-authoritative. Version changes are in [`CHANGELOG.md`](CHANGELOG.md).
+authoritative. Schema changes are in
+[`doc/schema-history.md`](doc/schema-history.md).
 
 ---
 
@@ -353,16 +357,23 @@ rtldbgdb-elab.log
 
 ## Performance
 
-Release build, macOS arm64, schema v20:
+Release build, macOS arm64, schema v21:
 
-| Design | Definitions | Instances | Nets | Statements | Dependencies | Time | DB |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0.03 s | 0.89 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 0.03 s | 1.38 MB |
-| VeeRwolf | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 0.24 s | 11.0 MB |
+| Design | Definitions | Instances | Nets | Statements | Dependencies | Connection arcs | Trace edges | Time | DB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0 | 3,373 | 0.02 s | 0.95 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 451 | 5,631 | 0.03 s | 1.51 MB |
+| VeeRwolf | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 10,971 | 47,337 | 0.25 s | 12.35 MB |
 
-A 320k-line design elaborating to 145k instances and 4.8M rows: **about
-4 s / 324 MB**.
+Warm-cache SQLite point queries on the first 1,000 VeeRwolf net ids, median of
+five runs:
+
+| Query | Schema v20 | Schema v21 |
+| --- | ---: | ---: |
+| `net_dep` by source / target | 6.00 / 6.04 µs | 5.63 / 6.09 µs |
+| `v_driver` / `v_load` | 24.29 / 25.89 µs | 22.28 / 25.03 µs |
+| `conn_arc` by source / destination | — | 3.89 / 3.77 µs |
+| `v_trace_edge` by source / destination | — | 8.88 / 9.30 µs |
 
 ```bash
 # See per-phase timing
@@ -374,7 +385,8 @@ rtl-designdb ... --time-report
 ## Documentation
 
 * [`doc/designdb-schema.md`](doc/designdb-schema.md) — schema, columns and relationships
-* [`CHANGELOG.md`](CHANGELOG.md) — version changes
+* [`doc/schema-history.md`](doc/schema-history.md) — schema history
+* [`CHANGELOG.md`](CHANGELOG.md) — release changes
 * [`third-party-licenses.md`](third-party-licenses.md) — third-party licences
 
 <details>

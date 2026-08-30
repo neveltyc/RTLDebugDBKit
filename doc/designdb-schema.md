@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 20. The version is the *consumption contract*, not the DDL: a
+Schema version 21. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
@@ -22,6 +22,9 @@ No database is upgraded in place: a version bump means re-exporting the RTL.
   them.
 * *Who drives it / who reads it?* `v_driver`, `v_load`: every recorded arc,
   in-module and across the boundary, discriminated by kind.
+* *What is the traversable one-hop graph?* `v_trace_edge`: normalized
+  net-to-net dependencies with semantic kind, conservative ranges, mapping
+  precision and provenance.
 * *Which statement did that?* `v_stmt` and its target/operand views;
   every dependency names its statement.
 * *What leaves this instance?* `hier_ref`, as written and — where possible
@@ -29,7 +32,7 @@ No database is upgraded in place: a version bump means re-exporting the RTL.
 
 ## Tables
 
-Twenty-six tables in six groups. Every relationship is a foreign key: a
+Twenty-seven tables in six groups. Every relationship is a foreign key: a
 column named `<x>_id` holds the primary key of another table, and nowhere
 else does `_id` appear. The map (arrow points from the table that carries
 the key to the table it references; `╌╌` marks the two same-id subtype
@@ -70,6 +73,7 @@ flowchart LR
     proc_event[proc_event]
   end
   net_dep[net_dep]
+  conn_arc[conn_arc]
   hier_ref[hier_ref]
 
   file --> src_file
@@ -118,6 +122,9 @@ flowchart LR
   net_dep -.->|prim_id| prim
   net_dep -.->|call_site_id| call_site
   net_dep -.->|src/tgt_hier_ref_id| hier_ref
+  conn_arc -->|src/dst_net_id| net
+  conn_arc -->|conn_id| net_conn
+  conn_arc -->|term_map_id| term_map
   hier_ref -->|inst_id| inst
   hier_ref -.->|branch_id| branch
   hier_ref -.->|resolved_net_id| net
@@ -157,6 +164,7 @@ does not apply to); solid edges are always present.
 | | `expr_ref` | one non-operand read of a statement, classified by role | `stmt_id → stmt`, `net_id → net` |
 | | `proc_event` | one edge event triggered or waited on | `proc_id → proc`, `stmt_id → stmt`, `net_id → net` |
 | dataflow | `net_dep` | one net-to-net dependency occurrence | `src_net_id`/`tgt_net_id → net`, `stmt_id → stmt`, `branch_id → branch`, `prim_id → prim`, `call_site_id → call_site`, `assign_operand_id`, `stmt_target_id`, `expr_ref_id`, `src_hier_ref_id`/`tgt_hier_ref_id → hier_ref` |
+| | `conn_arc` | one directed, traversable terminal crossing | `src_net_id`/`dst_net_id → net`, `conn_id → net_conn`, `term_map_id → term_map` |
 | boundary | `hier_ref` | one reference that leaves its instance | `inst_id → inst`, `stmt_id → stmt`, `branch_id → branch`, `resolved_net_id → net` |
 
 The DDL in `src/sql/Schema.inc` carries the authoritative per-column comments;
@@ -552,6 +560,30 @@ through an unresolvable name from an undriven one.
 `src_net_id`/`tgt_net_id` repeat the referenced rows' net ids; the verifier
 holds the copies equal.
 
+**`conn_arc`** — the materialized, directed net-to-net crossings:
+`id, src_net_id, dst_net_id, src_lo, src_hi, dst_lo, dst_hi, map_kind,
+conn_id, term_map_id`. One row is one effective overlap between a `net_conn`
+segment and a `term_map` segment, in one direction allowed by the terminal:
+
+* `input` points from the outside net to the inside net;
+* `output` points from the inside net to the outside net;
+* `inout` and `ref` produce both directions;
+* an `expression_operand` points outside to inside and carries
+  `map_kind='inexact'`.
+
+Both net ids are required. A constant or unconnected terminal, an interface
+binding, and an outward reference that did not resolve have no pair of graph
+endpoints and produce no row. `conn_id` and `term_map_id` preserve the two
+source records at the actual row granularity; neither alone identifies the
+overlap.
+
+Ranges are inclusive flattened bounds. Whole exact ends are expanded
+to `[0, width-1]`. `map_kind='exact'` means all four bounds are present, the two
+widths are equal, and offset correspondence across the edge is safe. An
+`inexact` arc may still carry a conservative source or destination range, which
+is safe for rejecting a disjoint bit query; it does not promise an offset map.
+The table is indexed on both net ids. It stores no transitive closure.
+
 ### Leaving the instance
 
 **`hier_ref`** — one row per (reference, direction, statement) that leaves
@@ -636,6 +668,13 @@ correspondence, because a carry crosses them: `map_exact=0` there is range
 granularity, not doubt about the dependency. NULL means no second end to
 correspond with (a constant, an unconnected pin).
 
+`v_trace_edge` is the normalized consumer surface and therefore exposes none
+of `src_exact`, `tgt_exact` or `map_exact`. Its `map_kind` is `exact` only when
+all three fact-layer conditions establish a concrete equal-width mapping;
+otherwise it is `inexact`. `edge_kind` is a separate axis: arithmetic and a
+dynamic address are `data + inexact`, a branch condition is
+`control + inexact`, and a bit-preserving assignment is `data + exact`.
+
 Columns describing an end that does not exist are NULL together. The one
 exception: an `'external'` dependency's source end exists — the reference
 names it — so its window and `map_exact` are set beside a NULL
@@ -650,7 +689,7 @@ flag marks the hop where bit precision is lost.
 
 ## The stable query interface
 
-Eighteen views. Their existence, column sets and order, column semantics,
+Nineteen views. Their existence, column sets and order, column semantics,
 NULL rules and row granularity are the contract; `verify-designdb.py`
 asserts all of it on every export. Ground rules:
 
@@ -662,6 +701,10 @@ asserts all of it on every export. Ground rules:
   `v_hier_ref` — and
   count(view) == count(base) is checked. Every internal join is against a
   primary key; nothing fans out.
+* `v_trace_edge` is the graph projection: one row per `net_dep`, followed by
+  one row per `conn_arc` through `UNION ALL`. It normalizes ranges and mapping
+  precision but does not compute reachability or copy `net_dep` into another
+  table.
 * Not every id the contract publishes has a view to follow it into.
   `expr_ref` and `prim` are named by `v_net_attachment`,
   `v_net_dep`, `v_driver` and `v_load` and have none — a consumer that needs
@@ -685,11 +728,11 @@ asserts all of it on every export. Ground rules:
   composition breaks a count even though both composite views would still
   self-reconcile.
 * `v_conn_arc` exists in the file but is NOT contract: it is the scaffolding
-  the two composite views share, may change or vanish without a version
-  bump, and consumers must not query it.
-* Point queries seek. `v_driver`, `v_load` and `v_net_attachment` by
-  `signal_net_id`/`net_id`, `v_net_dep` by `tgt_net_id`, `v_net_conn` by
-  `outer_net_id`
+  the physical arc build and compatibility views share, may change or vanish
+  without a version bump, and consumers must not query it.
+* Point queries seek. `v_trace_edge` by `src_net_id` or `dst_net_id`,
+  `v_driver`, `v_load` and `v_net_attachment` by `signal_net_id`/`net_id`,
+  `v_net_dep` by `tgt_net_id`, and `v_net_conn` by `outer_net_id`
   use an index, never a base-table scan — the closure is the consumer's,
   one point query per hop, so a scan per hop would be a scan per net in
   the cone. The verifier asserts the query plan itself; a change to how a
@@ -702,7 +745,8 @@ asserts all of it on every export. Ground rules:
   application; the recursive form trades that for a single statement and
   one up-front materialisation.
 * Explicit column lists, never `SELECT *`; no transitive closure — a
-  fan-in cone is the consumer's recursive query, one step per row here.
+  fan-in cone is the consumer's recursive query over `v_trace_edge`, one step
+  per row here.
 
 **`v_db_info`** — the seal, one row, projected from `db_info`:
 `schema_version, tool, tool_version, slang_version, producer_revision, top,
@@ -774,6 +818,30 @@ primitive's for a primitive arc. A row whose `src_inst_id` and
 that end names the reference it went through. `call_site_id` is set when
 the row was produced walking a subroutine body (NULL at module level).
 Not deduplicated.
+
+**`v_trace_edge`** — one directed graph edge:
+`edge_id, edge_source, src_net_id, dst_net_id, src_lo, src_hi, dst_lo,
+dst_hi, map_kind, edge_kind, dep_id, conn_arc_id, stmt_id,
+assign_operand_id, stmt_target_id, expr_ref_id, branch_id, call_site_id,
+prim_id, file_path, src_line, src_col`.
+
+`edge_source` is `net_dep` or `conn_arc`; `edge_id` is the id in that source,
+and exactly the matching typed id (`dep_id` or `conn_arc_id`) is set. The pair
+`(edge_source, edge_id)` is the identity across the union. A source-less
+dependency remains a row with `src_net_id` NULL because its provenance and
+target are still facts, but it is not a traversable graph hop.
+
+`edge_kind` is `data | control | primitive | procedure | alias | connection |
+connection_expression`. It says what the dependency means. `map_kind` is
+`exact | inexact` and says only whether offsets map across it. For `exact`, all
+four range bounds exist and the widths match. For `inexact`, either range may
+still be present as conservative coverage; a consumer may prune a disjoint
+window but must widen rather than calculate an offset on the far side.
+
+The statement-level provenance fields and location project the `net_dep`
+source. A connection edge leaves them NULL; `conn_arc_id` reaches the physical
+arc and from there its `conn_id` and `term_map_id` pair. Point lookups on either
+net end use the corresponding `net_dep` and `conn_arc` indexes.
 
 **`v_driver`** — every direct driving arc of `signal_net`, one row each:
 `signal_net_id, signal_inst_id, signal_name, signal_ref, signal_lo,
@@ -1046,7 +1114,9 @@ ordinal, sequence, signature, width).
 * A bit range is prefixed with the end it describes (`src_lo`,
   `term_exact`); where a row has only one, it spells it bare (`lo`/`hi`/
   `is_exact`). Views follow the same rule as tables: `v_net_dep` has two
-  ends and prefixes both, `v_stmt_target` has one and does not.
+  ends and prefixes both, `v_stmt_target` has one and does not. `map_exact`
+  and `map_kind` describe correspondence between ends, never either end's
+  coverage.
 * The two sides of a terminal are `outer_*` (what the parent wired — the
   actual; VPI's highConn) and `inner_*` (what the pin stands for inside;
   vpiLowConn). Direction words never name structure: an `inout` pin's

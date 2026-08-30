@@ -71,6 +71,7 @@ DOMAINS = (
     ("net_conn", "conn_kind",
      ("signal", "constant", "unconnected", "expression_operand", "interface",
       "external_reference"), False),
+    ("conn_arc", "map_kind", ("exact", "inexact"), False),
     ("proc", "proc_kind",
      ("always", "always_ff", "always_comb", "always_latch", "initial",
       "final"), False),
@@ -97,6 +98,11 @@ DOMAINS = (
 # CHECK clause of their own. They are published the same way and covered the
 # same way.
 VIEW_DOMAINS = (
+    ("v_trace_edge", "edge_source", ("net_dep", "conn_arc")),
+    ("v_trace_edge", "map_kind", ("exact", "inexact")),
+    ("v_trace_edge", "edge_kind",
+     ("data", "control", "primitive", "procedure", "alias", "connection",
+      "connection_expression")),
     ("v_driver", "driver_kind",
      ("data", "control", "primitive", "procedure", "connection",
       "connection_expression", "constant", "terminal", "system_task", "alias",
@@ -180,7 +186,7 @@ except sqlite3.Error as e:
     sys.exit(f"error: cannot read {db_path}: {e}")
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "20"
+SCHEMA_VERSION = "21"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
@@ -334,6 +340,35 @@ for tbl, lo, hi, exact in (
               f'WHERE "{lo}" IS NOT NULL AND "{exact}" IS NULL')
     check(not bad, f"{tbl} endpoints imply a readable {exact}",
           f"{bad} range(s) with endpoints and NULL {exact}")
+
+# conn_arc has no per-end exactness bit: map_kind is correspondence precision,
+# while a present range is always a conservative window usable for pruning.
+for lo, hi in (("src_lo", "src_hi"), ("dst_lo", "dst_hi")):
+    bad = one(f'SELECT count(*) FROM conn_arc '
+              f'WHERE ("{lo}" IS NULL) != ("{hi}" IS NULL)')
+    check(not bad, f"conn_arc.{lo}/{hi} are both present or both absent",
+          f"{bad} range(s) with one endpoint")
+    bad = one(f'SELECT count(*) FROM conn_arc WHERE "{lo}" > "{hi}"')
+    check(not bad, f"conn_arc.{lo} <= {hi}", f"{bad} range(s) inverted")
+
+check(one("""
+    SELECT count(*) FROM conn_arc a
+    JOIN net n ON n.id = a.src_net_id
+    WHERE a.src_lo IS NOT NULL
+      AND (a.src_lo < 0 OR a.src_hi >= n.width)""") == 0,
+      "conn_arc source ranges lie inside their nets")
+check(one("""
+    SELECT count(*) FROM conn_arc a
+    JOIN net n ON n.id = a.dst_net_id
+    WHERE a.dst_lo IS NOT NULL
+      AND (a.dst_lo < 0 OR a.dst_hi >= n.width)""") == 0,
+      "conn_arc destination ranges lie inside their nets")
+check(one("""
+    SELECT count(*) FROM conn_arc
+    WHERE map_kind = 'exact'
+      AND (src_lo IS NULL OR src_hi IS NULL OR dst_lo IS NULL OR dst_hi IS NULL
+           OR src_hi - src_lo != dst_hi - dst_lo)""") == 0,
+      "every exact conn_arc has concrete equal-width ranges")
 
 # -------------------------------------------------- tree and the subtypes
 check(one("SELECT count(*) FROM tree_node WHERE (parent_node_id IS NULL) != "
@@ -1090,16 +1125,16 @@ if unset:
 check(str(by["schema_version"]) == SCHEMA_VERSION,
       f"schema_version is {SCHEMA_VERSION}", f"got {by['schema_version']}")
 
-# The version is stated in four independent places -- this constant, the
-# exporter's SchemaVersion, the field reference's opening line and the
-# README's measurements table -- and a bump that misses one leaves a consumer
-# reading the wrong contract from a document that looks authoritative. Run
-# only when the repository is beside this script, so verifying a database on
-# its own is unaffected.
+# The version is stated in the verifier, exporter, field reference and both
+# README languages. A bump that misses one leaves a consumer reading the wrong
+# contract from a document that looks authoritative. Run only when the
+# repository is beside this script, so verifying a database on its own is
+# unaffected.
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _rel, _pattern in (("src/DesignDb.h", r"SchemaVersion\s*=\s*(\d+)"),
                        ("doc/designdb-schema.md", r"^Schema version (\d+)\."),
-                       ("README.md", r"schema v(\d+)")):
+                       ("README.md", r"schema v(\d+)"),
+                       ("README_en.md", r"schema-v(\d+)")):
     try:
         _text = open(os.path.join(_REPO, _rel), encoding="utf-8").read()
     except OSError:
@@ -1136,7 +1171,7 @@ check(not (status == "partial" and not explained),
       "a partial status names the count that caused it")
 
 # --------------------------------------------------------- view contract
-# The fifteen stable views: existence, exact columns in exact order, and row
+# The stable views: existence, exact columns in exact order, and row
 # formulas. v_conn_arc is scaffolding, not contract, and is deliberately
 # absent from this list.
 VIEW_COLUMNS = {
@@ -1183,6 +1218,12 @@ VIEW_COLUMNS = {
         "src_hier_ref_id", "tgt_hier_ref_id",
         "dep_kind", "map_exact", "call_site_id", "file_path", "src_path",
         "src_line", "src_col"],
+    "v_trace_edge": [
+        "edge_id", "edge_source", "src_net_id", "dst_net_id",
+        "src_lo", "src_hi", "dst_lo", "dst_hi", "map_kind", "edge_kind",
+        "dep_id", "conn_arc_id", "stmt_id", "assign_operand_id",
+        "stmt_target_id", "expr_ref_id", "branch_id", "call_site_id",
+        "prim_id", "file_path", "src_line", "src_col"],
     "v_driver": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_ref",
         "signal_lo", "signal_hi", "signal_exact",
@@ -1268,6 +1309,103 @@ for view, base in (
     check(nv == nb, f"{view} has one row per {base} row",
           f"{nv} view rows, {nb} base rows")
 
+# v_trace_edge normalizes the two graph sources without copying net_dep.
+check(one("SELECT count(*) FROM v_trace_edge") ==
+      one("SELECT count(*) FROM net_dep") + one("SELECT count(*) FROM conn_arc"),
+      "v_trace_edge is net_dep UNION ALL conn_arc")
+check(one("""
+    SELECT count(*) FROM sqlite_master
+    WHERE type = 'table' AND name = 'trace_edge'""") == 0,
+      "the unified trace graph is a view, not a net_dep copy")
+check(one("""
+    SELECT count(*) FROM v_trace_edge
+    WHERE CASE edge_source
+        WHEN 'net_dep' THEN dep_id IS NULL OR conn_arc_id IS NOT NULL
+                            OR edge_id != dep_id
+        WHEN 'conn_arc' THEN conn_arc_id IS NULL OR dep_id IS NOT NULL
+                             OR edge_id != conn_arc_id
+        ELSE 1 END""") == 0,
+      "every trace edge names exactly its typed source row")
+check(one("""
+    SELECT count(*) FROM v_trace_edge e
+    LEFT JOIN net_dep d ON d.id = e.dep_id
+    LEFT JOIN conn_arc a ON a.id = e.conn_arc_id
+    LEFT JOIN net_conn c ON c.id = a.conn_id
+    WHERE e.edge_kind IS NOT CASE e.edge_source
+        WHEN 'net_dep' THEN d.dep_kind
+        WHEN 'conn_arc' THEN CASE WHEN c.conn_kind = 'expression_operand'
+                                 THEN 'connection_expression'
+                                 ELSE 'connection' END
+        END""") == 0,
+      "edge_kind is independent RTL semantics from the source fact")
+check(one("""
+    SELECT count(*) FROM v_trace_edge
+    WHERE map_kind = 'exact'
+      AND (src_net_id IS NULL OR src_lo IS NULL OR src_hi IS NULL
+           OR dst_lo IS NULL OR dst_hi IS NULL
+           OR src_hi - src_lo != dst_hi - dst_lo)""") == 0,
+      "every exact trace edge has two concrete equal-width ranges")
+check(one("""
+    SELECT count(*) FROM v_trace_edge e
+    JOIN net n ON n.id = e.src_net_id
+    WHERE e.src_lo IS NOT NULL
+      AND (e.src_lo < 0 OR e.src_hi >= n.width)""") == 0,
+      "trace-edge source ranges lie inside their nets")
+check(one("""
+    SELECT count(*) FROM v_trace_edge e
+    JOIN net n ON n.id = e.dst_net_id
+    WHERE e.dst_lo IS NOT NULL
+      AND (e.dst_lo < 0 OR e.dst_hi >= n.width)""") == 0,
+      "trace-edge destination ranges lie inside their nets")
+check(one("""
+    SELECT count(*) FROM v_trace_edge
+    WHERE edge_kind = 'control' AND map_kind != 'inexact'""") == 0,
+      "control semantics never masquerade as mapping precision")
+
+# The net_dep branch preserves explicit conservative ranges and turns a whole
+# exact end into concrete flattened bounds. This is the normalization that
+# lets a consumer ignore src_exact/tgt_exact/map_exact entirely.
+check(one("""
+    SELECT count(*) FROM v_trace_edge e
+    JOIN net_dep d ON d.id = e.dep_id
+    LEFT JOIN net sn ON sn.id = d.src_net_id
+    JOIN net tn ON tn.id = d.tgt_net_id
+    WHERE e.src_lo IS NOT CASE
+              WHEN d.src_lo IS NOT NULL THEN d.src_lo
+              WHEN d.src_net_id IS NOT NULL AND d.src_exact = 1
+                   AND sn.width > 0 THEN 0 END
+       OR e.src_hi IS NOT CASE
+              WHEN d.src_hi IS NOT NULL THEN d.src_hi
+              WHEN d.src_net_id IS NOT NULL AND d.src_exact = 1
+                   AND sn.width > 0 THEN sn.width - 1 END
+       OR e.dst_lo IS NOT CASE
+              WHEN d.tgt_lo IS NOT NULL THEN d.tgt_lo
+              WHEN d.tgt_exact = 1 AND tn.width > 0 THEN 0 END
+       OR e.dst_hi IS NOT CASE
+              WHEN d.tgt_hi IS NOT NULL THEN d.tgt_hi
+              WHEN d.tgt_exact = 1 AND tn.width > 0 THEN tn.width - 1 END""") == 0,
+      "v_trace_edge preserves each dependency's conservative coverage")
+check(one("""
+    SELECT count(*) FROM v_trace_edge e
+    JOIN net_dep d ON d.id = e.dep_id
+    LEFT JOIN net sn ON sn.id = d.src_net_id
+    JOIN net tn ON tn.id = d.tgt_net_id
+    WHERE (e.map_kind = 'exact') != COALESCE(
+          (d.src_net_id IS NOT NULL AND d.map_exact = 1
+           AND d.src_exact = 1 AND d.tgt_exact = 1
+           AND COALESCE(d.src_hi - d.src_lo + 1, sn.width) > 0
+           AND COALESCE(d.src_hi - d.src_lo + 1, sn.width) =
+               COALESCE(d.tgt_hi - d.tgt_lo + 1, tn.width)), 0)""") == 0,
+      "v_trace_edge derives exact mapping from all three dependency facts")
+check(one("""
+    SELECT count(*) FROM v_trace_edge e
+    JOIN conn_arc a ON a.id = e.conn_arc_id
+    WHERE e.src_net_id != a.src_net_id OR e.dst_net_id != a.dst_net_id
+       OR e.src_lo IS NOT a.src_lo OR e.src_hi IS NOT a.src_hi
+       OR e.dst_lo IS NOT a.dst_lo OR e.dst_hi IS NOT a.dst_hi
+       OR e.map_kind IS NOT a.map_kind""") == 0,
+      "v_trace_edge projects every materialized connection arc unchanged")
+
 # Composite views: the row count is the sum of the branches, each branch
 # re-derived here from the base tables.
 #
@@ -1299,6 +1437,76 @@ OUTER_PRESENT = "(c.outer_net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)"
 # row more or fewer.
 check(one("SELECT count(*) FROM v_conn_arc") == one(f"SELECT count(*) {SEG}"),
       "v_conn_arc is exactly the net_conn/term_map overlap")
+
+# The physical graph is the directed, two-net subset of that overlap. Derive
+# the expected rows independently from v_conn_arc: input-like terminals point
+# outside -> inside, output-like terminals inside -> outside, and inout/ref do
+# both. Whole exact ranges are made explicit because v_trace_edge has no
+# per-end exactness flags for a consumer to reinterpret.
+EXPECTED_CONN_ARCS = """
+    WITH directed AS (
+        SELECT a.conn_id, a.term_map_id,
+               a.outer_net_id AS src_net_id, a.inner_net_id AS dst_net_id,
+               a.outer_lo AS src_lo, a.outer_hi AS src_hi,
+               a.outer_exact AS src_exact,
+               a.inner_lo AS dst_lo, a.inner_hi AS dst_hi,
+               a.inner_exact AS dst_exact, a.map_exact
+        FROM v_conn_arc a
+        WHERE a.outer_net_id IS NOT NULL
+          AND a.direction IN ('input','inout','ref')
+        UNION ALL
+        SELECT a.conn_id, a.term_map_id,
+               a.inner_net_id, a.outer_net_id,
+               a.inner_lo, a.inner_hi, a.inner_exact,
+               a.outer_lo, a.outer_hi, a.outer_exact, a.map_exact
+        FROM v_conn_arc a
+        WHERE a.outer_net_id IS NOT NULL
+          AND a.direction IN ('output','inout','ref')
+          AND a.conn_kind IN ('signal','external_reference')
+    ), normalized AS (
+        SELECT d.conn_id, d.term_map_id, d.src_net_id, d.dst_net_id,
+               CASE WHEN d.src_lo IS NOT NULL THEN d.src_lo
+                    WHEN d.src_exact = 1 AND sn.width > 0 THEN 0 END AS src_lo,
+               CASE WHEN d.src_hi IS NOT NULL THEN d.src_hi
+                    WHEN d.src_exact = 1 AND sn.width > 0
+                    THEN sn.width - 1 END AS src_hi,
+               CASE WHEN d.dst_lo IS NOT NULL THEN d.dst_lo
+                    WHEN d.dst_exact = 1 AND dn.width > 0 THEN 0 END AS dst_lo,
+               CASE WHEN d.dst_hi IS NOT NULL THEN d.dst_hi
+                    WHEN d.dst_exact = 1 AND dn.width > 0
+                    THEN dn.width - 1 END AS dst_hi,
+               d.src_exact, d.dst_exact, d.map_exact
+        FROM directed d
+        JOIN net sn ON sn.id = d.src_net_id
+        JOIN net dn ON dn.id = d.dst_net_id
+    )
+    SELECT conn_id, term_map_id, src_net_id, dst_net_id,
+           src_lo, src_hi, dst_lo, dst_hi,
+           CASE WHEN map_exact = 1 AND src_exact = 1 AND dst_exact = 1
+                          AND src_lo IS NOT NULL AND src_hi IS NOT NULL
+                          AND dst_lo IS NOT NULL AND dst_hi IS NOT NULL
+                          AND src_hi - src_lo = dst_hi - dst_lo
+                THEN 'exact' ELSE 'inexact' END AS map_kind
+    FROM normalized
+"""
+expected_conn_arcs = one(f"SELECT count(*) FROM ({EXPECTED_CONN_ARCS})")
+check(one("SELECT count(*) FROM conn_arc") == expected_conn_arcs,
+      "conn_arc has one row per traversable directed connection overlap",
+      f"{one('SELECT count(*) FROM conn_arc')} rows, expected {expected_conn_arcs}")
+check(one(f"""
+    SELECT count(*) FROM conn_arc a
+    LEFT JOIN ({EXPECTED_CONN_ARCS}) e
+      ON e.conn_id = a.conn_id AND e.term_map_id = a.term_map_id
+     AND e.src_net_id = a.src_net_id AND e.dst_net_id = a.dst_net_id
+    WHERE e.conn_id IS NULL
+       OR a.src_lo IS NOT e.src_lo OR a.src_hi IS NOT e.src_hi
+       OR a.dst_lo IS NOT e.dst_lo OR a.dst_hi IS NOT e.dst_hi
+       OR a.map_kind IS NOT e.map_kind""") == 0,
+      "conn_arc ranges, precision and provenance equal v_conn_arc geometry")
+check(one("""
+    SELECT count(*) FROM conn_arc
+    WHERE id < 1 OR id > (SELECT count(*) FROM conn_arc)""") == 0,
+      "conn_arc ids are dense from one")
 arcs_in = one(f"SELECT count(*) {SEG} AND t.direction IN ('input','inout','ref')")
 arcs_out = one(f"""SELECT count(*) {SEG}
     AND t.direction IN ('output','inout','ref')
@@ -1638,10 +1846,9 @@ check(one("""
       "load_kind stays in its vocabulary")
 
 # ------------------------------------------------- query plan discipline
-# A point query on the driver/load views must seek, not scan. These are the
-# two views a consumer walks a net at a time -- a fan-in cone is its own
-# recursive query, by design -- so a plan that scans a base table turns one
-# traced signal into one full scan per hop. Deriving the outer end of a
+# A point query on the one-hop views must seek, not scan. A fan-in cone walks
+# them a net at a time, so a plan that scans a base table turns one traced
+# signal into one full scan per hop. Deriving the outer end of a
 # crossing with COALESCE over two tables is how that happens: the value is
 # attributable to neither, so neither table's index can be used, and tracing
 # a clock takes minutes.
@@ -1651,6 +1858,8 @@ check(one("""
 # and a walk that does it per hop pays a scan per hop without an index behind
 # each one.
 for view, col in (("v_driver", "signal_net_id"), ("v_load", "signal_net_id"),
+                  ("v_trace_edge", "src_net_id"),
+                  ("v_trace_edge", "dst_net_id"),
                   ("v_net_dep", "tgt_net_id"),
                   ("v_net_conn", "outer_net_id"),
                   ("v_net_attachment", "net_id"),
@@ -1871,11 +2080,33 @@ if mode == "constructs":
         WHERE d.stmt_id=? AND d.dep_kind='data'""", sid) ==
           one("""SELECT count(*) FROM assign_operand o WHERE o.stmt_id=?""", sid),
           "the concatenation pairs halves, it does not cross them")
+    check(one("""
+        SELECT count(*) FROM v_trace_edge
+        WHERE stmt_id=? AND edge_source='net_dep' AND edge_kind='data'""", sid) ==
+          one("""SELECT count(*) FROM assign_operand o WHERE o.stmt_id=?""", sid),
+          "the normalized trace graph preserves concatenation pairing")
     # Dynamic select: an upper bound, not a guess (`assign q = bus[i]`).
     check(one("""
         SELECT count(*) FROM v_net_dep
         WHERE src_name='bus' AND src_exact=0""") >= 1,
           "a dynamic select's read is an upper bound")
+    check(one("""
+        SELECT count(*) FROM v_trace_edge e
+        JOIN net s ON s.id=e.src_net_id JOIN net t ON t.id=e.dst_net_id
+        WHERE s.name IN ('bus','i') AND t.name='q'
+          AND (e.edge_kind!='data' OR e.map_kind!='inexact')""") == 0 and
+          one("""SELECT count(DISTINCT s.name) FROM v_trace_edge e
+                 JOIN net s ON s.id=e.src_net_id JOIN net t ON t.id=e.dst_net_id
+                 WHERE s.name IN ('bus','i') AND t.name='q'""") == 2,
+          "dynamic data and address dependencies stay data and inexact")
+    check(one("""
+        SELECT count(*) FROM v_trace_edge
+        WHERE edge_kind='control' AND map_kind='inexact'""") >= 1,
+          "control kind and inexact mapping are separate trace-edge fields")
+    check(one("""
+        SELECT count(*) FROM v_trace_edge
+        WHERE edge_kind='connection_expression' AND map_kind='inexact'""") >= 1,
+          "connection expressions are semantic edges without bit correspondence")
     # Dropped operands are counted.
     check(one("""
         SELECT count(*) FROM stmt WHERE dropped_operand_count > 0""") >= 1,

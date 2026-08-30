@@ -52,7 +52,7 @@ def share(part, whole):
 
 TABLES = ("module", "tree_node", "inst", "inst_param", "prim", "net", "term",
           "term_map",
-          "net_conn", "proc", "call_site", "stmt", "stmt_target", "assign_operand",
+          "net_conn", "conn_arc", "proc", "call_site", "stmt", "stmt_target", "assign_operand",
           "expr_ref", "proc_event", "net_dep", "hier_ref", "data_type", "file",
           "src_file")
 
@@ -93,6 +93,14 @@ conns_total = scalar("SELECT count(*) FROM net_conn WHERE map_exact IS NOT NULL"
 ccoarse = scalar("SELECT count(*) FROM net_conn WHERE map_exact = 0")
 report["coarse_conn_mapping"] = {
     "n": ccoarse, "of": conns_total, "pct": share(ccoarse, conns_total)}
+trace_total = scalar("SELECT count(*) FROM v_trace_edge")
+trace_inexact = scalar("SELECT count(*) FROM v_trace_edge WHERE map_kind='inexact'")
+report["trace_graph"] = {
+    "edges": trace_total,
+    "connection_arcs": report["rows"]["conn_arc"],
+    "inexact": trace_inexact,
+    "pct_inexact": share(trace_inexact, trace_total),
+}
 
 # Operands the exporter removed: compile-time constants, and references it
 # could not store as a path. A statement with one operand and three dropped
@@ -199,6 +207,9 @@ c = report["coarse_bit_mapping"]
 print(f"no per-bit map     {c['n']:,} of {c['of']:,} mapped deps ({c['pct']}%)")
 pc = report["coarse_conn_mapping"]
 print(f"  at boundaries    {pc['n']:,} of {pc['of']:,} net ties ({pc['pct']}%)")
+g = report["trace_graph"]
+print(f"trace graph        {g['edges']:,} edges, {g['connection_arcs']:,} crossings; "
+      f"{g['inexact']:,} inexact ({g['pct_inexact']}%)")
 h = report["hier_ref_resolution"]
 print(f"references out     {h['to_net']:,} of {h['of']:,} resolved to a net "
       f"({h['pct_to_net']}%)")

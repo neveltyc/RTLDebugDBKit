@@ -1,5 +1,5 @@
-// The stable query interface: eighteen contracted views (v_conn_arc is the
-// nineteenth and is scaffolding, see below), the consumption contract.
+// The stable query interface: nineteen contracted views (v_conn_arc is the
+// twentieth and is scaffolding, see below), the consumption contract.
 // Their existence, column sets and order, column semantics, NULL rules and
 // row granularity are what a consumer may rely on; changing any of those --
 // adding a column included, since the version integer is the only capability
@@ -15,18 +15,20 @@
 //     v_hier_ref -- and the verifier checks count(view) == count(base). Every
 //     internal join is against a primary key, so nothing fans out;
 //     v_branch.labels is a scalar subquery, which likewise cannot.
+//   * v_trace_edge is the GRAPH projection: net_dep UNION ALL conn_arc, one
+//     row per source row with normalized range and mapping semantics.
 //   * v_driver and v_load are COMPOSITE: UNION ALL branches discriminated by
 //     driver_kind/load_kind, each branch's row count reconcilable against
-//     its base tables by a formula the verifier evaluates. They are the one
-//     place the hierarchy crossing is composed (net_conn against term_map),
-//     so a consumer never reconstructs it.
-//   * v_conn_arc is scaffolding for that composition, NOT part of the
+//     its base tables by a formula the verifier evaluates. These compatibility
+//     views still project the shared crossing composition; graph consumers use
+//     the physical conn_arc rows through v_trace_edge.
+//   * v_conn_arc is scaffolding for connection composition, NOT part of the
 //     contract: consumers must not query it, and it may change or vanish
-//     without a version bump. It exists because the same composition feeds
-//     four branches and inlining it four times would guarantee drift.
+//     without a version bump. It feeds the physical conn_arc build and four
+//     compatibility-view branches from one overlap implementation.
 //   * Explicit column lists, never SELECT *. No transitive closure -- a
-//     fan-in cone is the consumer's recursive query over net_dep, one step
-//     per row here.
+//     fan-in cone is the consumer's recursive query over v_trace_edge, one
+//     step per row here.
 //   * Plain CREATE VIEW, not IF NOT EXISTS: the writer only ever creates a
 //     fresh database, so a name collision is a bug to fail on.
 //
@@ -256,8 +258,8 @@ LEFT JOIN prim p    ON p.id = d.prim_id
 LEFT JOIN file f         ON f.id = COALESCE(s.file_id, p.file_id)
 LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 
--- NOT part of the stable contract. The composition v_driver and v_load
--- project: one row per overlapping (net_conn segment, term_map segment)
+-- NOT part of the stable contract. The composition conn_arc, v_driver and
+-- v_load project: one row per overlapping (net_conn segment, term_map segment)
 -- pair -- a terminal's outside met with its inside. Windows are intersected
 -- on the terminal; a side's net range is narrowed through the overlap when
 -- every link of that side's chain is exact, passed through untouched when
@@ -284,6 +286,7 @@ CREATE VIEW v_conn_arc AS
 WITH seg AS (
     SELECT
         c.id                                   AS conn_id,
+        mp.id                                  AS term_map_id,
         c.conn_kind                            AS conn_kind,
         c.outer_net_id                         AS outer_net_id,
         -- Always NULL in practice: this branch is the connection's OWN net,
@@ -331,6 +334,7 @@ WITH seg AS (
     UNION ALL
     SELECT
         c.id                                   AS conn_id,
+        mp.id                                  AS term_map_id,
         c.conn_kind                            AS conn_kind,
         hr.resolved_net_id                     AS outer_net_id,
         hr.path                                AS outer_ref,
@@ -386,7 +390,7 @@ arc AS (
     FROM seg
 )
 SELECT
-    conn_id, conn_kind, term_id, term_inst_id, direction,
+    conn_id, term_map_id, conn_kind, term_id, term_inst_id, direction,
     outer_net_id, inner_net_id, outer_ref,
     CASE WHEN outer_net_id IS NULL THEN NULL
          WHEN outer_chain AND c_net_exact = 1 AND ilo IS NOT NULL
@@ -413,6 +417,114 @@ SELECT
          ELSE (c_map AND m_map) END AS map_exact,
     file_id, line, col
 FROM arc;
+
+-- One directed dependency edge. This is the graph contract: fact-layer
+-- exactness flags are normalized into a mapping precision independent of the
+-- RTL semantic kind. Whole exact ends become explicit [0,width-1] ranges, so
+-- every exact edge has two concrete, equal-width windows. Inexact edges keep
+-- any conservative range the producer knows; NULL means that side cannot be
+-- narrowed further statically, not that the dependency is absent.
+CREATE VIEW v_trace_edge AS
+WITH dep_normalized AS (
+    SELECT
+        d.id,
+        d.src_net_id,
+        d.tgt_net_id,
+        d.stmt_id,
+        d.assign_operand_id,
+        d.stmt_target_id,
+        d.expr_ref_id,
+        d.branch_id,
+        d.call_site_id,
+        d.prim_id,
+        d.dep_kind,
+        d.src_exact,
+        d.tgt_exact,
+        d.map_exact,
+        CASE WHEN d.src_lo IS NOT NULL THEN d.src_lo
+             WHEN d.src_net_id IS NOT NULL AND d.src_exact = 1
+                  AND sn.width > 0 THEN 0 END AS norm_src_lo,
+        CASE WHEN d.src_hi IS NOT NULL THEN d.src_hi
+             WHEN d.src_net_id IS NOT NULL AND d.src_exact = 1
+                  AND sn.width > 0 THEN sn.width - 1 END AS norm_src_hi,
+        CASE WHEN d.tgt_lo IS NOT NULL THEN d.tgt_lo
+             WHEN d.tgt_exact = 1 AND tn.width > 0 THEN 0 END AS norm_dst_lo,
+        CASE WHEN d.tgt_hi IS NOT NULL THEN d.tgt_hi
+             WHEN d.tgt_exact = 1 AND tn.width > 0 THEN tn.width - 1 END AS norm_dst_hi,
+        s.file_id AS stmt_file_id,
+        s.line AS stmt_line,
+        s.col AS stmt_col,
+        p.file_id AS prim_file_id,
+        p.line AS prim_line,
+        p.col AS prim_col
+    FROM net_dep d
+    JOIN net tn ON tn.id = d.tgt_net_id
+    LEFT JOIN net sn ON sn.id = d.src_net_id
+    LEFT JOIN stmt s ON s.id = d.stmt_id
+    LEFT JOIN prim p ON p.id = d.prim_id
+)
+SELECT
+    d.id                     AS edge_id,
+    'net_dep'                AS edge_source,
+    d.src_net_id             AS src_net_id,
+    d.tgt_net_id             AS dst_net_id,
+    d.norm_src_lo            AS src_lo,
+    d.norm_src_hi            AS src_hi,
+    d.norm_dst_lo            AS dst_lo,
+    d.norm_dst_hi            AS dst_hi,
+    CASE WHEN d.src_net_id IS NOT NULL
+                   AND d.map_exact = 1
+                   AND d.src_exact = 1 AND d.tgt_exact = 1
+                   AND d.norm_src_lo IS NOT NULL AND d.norm_src_hi IS NOT NULL
+                   AND d.norm_dst_lo IS NOT NULL AND d.norm_dst_hi IS NOT NULL
+                   AND d.norm_src_hi - d.norm_src_lo =
+                       d.norm_dst_hi - d.norm_dst_lo
+         THEN 'exact' ELSE 'inexact' END AS map_kind,
+    d.dep_kind               AS edge_kind,
+    d.id                     AS dep_id,
+    NULL                     AS conn_arc_id,
+    d.stmt_id                AS stmt_id,
+    d.assign_operand_id      AS assign_operand_id,
+    d.stmt_target_id         AS stmt_target_id,
+    d.expr_ref_id            AS expr_ref_id,
+    d.branch_id              AS branch_id,
+    d.call_site_id           AS call_site_id,
+    d.prim_id                AS prim_id,
+    f.path                   AS file_path,
+    COALESCE(d.stmt_line, d.prim_line) AS src_line,
+    COALESCE(d.stmt_col, d.prim_col)   AS src_col
+FROM dep_normalized d
+LEFT JOIN file f ON f.id = COALESCE(d.stmt_file_id, d.prim_file_id)
+
+UNION ALL
+
+SELECT
+    a.id                     AS edge_id,
+    'conn_arc'               AS edge_source,
+    a.src_net_id             AS src_net_id,
+    a.dst_net_id             AS dst_net_id,
+    a.src_lo                 AS src_lo,
+    a.src_hi                 AS src_hi,
+    a.dst_lo                 AS dst_lo,
+    a.dst_hi                 AS dst_hi,
+    a.map_kind               AS map_kind,
+    CASE WHEN c.conn_kind = 'expression_operand'
+         THEN 'connection_expression' ELSE 'connection' END AS edge_kind,
+    NULL                     AS dep_id,
+    a.id                     AS conn_arc_id,
+    NULL                     AS stmt_id,
+    NULL                     AS assign_operand_id,
+    NULL                     AS stmt_target_id,
+    NULL                     AS expr_ref_id,
+    NULL                     AS branch_id,
+    NULL                     AS call_site_id,
+    NULL                     AS prim_id,
+    f.path                   AS file_path,
+    c.line                   AS src_line,
+    c.col                    AS src_col
+FROM conn_arc a
+JOIN net_conn c ON c.id = a.conn_id
+LEFT JOIN file f ON f.id = c.file_id;
 
 -- Every direct driving arc of signal_net, one row each. Branches, told
 -- apart by driver_kind:

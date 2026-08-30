@@ -900,7 +900,7 @@ designdb::Stats writeDatabase(const Options& opt, const std::string& tmpPath,
     { Phase p("extract+write", opt.timeReport);
       stats = designdb::extract(compilation, analysis, writer); }
 
-    { Phase p("index+views", opt.timeReport); writer.finish(); }
+    { Phase p("graph+index+views", opt.timeReport); writer.finish(); }
 
     // The seal is written after finish() so the data and the indexes are
     // complete before the row that says the export ran to completion exists.

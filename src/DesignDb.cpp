@@ -15,16 +15,15 @@ namespace designdb {
 
 namespace {
 
-// The DDL lives in src/sql/, one file per phase, so the schema and its views
-// do not bury the writer that streams rows: the writer reads without scrolling
-// past the whole schema. Each file holds one raw string
+// The SQL lives in src/sql/, one file per phase, so the schema, derived graph,
+// indexes and views do not bury the writer that streams rows: the writer reads
+// without scrolling past all of them. Each file holds one raw string
 // literal, so the `#include` has to sit OUTSIDE the literal: the preprocessor
 // does not run inside R"SQL(...)SQL", and a directive written in there would be
 // stored as SQL text and handed to SQLite verbatim.
 //
 // The design commentary travels with the SQL it describes rather than staying
-// here; what the three names mean is the writer's business, and how the schema
-// is shaped is the schema's.
+// here; phase order is the writer's business, and shape is the schema's.
 constexpr const char* kSchema =
 #include "sql/Schema.inc"
     ;
@@ -35,6 +34,10 @@ constexpr const char* kIndexes =
 
 constexpr const char* kViews =
 #include "sql/Views.inc"
+    ;
+
+constexpr const char* kMaterialize =
+#include "sql/Materialize.inc"
     ;
 
 // Rows per transaction. Committing per row is orders of magnitude slower;
@@ -841,11 +844,15 @@ void Writer::addHierRef(const HierRefRow& r) {
 
 void Writer::finish() {
     commit();
-    exec(kIndexes);
-    // After the indexes: views are stored SQL and cost the write path nothing,
-    // but creating them here keeps the publish order legible -- data, then
-    // indexes, then the query interface over both.
+    // Views are stored definitions and expose no intermediate file: the
+    // caller publishes the database only after this writer closes it. Defining
+    // v_conn_arc here lets the materialization use the same overlap semantics
+    // as the compatibility views instead of maintaining a second geometry
+    // implementation.
     exec(kViews);
+    exec(kMaterialize);
+    // Build indexes after every physical row, including the derived arcs.
+    exec(kIndexes);
 }
 
 // ---------------------------------------------------------------- SHA-256

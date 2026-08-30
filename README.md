@@ -5,7 +5,7 @@
 <p>
   <img alt="Release" src="https://img.shields.io/github/v/release/neveltyc/RTLDebugDBKit?sort=semver&style=flat-square&color=3366cc">
   <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/neveltyc/RTLDebugDBKit/ci.yml?branch=main&style=flat-square&label=CI">
-  <img alt="schema" src="https://img.shields.io/badge/schema-v20-3366cc?style=flat-square">
+  <img alt="schema" src="https://img.shields.io/badge/schema-v21-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
 </p>
@@ -96,7 +96,7 @@ sqlite3 -box design.db "SELECT * FROM v_db_info;"
 
 ## 数据库
 
-当前 schema version：**20**
+当前 schema version：**21**
 
 RTLDebugDBKit 保存的是 **instance-level design**。
 
@@ -126,6 +126,7 @@ driver、load、statement 和 dependency 都落在具体 instance 上。
 | Object | `v_term` | terminal |
 | Object | `v_term_map` | terminal 与实例内部对象的映射 |
 | Connection | `v_net_conn` | instance boundary 连接 |
+| Trace graph | `v_trace_edge` | 规范化的一跳 net → net 依赖 |
 | Dataflow | `v_driver` | net 的直接 driver |
 | Dataflow | `v_load` | net 的直接 load |
 | Dataflow | `v_net_dep` / `net_dep` | net → net 静态依赖 |
@@ -155,6 +156,8 @@ driver、load、statement 和 dependency 都落在具体 instance 上。
 | `width` | 位宽 |
 | `*_kind` | 对象或关系类型 |
 | `*_exact` | range / mapping 是否精确 |
+| `edge_kind` | 一跳依赖的 RTL 语义 |
+| `map_kind` | 跨边 bit 对应是 `exact` 或 `inexact` |
 
 > [!TIP]
 > 位范围、NULL、row granularity 和 exactness 的具体语义见 schema 文档。
@@ -193,7 +196,7 @@ outside net ── terminal ── inside net
 ```
 
 主要查询入口：
-`v_net_conn` · `v_term_map` · `v_driver` · `v_load`
+`v_trace_edge` · `v_net_conn` · `v_term_map` · `v_driver` · `v_load`
 
 ### 跨层次引用
 
@@ -210,7 +213,7 @@ reference 和解析状态。
 
 常见 trace 路径：
 
-> **path → net → driver/load → statement → branch → fan-in**
+> **path → net → trace edge → statement → branch → fan-in**
 
 | 要查什么 | 查询入口 |
 | --- | --- |
@@ -220,7 +223,7 @@ reference 和解析状态。
 | 查 RTL 位置 | `v_stmt` |
 | 查外层控制条件 | `v_branch` + `branch_ancestor` |
 | 查 branch 使用的信号 | `branch_ref` |
-| 向上追 fan-in | `net_dep` |
+| 向上/向下追一跳 | `v_trace_edge` |
 
 <details>
 <summary><strong>常用 SQL</strong></summary>
@@ -266,9 +269,9 @@ ORDER BY b.depth;
 WITH RECURSIVE c(net_id, depth) AS (
   SELECT :net_id, 0
   UNION
-  SELECT d.src_net_id, c.depth + 1
-  FROM net_dep d JOIN c ON d.tgt_net_id = c.net_id
-  WHERE d.src_net_id IS NOT NULL AND c.depth < 4
+  SELECT e.src_net_id, c.depth + 1
+  FROM v_trace_edge e JOIN c ON e.dst_net_id = c.net_id
+  WHERE e.src_net_id IS NOT NULL AND c.depth < 4
 )
 SELECT depth, count(*) FROM c GROUP BY depth ORDER BY depth;
 ```
@@ -285,16 +288,16 @@ Schema version：
 db_info.schema_version
 ```
 
-当前 schema v20 有 **18 个公开 `v_*` view**。
+当前 schema v21 有 **19 个公开 `v_*` view**。
 
 常规查询优先使用 view。部分关系直接通过公开基表提供：
-`net_dep` · `branch_ref` · `branch_ancestor` · `module` · `inst_param` · `expr_ref` · `prim`
+`net_dep` · `conn_arc` · `branch_ref` · `branch_ancestor` · `module` · `inst_param` · `expr_ref` · `prim`
 
 > [!WARNING]
 > `v_conn_arc` 是内部 view，不属于公开查询接口。
 
 数据库消费端以 [`doc/designdb-schema.md`](doc/designdb-schema.md) 为准。
-版本变化见 [`CHANGELOG.md`](CHANGELOG.md)。
+Schema 变化见 [`doc/schema-history.md`](doc/schema-history.md)。
 
 ---
 
@@ -342,15 +345,22 @@ rtldbgdb-elab.log
 
 ## 性能
 
-Release build，macOS arm64，schema v20：
+Release build，macOS arm64，schema v21：
 
-| 设计 | 定义 | 实例 | 网 | 语句 | 依赖 | 耗时 | 数据库 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0.03 s | 0.89 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 0.03 s | 1.38 MB |
-| VeeRwolf | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 0.24 s | 11.0 MB |
+| 设计 | 定义 | 实例 | 网 | 语句 | 依赖 | Connection arcs | Trace edges | 耗时 | 数据库 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0 | 3,373 | 0.02 s | 0.95 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 451 | 5,631 | 0.03 s | 1.51 MB |
+| VeeRwolf | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 10,971 | 47,337 | 0.25 s | 12.35 MB |
 
-约 32 万行 RTL、14.5 万 instance、480 万条记录的设计：**约 4 s / 324 MB**。
+VeeRwolf 热缓存 SQLite point query，按 id 前 1,000 个 net，5 轮中位数：
+
+| 查询 | Schema v20 | Schema v21 |
+| --- | ---: | ---: |
+| `net_dep` by source / target | 6.00 / 6.04 µs | 5.63 / 6.09 µs |
+| `v_driver` / `v_load` | 24.29 / 25.89 µs | 22.28 / 25.03 µs |
+| `conn_arc` by source / destination | — | 3.89 / 3.77 µs |
+| `v_trace_edge` by source / destination | — | 8.88 / 9.30 µs |
 
 ```bash
 # 查看各阶段耗时
@@ -362,7 +372,8 @@ rtl-designdb ... --time-report
 ## 文档
 
 * [`doc/designdb-schema.md`](doc/designdb-schema.md) — schema、字段和关系
-* [`CHANGELOG.md`](CHANGELOG.md) — 版本变化
+* [`doc/schema-history.md`](doc/schema-history.md) — schema 变更历史
+* [`CHANGELOG.md`](CHANGELOG.md) — release 变化
 * [`third-party-licenses.md`](third-party-licenses.md) — 第三方许可证
 
 <details>
