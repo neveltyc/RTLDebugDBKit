@@ -67,9 +67,8 @@ run() {
             return
         fi
     fi
-    # examples/reorder covers the same property in CI with five files; these
-    # designs cover it at a scale where a race has room to happen -- 28 source
-    # files in tinyriscv alone. Two more exports, diffed row by row.
+    # examples/reorder covers reproducibility in CI at five files; these designs
+    # cover it at a scale where a race has room to happen. Two exports, diffed.
     if [ -f "$repro" ]; then
         if ! (cd "$dir" && python3 "$repro" "$bin" "$@") >/dev/null; then
             echo "FAIL: reproducible $name" >&2

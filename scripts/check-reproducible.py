@@ -4,19 +4,13 @@
 #
 # Export one design twice with one binary and fail if any row differs.
 #
-# Why this exists: `src_file` ids were handed out in the order slang's source
-# loader finished reading files, which is a thread pool's completion order.
-# Two exports of an unchanged tinyriscv disagreed on 44 of 15,773 rows -- 23
-# of 28 `src_file` rows and the 21 `file.src_file_id` values pointing at them
-# -- while being, row for row, the same database. Nothing was wrong with
-# either one; they simply could not be compared, and comparing them is what
-# `config_digest` and the per-file SHA-256 digests exist to make possible.
-#
-# The exporter already pays for this property elsewhere -- TemplateBuilder's
-# group key is a source location rather than a pointer precisely so that
-# module ids do not follow an address -- and it is asserted here rather than
-# assumed, because the assumption held everywhere except one loop and no test
-# would have noticed.
+# Reproducibility is a contract: two exports of unchanged RTL must be identical
+# row for row, so that `config_digest` and the per-file SHA-256 digests can
+# compare them. An id that follows a nondeterministic order breaks it -- a
+# thread pool's file-completion order, an allocation address -- leaving two
+# databases that are the same design yet cannot be diffed. The exporter keeps
+# ids tied to stable keys (a source location, not a pointer); this gate asserts
+# that property rather than trusting it.
 #
 #   check-reproducible.py [-n N] <exporter> [exporter-arg...]
 #

@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # Build release `rtl-designdb` binaries for the supported deployment platforms.
 #
-# The platform set matches the waveform viewer this database ships beside: it
-# is read next to a waveform, so it ships everywhere the viewer does.
-#
 #   target           Toolchain                        Output                                Linking
 #   --------------   ------------------------------   -----------------------------------  ----------
 #   linux-amd64      Alpine container (gcc/musl)      dist/rtl-designdb-linux-amd64         fully static
@@ -11,11 +8,10 @@
 #   windows-amd64    MSVC on a Windows host           dist/rtl-designdb-windows-amd64.exe   static CRT (no DLLs required)
 #   macos-arm64      native clang (Apple Silicon)     dist/rtl-designdb-macos-arm64         native
 #
-# Where the viewer pins linux-amd64 to a glibc 2.17 baseline (its plugin backends
-# dlopen vendor .so files, so it must stay glibc-dynamic), this exporter has no
-# dlopen at all — SQLite is compiled in with loadable extensions omitted — so
-# both Linux targets are musl and fully static: one file that runs on any
-# distro, any glibc, including the CentOS 7-era farms EDA tools live on.
+# Both Linux targets are musl and fully static: this exporter has no dlopen at
+# all — SQLite is compiled in with loadable extensions omitted — so a single
+# file runs on any distro and any glibc, down to the CentOS 7-era farms EDA
+# tools live on.
 #
 # Host support:
 #   - Linux targets build natively when the host is already musl of the right
@@ -43,7 +39,7 @@ while [ $# -gt 0 ]; do
     --target) TARGETS_INPUT="${2:-}"; shift 2 ;;
     --target=*) TARGETS_INPUT="${1#*=}"; shift ;;
     --run) RUN=1; shift ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
