@@ -5,6 +5,30 @@ based on [Keep a Changelog](https://keepachangelog.com/). The tool uses
 [Semantic Versioning](https://semver.org/); the database contract consumers read
 carries its own integer, `db_info.schema_version`, which moves independently.
 
+## [Unreleased]
+
+### Added
+
+* Schema v21 materializes directed `conn_arc` rows from effective
+  `net_conn × term_map` overlaps. Every arc keeps both provenance ids, explicit
+  conservative ranges, `exact`/`inexact` mapping precision, and indexes on its
+  source and destination nets.
+* `v_trace_edge` provides one normalized graph contract over `net_dep` and
+  `conn_arc`. It separates RTL semantics in `edge_kind` from bit correspondence
+  in `map_kind`, preserves statement and source provenance, and supports indexed
+  one-hop lookup in either direction without storing a transitive closure.
+
+### Changed
+
+* The public database contract now contains 27 tables and 19 stable views.
+  Existing fact tables and the `v_driver` / `v_load` compatibility views remain
+  available. Consumers must re-export RTL before reading the schema v21 layout.
+* Database verification independently recomputes connection overlap geometry
+  from the fact tables, checks materialized-arc equivalence, exact-range
+  invariants, concat pairing, dynamic-index semantics, and indexed query plans.
+* The field reference, schema history, coverage report, bilingual README, and
+  measured generation/query performance describe the schema v21 contract.
+
 ## [0.1.0] — 2026-08-28
 
 First release.
