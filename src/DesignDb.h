@@ -26,7 +26,7 @@ namespace designdb {
 /// read it as though the layout held; no database is upgraded in place, so a
 /// bump means re-exporting the RTL. What each past bump changed is in
 /// doc/schema-history.md.
-inline constexpr int SchemaVersion = 21;
+inline constexpr int SchemaVersion = 22;
 
 /// Every id in these rows is assigned by the extractor, never by SQLite.
 /// The stamping pass computes cross-references between tables before any row

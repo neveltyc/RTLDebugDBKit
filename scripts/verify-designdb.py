@@ -107,9 +107,13 @@ VIEW_DOMAINS = (
      ("data", "control", "primitive", "procedure", "connection",
       "connection_expression", "constant", "terminal", "system_task", "alias",
       "external", "trigger")),
+    ("v_driver", "map_kind", ("exact", "inexact")),
     ("v_load", "load_kind",
      ("dataflow", "connection", "sensitivity", "wait", "statement", "condition",
       "terminal", "alias")),
+    ("v_load", "map_kind", ("exact", "inexact")),
+    ("v_load", "dep_kind",
+     ("data", "control", "primitive", "procedure", "alias")),
     ("v_net_attachment", "attachment_kind",
      ("terminal_inside", "actual_outside", "written_by", "release_target",
       "alias_binding", "read_by", "condition", "statement_read", "event",
@@ -186,7 +190,7 @@ except sqlite3.Error as e:
     sys.exit(f"error: cannot read {db_path}: {e}")
 mode = sys.argv[2] if len(sys.argv) == 3 else None
 
-SCHEMA_VERSION = "21"
+SCHEMA_VERSION = "22"
 
 # Failures are collected rather than raised, so one run reports every broken
 # contract instead of the first one. Only a precondition the rest of the file
@@ -1230,15 +1234,15 @@ VIEW_COLUMNS = {
         "driver_net_id", "driver_inst_id",
         "driver_name", "driver_ref", "driver_lo", "driver_hi", "driver_exact",
         "driver_kind", "dep_id", "conn_id", "stmt_id",
-        "prim_id", "term_id", "map_exact", "call_site_id", "file_path",
-        "src_path", "src_line", "src_col"],
+        "prim_id", "term_id", "map_exact", "map_kind", "call_site_id",
+        "file_path", "src_path", "src_line", "src_col"],
     "v_load": [
         "signal_net_id", "signal_inst_id", "signal_name", "signal_ref",
         "signal_lo", "signal_hi", "signal_exact",
         "load_net_id", "load_inst_id",
         "load_name", "load_ref", "load_lo", "load_hi", "load_exact",
-        "load_kind", "dep_id", "conn_id", "stmt_id", "proc_id",
-        "term_id", "map_exact", "call_site_id", "branch_id",
+        "load_kind", "dep_kind", "dep_id", "conn_id", "stmt_id", "proc_id",
+        "term_id", "map_exact", "map_kind", "call_site_id", "branch_id",
         "file_path", "src_path", "src_line", "src_col"],
     "v_stmt": [
         "stmt_id", "inst_id", "module_id", "module_name",
@@ -1640,6 +1644,43 @@ want = (one("SELECT count(*) FROM net_dep WHERE src_net_id IS NOT NULL")
                                      AND d.src_net_id = r.net_id)"""))
 check(n_load == want, "v_load reconciles with its branch formula",
       f"{n_load} rows, branch sum says {want}")
+
+# map_kind and dep_kind exist so a consumer of the composite views never
+# recomputes the normalized precision or the dependency kind from raw flags --
+# the drift these columns close. So they must agree with the graph contract row
+# for row: the dataflow branch with v_trace_edge, the connection branch with the
+# physical conn_arc it projects.
+for view, far in (("v_driver", "driver_net_id"), ("v_load", "load_net_id")):
+    check(one(f"SELECT count(*) FROM {view} WHERE map_kind IS NULL") == 0,
+          f"{view}.map_kind is never NULL")
+    check(one(f"""SELECT count(*) FROM {view} v
+        JOIN v_trace_edge e ON e.edge_source = 'net_dep' AND e.dep_id = v.dep_id
+        WHERE v.dep_id IS NOT NULL AND v.map_kind IS NOT e.map_kind""") == 0,
+          f"{view} dependency map_kind equals v_trace_edge's")
+    check(one(f"""SELECT count(*) FROM {view}
+        WHERE map_kind = 'exact'
+          AND ({far} IS NULL OR signal_net_id IS NULL)""") == 0,
+          f"{view} marks exact only where two nets meet")
+# The connection rows project the physical arc's map_kind for the directed edge
+# (v_driver: driver -> signal; v_load: signal -> load), checked as a multiset
+# over (conn_id, src, dst, map_kind) so a reversed or mis-keyed join cannot
+# pass. A crossing with no arc -- a constant tie-off, far net NULL -- is inexact,
+# which the exact-needs-two-nets check above already holds.
+for view, src, dst in (("v_driver", "driver_net_id", "signal_net_id"),
+                       ("v_load", "signal_net_id", "load_net_id")):
+    va = (f"SELECT conn_id, {src}, {dst}, map_kind, count(*) FROM {view} "
+          f"WHERE conn_id IS NOT NULL AND {src} IS NOT NULL GROUP BY 1,2,3,4")
+    ca = ("SELECT conn_id, src_net_id, dst_net_id, map_kind, count(*) "
+          "FROM conn_arc GROUP BY 1,2,3,4")
+    check(one(f"SELECT count(*) FROM ({va} EXCEPT {ca})") == 0
+          and one(f"SELECT count(*) FROM ({ca} EXCEPT {va})") == 0,
+          f"{view} connection map_kind matches the physical arc")
+check(one("""SELECT count(*) FROM v_load v JOIN net_dep d ON d.id = v.dep_id
+    WHERE v.dep_id IS NOT NULL AND v.dep_kind IS NOT d.dep_kind""") == 0,
+      "v_load.dep_kind is the dependency's own kind")
+check(one("""SELECT count(*) FROM v_load
+    WHERE dep_id IS NULL AND dep_kind IS NOT NULL""") == 0,
+      "v_load.dep_kind is set only on the dataflow branch")
 
 n_att = one("SELECT count(*) FROM v_net_attachment")
 want = (one("SELECT count(*) FROM term_map")

@@ -1,6 +1,6 @@
 # design.db — the field reference
 
-Schema version 21. The version is the *consumption contract*, not the DDL: a
+Schema version 22. The version is the *consumption contract*, not the DDL: a
 reader that does not know the number must refuse the file rather than read it
 as though the layout held. One rule: **any change to the contract bumps it.**
 The contract is the view set, each view's columns and their order, every
@@ -848,7 +848,7 @@ net end use the corresponding `net_dep` and `conn_arc` indexes.
 signal_hi,
 signal_exact, driver_net_id, driver_inst_id, driver_name, driver_ref,
 driver_lo, driver_hi, driver_exact, driver_kind, dep_id, conn_id,
-stmt_id, prim_id, term_id, map_exact, call_site_id, file_path,
+stmt_id, prim_id, term_id, map_exact, map_kind, call_site_id, file_path,
 src_path, src_line, src_col`.
 
 `signal_ref` and `driver_ref` are how each end was **spelled** when it was
@@ -919,13 +919,22 @@ rest of the reference is `v_hier_ref`. `driver_kind`:
 
 An unconnected terminal contributes no row.
 
+`map_kind` is the normalized precision `v_trace_edge` publishes — `exact` or
+`inexact` — carried here beside the raw `map_exact`/`*_exact` flags, not
+replacing them. It is `exact` only where a concrete equal-width mapping holds,
+counting a whole exact end as its net's width, so an exact whole-to-whole
+connection reads as `exact` rather than the widened bound a consumer reaches by
+trusting `map_exact` alone. The verifier holds it equal to `v_trace_edge` for
+the same dependency and to the physical `conn_arc` for the same crossing; a row
+with no second end (a constant, a terminal) is `inexact`, never NULL.
+
 **`v_load`** — every recorded read of `signal_net`, one row each:
 `signal_net_id, signal_inst_id, signal_name, signal_ref, signal_lo,
 signal_hi,
 signal_exact, load_net_id, load_inst_id, load_name, load_ref, load_lo,
-load_hi, load_exact, load_kind, dep_id, conn_id, stmt_id,
-proc_id, term_id, map_exact, call_site_id, branch_id, file_path, src_path,
-src_line, src_col`. `branch_id` is set on the `condition` rows, whose read
+load_hi, load_exact, load_kind, dep_kind, dep_id, conn_id, stmt_id,
+proc_id, term_id, map_exact, map_kind, call_site_id, branch_id, file_path,
+src_path, src_line, src_col`. `branch_id` is set on the `condition` rows, whose read
 belongs to a level rather than to a statement — with the level's own
 `proc_id` and `call_site_id` beside it, since a level is walked per
 expansion exactly as a statement is.
@@ -951,6 +960,14 @@ nameable target. One read, one row: a reference already carried into
 `dataflow` by a dependency is not repeated as `statement` or `condition`. Membership
 follows the netlist model — a clock net's loads include the flop clock
 pins, so a sensitivity is a load.
+
+`dep_kind` refines a `dataflow` row into the dependency's own
+`data | control | primitive | procedure | alias`, so telling a signal read as a
+datum from one read as a gate needs no rejoin to `net_dep`; it equals
+`v_trace_edge`'s `edge_kind` for the same dependency and is NULL on every other
+branch. `map_kind` is as on `v_driver`: the normalized `exact`/`inexact`
+precision, equal to `v_trace_edge` for a dependency and to `conn_arc` for a
+crossing, never NULL.
 
 **`v_stmt`** — one row per statement: `stmt_id, inst_id,
 module_id, module_name, scope_node_id, proc_id, ordinal, sequence,

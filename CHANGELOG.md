@@ -7,6 +7,29 @@ carries its own integer, `db_info.schema_version`, which moves independently.
 
 ## [Unreleased]
 
+### Added
+
+* Schema v22 exposes `map_kind` (`exact`/`inexact`) on `v_driver` and `v_load`,
+  the normalized mapping precision previously only on `v_trace_edge`. Its value
+  matches `v_trace_edge` for a dependency and the physical `conn_arc` for a
+  crossing, and is `inexact` (never NULL) where a row has no second end. A
+  consumer that needs per-arc spelling and provenance no longer recomputes
+  precision from the raw `map_exact`/`*_exact` flags.
+* `v_load` gains `dep_kind`, the dependency's own
+  `data`/`control`/`primitive`/`procedure`/`alias` that `load_kind` folds into
+  `dataflow`, so distinguishing a datum read from a gate read needs no rejoin to
+  `net_dep`.
+
+### Changed
+
+* The public database contract is schema v22: still 27 tables and 19 stable
+  views, with the two added columns and unchanged row granularity. The raw
+  `src_exact`/`tgt_exact`/`map_exact` and range columns remain. Consumers must
+  re-export RTL before reading the schema v22 layout.
+* Database verification holds the new columns equal to the graph contract row
+  for row: each view's `map_kind` against `v_trace_edge` and `conn_arc`, and
+  `v_load.dep_kind` against the dependency's own kind.
+
 ## [0.2.0] — 2026-08-30
 
 ### Added

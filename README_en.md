@@ -5,7 +5,7 @@
 <p>
   <img alt="Release" src="https://img.shields.io/github/v/release/neveltyc/RTLDebugDBKit?sort=semver&style=flat-square&color=3366cc">
   <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/neveltyc/RTLDebugDBKit/ci.yml?branch=main&style=flat-square&label=CI">
-  <img alt="schema" src="https://img.shields.io/badge/schema-v21-3366cc?style=flat-square">
+  <img alt="schema" src="https://img.shields.io/badge/schema-v22-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
 </p>
@@ -106,7 +106,7 @@ sqlite3 -box design.db "SELECT * FROM v_db_info;"
 
 ## The database
 
-Current schema version: **21**
+Current schema version: **22**
 
 RTLDebugDBKit stores an **instance-level design**.
 
@@ -303,7 +303,7 @@ The schema version:
 db_info.schema_version
 ```
 
-Schema v21 publishes **19 public `v_*` views**.
+Schema v22 publishes **19 public `v_*` views**.
 
 Prefer a view for ordinary queries. A few relations are exposed directly as
 public base tables:

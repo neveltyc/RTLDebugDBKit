@@ -16,6 +16,23 @@ the folded model -- rows hung off a module rather than an instance -- whose
 tables (`edge`, `assignment`, `symbol`, `port`, `child`) v10 replaced with the
 instance-level object model the field reference documents.
 
+## v22
+
+v22 surfaces the normalized precision on the composite views so a consumer of
+`v_driver`/`v_load` reads it directly instead of recomputing it from the raw
+`map_exact`/`*_exact` flags -- the recomputation that widened an exact
+whole-to-whole window to the whole net downstream. Both views gain `map_kind`
+(`exact`/`inexact`), equal to `v_trace_edge` for a dependency and to the
+physical `conn_arc` for a crossing, and `inexact` (never NULL) where a row has
+no second end. The dependency branch inlines the same precision expression the
+graph contract uses; the connection branch projects `conn_arc.map_kind`.
+
+`v_load` also gains `dep_kind`, the dependency's own
+`data`/`control`/`primitive`/`procedure`/`alias` that `load_kind` folds into
+`dataflow`, equal to `v_trace_edge`'s `edge_kind` and NULL off the dataflow
+branch. No table, view or row granularity changes; the columns are additive and
+the raw flags remain.
+
 ## v21
 
 v21 adds a normalized one-hop graph above the existing fact layer. `conn_arc`

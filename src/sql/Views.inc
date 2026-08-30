@@ -635,6 +635,17 @@ SELECT
     d.prim_id                AS prim_id,
     NULL                     AS term_id,
     d.map_exact              AS map_exact,
+    -- The normalized precision v_trace_edge publishes, from the same three
+    -- facts: a whole exact end counts as its net's width, so an exact
+    -- whole-to-whole map is exact rather than the widened bound a consumer
+    -- reaches by trusting map_exact alone. The verifier holds this equal to
+    -- v_trace_edge for the same net_dep.
+    CASE WHEN d.src_net_id IS NOT NULL AND d.map_exact = 1
+              AND d.src_exact = 1 AND d.tgt_exact = 1
+              AND COALESCE(d.src_hi - d.src_lo + 1, sn.width) > 0
+              AND COALESCE(d.src_hi - d.src_lo + 1, sn.width)
+                  = COALESCE(d.tgt_hi - d.tgt_lo + 1, tn.width)
+         THEN 'exact' ELSE 'inexact' END AS map_kind,
     d.call_site_id           AS call_site_id,
     f.path                   AS file_path,
     sf.path                  AS src_path,
@@ -660,11 +671,17 @@ SELECT
          WHEN 'constant'           THEN 'constant'
          ELSE 'connection' END,
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact, NULL,
+    -- The physical arc carries the normalized precision; the driver of this
+    -- crossing is the outer end, so the arc runs outer -> inner. A constant
+    -- tie-off has no arc and stays inexact.
+    a.map_exact, COALESCE(ca.map_kind, 'inexact'), NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
 LEFT JOIN net outnet     ON outnet.id = a.outer_net_id
+LEFT JOIN conn_arc ca    ON ca.conn_id = a.conn_id AND ca.term_map_id = a.term_map_id
+                        AND ca.src_net_id = a.outer_net_id
+                        AND ca.dst_net_id = a.inner_net_id
 LEFT JOIN file f         ON f.id = a.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
@@ -676,11 +693,16 @@ SELECT
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact, NULL,
+    -- Output-like crossing: the inner end drives, so the arc runs
+    -- inner -> outer.
+    a.map_exact, COALESCE(ca.map_kind, 'inexact'), NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
 JOIN net outnet          ON outnet.id = a.outer_net_id
+LEFT JOIN conn_arc ca    ON ca.conn_id = a.conn_id AND ca.term_map_id = a.term_map_id
+                        AND ca.src_net_id = a.inner_net_id
+                        AND ca.dst_net_id = a.outer_net_id
 LEFT JOIN file f         ON f.id = a.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('output', 'inout', 'ref')
@@ -692,7 +714,7 @@ SELECT
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
     NULL, NULL, NULL, NULL, t.id,
-    NULL, NULL,
+    NULL, 'inexact', NULL,
     f.path, sf.path, t.line, t.col
 FROM term_map m
 JOIN term t              ON t.id = m.term_id
@@ -705,9 +727,9 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 -- Every recorded read of signal_net, one row each -- in-module reads and
 -- the boundary crossing alike. load_kind:
 --
---   dataflow      a net_dep row: the signal feeds a target (data, control,
---                 primitive or procedure -- join net_dep on dep_id
---                 for which).
+--   dataflow      a net_dep row: the signal feeds a target. dep_kind carries
+--                 which of data/control/primitive/procedure/alias, so the
+--                 fold into 'dataflow' costs no rejoin.
 --   connection    the crossing reads it: a parent net feeding an
 --                 input/inout/ref terminal, an internal net feeding an
 --                 output/inout/ref one, or a resolved external tie either
@@ -768,12 +790,24 @@ SELECT
     d.tgt_exact              AS load_exact,
     CASE WHEN d.dep_kind = 'alias' THEN 'alias'
          ELSE 'dataflow' END AS load_kind,
+    -- The dependency's own semantic kind, which load_kind folds into
+    -- 'dataflow'. A consumer distinguishes a data read from a control read
+    -- here instead of rejoining net_dep on dep_id. NULL on every branch that
+    -- is not a net_dep row.
+    d.dep_kind               AS dep_kind,
     d.id                     AS dep_id,
     NULL                     AS conn_id,
     d.stmt_id                AS stmt_id,
     s.proc_id                AS proc_id,
     NULL                     AS term_id,
     d.map_exact              AS map_exact,
+    -- Same normalized precision as v_driver and v_trace_edge for this dep.
+    CASE WHEN d.src_net_id IS NOT NULL AND d.map_exact = 1
+              AND d.src_exact = 1 AND d.tgt_exact = 1
+              AND COALESCE(d.src_hi - d.src_lo + 1, sn.width) > 0
+              AND COALESCE(d.src_hi - d.src_lo + 1, sn.width)
+                  = COALESCE(d.tgt_hi - d.tgt_lo + 1, tn.width)
+         THEN 'exact' ELSE 'inexact' END AS map_kind,
     d.call_site_id           AS call_site_id,
     d.branch_id              AS branch_id,
     f.path                   AS file_path,
@@ -796,13 +830,17 @@ SELECT
     a.inner_net_id, innet.inst_id, innet.name, NULL,
     a.inner_lo, a.inner_hi, a.inner_exact,
     'connection',
+    NULL,
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact, NULL,
+    a.map_exact, COALESCE(ca.map_kind, 'inexact'), NULL,
     NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net outnet          ON outnet.id = a.outer_net_id
 JOIN net innet           ON innet.id = a.inner_net_id
+LEFT JOIN conn_arc ca    ON ca.conn_id = a.conn_id AND ca.term_map_id = a.term_map_id
+                        AND ca.src_net_id = a.outer_net_id
+                        AND ca.dst_net_id = a.inner_net_id
 LEFT JOIN file f         ON f.id = a.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('input', 'inout', 'ref')
@@ -813,13 +851,17 @@ SELECT
     a.outer_net_id, outnet.inst_id, outnet.name, a.outer_ref,
     a.outer_lo, a.outer_hi, a.outer_exact,
     'connection',
+    NULL,
     NULL, a.conn_id, NULL, NULL, NULL,
-    a.map_exact, NULL,
+    a.map_exact, COALESCE(ca.map_kind, 'inexact'), NULL,
     NULL,
     f.path, sf.path, a.line, a.col
 FROM v_conn_arc a
 JOIN net innet           ON innet.id = a.inner_net_id
 JOIN net outnet          ON outnet.id = a.outer_net_id
+LEFT JOIN conn_arc ca    ON ca.conn_id = a.conn_id AND ca.term_map_id = a.term_map_id
+                        AND ca.src_net_id = a.inner_net_id
+                        AND ca.dst_net_id = a.outer_net_id
 LEFT JOIN file f         ON f.id = a.file_id
 LEFT JOIN src_file sf ON sf.id = f.src_file_id
 WHERE a.direction IN ('output', 'inout', 'ref')
@@ -830,7 +872,8 @@ SELECT
     NULL, NULL, 1,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     pe.event_kind,
-    NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
+    NULL, NULL, pe.stmt_id, pe.proc_id, NULL, NULL, 'inexact', s.call_site_id,
     NULL,
     f.path, sf.path, pe.line, pe.col
 FROM proc_event pe
@@ -846,7 +889,8 @@ SELECT
     CASE e.role WHEN 'wait' THEN 'wait'
                 WHEN 'event' THEN 'sensitivity'
                 ELSE 'statement' END,
-    NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
+    NULL, NULL, e.stmt_id, s.proc_id, NULL, NULL, 'inexact', s.call_site_id,
     NULL,
     f.path, sf.path, s.line, s.col
 FROM expr_ref e
@@ -866,7 +910,8 @@ SELECT
     r.lo, r.hi, r.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'condition',
-    NULL, NULL, NULL, b.proc_id, NULL, NULL, b.call_site_id,
+    NULL,
+    NULL, NULL, NULL, b.proc_id, NULL, NULL, 'inexact', b.call_site_id,
     r.branch_id,
     f.path, sf.path, b.line, b.col
 FROM branch_ref r
@@ -882,7 +927,8 @@ SELECT
     o.lo, o.hi, o.is_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'statement',
-    NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, s.call_site_id,
+    NULL,
+    NULL, NULL, o.stmt_id, s.proc_id, NULL, NULL, 'inexact', s.call_site_id,
     NULL,
     f.path, sf.path, s.line, s.col
 FROM assign_operand o
@@ -897,7 +943,8 @@ SELECT
     m.inner_lo, m.inner_hi, m.inner_exact,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     'terminal',
-    NULL, NULL, NULL, NULL, t.id, NULL, NULL,
+    NULL,
+    NULL, NULL, NULL, NULL, t.id, NULL, 'inexact', NULL,
     NULL,
     f.path, sf.path, t.line, t.col
 FROM term_map m

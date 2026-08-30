@@ -5,7 +5,7 @@
 <p>
   <img alt="Release" src="https://img.shields.io/github/v/release/neveltyc/RTLDebugDBKit?sort=semver&style=flat-square&color=3366cc">
   <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/neveltyc/RTLDebugDBKit/ci.yml?branch=main&style=flat-square&label=CI">
-  <img alt="schema" src="https://img.shields.io/badge/schema-v21-3366cc?style=flat-square">
+  <img alt="schema" src="https://img.shields.io/badge/schema-v22-3366cc?style=flat-square">
   <img alt="slang" src="https://img.shields.io/badge/slang-v11.0-3366cc?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-BSD--3--Clause-3366cc?style=flat-square">
 </p>
@@ -100,7 +100,7 @@ sqlite3 -box design.db "SELECT * FROM v_db_info;"
 
 ## 数据库
 
-当前 schema version：**21**
+当前 schema version：**22**
 
 RTLDebugDBKit 保存的是 **instance-level design**。
 
@@ -292,7 +292,7 @@ Schema version：
 db_info.schema_version
 ```
 
-当前 schema v21 有 **19 个公开 `v_*` view**。
+当前 schema v22 有 **19 个公开 `v_*` view**。
 
 常规查询优先使用 view。部分关系直接通过公开基表提供：
 `net_dep` · `conn_arc` · `branch_ref` · `branch_ancestor` · `module` · `inst_param` · `expr_ref` · `prim`
