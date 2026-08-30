@@ -92,6 +92,10 @@ sqlite3 -box design.db "SELECT * FROM v_db_info;"
 | `partial` | 数据库可用，但存在分析缺口 |
 | `hierarchy_only` | 只保留层次信息 |
 
+> [!TIP]
+> 有分发或归档 `design.db` 的需求时，推荐用 `zstd` 或 `xz` 压缩：SQLite 文件冗余度高，
+> 通常可压缩数倍（zstd 约 5–7×、xz 约 12×），显著节省存储空间，用前解压一次即可。
+
 ---
 
 ## 数据库

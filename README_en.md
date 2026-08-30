@@ -96,6 +96,12 @@ sqlite3 -box design.db "SELECT * FROM v_db_info;"
 | `partial` | Database is usable, but has analysis gaps |
 | `hierarchy_only` | Hierarchy only |
 
+> [!TIP]
+> When distributing or archiving `design.db`, compress it with `zstd` or `xz`:
+> SQLite files are highly redundant and typically shrink several-fold (about
+> 5–7× with zstd, ~12× with xz), a significant storage saving; decompress once
+> before use.
+
 ---
 
 ## The database
