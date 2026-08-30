@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build release `rtl-designdb` binaries for the supported deployment platforms.
 #
-# The platform set is rwave's, deliberately: this database is read next to a
-# waveform, so it ships everywhere the viewer does.
+# The platform set matches the waveform viewer this database ships beside: it
+# is read next to a waveform, so it ships everywhere the viewer does.
 #
 #   target           Toolchain                        Output                                Linking
 #   --------------   ------------------------------   -----------------------------------  ----------
@@ -11,7 +11,7 @@
 #   windows-amd64    MSVC on a Windows host           dist/rtl-designdb-windows-amd64.exe   static CRT (no DLLs required)
 #   macos-arm64      native clang (Apple Silicon)     dist/rtl-designdb-macos-arm64         native
 #
-# Where rwave pins linux-amd64 to a glibc 2.17 baseline (its plugin backends
+# Where the viewer pins linux-amd64 to a glibc 2.17 baseline (its plugin backends
 # dlopen vendor .so files, so it must stay glibc-dynamic), this exporter has no
 # dlopen at all — SQLite is compiled in with loadable extensions omitted — so
 # both Linux targets are musl and fully static: one file that runs on any

@@ -4,7 +4,7 @@ name: Binaries
 # ci.yml and release.yml both call this workflow, so the binary a release
 # ships is produced by exactly the pipeline CI has been running all along.
 #
-# The set matches rwave's platform selection — linux-amd64, linux-arm64,
+# The set matches the waveform viewer's platforms — linux-amd64, linux-arm64,
 # windows-amd64, macos-arm64 — because the database is read next to a
 # waveform: the exporter ships everywhere the viewer does.
 on:

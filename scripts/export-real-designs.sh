@@ -2,7 +2,7 @@
 # Export the local open-source CPU designs as extra test cases.
 #
 # These live outside the repository (they are large third-party trees), so
-# this is a developer tool rather than CI: point RWA_DIR at a checkout that
+# this is a developer tool rather than CI: point DESIGNS_DIR at a checkout that
 # contains picorv32/, tinyriscv/ and veerwolf_run/, or keep the default
 # layout where it sits beside the project. Each design is exported, checked
 # with `PRAGMA foreign_key_check`, and -- when the verifier is present --
@@ -16,19 +16,19 @@ bin="$here/build/rtl-designdb"
 verify="$here/scripts/verify-designdb.py"
 repro="$here/scripts/check-reproducible.py"
 out="${OUT_DIR:-/tmp/designdb-real}"
-rwa="${RWA_DIR:-}"
+designs="${DESIGNS_DIR:-}"
 
-if [ -z "$rwa" ]; then
-    for cand in "$here/../rwa" "$here/../../rwa" "$here/../../../rwa" \
-                "$here/../../../../rwa"; do
+if [ -z "$designs" ]; then
+    for cand in "$here/../designs" "$here/../../designs" "$here/../../../designs" \
+                "$here/../../../../designs"; do
         if [ -d "$cand/picorv32" ]; then
-            rwa="$(cd "$cand" && pwd)"
+            designs="$(cd "$cand" && pwd)"
             break
         fi
     done
 fi
-if [ -z "$rwa" ] || [ ! -d "$rwa" ]; then
-    echo "error: no rwa design directory found; set RWA_DIR" >&2
+if [ -z "$designs" ] || [ ! -d "$designs" ]; then
+    echo "error: no design directory found; set DESIGNS_DIR" >&2
     exit 1
 fi
 if [ ! -x "$bin" ]; then
@@ -89,10 +89,10 @@ run() {
     echo "ok: $name  ${size} bytes  ${ms} ms"
 }
 
-run picorv32  "$rwa/picorv32"  "$rwa/picorv32/picorv32.v" --top picorv32 --quiet
-run tinyriscv "$rwa/tinyriscv" -f tiny.f --top tinyriscv_soc_top --quiet
+run picorv32  "$designs/picorv32"  "$designs/picorv32/picorv32.v" --top picorv32 --quiet
+run tinyriscv "$designs/tinyriscv" -f tiny.f --top tinyriscv_soc_top --quiet
 
-veer="$rwa/veerwolf_run/build/veerwolf_0.7.5/sim-verilator"
+veer="$designs/veerwolf_run/build/veerwolf_0.7.5/sim-verilator"
 if [ -d "$veer" ] && [ -f "$veer/designdb_real.f" ]; then
     run veerwolf "$veer" -f designdb_real.f --top veerwolf_core --quiet
 else

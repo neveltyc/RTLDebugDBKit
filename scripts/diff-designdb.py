@@ -19,7 +19,7 @@
 #                           '#' comments; a pair that never fires is reported
 #                           as stale so the list cannot outlive its change
 #   --designs auto|off|DIR  the export-real-designs.sh corpus: auto (default)
-#                           probes the same ../rwa layout that script uses,
+#                           probes the same ../designs layout that script uses,
 #                           off skips, DIR names the checkout
 #   --triage                for tables that differ, also diff with id-shaped
 #                           columns removed -- separates "same content, ids
@@ -76,27 +76,27 @@ def corpus(repo, designs):
     cases.append(("reorder", os.path.join(ex, "reorder"), ["-f", "reorder.f"]))
 
     if designs != "off":
-        rwa = None
+        designs_dir = None
         if designs == "auto":
-            for cand in ("../rwa", "../../rwa", "../../../rwa",
-                         "../../../../rwa"):
+            for cand in ("../designs", "../../designs", "../../../designs",
+                         "../../../../designs"):
                 p = os.path.abspath(os.path.join(repo, cand))
                 if os.path.isdir(os.path.join(p, "picorv32")):
-                    rwa = p
+                    designs_dir = p
                     break
         elif os.path.isdir(designs):
-            rwa = os.path.abspath(designs)
+            designs_dir = os.path.abspath(designs)
         else:
             fail(f"--designs {designs}: no such directory")
-        if rwa:
-            cases.append(("picorv32", os.path.join(rwa, "picorv32"),
-                          [os.path.join(rwa, "picorv32", "picorv32.v"),
+        if designs_dir:
+            cases.append(("picorv32", os.path.join(designs_dir, "picorv32"),
+                          [os.path.join(designs_dir, "picorv32", "picorv32.v"),
                            "--top", "picorv32"]))
-            tiny = os.path.join(rwa, "tinyriscv")
+            tiny = os.path.join(designs_dir, "tinyriscv")
             if os.path.isfile(os.path.join(tiny, "tiny.f")):
                 cases.append(("tinyriscv", tiny,
                               ["-f", "tiny.f", "--top", "tinyriscv_soc_top"]))
-            veer = os.path.join(rwa, "veerwolf_run", "build",
+            veer = os.path.join(designs_dir, "veerwolf_run", "build",
                                 "veerwolf_0.7.5", "sim-verilator")
             if os.path.isfile(os.path.join(veer, "designdb_real.f")):
                 cases.append(("veerwolf", veer,
