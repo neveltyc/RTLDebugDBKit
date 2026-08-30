@@ -7,6 +7,8 @@ carries its own integer, `db_info.schema_version`, which moves independently.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-31
+
 ### Added
 
 * Schema v22 exposes `map_kind` (`exact`/`inexact`) on `v_driver` and `v_load`,

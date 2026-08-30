@@ -15,7 +15,7 @@ cmake_minimum_required(VERSION 3.20)
 # system libsqlite3 compiles no C of our own and generates fine either way.
 project(
   rtl-designdb
-  VERSION 0.2.0
+  VERSION 0.3.0
   LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
