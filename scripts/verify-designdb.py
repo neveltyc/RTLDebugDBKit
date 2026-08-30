@@ -1438,20 +1438,117 @@ OUTER_PRESENT = "(c.outer_net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)"
 check(one("SELECT count(*) FROM v_conn_arc") == one(f"SELECT count(*) {SEG}"),
       "v_conn_arc is exactly the net_conn/term_map overlap")
 
-# The physical graph is the directed, two-net subset of that overlap. Derive
-# the expected rows independently from v_conn_arc: input-like terminals point
-# outside -> inside, output-like terminals inside -> outside, and inout/ref do
-# both. Whole exact ranges are made explicit because v_trace_edge has no
-# per-end exactness flags for a consumer to reinterpret.
-EXPECTED_CONN_ARCS = """
-    WITH directed AS (
+# Recompute the geometry from base tables with a deliberately different outer
+# endpoint expression from v_conn_arc's two query-plan branches. This catches a
+# wrong range intersection or resolved-reference selection even when the
+# materialized table and compatibility views share the same implementation.
+EXPECTED_CONN_OVERLAPS = """
+    WITH seg AS (
+        SELECT c.id AS conn_id, mp.id AS term_map_id, c.conn_kind,
+               CASE WHEN c.outer_net_id IS NOT NULL THEN c.outer_net_id
+                    ELSE hr.resolved_net_id END AS outer_net_id,
+               CASE WHEN c.outer_net_id IS NOT NULL THEN c.outer_lo
+                    ELSE hr.lo END AS c_net_lo,
+               CASE WHEN c.outer_net_id IS NOT NULL THEN c.outer_hi
+                    ELSE hr.hi END AS c_net_hi,
+               CASE WHEN c.outer_net_id IS NOT NULL THEN c.outer_exact
+                    ELSE hr.is_exact END AS c_net_exact,
+               c.term_lo AS c_lo, c.term_hi AS c_hi,
+               c.term_exact AS c_term_exact, c.map_exact AS c_map,
+               t.direction, mp.inner_net_id,
+               mp.term_lo AS m_lo, mp.term_hi AS m_hi,
+               mp.term_exact AS m_term_exact,
+               mp.inner_lo AS m_net_lo, mp.inner_hi AS m_net_hi,
+               mp.inner_exact AS m_net_exact, mp.map_exact AS m_map
+        FROM net_conn c
+        JOIN term t ON t.id = c.term_id
+        JOIN term_map mp ON mp.term_id = c.term_id
+        LEFT JOIN hier_ref hr ON hr.id = c.outer_hier_ref_id
+        WHERE c.conn_kind IN ('signal','expression_operand','constant',
+                              'external_reference')
+          AND (c.conn_kind != 'external_reference'
+               OR hr.resolved_net_id IS NOT NULL)
+          AND (c.conn_kind != 'expression_operand'
+               OR c.outer_net_id IS NOT NULL OR hr.resolved_net_id IS NOT NULL)
+          AND (c.term_lo IS NULL OR mp.term_hi IS NULL
+               OR c.term_lo <= mp.term_hi)
+          AND (mp.term_lo IS NULL OR c.term_hi IS NULL
+               OR mp.term_lo <= c.term_hi)
+    ), arc AS (
+        SELECT seg.*,
+               CASE WHEN c_lo IS NULL THEN m_lo
+                    WHEN m_lo IS NULL THEN c_lo
+                    ELSE MAX(c_lo, m_lo) END AS ilo,
+               CASE WHEN c_hi IS NULL THEN m_hi
+                    WHEN m_hi IS NULL THEN c_hi
+                    ELSE MIN(c_hi, m_hi) END AS ihi,
+               (COALESCE(c_map, 0) = 1
+                AND COALESCE(c_term_exact, 0) = 1
+                AND m_term_exact = 1) AS outer_chain,
+               (m_map = 1 AND COALESCE(c_term_exact, 0) = 1
+                AND m_term_exact = 1) AS inner_chain,
+               (m_lo IS NOT NULL OR m_hi IS NOT NULL) AS m_narrows,
+               (c_lo IS NOT NULL OR c_hi IS NOT NULL) AS c_narrows
+        FROM seg
+    )
+    SELECT conn_id, term_map_id, conn_kind, direction,
+           outer_net_id, inner_net_id,
+           CASE WHEN outer_net_id IS NULL THEN NULL
+                WHEN outer_chain AND c_net_exact = 1 AND ilo IS NOT NULL
+                THEN COALESCE(c_net_lo, 0) + ilo - COALESCE(c_lo, 0)
+                ELSE c_net_lo END AS outer_lo,
+           CASE WHEN outer_net_id IS NULL THEN NULL
+                WHEN outer_chain AND c_net_exact = 1 AND ihi IS NOT NULL
+                THEN COALESCE(c_net_lo, 0) + ihi - COALESCE(c_lo, 0)
+                ELSE c_net_hi END AS outer_hi,
+           CASE WHEN outer_net_id IS NULL THEN NULL
+                WHEN outer_chain OR NOT m_narrows THEN c_net_exact
+                ELSE 0 END AS outer_exact,
+           CASE WHEN inner_chain AND m_net_exact = 1 AND ilo IS NOT NULL
+                THEN COALESCE(m_net_lo, 0) + ilo - COALESCE(m_lo, 0)
+                ELSE m_net_lo END AS inner_lo,
+           CASE WHEN inner_chain AND m_net_exact = 1 AND ihi IS NOT NULL
+                THEN COALESCE(m_net_lo, 0) + ihi - COALESCE(m_lo, 0)
+                ELSE m_net_hi END AS inner_hi,
+           CASE WHEN inner_chain OR NOT c_narrows THEN m_net_exact
+                ELSE 0 END AS inner_exact,
+           CASE WHEN outer_net_id IS NULL THEN NULL
+                WHEN conn_kind = 'expression_operand' THEN 0
+                ELSE (c_map AND m_map) END AS map_exact
+    FROM arc
+"""
+check(one(f"SELECT count(*) FROM ({EXPECTED_CONN_OVERLAPS})") ==
+      one("SELECT count(*) FROM v_conn_arc"),
+      "the independently derived connection overlaps match v_conn_arc count")
+check(one(f"""
+    SELECT count(*) FROM v_conn_arc a
+    LEFT JOIN ({EXPECTED_CONN_OVERLAPS}) e
+      ON e.conn_id = a.conn_id AND e.term_map_id = a.term_map_id
+    WHERE e.conn_id IS NULL
+       OR a.conn_kind IS NOT e.conn_kind OR a.direction IS NOT e.direction
+       OR a.outer_net_id IS NOT e.outer_net_id
+       OR a.inner_net_id IS NOT e.inner_net_id
+       OR a.outer_lo IS NOT e.outer_lo OR a.outer_hi IS NOT e.outer_hi
+       OR a.outer_exact IS NOT e.outer_exact
+       OR a.inner_lo IS NOT e.inner_lo OR a.inner_hi IS NOT e.inner_hi
+       OR a.inner_exact IS NOT e.inner_exact
+       OR a.map_exact IS NOT e.map_exact""") == 0,
+      "v_conn_arc endpoints, ranges and precision match base-table geometry")
+
+# The physical graph is the directed, two-net subset of those independently
+# derived overlaps: input-like terminals point outside -> inside, output-like
+# terminals inside -> outside, and inout/ref do both. Whole exact ranges are
+# made explicit because v_trace_edge has no per-end exactness flags.
+EXPECTED_CONN_ARCS = f"""
+    WITH overlaps AS ({EXPECTED_CONN_OVERLAPS}),
+    directed AS (
         SELECT a.conn_id, a.term_map_id,
                a.outer_net_id AS src_net_id, a.inner_net_id AS dst_net_id,
                a.outer_lo AS src_lo, a.outer_hi AS src_hi,
                a.outer_exact AS src_exact,
                a.inner_lo AS dst_lo, a.inner_hi AS dst_hi,
                a.inner_exact AS dst_exact, a.map_exact
-        FROM v_conn_arc a
+        FROM overlaps a
         WHERE a.outer_net_id IS NOT NULL
           AND a.direction IN ('input','inout','ref')
         UNION ALL
@@ -1459,7 +1556,7 @@ EXPECTED_CONN_ARCS = """
                a.inner_net_id, a.outer_net_id,
                a.inner_lo, a.inner_hi, a.inner_exact,
                a.outer_lo, a.outer_hi, a.outer_exact, a.map_exact
-        FROM v_conn_arc a
+        FROM overlaps a
         WHERE a.outer_net_id IS NOT NULL
           AND a.direction IN ('output','inout','ref')
           AND a.conn_kind IN ('signal','external_reference')
