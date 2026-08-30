@@ -365,23 +365,13 @@ rtldbgdb-elab.log
 
 ## Performance
 
-Release build, macOS arm64, schema v21:
+Release build, macOS arm64, schema v22:
 
 | Design | Definitions | Instances | Nets | Statements | Dependencies | Connection arcs | Trace edges | Time | DB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0 | 3,373 | 0.02 s | 0.95 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 451 | 5,631 | 0.03 s | 1.51 MB |
-| VeeRwolf | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 10,971 | 47,337 | 0.25 s | 12.35 MB |
-
-Warm-cache SQLite point queries on the first 1,000 VeeRwolf net ids, median of
-five runs:
-
-| Query | Schema v20 | Schema v21 |
-| --- | ---: | ---: |
-| `net_dep` by source / target | 6.00 / 6.04 µs | 5.63 / 6.09 µs |
-| `v_driver` / `v_load` | 24.29 / 25.89 µs | 22.28 / 25.03 µs |
-| `conn_arc` by source / destination | — | 3.89 / 3.77 µs |
-| `v_trace_edge` by source / destination | — | 8.88 / 9.30 µs |
+| picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0 | 3,373 | 0.02 s | 0.91 MB |
+| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 451 | 5,631 | 0.03 s | 1.44 MB |
+| VeeRwolf | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 10,971 | 47,337 | 0.25 s | 11.78 MB |
 
 ```bash
 # See per-phase timing
