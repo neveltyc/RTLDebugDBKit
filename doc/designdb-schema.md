@@ -141,7 +141,7 @@ does not apply to); solid edges are always present.
 |---|---|---|---|
 | provenance | `db_info` | the seal — exactly one row per database | — |
 | | `src_file` | one file slang read, with its SHA-256 | — |
-| | `file` | one path spelling rows carry | `src_file_id → src_file` |
+| | `file` | one working-dir-relative path rows carry | `src_file_id → src_file` |
 | | `data_type` | one interned type text | — |
 | hierarchy | `module` | one source definition | `file_id → file` |
 | | `tree_node` | one level of the elaborated tree | `parent_node_id → tree_node` |
@@ -1100,9 +1100,9 @@ The common case does not need it: `v_driver.driver_ref` and
 directional views never joins here. What is here is the rest of the
 reference — access, where it landed, its window, its location.
 
-`file_path` is the spelling as written in the filelist; `src_path` the
-absolute path it resolved to. They answer different questions and neither
-substitutes for the other.
+`file_path` is the source path relative to the export working directory;
+`src_path` the absolute path it resolved to. They answer different questions
+and neither substitutes for the other.
 
 ## Naming rules
 
@@ -1251,7 +1251,7 @@ unchanged design be compared row for row: its ids come from SQLite rather
 than an extractor counter, so its insert order is its id order, and the order
 slang hands the buffers back in is the order a thread pool finished reading
 them.
-`file` holds the spellings rows carry — as written in the filelist —
+`file` holds the paths rows carry — relative to the export working directory —
 joined to their src_file. `db_info` is the seal: one row, one column per
 fact, every column NOT NULL but `top` — the space-separated names of the
 elaborated top instances, NULL when the design elaborates none. It is a

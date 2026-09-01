@@ -86,11 +86,11 @@ CREATE TABLE src_file(
     path    TEXT UNIQUE,
     digest  TEXT);
 
--- `path` is the spelling the rows carry -- as written in the filelist or on
--- the command line -- while `src_file.path` is absolute. The two genuinely
--- differ, so `src_file_id` joins them: without it a consumer checking
--- digests had to match spellings by basename, which breaks on the first
--- design with two files of one name.
+-- `path` is the path the rows carry, relative to the export working directory
+-- (slang's getFileName), while `src_file.path` is the absolute path it
+-- resolved to. The two genuinely differ, so `src_file_id` joins them: without
+-- it a consumer checking digests had to match by basename, which breaks on the
+-- first design with two files of one name.
 CREATE TABLE file(
     id             INTEGER PRIMARY KEY,
     path           TEXT UNIQUE,
