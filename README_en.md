@@ -73,6 +73,8 @@ The filelist understands:
 
 Relative paths resolve against the filelist's own directory.
 
+`-v` library files follow VCS: a library module only fills in what the sources leave undefined, a source definition of the same name wins without a warning, and a library module nobody instantiates never becomes a top. When two source files define the same module, slang keeps the one read last, and the run says which one was exported.
+
 slang always parses with the rules of `--compat vcs`: the 10 compilation rules VCS relaxes (use before declaration, implicit enum/string conversions, and so on) and 1 analysis rule (multiply driven function locals); `` `include`` searches `+incdir+`/`-I` before the including file's own directory; and a macro line continuation may have spaces after the backslash. RTL written against commercial simulators needs no source edits first.
 
 ---

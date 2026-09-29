@@ -32,6 +32,7 @@
 #include "slang/text/SourceManager.h"
 #include "slang/diagnostics/DiagnosticEngine.h"
 #include "slang/diagnostics/Diagnostics.h"
+#include "slang/diagnostics/LookupDiags.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/numeric/Time.h"
 #include "slang/util/Bag.h"
@@ -48,6 +49,9 @@ namespace {
 struct Options {
     std::vector<std::string> filelists;
     std::vector<std::string> files;
+    /// `-v` library files: their modules fill in only what the sources leave
+    /// undefined, and are never elaborated as tops on their own.
+    std::vector<std::string> libFiles;
     std::vector<std::string> defines;
     std::vector<std::string> includeDirs;
     std::string top;
@@ -417,7 +421,7 @@ bool readFilelist(const fs::path& path, Options& opt, ElabLog& log, int depth = 
                         return false;
                 }
                 else if (what == Pending::LibFile) {
-                    opt.files.push_back(resolve(tok).string());
+                    opt.libFiles.push_back(resolve(tok).string());
                 }
                 continue;   // LibDir: consumed and ignored, warned when seen
             }
@@ -448,10 +452,8 @@ bool readFilelist(const fs::path& path, Options& opt, ElabLog& log, int depth = 
             else if (tok == "-v" && t + 1 < toks.size()) {
                 // A VCS library file: module definitions compiled on demand.
                 // Ignoring it loses those modules, which shows up as an
-                // "unknown module" error deep in a vendor PHY. slang has no
-                // on-demand rule, so it goes in as an ordinary source and only
-                // what is actually instantiated gets elaborated.
-                opt.files.push_back(resolve(toks[++t]).string());
+                // "unknown module" error deep in a vendor PHY.
+                opt.libFiles.push_back(resolve(toks[++t]).string());
             }
             else if (tok == "-y" && t + 1 < toks.size()) {
                 t++;    // library *directory*: needs a name-to-file rule; unused here
@@ -577,6 +579,17 @@ driver::CompatSettings vcsCompat() {
 Bag buildOptionBag(const Options& opt) {
     Bag optionBag;
 
+    // One compilation unit for the whole list under --single-unit. Designs
+    // that put their configuration in a leading `defines file need this:
+    // slang gives each file its own unit by default, so those macros would
+    // not reach anything after them and the design elaborates with the wrong
+    // widths -- reported as "dimension requires a constant range", far from
+    // the actual cause. Library files see those macros too, as under VCS.
+    driver::SourceOptions srcOpts{};
+    srcOpts.singleUnit = opt.singleUnit;
+    srcOpts.librariesInheritMacros = opt.singleUnit;
+    optionBag.set(srcOpts);
+
     parsing::PreprocessorOptions ppOpts;
     for (auto& d : opt.defines)
         ppOpts.predefines.push_back(d);
@@ -640,7 +653,7 @@ analysis::AnalysisOptions vcsAnalysisOptions() {
 /// the SourceLibrary objects, and both SourceManager::FileInfo::library and
 /// SyntaxTree::library keep non-owning pointers into that map -- so it has to
 /// outlive the compilation, not the parse. Nothing names a library today
-/// (addFiles passes none, and addSeparateUnit's empty library name resolves to
+/// (addFiles passes none, and addLibraryFiles' empty library name resolves to
 /// none), which is the only reason a loader scoped to this call would not
 /// already be a use-after-free.
 bool parseSources(const Options& opt, ElabLog& log, driver::SourceLoader& loader,
@@ -649,19 +662,14 @@ bool parseSources(const Options& opt, ElabLog& log, driver::SourceLoader& loader
     for (auto& inc : opt.includeDirs)
         loader.addSearchDirectories(inc);
 
-    if (opt.singleUnit) {
-        // One compilation unit for the whole list. Designs that put their
-        // configuration in a leading `defines file need this: slang gives
-        // each file its own unit by default, so those macros would not
-        // reach anything after them and the design elaborates with the
-        // wrong widths -- reported as "dimension requires a constant
-        // range", far from the actual cause.
-        loader.addSeparateUnit(opt.files, opt.includeDirs, opt.defines, "", {});
-    }
-    else {
-        for (auto& f : opt.files)
-            loader.addFiles(f);
-    }
+    for (auto& f : opt.files)
+        loader.addFiles(f);
+    // VCS semantics for `-v`: a source definition always wins, silently. slang
+    // gets there when the library copy is the duplicate that arrives second
+    // (AllowLibModuleRedefinition discards it), and library files are parsed
+    // after the sources whatever order the filelist named them in.
+    for (auto& f : opt.libFiles)
+        loader.addLibraryFiles("", f);
 
     { Phase p("parse", opt.timeReport);
       trees = loader.loadAndParseSources(optionBag, &pool); }
@@ -740,6 +748,34 @@ DiagCounts reportDiagnostics(const Options& opt, ElabLog& log,
     return counts;
 }
 
+/// Names, per duplicated definition, the copy that was elaborated. slang keeps
+/// a same-named module from a later source file over an earlier one with only
+/// a warning, and a warning among hundreds is not where anyone looks for "the
+/// module you are debugging is not the one in the database".
+void reportDuplicateDefinitions(const Options& opt, ElabLog& log, const Diagnostics& diags,
+                                ast::Compilation& compilation,
+                                const SourceManager& sourceManager) {
+    for (auto& d : diags) {
+        if (d.code != diag::DuplicateDefinition || d.args.empty())
+            continue;
+        auto* name = std::get_if<std::string>(&d.args.front());
+        if (!name)
+            continue;
+        auto used = compilation.tryGetDefinition(*name, compilation.getRoot()).definition;
+        if (!used || !used->location.valid()) {
+            finding(opt, log, "warning: '%s' is defined more than once; %s\n",
+                    name->c_str(), diagnosticsAt(log).c_str());
+            continue;
+        }
+        finding(opt, log,
+                "warning: '%s' is defined more than once; the one exported is at "
+                "%s:%zu\n",
+                name->c_str(),
+                std::string(sourceManager.getFileName(used->location)).c_str(),
+                sourceManager.getLineNumber(used->location));
+    }
+}
+
 /// False when --top named something that did not elaborate as a top module.
 bool checkTopElaborated(const Options& opt, ElabLog& log,
                         ast::Compilation& compilation) {
@@ -776,6 +812,7 @@ std::string configDigest(const Options& opt, ast::Compilation& compilation) {
         cfg += '\n';
     };
     for (auto& f : opt.files) put("file", f);
+    for (auto& f : opt.libFiles) put("libfile", f);
     for (auto& i : opt.includeDirs) put("incdir", i);
     for (auto& d : opt.defines) put("define", d);
     put("mode", opt.singleUnit ? "single-unit" : "multi-unit");
@@ -1188,6 +1225,7 @@ int main(int argc, char** argv) {
         auto& diags = compilation.getAllDiagnostics();
         elab.stop();
         const DiagCounts counts = reportDiagnostics(opt, log, diags, sourceManager);
+        reportDuplicateDefinitions(opt, log, diags, compilation, sourceManager);
 
         if (!checkTopElaborated(opt, log, compilation))
             return finished(log, opt, ExitBadInput);

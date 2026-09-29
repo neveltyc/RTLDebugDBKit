@@ -447,7 +447,7 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // arrives with upwardCount 0 and would otherwise read as downward. The
     // body's own instance matched by its definition name is the one genuine
     // zero-level climb, and stays one.
-    const Symbol* head = hv->ref.path.empty() ? nullptr : hv->ref.path.front().symbol;
+    const Symbol* head = hv->ref.path.empty() ? nullptr : hv->ref.path.front().symbol.get();
     const bool fromRoot =
         head && (head->kind == SymbolKind::Root ||
                  (hv->ref.upwardCount == 0 && head->kind == SymbolKind::Instance &&

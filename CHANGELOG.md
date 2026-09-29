@@ -23,6 +23,14 @@ carries its own integer, `db_info.schema_version`, which moves independently.
   around them: tinyriscv and VeeRwolf both export `complete` with no
   elaboration errors. The schema is unchanged (still v22); `config_digest`
   includes the mode, so its value differs from 0.3.0 for the same inputs.
+* `-v` library files are loaded as libraries rather than as ordinary sources:
+  a source definition of the same module wins silently wherever the filelist
+  lists the library (previously a library listed after the sources replaced
+  the source module), and an uninstantiated library module no longer becomes
+  a top. Under `--single-unit` library files see the sources' macros.
+* A module defined in more than one source file is reported on the terminal
+  with the location of the copy that was exported (slang keeps the last one
+  read); previously this was a warning in the log only.
 * The VeeRwolf reference export uses `--single-unit`, as Verilator builds it:
   `common_defines.vh` defines the `RV_*` macros every later VeeR file uses.
   Measured performance in the README reflects the complete parse (3,955

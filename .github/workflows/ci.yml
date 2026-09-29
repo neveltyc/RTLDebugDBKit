@@ -181,6 +181,24 @@ jobs:
           (cd examples/reorder && ../../build/rtl-designdb -f reorder.f \
              -o "$GITHUB_WORKSPACE/reorder.db")
           python3 scripts/verify-designdb.py reorder.db
+          # `-v` follows VCS: a source definition beats a library one without a
+          # word, whichever the filelist names first, and a library module
+          # nobody instantiates is not a top. Given the same two files as
+          # plain sources, slang keeps the later `m`, and the run has to say
+          # which one the database holds.
+          (cd examples/libfile && ../../build/rtl-designdb -f libfile.f \
+             -o "$GITHUB_WORKSPACE/libfile.db" > "$GITHUB_WORKSPACE/libfile.out" 2>&1)
+          python3 scripts/verify-designdb.py libfile.db
+          [ "$(sqlite3 libfile.db "SELECT top FROM db_info")" = top ] \
+            || { echo "a library module became a top"; exit 1; }
+          [ "$(sqlite3 libfile.db "SELECT file_path FROM v_stmt WHERE module_name = 'm'")" = top.sv ] \
+            || { echo "the library copy of m beat the source one"; exit 1; }
+          ! grep -q "defined more than once" libfile.out \
+            || { echo "a library duplicate was reported"; exit 1; }
+          (cd examples/libfile && ../../build/rtl-designdb top.sv cells.v --top top \
+             -o "$GITHUB_WORKSPACE/dupdef.db" > "$GITHUB_WORKSPACE/dupdef.out" 2>&1)
+          grep -q "'m' is defined more than once; the one exported is at cells.v:7" dupdef.out \
+            || { echo "a duplicate source definition went unreported"; exit 1; }
 
       # What keeps the fixture set driven by the schema rather than by
       # whichever constructs happened to break once: every value the schema
