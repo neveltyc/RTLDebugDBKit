@@ -7,6 +7,18 @@ carries its own integer, `db_info.schema_version`, which moves independently.
 
 ## [Unreleased]
 
+### Changed
+
+* slang runs with the rule set of its `--compat vcs`: ten relaxed compilation
+  rules (`AllowUseBeforeDeclare`, `AllowHierarchicalConst`,
+  `RelaxEnumConversions`, `RelaxStringConversions`,
+  `AllowRecursiveImplicitCall`, `AllowBareValParamAssignment`,
+  `AllowSelfDeterminedStreamConcat`, `AllowMergingAnsiPorts`,
+  `AllowArrayConcatAssignPattern`, `AllowLibModuleRedefinition`) and one
+  analysis rule (`AllowMultiDrivenLocals`). Constructs VCS accepts no longer
+  cost the statements around them; tinyriscv now exports `complete`. The schema
+  is unchanged, and `config_digest` includes the mode.
+
 ## [0.3.0] — 2026-08-31
 
 ### Added

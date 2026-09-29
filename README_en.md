@@ -73,6 +73,8 @@ The filelist understands:
 
 Relative paths resolve against the filelist's own directory.
 
+slang always parses with the rules of `--compat vcs`: the 10 compilation rules VCS relaxes (use before declaration, implicit enum/string conversions, and so on) and 1 analysis rule (multiply driven function locals), so RTL written against commercial simulators needs no source edits first.
+
 ---
 
 ## Generate a database

@@ -25,6 +25,7 @@
 #include "slang/ast/Compilation.h"
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/driver/CompatSettings.h"
 #include "slang/driver/SourceLoader.h"
 #include "slang/syntax/SyntaxTree.h"
 #include "slang/text/SourceManager.h"
@@ -565,6 +566,12 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     return true;
 }
 
+driver::CompatSettings vcsCompat() {
+    driver::CompatSettings compat;
+    compat.setMode(driver::CompatMode::Vcs);
+    return compat;
+}
+
 /// The option bag slang is driven with.
 Bag buildOptionBag(const Options& opt) {
     Bag optionBag;
@@ -597,9 +604,24 @@ Bag buildOptionBag(const Options& opt) {
     // exporter has no interest in timing.
     if (auto ts = TimeScale::fromString("1ns/1ps"))
         compOpts.defaultTimeScale = *ts;
+    //
+    // Real IP is written against commercial simulators, not the LRM, so the
+    // compilation relaxes the rules VCS relaxes -- the same set slang's own
+    // `--compat vcs` applies (the analysis half is in vcsAnalysisOptions).
+    for (auto flag : vcsCompat().getCompilationFlags())
+        compOpts.flags |= flag;
     optionBag.set(compOpts);
 
     return optionBag;
+}
+
+/// The analysis half of `--compat vcs`: a function's locals are not reported
+/// as multiply driven when two procedures call it.
+analysis::AnalysisOptions vcsAnalysisOptions() {
+    analysis::AnalysisOptions analysisOpts;
+    for (auto flag : vcsCompat().getAnalysisFlags())
+        analysisOpts.flags |= flag;
+    return analysisOpts;
 }
 
 /// Loads and parses every source into `trees`. False when a source that was
@@ -751,6 +773,7 @@ std::string configDigest(const Options& opt, ast::Compilation& compilation) {
     put("mode", opt.singleUnit ? "single-unit" : "multi-unit");
     for (auto inst : compilation.getRoot().topInstances) put("top", inst->name);
     put("timescale", "1ns/1ps");
+    put("compat", "vcs");
     put("tool", RTLDESIGNDB_VERSION);
     put("slang", RTLDESIGNDB_SLANG_TAG);
     return designdb::digest(cfg);
@@ -1173,7 +1196,7 @@ int main(int argc, char** argv) {
                     diagnosticsAt(log).c_str());
         }
 
-        analysis::AnalysisManager analysis({}, pool);
+        analysis::AnalysisManager analysis(vcsAnalysisOptions(), pool);
         // The analysis contract: the compilation is frozen while the manager's
         // worker threads read it, and unfrozen after, because extraction still
         // elaborates lazily. slang's own driver does exactly this pair; a

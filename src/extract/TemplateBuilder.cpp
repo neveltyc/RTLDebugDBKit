@@ -440,8 +440,19 @@ void TemplateBuilder::fillResolution(Build& b, TplHierRef& row, const Ref& r) {
     // $root. They replay differently -- the first is searched for above each
     // occurrence, the second descends from the root -- so Absolute is told
     // apart here rather than left unreachable behind isUpward().
-    const bool fromRoot = !hv->ref.path.empty() && hv->ref.path.front().symbol &&
-                          hv->ref.path.front().symbol->kind == SymbolKind::Root;
+    //
+    // A top instance heading the path with no climb is a root anchor too:
+    // under AllowUseBeforeDeclare slang finds a top-level name among $root's
+    // members by plain lookup, so `top.u.x` inside a body below `top`
+    // arrives with upwardCount 0 and would otherwise read as downward. The
+    // body's own instance matched by its definition name is the one genuine
+    // zero-level climb, and stays one.
+    const Symbol* head = hv->ref.path.empty() ? nullptr : hv->ref.path.front().symbol;
+    const bool fromRoot =
+        head && (head->kind == SymbolKind::Root ||
+                 (hv->ref.upwardCount == 0 && head->kind == SymbolKind::Instance &&
+                  head->getParentScope()->asSymbol().kind == SymbolKind::Root &&
+                  &head->as<InstanceSymbol>().body != b.body));
     const bool upward = !fromRoot && hv->ref.isUpward();
     // A modport port stands for the net behind it: the reference
     // resolves to that net, not to the modport's own symbol -- whose
