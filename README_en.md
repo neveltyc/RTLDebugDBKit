@@ -58,7 +58,7 @@ rtl-designdb [options] <source...>
 | `+incdir+<dir>` | Include directory |
 | `-I <dir>` | Include directory |
 | `--top <module>` | Set the top module |
-| `--single-unit` | One compilation unit |
+| `--single-unit` | All files share one compilation unit, so a macro defined in an earlier file reaches later ones (Verilator's default; needed by projects such as VeeR that define macros in a common header) |
 | `-o <file.db>` | Output database |
 | `--diag [N]` | Show diagnostics |
 | `--log <file>` | Log file path |
@@ -73,7 +73,7 @@ The filelist understands:
 
 Relative paths resolve against the filelist's own directory.
 
-slang always parses with the rules of `--compat vcs`: the 10 compilation rules VCS relaxes (use before declaration, implicit enum/string conversions, and so on) and 1 analysis rule (multiply driven function locals), so RTL written against commercial simulators needs no source edits first.
+slang always parses with the rules of `--compat vcs`: the 10 compilation rules VCS relaxes (use before declaration, implicit enum/string conversions, and so on) and 1 analysis rule (multiply driven function locals); `` `include`` searches `+incdir+`/`-I` before the including file's own directory; and a macro line continuation may have spaces after the backslash. RTL written against commercial simulators needs no source edits first.
 
 ---
 
@@ -372,8 +372,8 @@ Release build, macOS arm64, schema v22:
 | Design | Definitions | Instances | Nets | Statements | Dependencies | Connection arcs | Trace edges | Time | DB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | picorv32 | 1 | 1 | 225 | 744 | 3,373 | 0 | 3,373 | 0.02 s | 0.91 MB |
-| tinyriscv | 26 | 43 | 870 | 1,543 | 5,180 | 451 | 5,631 | 0.03 s | 1.44 MB |
-| VeeRwolf | 91 | 1,925 | 17,808 | 11,083 | 36,366 | 10,971 | 47,337 | 0.25 s | 11.78 MB |
+| tinyriscv | 26 | 43 | 870 | 1,567 | 5,248 | 451 | 5,699 | 0.03 s | 1.45 MB |
+| VeeRwolf | 101 | 3,955 | 30,358 | 16,226 | 51,926 | 28,295 | 80,221 | 0.35 s | 19.66 MB |
 
 ```bash
 # See per-phase timing

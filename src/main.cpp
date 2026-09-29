@@ -27,6 +27,7 @@
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/driver/CompatSettings.h"
 #include "slang/driver/SourceLoader.h"
+#include "slang/parsing/Lexer.h"
 #include "slang/syntax/SyntaxTree.h"
 #include "slang/text/SourceManager.h"
 #include "slang/diagnostics/DiagnosticEngine.h"
@@ -582,6 +583,13 @@ Bag buildOptionBag(const Options& opt) {
     for (auto& inc : opt.includeDirs)
         ppOpts.additionalIncludePaths.emplace_back(inc);
     optionBag.set(ppOpts);
+
+    // The lexer half of `--compat vcs`: a macro line continuation may have
+    // spaces or tabs between the backslash and the newline. (The include
+    // search order half is set on the SourceManager in main.)
+    parsing::LexerOptions lexOpts;
+    lexOpts.allowMacroTrailingSpace = true;
+    optionBag.set(lexOpts);
 
     ast::CompilationOptions compOpts;
     if (!opt.top.empty())
@@ -1143,6 +1151,10 @@ int main(int argc, char** argv) {
 
     try {
         SourceManager sourceManager;
+        // `--compat vcs` searches +incdir+/-I before the including file's own
+        // directory, so a header shadowed next to a source resolves as VCS
+        // resolves it.
+        sourceManager.setIncDirFirst(true);
         const Bag optionBag = buildOptionBag(opt);
 
         // Both the parser and the analysis manager take a thread pool and

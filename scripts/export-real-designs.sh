@@ -93,7 +93,9 @@ run tinyriscv "$designs/tinyriscv" -f tiny.f --top tinyriscv_soc_top --quiet
 
 veer="$designs/veerwolf_run/build/veerwolf_0.7.5/sim-verilator"
 if [ -d "$veer" ] && [ -f "$veer/designdb_real.f" ]; then
-    run veerwolf "$veer" -f designdb_real.f --top veerwolf_core --quiet
+    # One compilation unit, as Verilator builds it: config/common_defines.vh
+    # defines the RV_* macros every later VeeR file uses.
+    run veerwolf "$veer" -f designdb_real.f --single-unit --top veerwolf_core --quiet
 else
     echo "skip: veerwolf (no fusesoc work root at $veer)"
 fi

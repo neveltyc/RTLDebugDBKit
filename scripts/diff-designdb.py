@@ -99,8 +99,9 @@ def corpus(repo, designs):
             veer = os.path.join(designs_dir, "veerwolf_run", "build",
                                 "veerwolf_0.7.5", "sim-verilator")
             if os.path.isfile(os.path.join(veer, "designdb_real.f")):
+                # --single-unit: see export-real-designs.sh.
                 cases.append(("veerwolf", veer,
-                              ["-f", "designdb_real.f",
+                              ["-f", "designdb_real.f", "--single-unit",
                                "--top", "veerwolf_core"]))
     return cases
 

@@ -7,17 +7,26 @@ carries its own integer, `db_info.schema_version`, which moves independently.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-29
+
 ### Changed
 
-* slang runs with the rule set of its `--compat vcs`: ten relaxed compilation
-  rules (`AllowUseBeforeDeclare`, `AllowHierarchicalConst`,
+* slang parses with everything its `--compat vcs` applies: ten relaxed
+  compilation rules (`AllowUseBeforeDeclare`, `AllowHierarchicalConst`,
   `RelaxEnumConversions`, `RelaxStringConversions`,
   `AllowRecursiveImplicitCall`, `AllowBareValParamAssignment`,
   `AllowSelfDeterminedStreamConcat`, `AllowMergingAnsiPorts`,
-  `AllowArrayConcatAssignPattern`, `AllowLibModuleRedefinition`) and one
-  analysis rule (`AllowMultiDrivenLocals`). Constructs VCS accepts no longer
-  cost the statements around them; tinyriscv now exports `complete`. The schema
-  is unchanged, and `config_digest` includes the mode.
+  `AllowArrayConcatAssignPattern`, `AllowLibModuleRedefinition`), one analysis
+  rule (`AllowMultiDrivenLocals`), `+incdir+`/`-I` searched before the
+  including file's own directory, and spaces allowed after a macro line
+  continuation backslash. Constructs VCS accepts no longer cost the statements
+  around them: tinyriscv and VeeRwolf both export `complete` with no
+  elaboration errors. The schema is unchanged (still v22); `config_digest`
+  includes the mode, so its value differs from 0.3.0 for the same inputs.
+* The VeeRwolf reference export uses `--single-unit`, as Verilator builds it:
+  `common_defines.vh` defines the `RV_*` macros every later VeeR file uses.
+  Measured performance in the README reflects the complete parse (3,955
+  instances, up from 1,925).
 
 ## [0.3.0] — 2026-08-31
 
