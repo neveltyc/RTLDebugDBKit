@@ -1,5 +1,5 @@
 // UNIQUE constraints already index (stmt_id, ordinal) on the three statement
-// child tables and (term_id, ordinal) on net_conn; term_map's primary key
+// child tables and (term_id, ordinal) on net_conn; term_map's UNIQUE constraint
 // covers (term_id, ordinal). What is added here is the other direction of
 // each relation and the point queries the views document: driver = by
 // target, load = by source, provenance = by each reference id.
@@ -55,11 +55,7 @@ CREATE INDEX stmt_by_branch         ON stmt(branch_id)
     WHERE branch_id IS NOT NULL;
 CREATE INDEX stmt_by_proc      ON stmt(proc_id, sequence)
     WHERE proc_id IS NOT NULL;
--- The statement-side twin of net_dep_by_call_site. v15 put `call_site_id` on
--- v_stmt, v_stmt_target and v_stmt_operand precisely so "which statements
--- belong to this call" is a lookup rather than a trace; without this it is a
--- scan of stmt, once per call site, on the side a walk falls back to when a
--- dependency did not survive its sources.
+-- Statements belonging to one call-site expansion.
 CREATE INDEX stmt_by_call_site      ON stmt(call_site_id)
     WHERE call_site_id IS NOT NULL;
 CREATE INDEX stmt_target_by_net   ON stmt_target(net_id);

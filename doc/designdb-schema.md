@@ -222,9 +222,9 @@ likewise. Parentless nodes are exactly the roots and packages.
 levels — the ancestry `tree_node` already encodes, denormalised one hop
 because every ownership rule walks it; the verifier holds the two encodings
 equal. `param_signature` is the elaborated parameter values, normalised,
-declaration order, localparams included — it over-splits and never
-under-splits, so two instances share a signature exactly when they share a
-body. Instances of one module with one signature carry identical row sets.
+in declaration order, localparams included. Extraction templates are grouped
+by definition identity and these values; each occurrence gets fresh ids and
+its cross-instance references are resolved when stamped.
 Location is the instantiation site; the root has none.
 
 **`inst_param`** — `param_signature` made queryable: `(inst_id, ordinal,
@@ -1530,27 +1530,18 @@ nets. A fan-in cone that treats those formals as ordinary nets mixes the
 two calls — it reaches a formal, then *both* callers' arguments, admitting
 `g1` (call 1's gating) with call 2's argument, a path no execution takes.
 
-`call_site_id` breaks the mixing without materialising per-site nets. Every
-row a body walk produced carries the site it belongs to;
-`v_call_site` names each site's caller statement, subroutine and depth, and
-chains nested calls through `parent_call_site_id`. The recipe: when a
-recursive trace reaches a dependency that carries a `call_site_id`, follow
-only rows of that same site (module-level rows, `call_site_id` NULL, always
-pass). One call's cone then holds that call's real combination and no
-other's — `{g1, a}` and `{g2, b}`, never `{g1, b}`. This is context
-sensitivity by call string, the shape static analysis calls *k*-CFA, done
-at query time over tags rather than baked into the stored graph.
+`call_site_id` identifies the expansion that produced a row. `v_call_site`
+names its caller statement, subroutine and depth; `parent_call_site_id`
+links nested expansions. The tag is exposed on `v_trace_edge`, `v_net_dep`,
+`v_driver`, `v_load`, `v_stmt`, `v_stmt_target` and `v_stmt_operand`.
 
-The tag is on all six views a walk meets: `v_net_dep`, `v_driver` and
-`v_load` for the dependency path, and `v_stmt`, `v_stmt_target` and
-`v_stmt_operand` for the statement path — the one a consumer falls back to
-when a dependency did not survive its unresolvable sources. The statement
-layer carries the tag on its views as well as its base table, or the recipe
-is unexecutable from exactly that side. It is also the layer
-where the question is asked without tracing at all: "which call does this
-statement in a shared package or interface body belong to" is a lookup, and
-had no answer.
+A context-sensitive trace must track the call chain across argument bindings
+and body dependencies. Nested calls have distinct ids: in
+`outer(a)` calling `inner(u)`, `a → outer.u` belongs to the outer site,
+while `outer.u → inner.v` and the inner body's dependencies belong to its
+child site. Filtering the entire walk by one fixed `call_site_id` cuts this
+path. Conversely, allowing every child of a parent can mix sibling calls.
 
-The shared formal is still one net row; `call_site_id` is the tag that
-tells the calls apart. A consumer that ignores it sees the graph without
-the call-site distinction — well-formed, less precise across calls.
+The shared formal is still one net row. A trace that ignores call context
+can mix calls; the tags do not add paths absent from the exported graph
+(see *Known limits*).

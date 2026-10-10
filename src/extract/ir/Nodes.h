@@ -35,11 +35,8 @@ using BranchId = int32_t;
 
 /// One level of the gating context, as the walk pushed it.
 ///
-/// The level is identified by WHERE it was pushed, never by what it reads.
-/// Interning gate stacks by content -- what v18 did -- gave the two arms of
-/// one `if` a single id, since both carry exactly the condition's
-/// references, and no consumer could then tell a then-arm assignment from an
-/// else-arm one.
+/// The two arms of an `if` have separate identities even when they read
+/// the same condition.
 struct BranchFrame {
     BranchId parent = -1;
     int32_t depth = 1;

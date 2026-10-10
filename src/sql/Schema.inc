@@ -4,8 +4,7 @@
 // statement is one row with one id -- "who drives bit 3 of THIS instance's
 // q" is an indexed lookup, and a fan-in cone walks `v_trace_edge` rather than
 // using an application-side traversal that re-folds the hierarchy
-// at every boundary. The fold was v9's trade; this is the other side of it,
-// taken deliberately (see doc/designdb-schema.md for the accounting).
+// at every boundary.
 //
 // Naming rules, so a column can be guessed rather than looked up:
 //
@@ -26,8 +25,8 @@
 //   * `ordinal` is position in a declaration or extraction list; `sequence`
 //     is execution order inside a procedure. Neither is an identity.
 //
-// Ranges keep the v7 encoding everywhere: LSB-relative offsets into the
-// flattened object, NOT declared indices. `logic [15:8] off` has bit 15 at
+// Ranges are LSB-relative offsets into the flattened object, NOT declared
+// indices. `logic [15:8] off` has bit 15 at
 // offset 7. NULL bits with exact=1 is the whole object; NULL bits with
 // exact=0 is somewhere inside it, unknown where; a present range with
 // exact=0 is an upper bound rather than the bits actually touched.
@@ -96,17 +95,15 @@ CREATE TABLE file(
     path           TEXT UNIQUE,
     src_file_id    INTEGER REFERENCES src_file(id));
 
--- Repeated type text, interned -- the one intern table v10 keeps. A packed
+-- Repeated type text is interned. A packed
 -- struct or enum prints as its entire member list, far larger than the row
 -- referencing it, and the instance-level model repeats each declaration once
--- per occurrence. Names are not interned: they are short, and the join every
--- query paid the old `name` table was the storage tail wagging the schema.
+-- per occurrence.
 CREATE TABLE data_type(id INTEGER PRIMARY KEY, text TEXT UNIQUE);
 
 -- A source definition: what was written, not what it elaborated into. The
 -- parameter values a body elaborated with are per-occurrence facts and live
--- on `inst.param_signature` -- v9 folded them into module identity, v10
--- puts identity where the source has it. (name, file_id, line) is the
+-- on `inst.param_signature`. (name, file_id, line) is the
 -- definition's own identity; two libraries may define one name.
 CREATE TABLE module(
     id              INTEGER PRIMARY KEY,
@@ -121,17 +118,17 @@ CREATE TABLE module(
 -- resolving `a.b[0].c` is one indexed lookup per segment, which is why the
 -- paths themselves are never stored. This is the supertype: a module
 -- instance is a `tree_node` plus an `inst` row under the same id, a gate is
--- a `tree_node` plus a `primitive` row, a generate block is a bare
+-- a `tree_node` plus a `prim` row, a generate block is a bare
 -- `tree_node`. node_kind says which, and the verifier holds the bijection.
 --
 --   root        the top instance; it has an `inst` row and no parent.
 --   instance    a resolved module/interface/program instance -> `inst`.
 --   generate    a generate block or one element of a generate array. A
 --               naming level, not an object; nothing subtypes it.
---   primitive   a gate, switch or UDP -> `primitive`.
+--   primitive   a gate, switch or UDP -> `prim`.
 --   unresolved  an instance whose definition slang could not find -> `inst`
 --               with module_id NULL. A trace really does stop here.
---   package     a package (or the compilation unit's `$unit` scope), a
+--   package     a package, a
 --               pseudo-occurrence above the roots -> `inst` with
 --               parent_inst_id NULL and a `module` of def_kind 'package'.
 --               Its variables are `net` rows, so a `pkg::x` reference
@@ -153,9 +150,8 @@ CREATE TABLE tree_node(
 -- encodings equal.
 --
 -- `param_signature` is the elaborated parameter values, normalised, in
--- declaration order, localparams included (it over-splits, never
--- under-splits). Instances of one module with one signature share a body and
--- carry identical rows -- the sharing v9 stored once, v10 stamps out.
+-- declaration order, localparams included. Extraction templates are grouped
+-- by definition identity and these values; each occurrence gets fresh ids.
 CREATE TABLE inst(
     id                    INTEGER PRIMARY KEY REFERENCES tree_node(id),
     module_id             INTEGER REFERENCES module(id),
@@ -198,11 +194,10 @@ CREATE TABLE prim(
 -- net's full path is its INSTANCE's tree path plus `name`. scope_node_id is
 -- the node that declares it -- the filter for "signals of this scope",
 -- never the name's anchor: prefixing the scope node's path onto `name`
--- counts every generate segment twice. Parameters, type parameters and
--- interface ports are NOT here: they are not connectable, and v9 mixing them
--- into `symbol` made every "signals of this scope" query filter them out.
+-- counts every generate segment twice. Parameters and type parameters are
+-- not nets; interface-port bindings belong to `term`/`net_conn`.
 --
--- Subroutine formals and locals ARE here (name spells the subroutine
+-- Local subroutine formals and locals ARE here (name spells the subroutine
 -- segment, `bump.v`): a call binds actuals to formals and `net_dep` ends are
 -- ids, so a formal without a row would be a dependency with a dangling end.
 -- Their scope_node_id is the nearest tree_node, since a subroutine is not a
@@ -227,12 +222,10 @@ CREATE TABLE net(
 
 -- One terminal: a port on an instance's boundary. The root instance's
 -- terminals are the design's top-level ports; a child's are the pins its
--- parent connects. One noun for both, because they are the same object seen
--- from the two sides v9 conflated in one `port` row.
+-- parent connects.
 --
 -- direction is NULL for an interface terminal (it has none) and for a
--- terminal of an unresolved instance (nobody knows). is_const marks
--- `const ref`; NULL where constness does not apply. An unresolved instance
+-- terminal of an unresolved instance (nobody knows). An unresolved instance
 -- still gets terminal rows -- one per connection its parent wrote, named as
 -- the connection names them -- so `net_conn` has something to bind and
 -- "connected to a black box" stays distinct from "connected to nothing".
@@ -254,9 +247,7 @@ CREATE TABLE term(
 -- one row per segment. An ANSI port is one whole-to-whole row; a non-ANSI
 -- `.p({hi, lo})` formal is one row per element, each with its window of the
 -- terminal (`term_lo`/`term_hi`) and of the net. Both nets belong to the
--- terminal's own instance -- the outside is `net_conn`'s business, and
--- keeping the two relations apart is what v9's one-table version kept
--- getting wrong.
+-- terminal's own instance; the outside is recorded in `net_conn`.
 CREATE TABLE term_map(
     id            INTEGER PRIMARY KEY,
     term_id       INTEGER NOT NULL REFERENCES term(id),
@@ -335,9 +326,8 @@ CREATE TABLE conn_arc(
     UNIQUE(conn_id, term_map_id, src_net_id, dst_net_id));
 
 -- One procedure: an always/initial/final block. Task and function bodies
--- get no row; their statements belong to the calling procedure. v9 named
--- these with a bare per-module integer that was not a key in any table;
--- this is the object that integer was gesturing at.
+-- get no row; their statements use the caller's proc_id, NULL when the call
+-- is outside a procedure.
 CREATE TABLE proc(
     id             INTEGER PRIMARY KEY,
     inst_id        INTEGER NOT NULL REFERENCES inst(id),
@@ -350,16 +340,14 @@ CREATE TABLE proc(
 
 -- One subroutine-body expansion. A task or function body is walked once per
 -- call site (its statements carry that call's gating and delay), and this is
--- that site's identity, so a consumer can partition a fan-in cone by it and
--- never mix one call's gating with another's argument -- the combination no
--- single call makes, which a shared formal net otherwise admits. `stmt` and
+-- that site's identity. Formal nets are shared across calls, so traces must
+-- track call context to avoid mixing arguments from different calls. `stmt` and
 -- `net_dep` rows a body walk produced name their site in `call_site_id`;
 -- `parent_call_site_id` chains nested calls into a call string.
 --
 -- caller_stmt_id is the statement making the call (NULL for a call in a
 -- control expression, which this schema attaches to no statement). depth is
--- the call-stack depth, 1 at the outermost call. Additive: a reader that
--- does not know call sites ignores the column and the table.
+-- the call-stack depth, 1 at the outermost call.
 CREATE TABLE call_site(
     id                   INTEGER PRIMARY KEY,
     inst_id              INTEGER NOT NULL REFERENCES inst(id),
@@ -373,7 +361,7 @@ CREATE TABLE call_site(
 -- outward, so a statement's conditions are the walk from `stmt.branch_id` up
 -- to a root, outermost last -- the shape `call_site` already uses for nested
 -- calls. Levels are SHARED: every statement in one arm names the same row,
--- and only a level that gates something has a row at all.
+-- including levels whose bodies contain no recorded statements.
 --
 -- What each kind carries, and what is NULL beside it:
 --
@@ -386,20 +374,14 @@ CREATE TABLE call_site(
 --                 unique/priority qualifier, and the level's control reads
 --                 are the SELECTOR's. Its children are the arms.
 --   case_item     one arm. Its control reads are that item's own labels, and
---                 `branch_label` holds their evaluated values -- v18 pushed
---                 every item's labels onto one gate before walking any body,
---                 so each arm saw all of them and none could be told apart.
+--                 `branch_label` holds their evaluated values.
 --                 Arms are SIBLINGS, not a chain: an arm carries its own
 --                 label and not the preceding arms', so the priority a plain
 --                 `case` has -- arm k is reached only if arms 0..k-1 did not
 --                 match -- is `ordinal`, their written order under the point,
 --                 not a read repeated onto every later arm. `ordinal` is set
 --                 on exactly the arms: source line cannot carry the order,
---                 since a whole case may be written on one. It matters for
---                 the `case (1'b1)` one-hot idiom, whose labels are
---                 expressions: picorv32's decoder read `instr_trap` on 207
---                 control rows in v18 and reads it on 36 here, one per
---                 statement of the three arms whose label actually names it.
+--                 since a whole case may be written on one.
 --   case_default  the `default` arm. No labels.
 --   loop          a loop body. The control reads are the guard (`while`'s
 --                 condition, `for`'s stop expression, `repeat`'s count), and
@@ -517,11 +499,8 @@ CREATE TABLE branch_ancestor(
     PRIMARY KEY(branch_id, ancestor_branch_id)) WITHOUT ROWID;
 
 
--- One statement, or one statement-level construct. The statement is the
--- object; its targets, operands and other reads are child rows -- v9's
--- `assignment` was one row per TARGET, so `{a,b} = {x,y}` was two rows
--- claiming one statement and a statement writing only outward was no row at
--- all. Here it is one row regardless.
+-- One statement, or one statement-level construct. Targets, operands and
+-- other reads are child rows; `{a,b} = {x,y}` is one statement row.
 --
 -- sequence is execution order within the procedure, NULL outside one (a
 -- continuous assign has no execution order) and on the procedure-header
@@ -616,7 +595,7 @@ CREATE TABLE expr_ref(
 -- One edge event a procedure triggers on or waits on. All of them, because
 -- an event list has no order and recording "the first" records how the
 -- author arranged the list. Which is the clock is deliberately not decided
--- here, exactly as in v9.
+-- here.
 --
 -- event_kind='sensitivity' rows belong to the procedure header (stmt_id
 -- NULL); event_kind='wait' rows are statement-level controls reached during
@@ -634,8 +613,7 @@ CREATE TABLE proc_event(
     line         INTEGER,
     col          INTEGER);
 
--- One net-to-net dependency occurrence -- the adjacency list v_driver and
--- v_load index, and the provenance record v9's deduplicated `edge` erased.
+-- One net-to-net dependency occurrence, indexed by v_driver and v_load.
 -- NOT deduplicated: the same source reaching the same target from two
 -- statements is two rows, each naming its statement. `{a,b} = {x,y}` is
 -- x->a and y->b, each naming its operand and target rows -- never the

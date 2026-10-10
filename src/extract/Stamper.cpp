@@ -866,11 +866,9 @@ private:
 
         // The cross-instance dependencies. An endpoint is a local net (base
         // plus index) or a reference's resolution. The TARGET must resolve:
-        // target_net_id is NOT NULL, and guessing a written object would be
+        // tgt_net_id is NOT NULL, and guessing a written object would be
         // a wrong fact. The SOURCE may not: a `$unit` item is a real driver
-        // this export has no net row for, and v10/v11 dropping the whole row
-        // made "driven through an unresolvable name" indistinguishable from
-        // "undriven". The row is now written with a NULL source net and the
+        // this export has no net row for. Keep a NULL source net and the
         // reference on the source end; v_driver reports it as 'external'.
         for (auto& job : crossJobs) {
             const TplDep& d = job.t->deps[job.idx];

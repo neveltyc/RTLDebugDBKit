@@ -55,11 +55,9 @@ private:
 };
 
 
-// Everything a group's occurrences share, held with template-local indices.
-// Stamping is then arithmetic: global id = per-occurrence base + index. The
-// invariant that makes this sound: two bodies with one (definition,
-// parameters) key are the same AST, so any deterministic traversal of one is
-// the same traversal of the other.
+// Rows extracted from the group's chosen body, held with template-local
+// indices. Stamping gives each occurrence fresh ids and resolves its
+// cross-instance references.
 
 struct TplLoc {
     int64_t fileId = 0;

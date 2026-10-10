@@ -3,10 +3,9 @@
 //
 // The closed vocabularies, as enums with their published spellings.
 //
-// Every value here is interface: it appears in a schema CHECK clause, in
-// doc/designdb-schema.md, and in verify-designdb.py's DOMAINS table, which
-// --domain-coverage holds the fixture corpus to. Template rows store the
-// enum; the word appears where a row becomes SQL.
+// These spellings are published in doc/designdb-schema.md and checked by
+// verify-designdb.py's DOMAINS table. --domain-coverage requires the fixtures
+// to produce every value. Template rows store the enum; SQL stores the word.
 //
 // Domains the schema publishes as OPEN stay strings and are absent here:
 // stmt.construct takes a system task's or built-in method's own name,

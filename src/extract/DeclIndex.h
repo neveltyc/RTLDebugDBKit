@@ -62,10 +62,8 @@ public:
     ///
     /// A symbol inside a CHILD instance is not a net of this one, even
     /// though its path extends this body's -- `u_cnt.cnt` is the child's
-    /// net, which has a row of its own under the child. v9 stored the dotted
-    /// spelling as a local name because the folded model had nothing to
-    /// point at; the instance model does, so a downward reference goes to
-    /// hier_ref and resolves to the real object.
+    /// net, which has a row of its own under the child. A downward reference
+    /// goes to hier_ref and resolves to that object.
     int32_t netFor(const ValueSymbol& sym) {
         if (auto it = netOf.find(&sym); it != netOf.end())
             return it->second;

@@ -209,12 +209,9 @@ struct StatementWalker : public ASTVisitor<StatementWalker, VisitFlags::AllGood>
     /// call expression as usual.
     ///
     /// Only what the call site itself names is read here. A user
-    /// subroutine's own reads are recorded by walking its body, which v10
-    /// does once per call site -- summarising them here as well reported
-    /// every one of them twice, as a `dataflow` load from the body and a
-    /// `statement` load from the call, against a schema that promises one
-    /// read is one row. A system task has no body to walk, so its free
-    /// reads still have to be gathered.
+    /// subroutine's own reads are recorded by walking its body once per call
+    /// site. A system task has no body to walk, so its free reads are gathered
+    /// here.
     void handle(const ExpressionStatement& stmt) {
         if (stmt.expr.kind != ExpressionKind::Call) {
             visitDefault(stmt);

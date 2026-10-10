@@ -125,9 +125,8 @@ inline std::string escapedSegment(std::string_view t) {
 
 /// The canonical text of a reference that leaves its instance: the path as
 /// written, with every select resolved to the constant it elaborated to.
-/// (See v9's history for why not the raw source text: generate loops share a
-/// spelling across distinct references, spellings differ in whitespace, and
-/// macro-assembled references span buffers.)
+/// Generate-loop references may share source spelling but resolve to different
+/// instances; macro-assembled references may span source buffers.
 inline std::string canonicalPath(const Expression* e, EvalContext& eval) {
     for (;;) {
         if (e && e->kind == ExpressionKind::ElementSelect)

@@ -412,11 +412,7 @@ public:
 
     /// Interns a repeated string into `data_type` and returns the row id.
     ///
-    /// The one intern table v10 keeps: a SystemVerilog enum or packed struct
-    /// prints as its whole member list, so one net row can carry kilobytes of
-    /// it, and the instance-level model repeats each row once per occurrence.
-    /// Names are not interned -- they are short, and the join-per-query the
-    /// name table cost every consumer was what the views existed to hide.
+    /// Enum and packed-struct type text can be large and repeats per occurrence.
     int64_t internDataType(const std::string& text);
     int64_t internFile(const std::string& path);
 

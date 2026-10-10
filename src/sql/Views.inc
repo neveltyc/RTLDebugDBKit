@@ -754,14 +754,9 @@ WHERE t.direction IN ('input', 'inout', 'ref');
 -- already carries into 'dataflow' is not repeated as 'statement' -- the
 -- NOT EXISTS guards are that rule, and the verifier re-derives the counts.
 --
--- call_site_id is the body expansion the read was walked for, on every arm
--- that has a statement to take it from -- dataflow, sensitivity, wait and
--- statement alike, including the arms that read a base table directly. A
--- consumer filtering `call_site_id = ? OR call_site_id IS NULL` -- the
--- documented recipe -- would otherwise admit one call's sensitivity into
--- every call's cone, the mixing the tag exists to prevent. The crossing and
--- terminal arms keep NULL: neither has a statement, so neither belongs to a
--- call.
+-- call_site_id identifies the body expansion that produced the read.
+-- Condition rows take it from branch; statement reads take it from stmt.
+-- Crossing and terminal rows keep NULL.
 --
 -- load_ref is v_driver's driver_ref with the ends exchanged: how the LOAD
 -- end was spelled when it was reached by a hierarchical name, NULL when it
@@ -1257,10 +1252,8 @@ LEFT JOIN src_file sf ON sf.id = f.src_file_id;
 -- One row per call_site: a subroutine-body expansion, the context a
 -- net_dep or stmt names in its call_site_id. Walk parent_call_site_id to
 -- recover the call string; caller_stmt_id is the statement that made the
--- call. depth is 1 at the outermost call. A fan-in cone stays
--- context-sensitive by following, at each hop through a subroutine, only
--- the rows whose call_site_id shares the chain -- never mixing one call's
--- gating with another's argument, the combination the shared formal admits.
+-- call. depth is 1 at the outermost call. Nested expansions have distinct
+-- ids; traces must track context across the parent/child calls.
 CREATE VIEW v_call_site AS
 SELECT
     cs.id                  AS call_site_id,

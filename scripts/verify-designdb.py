@@ -57,10 +57,8 @@ MODES = {
 }
 
 # Every closed value domain the schema publishes, as (table, column, values,
-# nullable). A value here is part of the interface: it is in the DDL's CHECK
-# clause and in doc/designdb-schema.md, so a consumer may write a branch for
-# it -- which is why --domain-coverage requires the fixture corpus to produce
-# every one of them, and why a value no input can reach does not belong.
+# nullable). These published domains are checked here rather than by per-row
+# enum CHECKs. --domain-coverage requires the fixtures to produce every value.
 DOMAINS = (
     ("module", "def_kind", ("module", "interface", "program", "package"), False),
     ("tree_node", "node_kind",
@@ -2540,9 +2538,7 @@ if mode == "params":
     # ---- a procedural if on a parameter, one variant per value
     # The elaboration settles the branch and the rows stay: a simulator has
     # the statement, a source view shows the line, and the level says which
-    # arm nothing can reach. v18 filtered the parameter out of the gating as
-    # a constant operand, so the dead arm carried no condition at all and q
-    # read as unconditionally driven from two places.
+    # arm nothing can reach.
     verdicts = sorted(con.execute("""
         SELECT i.param_signature, b.sense, b.static_taken
         FROM v_branch b JOIN inst i ON i.id = b.inst_id
@@ -2823,12 +2819,7 @@ if mode == "procedural":
           "each loop publishes exactly the space it can stand behind",
           f"got {space}")
 
-    # LRM 12.4 -- the red line the branch table exists for. `gating` writes q
-    # from all four arms of one if/else-if chain, and in v18 the two arms of
-    # each `if` produced rows that were equal column for column: same
-    # conditions, same expr_ref set, same everything but the operand. Each
-    # must now name a level of its own, and the levels must nest by the
-    # desugaring rather than flatten.
+    # LRM 12.4 -- each if/else-if arm has its own level, nested by desugaring.
     arms = con.execute("""
         SELECT s.src_line, b.depth, b.sense
         FROM v_stmt s
@@ -2860,7 +2851,7 @@ if mode == "procedural":
           "while the two innermost arms still read exactly the same nets")
     # LRM 12.5 -- the qualifier and the matching semantics belong to the case
     # POINT; the labels belong to the item, one row each, and no item sees
-    # another's. v18 pushed the selector and every label onto one gate.
+    # another's.
     check(sorted(con.execute("""
         SELECT case_kind, check_kind FROM v_branch
         WHERE module_name='gating' AND branch_kind='case'""").fetchall(),
